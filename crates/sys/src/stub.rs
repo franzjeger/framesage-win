@@ -51,6 +51,9 @@ pub mod apply {
     pub fn set_affinity_mask_for_pid(_pid: u32, _mask: u64) -> Result<()> {
         Err(anyhow!("framesage-sys: not supported on this host"))
     }
+    pub fn trim_working_set_for_pid(_pid: u32) -> Result<()> {
+        Err(anyhow!("framesage-sys: not supported on this host"))
+    }
 }
 
 pub mod process {

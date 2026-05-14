@@ -337,6 +337,23 @@ impl Engine {
         Ok(())
     }
 
+    /// Empty `pid`'s working set via `K32EmptyWorkingSet`. Useful as a
+    /// pre-launch nudge — trim fat background processes (browsers, mail
+    /// clients) so a heavy app has more resident RAM headroom without
+    /// hitting the pagefile.
+    pub fn trim_working_set(&self, pid: u32) -> Result<()> {
+        #[cfg(windows)]
+        {
+            framesage_sys::apply::trim_working_set_for_pid(pid)?;
+            info!(pid, "trim_working_set");
+        }
+        #[cfg(not(windows))]
+        {
+            let _ = pid;
+        }
+        Ok(())
+    }
+
     /// One-shot affinity pin against a live PID. Resolves `selector`
     /// against the current topology so the caller can say "Kind(Cache)"
     /// and let us figure out which CPUs are the X3D ones on this box.

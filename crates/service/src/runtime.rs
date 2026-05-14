@@ -402,6 +402,18 @@ async fn handle_client(
                     }
                 }
             }
+            Request::TrimWorkingSet { pid } => match engine.trim_working_set(pid) {
+                Ok(()) => write_response(&mut write_half, &Response::Ok).await?,
+                Err(e) => {
+                    write_response(
+                        &mut write_half,
+                        &Response::Error {
+                            message: format!("trim_working_set(pid={pid}) failed: {e:#}"),
+                        },
+                    )
+                    .await?;
+                }
+            },
             Request::SetPolicy { policy } => {
                 // Apply in-memory first so subsequent ticks see the change
                 // immediately, then persist to disk so the edit survives

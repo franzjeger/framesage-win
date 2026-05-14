@@ -116,6 +116,12 @@ pub enum Request {
         pid: u32,
         selector: framesage_core::CpuSelector,
     },
+    /// Call `K32EmptyWorkingSet` against `pid` to push its resident pages
+    /// back to the system's free pool. Useful before launching a heavy
+    /// app — trims fat background processes so the new launch has more
+    /// physical RAM headroom. One-shot; the trimmed process re-grows
+    /// its working set on its next page-touch.
+    TrimWorkingSet { pid: u32 },
 }
 
 impl Request {
@@ -142,7 +148,8 @@ impl Request {
             | Request::SuspendProcess { .. }
             | Request::ResumeProcess { .. }
             | Request::TerminateProcess { .. }
-            | Request::SetProcessAffinity { .. } => false,
+            | Request::SetProcessAffinity { .. }
+            | Request::TrimWorkingSet { .. } => false,
         }
     }
 
@@ -371,6 +378,7 @@ mod tests {
             selector: framesage_core::CpuSelector::All,
         }
         .is_read_only());
+        assert!(!Request::TrimWorkingSet { pid: 1 }.is_read_only());
         assert!(!Request::SetPolicy {
             policy: sample_policy()
         }
