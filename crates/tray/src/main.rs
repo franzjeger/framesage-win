@@ -18,7 +18,7 @@ use std::sync::{Arc, Mutex};
 
 use eframe::egui;
 
-use framesage_core::{AppMatch, AppRule, Policy, ProfileId};
+use framesage_core::{AppMatch, AppRule, CpuSelector, Policy, Profile, ProfileId};
 use framesage_ipc::{Event, ForegroundSnapshot, Request, Response, StatusSnapshot};
 #[cfg(windows)]
 use tray_icon::{
@@ -58,6 +58,7 @@ enum Tab {
     #[default]
     Status,
     Rules,
+    Profiles,
 }
 
 /// State for the Rules-tab inline editor. The model is "edit a local clone
@@ -237,6 +238,7 @@ impl eframe::App for FramesageApp {
                 ui.separator();
                 ui.selectable_value(&mut self.tab, Tab::Status, "Status");
                 ui.selectable_value(&mut self.tab, Tab::Rules, "Rules");
+                ui.selectable_value(&mut self.tab, Tab::Profiles, "Profiles");
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     if connected {
                         ui.colored_label(egui::Color32::from_rgb(80, 200, 120), "● connected");
@@ -255,6 +257,7 @@ impl eframe::App for FramesageApp {
             match self.tab {
                 Tab::Status => self.render_status_tab(ctx, ui, &status_snapshot, &recent_events),
                 Tab::Rules => self.render_rules_tab(ui, &status_snapshot),
+                Tab::Profiles => render_profiles_tab(ui, &status_snapshot),
             }
         });
     }
@@ -632,6 +635,183 @@ fn render_foreground(ui: &mut egui::Ui, fg: &ForegroundSnapshot) {
             ui.label(format!("title: {}", fg.title));
         }
     });
+}
+
+/// Render the Profiles tab — a read-only listing of every profile in the
+/// active policy with all its knobs spelled out. Discoverability surface:
+/// the user can see exactly what each profile does without reading the
+/// `policy.json` schema or the source. Editing comes in a follow-up commit.
+fn render_profiles_tab(ui: &mut egui::Ui, status: &Option<StatusSnapshot>) {
+    let Some(s) = status else {
+        ui.label("waiting for status…");
+        return;
+    };
+
+    ui.horizontal(|ui| {
+        ui.label("Profiles in active policy:");
+        let active_id = s.active_profile.as_ref().map(|p| p.id.0.as_str());
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            ui.label(format!("default: {}", s.policy.default_profile));
+            if let Some(bg) = &s.policy.background_profile {
+                ui.label(format!("background: {bg}"));
+            }
+            if let Some(active) = active_id {
+                ui.label(format!("active: {active}"));
+            }
+        });
+    });
+    ui.small("read-only for now — edit via Rules tab or policy.json. Per-profile editing is the next planned commit.");
+    ui.separator();
+
+    let mut profile_ids: Vec<&ProfileId> = s.policy.profiles.keys().collect();
+    profile_ids.sort_by(|a, b| a.0.cmp(&b.0));
+
+    egui::ScrollArea::vertical().show(ui, |ui| {
+        for id in profile_ids {
+            let Some(p) = s.policy.profiles.get(id) else {
+                continue;
+            };
+            // Mark the active profile with a marker for quick visual scan.
+            let is_active = s.active_profile.as_ref().is_some_and(|ap| ap.id == *id);
+            let header = if is_active {
+                format!("● {}", id.0)
+            } else {
+                format!("  {}", id.0)
+            };
+            egui::CollapsingHeader::new(header)
+                .default_open(is_active)
+                .show(ui, |ui| {
+                    render_profile_body(ui, p);
+                });
+        }
+    });
+}
+
+fn render_profile_body(ui: &mut egui::Ui, p: &Profile) {
+    if !p.description.is_empty() {
+        ui.label(&p.description);
+        ui.add_space(4.0);
+    }
+    ui.group(|ui| {
+        ui.heading("Per-process");
+        kv_row(ui, "cpu_sets", format_cpu_selector(p.cpu_sets.as_ref()));
+        kv_row(
+            ui,
+            "affinity_mask",
+            format_cpu_selector(p.affinity_mask.as_ref()),
+        );
+        kv_row(
+            ui,
+            "power_throttling",
+            p.power_throttling
+                .map(|v| format!("{v:?}"))
+                .unwrap_or_else(|| "<unset>".to_owned()),
+        );
+        kv_row(
+            ui,
+            "priority_class",
+            p.priority_class
+                .map(|v| format!("{v:?}"))
+                .unwrap_or_else(|| "<unset>".to_owned()),
+        );
+        kv_row(
+            ui,
+            "io_priority",
+            p.io_priority
+                .map(|v| format!("{v:?}"))
+                .unwrap_or_else(|| "<unset>".to_owned()),
+        );
+        kv_row(
+            ui,
+            "memory_priority",
+            p.memory_priority
+                .map(|v| format!("{v:?}"))
+                .unwrap_or_else(|| "<unset>".to_owned()),
+        );
+        kv_row(ui, "trim_working_set", p.trim_working_set.to_string());
+    });
+
+    if let Some(gm) = &p.game_mode {
+        ui.add_space(4.0);
+        ui.group(|ui| {
+            ui.heading("Game Mode (system-wide)");
+            kv_row(ui, "hide_taskbar", gm.hide_taskbar.to_string());
+            kv_row(
+                ui,
+                "stop_services",
+                if gm.stop_services.is_empty() {
+                    "<none>".to_owned()
+                } else {
+                    gm.stop_services.join(", ")
+                },
+            );
+            kv_row(
+                ui,
+                "suspend_processes",
+                if gm.suspend_processes.is_empty() {
+                    "<none>".to_owned()
+                } else {
+                    gm.suspend_processes.join(", ")
+                },
+            );
+            kv_row(
+                ui,
+                "power_plan",
+                gm.power_plan
+                    .as_ref()
+                    .map(|p| format!("{p:?}"))
+                    .unwrap_or_else(|| "<unset>".to_owned()),
+            );
+            kv_row(
+                ui,
+                "focus_assist",
+                gm.focus_assist
+                    .map(|m| format!("{m:?} (stub)"))
+                    .unwrap_or_else(|| "<unset>".to_owned()),
+            );
+            kv_row(
+                ui,
+                "pause_windows_update",
+                format!(
+                    "{}{}",
+                    gm.pause_windows_update,
+                    if gm.pause_windows_update {
+                        " (stub)"
+                    } else {
+                        ""
+                    }
+                ),
+            );
+        });
+    } else {
+        ui.add_space(4.0);
+        ui.colored_label(
+            egui::Color32::from_gray(150),
+            "Game Mode: not requested by this profile.",
+        );
+    }
+}
+
+fn kv_row(ui: &mut egui::Ui, key: &str, value: String) {
+    ui.horizontal(|ui| {
+        ui.add_sized(
+            [150.0, 16.0],
+            egui::Label::new(egui::RichText::new(key).monospace().weak()),
+        );
+        ui.label(value);
+    });
+}
+
+fn format_cpu_selector(sel: Option<&CpuSelector>) -> String {
+    match sel {
+        None => "<unset>".to_owned(),
+        Some(CpuSelector::All) => "All cores".to_owned(),
+        Some(CpuSelector::Kind(k)) => format!("Kind: {k:?}"),
+        Some(CpuSelector::Ccd(c)) => format!("CCD {c}"),
+        Some(CpuSelector::CcdNot(c)) => format!("Everything except CCD {c}"),
+        Some(CpuSelector::TopRanked(n)) => format!("Top {n} by CPPC rank"),
+        Some(CpuSelector::Mask(m)) => format!("Mask 0x{m:016x}"),
+    }
 }
 
 // ─── Tray icon ───────────────────────────────────────────────────────────────
