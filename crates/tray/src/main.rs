@@ -19,8 +19,8 @@ use std::sync::{Arc, Mutex};
 use eframe::egui;
 
 use framesage_core::{
-    AppMatch, AppRule, CoreKind, CpuSelector, IoPriority, MemoryPriority, Policy,
-    PowerThrottlingMode, PriorityClass, Profile, ProfileId,
+    AppMatch, AppRule, CoreKind, CpuSelector, FocusAssistMode, GameModeActions, IoPriority,
+    MemoryPriority, Policy, PowerPlanId, PowerThrottlingMode, PriorityClass, Profile, ProfileId,
 };
 use framesage_ipc::{Event, ForegroundSnapshot, Request, Response, StatusSnapshot};
 #[cfg(windows)]
@@ -994,16 +994,169 @@ fn render_profile_editor(ui: &mut egui::Ui, p: &mut Profile) {
 
     ui.add_space(4.0);
     ui.group(|ui| {
-        ui.heading("Game Mode (read-only — editor in a follow-up)");
-        kv_row(
-            ui,
-            "game_mode",
-            if p.game_mode.is_some() {
-                "configured (read-only)".to_owned()
-            } else {
-                "<unset>".to_owned()
-            },
+        ui.heading("Game Mode (editable)");
+        let mut enabled = p.game_mode.is_some();
+        let was_enabled = enabled;
+        ui.checkbox(
+            &mut enabled,
+            "Enable system-wide Game Mode for this profile",
         );
+        if enabled != was_enabled {
+            p.game_mode = if enabled {
+                Some(GameModeActions::default())
+            } else {
+                None
+            };
+        }
+        if let Some(gm) = &mut p.game_mode {
+            game_mode_editor(ui, gm);
+        }
+    });
+}
+
+/// Editor for the `GameModeActions` block. Service stop/process suspend
+/// lists are edited as multi-line text — one entry per line — so the user
+/// doesn't have to mentally parse comma-separated strings while typing.
+/// Both lists are gated by the engine's curated safe-list at apply time;
+/// unknown ids are logged and skipped, so the user can't break things
+/// with a typo here.
+fn game_mode_editor(ui: &mut egui::Ui, gm: &mut GameModeActions) {
+    ui.horizontal(|ui| {
+        ui.add_sized(
+            [150.0, 16.0],
+            egui::Label::new(egui::RichText::new("hide_taskbar").monospace().weak()),
+        );
+        ui.checkbox(&mut gm.hide_taskbar, "");
+    });
+
+    option_combo(
+        ui,
+        "focus_assist",
+        &mut gm.focus_assist,
+        &[
+            FocusAssistMode::Off,
+            FocusAssistMode::PriorityOnly,
+            FocusAssistMode::AlarmsOnly,
+        ],
+        |v| format!("{v:?} (stub)"),
+    );
+
+    string_list_edit(
+        ui,
+        "stop_services",
+        &mut gm.stop_services,
+        "One service short-name per line (e.g. SysMain, WSearch, DiagTrack).\nSafe-list gate at apply time — unknown ids are logged and skipped.",
+    );
+
+    string_list_edit(
+        ui,
+        "suspend_processes",
+        &mut gm.suspend_processes,
+        "One exe name per line (e.g. OneDrive.exe, Dropbox.exe).\nSafe-list gate at apply time — shell/kernel/AV/anti-cheat are denied.",
+    );
+
+    power_plan_edit(ui, "power_plan", &mut gm.power_plan);
+
+    ui.horizontal(|ui| {
+        ui.add_sized(
+            [150.0, 16.0],
+            egui::Label::new(
+                egui::RichText::new("pause_windows_update")
+                    .monospace()
+                    .weak(),
+            ),
+        );
+        ui.checkbox(&mut gm.pause_windows_update, "(stub in v0.1)");
+    });
+}
+
+/// `Vec<String>` editor: each entry on its own line in a multi-line text
+/// area. Empty lines are filtered out on save so the user can leave a
+/// trailing blank while typing without polluting the policy.
+fn string_list_edit(ui: &mut egui::Ui, label: &str, items: &mut Vec<String>, hint: &str) {
+    ui.horizontal(|ui| {
+        ui.add_sized(
+            [150.0, 16.0],
+            egui::Label::new(egui::RichText::new(label).monospace().weak()),
+        );
+        let mut buf = items.join("\n");
+        let resp = ui.add(
+            egui::TextEdit::multiline(&mut buf)
+                .desired_rows(3)
+                .desired_width(280.0)
+                .hint_text(hint),
+        );
+        if resp.changed() {
+            *items = buf
+                .lines()
+                .map(|s| s.trim().to_owned())
+                .filter(|s| !s.is_empty())
+                .collect();
+        }
+    });
+}
+
+/// Option<PowerPlanId> editor. PowerPlanId::Custom carries an arbitrary
+/// GUID string; the UI offers it via an "<custom>" entry that swaps in
+/// a text field for the GUID. Most users want one of the four named
+/// plans, so they're presented first.
+fn power_plan_edit(ui: &mut egui::Ui, label: &str, plan: &mut Option<PowerPlanId>) {
+    ui.horizontal(|ui| {
+        ui.add_sized(
+            [150.0, 16.0],
+            egui::Label::new(egui::RichText::new(label).monospace().weak()),
+        );
+
+        // Compute current selection text + discriminant tag for the combo.
+        let selected_text = match plan {
+            None => "<unset>".to_owned(),
+            Some(PowerPlanId::Balanced) => "Balanced".to_owned(),
+            Some(PowerPlanId::HighPerformance) => "High Performance".to_owned(),
+            Some(PowerPlanId::PowerSaver) => "Power Saver".to_owned(),
+            Some(PowerPlanId::UltimatePerformance) => "Ultimate Performance".to_owned(),
+            Some(PowerPlanId::Custom(_)) => "Custom GUID".to_owned(),
+        };
+
+        // Selection via a 6-way combo; on change we replace the whole option
+        // with the default value for the new variant.
+        let mut new_choice = match plan {
+            None => 0u8,
+            Some(PowerPlanId::Balanced) => 1,
+            Some(PowerPlanId::HighPerformance) => 2,
+            Some(PowerPlanId::PowerSaver) => 3,
+            Some(PowerPlanId::UltimatePerformance) => 4,
+            Some(PowerPlanId::Custom(_)) => 5,
+        };
+        let prev_choice = new_choice;
+        egui::ComboBox::from_id_source(("power-plan", label))
+            .selected_text(selected_text)
+            .show_ui(ui, |ui| {
+                ui.selectable_value(&mut new_choice, 0, "<unset>");
+                ui.selectable_value(&mut new_choice, 1, "Balanced");
+                ui.selectable_value(&mut new_choice, 2, "High Performance");
+                ui.selectable_value(&mut new_choice, 3, "Power Saver");
+                ui.selectable_value(&mut new_choice, 4, "Ultimate Performance");
+                ui.selectable_value(&mut new_choice, 5, "Custom GUID");
+            });
+        if new_choice != prev_choice {
+            *plan = match new_choice {
+                1 => Some(PowerPlanId::Balanced),
+                2 => Some(PowerPlanId::HighPerformance),
+                3 => Some(PowerPlanId::PowerSaver),
+                4 => Some(PowerPlanId::UltimatePerformance),
+                5 => Some(PowerPlanId::Custom(String::new())),
+                _ => None,
+            };
+        }
+
+        // Custom variant: render a GUID text field.
+        if let Some(PowerPlanId::Custom(guid)) = plan {
+            ui.add(
+                egui::TextEdit::singleline(guid)
+                    .hint_text("GUID like 381b4222-f694-…")
+                    .desired_width(260.0),
+            );
+        }
     });
 }
 
