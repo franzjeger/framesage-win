@@ -1967,6 +1967,13 @@ fn main() -> eframe::Result<()> {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([640.0, 560.0])
             .with_min_inner_size([520.0, 420.0])
+            // Cap the window aggressively. egui's `persistence` feature
+            // restores whatever last_size the prior session wrote — including
+            // the multi-thousand-pixel sizes that a pre-DPI-manifest drag
+            // between monitors used to produce. The manifest closes the root
+            // cause, but a stale persisted value would still come back to
+            // bite us, so we cap.
+            .with_max_inner_size([1600.0, 1400.0])
             .with_title(if elevated {
                 "FrameSage (admin)"
             } else {
