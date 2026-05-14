@@ -122,6 +122,58 @@ enum ProcessSortKey {
     Profile,
 }
 
+/// Visual classification for a Processes-tab row. Drives the colored leading
+/// marker column, the exe-name color, and (indirectly) several glyph
+/// prefixes. Order matters in `classify_row` — the cases are checked in
+/// priority sequence so the most "interesting" state wins.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RowState {
+    /// The currently-focused application. Wins over every other state — the
+    /// user wants the foreground row to be obvious at a glance.
+    Foreground,
+    /// ProBalance has demoted this process for contention relief.
+    Restrained,
+    /// A profile is currently applied (a rule matched, or manual mode).
+    Managed,
+    /// Plain background process — no special framesage involvement.
+    Default,
+}
+
+fn classify_row(p: &framesage_ipc::ProcessSnapshot, foreground_pid: Option<u32>) -> RowState {
+    if foreground_pid == Some(p.pid) {
+        RowState::Foreground
+    } else if p.restrained_by_probalance {
+        RowState::Restrained
+    } else if p.managed_profile.is_some() {
+        RowState::Managed
+    } else {
+        RowState::Default
+    }
+}
+
+/// Color for the leading vertical marker bar. `None` means "draw nothing"
+/// (default rows stay clean so the colored rows pop visually).
+fn row_marker_color(state: RowState) -> Option<egui::Color32> {
+    match state {
+        RowState::Foreground => Some(theme::ACCENT),
+        RowState::Restrained => Some(theme::WARNING),
+        RowState::Managed => Some(theme::SUCCESS),
+        RowState::Default => None,
+    }
+}
+
+/// Color for the exe-name column. Foreground gets the accent; ProBalance-
+/// restrained gets warning. Managed keeps default text — the leading marker
+/// and the Profile column already say "managed" loud enough; over-coloring
+/// the name on every managed row makes the list feel screamy.
+fn row_exe_color(state: RowState) -> egui::Color32 {
+    match state {
+        RowState::Foreground => theme::ACCENT,
+        RowState::Restrained => theme::WARNING,
+        RowState::Managed | RowState::Default => theme::TEXT,
+    }
+}
+
 /// State for the Rules-tab inline editor. Holds only the open form; the
 /// draft policy lives on `FramesageApp` so Rules and Profiles can edit
 /// the same buffer.
@@ -1865,15 +1917,25 @@ impl FramesageApp {
         let mut profile_ids = profile_ids;
         profile_ids.sort();
 
+        // ─── Foreground PID (drives the Foreground row state) ─────────────
+        let foreground_pid = status
+            .as_ref()
+            .and_then(|s| s.foreground.as_ref())
+            .map(|f| f.pid);
+
         // ─── Table ─────────────────────────────────────────────────────────
         //
         // egui_extras::TableBuilder handles virtualised rows so a 500-row
         // process list stays cheap even with the per-row context menu.
+        // The leading 6px "marker" column paints a colored vertical bar per
+        // row state — like the "modified" gutter in code editors. Empty in
+        // default rows so colored rows pop without the table looking busy.
         let mut action_queue: Vec<ProcessAction> = Vec::new();
         TableBuilder::new(ui)
             .striped(true)
             .resizable(true)
             .cell_layout(egui::Layout::left_to_right(egui::Align::Center))
+            .column(Column::exact(6.0)) // State marker (no header)
             .column(Column::initial(220.0).at_least(120.0)) // Exe
             .column(Column::initial(60.0).at_least(50.0)) // PID
             .column(Column::initial(60.0).at_least(45.0)) // CPU%
@@ -1884,6 +1946,7 @@ impl FramesageApp {
             .column(Column::initial(100.0).at_least(70.0)) // Profile
             .column(Column::remainder().at_least(70.0)) // Status
             .header(20.0, |mut header| {
+                header.col(|_ui| {}); // marker column — no header glyph
                 header.col(|ui| self.sortable_header(ui, "Process", ProcessSortKey::ExeName));
                 header.col(|ui| self.sortable_header(ui, "PID", ProcessSortKey::Pid));
                 header.col(|ui| self.sortable_header(ui, "CPU %", ProcessSortKey::Cpu));
@@ -1903,9 +1966,33 @@ impl FramesageApp {
                     let p = &rows[row.index()];
                     let pid = p.pid;
                     let exe = p.exe_name.clone();
+                    let state = classify_row(p, foreground_pid);
+
+                    // Marker column: paint a 3px vertical band on the left of
+                    // the cell when the row has a non-default state. The
+                    // painter is clipped to the cell, so this never leaks
+                    // outside the column even with the table's striping.
+                    row.col(|ui| {
+                        if let Some(color) = row_marker_color(state) {
+                            let rect = ui.max_rect();
+                            let bar =
+                                egui::Rect::from_min_size(rect.min, egui::vec2(3.0, rect.height()));
+                            ui.painter().rect_filled(bar, egui::Rounding::ZERO, color);
+                        }
+                    });
 
                     row.col(|ui| {
-                        let resp = ui.label(&p.exe_name);
+                        // Foreground rows get a small right-pointing triangle
+                        // prefix so the eye picks them out instantly even
+                        // when the user has scrolled away from the colored
+                        // marker. ▸ is U+25B8, a geometric-shapes-block
+                        // glyph supported by virtually every font.
+                        let label_text = if state == RowState::Foreground {
+                            format!("▸ {}", p.exe_name)
+                        } else {
+                            p.exe_name.clone()
+                        };
+                        let resp = ui.colored_label(row_exe_color(state), label_text);
                         // Right-click anywhere on the name opens the per-PID
                         // context menu — same affordance Process Explorer uses.
                         resp.context_menu(|ui| {
@@ -1970,7 +2057,21 @@ impl FramesageApp {
                     });
                     row.col(|ui| match &p.managed_profile {
                         Some(id) => {
-                            ui.colored_label(theme::ACCENT, id);
+                            // ★ prefix marks rows whose profile came from a
+                            // user-authored Rule (a match in policy.rules).
+                            // Without the prefix it'd be impossible at a
+                            // glance to tell a Rule-pinned profile from a
+                            // one-shot ApplyOnce or manual-override profile.
+                            // matched_rule_note is set for every rule match
+                            // (empty string if the user didn't write a note),
+                            // so its presence is the signal.
+                            let pinned = p.matched_rule_note.is_some();
+                            let label = if pinned {
+                                format!("★ {id}")
+                            } else {
+                                id.clone()
+                            };
+                            ui.colored_label(theme::ACCENT, label);
                         }
                         None => {
                             ui.weak("—");
@@ -1978,7 +2079,10 @@ impl FramesageApp {
                     });
                     row.col(|ui| {
                         if p.restrained_by_probalance {
-                            ui.colored_label(theme::WARNING, "ProBalance");
+                            // ● prefix calls out ProBalance involvement;
+                            // visually pairs with the WARNING-tinted marker
+                            // bar on the same row.
+                            ui.colored_label(theme::WARNING, "● ProBalance");
                         } else if let Some(note) = &p.matched_rule_note {
                             if note.is_empty() {
                                 ui.weak("rule");
@@ -2723,7 +2827,7 @@ fn display_profile_id(raw: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::display_profile_id;
+    use super::{classify_row, display_profile_id, row_marker_color, RowState};
 
     #[test]
     fn profile_id_display_handles_common_cases() {
@@ -2733,6 +2837,65 @@ mod tests {
         assert_eq!(display_profile_id("low_power"), "Low Power");
         assert_eq!(display_profile_id("cpu-bound"), "CPU Bound");
         assert_eq!(display_profile_id(""), "");
+    }
+
+    fn make_proc(pid: u32) -> framesage_ipc::ProcessSnapshot {
+        framesage_ipc::ProcessSnapshot {
+            pid,
+            exe_name: "test.exe".into(),
+            priority_class_raw: 0x20, // NORMAL_PRIORITY_CLASS
+            affinity_mask: 0xFFFF,
+            cpu_percent: 0,
+            memory_bytes: 0,
+            threads: 1,
+            matched_rule_note: None,
+            managed_profile: None,
+            restrained_by_probalance: false,
+        }
+    }
+
+    #[test]
+    fn classify_row_foreground_beats_everything() {
+        // Even if a process is also restrained or managed, the foreground
+        // designation wins — the user expects the focused row to read as
+        // "this is what you're using right now."
+        let mut p = make_proc(42);
+        p.restrained_by_probalance = true;
+        p.managed_profile = Some("game-x3d".into());
+        assert_eq!(classify_row(&p, Some(42)), RowState::Foreground);
+    }
+
+    #[test]
+    fn classify_row_restrained_beats_managed() {
+        let mut p = make_proc(7);
+        p.restrained_by_probalance = true;
+        p.managed_profile = Some("perf".into());
+        assert_eq!(classify_row(&p, Some(1)), RowState::Restrained);
+    }
+
+    #[test]
+    fn classify_row_managed_when_only_profile() {
+        let mut p = make_proc(7);
+        p.managed_profile = Some("perf".into());
+        assert_eq!(classify_row(&p, Some(1)), RowState::Managed);
+    }
+
+    #[test]
+    fn classify_row_default_otherwise() {
+        let p = make_proc(7);
+        assert_eq!(classify_row(&p, Some(1)), RowState::Default);
+        assert_eq!(classify_row(&p, None), RowState::Default);
+    }
+
+    #[test]
+    fn row_marker_default_paints_nothing() {
+        // Default rows leave the marker column empty so the colored ones
+        // pop. Locking this in — accidental "always-on" would defeat the
+        // gutter's purpose.
+        assert!(row_marker_color(RowState::Default).is_none());
+        assert!(row_marker_color(RowState::Foreground).is_some());
+        assert!(row_marker_color(RowState::Restrained).is_some());
+        assert!(row_marker_color(RowState::Managed).is_some());
     }
 }
 
