@@ -84,6 +84,23 @@ struct EngineState {
     /// changes until explicitly cleared via `clear_manual_override` /
     /// `Request::ClearManualOverride`.
     manual_override: Option<ProfileId>,
+    /// Foreground reported by a user-session helper (typically the tray).
+    /// `None` means "the user session is idle / on lock screen / no
+    /// foreground"; the tick should treat it the same as
+    /// `framesage_sys::foreground::current()` returning None.
+    ///
+    /// Set by [`Self::report_foreground`] from the IPC handler. The
+    /// service running as LocalSystem in session 0 can't call
+    /// `GetForegroundWindow` itself — that returns null cross-session —
+    /// so the engine prefers the report when one is fresh, falling back
+    /// to the session-local poll only if no report has ever arrived
+    /// (covers the console-mode dev path).
+    reported_foreground: Option<framesage_sys::foreground::ForegroundInfo>,
+    /// True once at least one IPC ReportForeground arrived. Lets the
+    /// tick path distinguish "user-session helper is connected and the
+    /// desktop is idle" from "no helper has ever reported, fall back to
+    /// session-local polling".
+    foreground_reporter_seen: bool,
 }
 
 /// How often the engine walks all PIDs to apply `Policy::background_profile`.
@@ -129,6 +146,8 @@ impl Engine {
                 system_mode: None,
                 last_background_scan: None,
                 manual_override: None,
+                reported_foreground: None,
+                foreground_reporter_seen: false,
             })),
             events: tx,
             safe_list: deps.safe_list,
@@ -278,6 +297,26 @@ impl Engine {
         );
     }
 
+    /// Accept a foreground report from a user-session helper (the tray).
+    /// See the `reported_foreground` field doc for the why.
+    pub fn report_foreground(&self, pid: u32, exe_name: String, path: String, title: String) {
+        let mut s = self.state.write();
+        s.reported_foreground = Some(framesage_sys::foreground::ForegroundInfo {
+            pid,
+            exe_name,
+            path,
+            title,
+        });
+        s.foreground_reporter_seen = true;
+    }
+
+    /// Accept a "no foreground" report (lock screen, UAC, transition).
+    pub fn report_no_foreground(&self) {
+        let mut s = self.state.write();
+        s.reported_foreground = None;
+        s.foreground_reporter_seen = true;
+    }
+
     /// Panic button: revert any active system mode regardless of foreground.
     /// Idempotent — `Ok(())` if no system mode was active.
     pub fn exit_system_mode_now(&self) {
@@ -386,7 +425,21 @@ impl Engine {
             return Ok(());
         }
 
-        let foreground = framesage_sys::foreground::current()?;
+        // Session 0 isolation: a service running as LocalSystem can't see
+        // the interactive desktop, so `GetForegroundWindow` returns null
+        // from session 0. We prefer a foreground report from the
+        // user-session helper (the tray, via Request::ReportForeground).
+        // If no report has ever arrived (console-mode dev path), we fall
+        // back to the in-process poll.
+        let foreground = {
+            let s = self.state.read();
+            if s.foreground_reporter_seen {
+                s.reported_foreground.clone()
+            } else {
+                drop(s);
+                framesage_sys::foreground::current()?
+            }
+        };
 
         let mut s = self.state.write();
         self.reconcile(&mut s, foreground)?;

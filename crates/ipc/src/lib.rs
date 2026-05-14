@@ -52,6 +52,25 @@ pub enum Request {
     /// Leave manual mode. Foreground apply returns to consulting Rules +
     /// default_profile. Idempotent — no-op if manual mode was already off.
     ClearManualOverride,
+    /// Report the user-session foreground app to the service.
+    ///
+    /// The service runs in Windows session 0 (LocalSystem) and can't see
+    /// the interactive desktop — `GetForegroundWindow()` returns null
+    /// from session 0. The tray runs in the user's session, polls
+    /// foreground itself, and sends this report on every frame. Engine
+    /// uses the most recent report instead of polling on its own. Sent
+    /// every few hundred ms; routed on the admin pipe because it
+    /// ultimately drives apply/revert.
+    ReportForeground {
+        pid: u32,
+        exe_name: String,
+        path: String,
+        title: String,
+    },
+    /// Tell the service the user-session currently has no foreground
+    /// (lock screen, UAC dialog, transition). Engine treats this as
+    /// "no foreground" so any active profile reverts.
+    ReportNoForeground,
     /// Pause the engine (still alive, but stops applying anything).
     Pause,
     /// Resume after a pause.
@@ -79,6 +98,8 @@ impl Request {
             | Request::ApplyOnce { .. }
             | Request::SetManualOverride { .. }
             | Request::ClearManualOverride
+            | Request::ReportForeground { .. }
+            | Request::ReportNoForeground
             | Request::Pause
             | Request::Resume
             | Request::GameModeOff => false,
@@ -180,6 +201,14 @@ mod tests {
         }
         .is_read_only());
         assert!(!Request::ClearManualOverride.is_read_only());
+        assert!(!Request::ReportForeground {
+            pid: 1,
+            exe_name: String::new(),
+            path: String::new(),
+            title: String::new(),
+        }
+        .is_read_only());
+        assert!(!Request::ReportNoForeground.is_read_only());
         assert!(!Request::Pause.is_read_only());
         assert!(!Request::Resume.is_read_only());
         assert!(!Request::GameModeOff.is_read_only());

@@ -389,6 +389,19 @@ async fn handle_client(
                 engine.clear_manual_override();
                 write_response(&mut write_half, &Response::Ok).await?;
             }
+            Request::ReportForeground {
+                pid,
+                exe_name,
+                path,
+                title,
+            } => {
+                engine.report_foreground(pid, exe_name, path, title);
+                write_response(&mut write_half, &Response::Ok).await?;
+            }
+            Request::ReportNoForeground => {
+                engine.report_no_foreground();
+                write_response(&mut write_half, &Response::Ok).await?;
+            }
             Request::Pause => {
                 engine.pause();
                 write_response(&mut write_half, &Response::Ok).await?;

@@ -160,6 +160,19 @@ impl FramesageApp {
             background_loop(bg_state);
         });
 
+        // Session-0 isolation work-around: the service runs as LocalSystem
+        // in session 0 and `GetForegroundWindow` returns null cross-session.
+        // The tray runs in the user's session, so it can see the foreground;
+        // it reports every 250ms to the service via the admin pipe. The
+        // engine prefers the report over its own (broken-from-session-0)
+        // poll. Without this loop, no profile ever applies when the service
+        // is properly installed.
+        #[cfg(windows)]
+        std::thread::Builder::new()
+            .name("framesage-tray-foreground-reporter".into())
+            .spawn(foreground_reporter_loop)
+            .expect("spawn foreground reporter thread");
+
         #[cfg(windows)]
         let tray = build_tray(&commands).expect("build tray icon");
 
@@ -594,7 +607,15 @@ impl FramesageApp {
                 }
             }
 
-            let save_enabled = self.elevated && dirty && self.rules.form.is_none();
+            // Save changes is enabled whenever there's something to
+            // save. Previously gated on "form not open", which made the
+            // button greyed-out while the user was filling in a rule —
+            // confusing and looked broken. The rule-form's own "Save"
+            // button now triggers persistence directly (further down),
+            // so most users won't even need this button; it's kept for
+            // the case where the user makes multiple edits via Edit
+            // buttons and wants to batch.
+            let save_enabled = self.elevated && dirty;
             if ui
                 .add_enabled(save_enabled, egui::Button::new("Save changes"))
                 .clicked()
@@ -604,7 +625,7 @@ impl FramesageApp {
                 }
             }
 
-            let discard_enabled = dirty && self.rules.form.is_none();
+            let discard_enabled = dirty;
             if ui
                 .add_enabled(discard_enabled, egui::Button::new("Discard"))
                 .clicked()
@@ -739,6 +760,16 @@ impl FramesageApp {
                 match editing_index {
                     Some(i) if i < draft.rules.len() => draft.rules[i] = new_rule,
                     _ => draft.rules.push(new_rule),
+                }
+                // Persist immediately. The hardware-validation footgun
+                // was the two-Save flow: form's Save just appended to
+                // the draft, then user had to find the toolbar's Save
+                // changes to actually push to the service. Single-click
+                // intent is what the user actually wants.
+                if self.elevated {
+                    if let Some(draft) = self.policy_draft.take() {
+                        self.send_admin_request(Request::SetPolicy { policy: draft }, "save rule");
+                    }
                 }
             } else if cancel {
                 self.rules.form = None;
@@ -895,11 +926,15 @@ impl FramesageApp {
                 }
             }
 
-            let save_enabled = self.elevated
-                && dirty
-                && self.profiles.editing_id.is_none()
-                && self.profiles.new_form.is_none()
-                && self.rules.form.is_none();
+            // Save changes is enabled whenever there's anything to save.
+            // It used to be gated on "no profile being edited and no form
+            // open", which was misery: users edited a profile, hit Save,
+            // saw nothing happen (button greyed out), and concluded the
+            // app was broken. Profile edits already stream into
+            // policy_draft every frame (via Op::UpdateProfile), so it's
+            // safe to persist mid-edit — the user can keep editing
+            // afterwards and Save again.
+            let save_enabled = self.elevated && dirty;
             if ui
                 .add_enabled(save_enabled, egui::Button::new("Save changes"))
                 .clicked()
@@ -908,7 +943,7 @@ impl FramesageApp {
                     self.send_admin_request(Request::SetPolicy { policy: draft }, "save policy");
                 }
             }
-            let discard_enabled = dirty && self.profiles.editing_id.is_none();
+            let discard_enabled = dirty;
             if ui
                 .add_enabled(discard_enabled, egui::Button::new("Discard"))
                 .clicked()
@@ -978,6 +1013,19 @@ impl FramesageApp {
                 // Drop straight into edit mode on the new profile so the
                 // user can fill in the knobs immediately.
                 self.profiles.editing_id = Some(id);
+                // Persist the bare new profile to disk immediately. Future
+                // field edits will continue to stream into the draft and
+                // can be saved via the toolbar Save changes button.
+                if self.elevated {
+                    if let Some(draft_to_save) = self.policy_draft.clone() {
+                        self.send_admin_request(
+                            Request::SetPolicy {
+                                policy: draft_to_save,
+                            },
+                            "save profile",
+                        );
+                    }
+                }
             } else if cancel {
                 self.profiles.new_form = None;
             }
@@ -2331,6 +2379,61 @@ fn try_connect_and_serve(state: Arc<Mutex<AppState>>) -> anyhow::Result<()> {
 fn background_loop(state: Arc<Mutex<AppState>>) {
     let mut s = state.lock().unwrap();
     s.last_error = Some("tray UI only operates against a Windows service".into());
+}
+
+/// User-session foreground reporter — the workaround for session-0
+/// isolation that lets a LocalSystem-installed service know what's
+/// foregrounded in the user's desktop.
+///
+/// Background: `GetForegroundWindow` returns null when called from
+/// session 0 (where Windows services run). The engine therefore can't
+/// see the foreground when it polls itself. This loop runs in the
+/// user's session (i.e., wherever the tray runs), polls
+/// `framesage_sys::foreground::current()` every 250ms, and forwards
+/// the result over the admin pipe as `Request::ReportForeground` or
+/// `Request::ReportNoForeground`. The engine then uses the reported
+/// value in its tick loop.
+///
+/// Deliberately tolerant of transient pipe failures: if the service
+/// isn't running yet (we start before it does on logon), we silently
+/// retry on the next tick. No backoff is needed — every 250ms is fine
+/// even if the service is down for minutes.
+#[cfg(windows)]
+fn foreground_reporter_loop() {
+    let interval = std::time::Duration::from_millis(250);
+    let mut last_pid: Option<u32> = None;
+    loop {
+        let req = match framesage_sys::foreground::current() {
+            Ok(Some(fg)) => {
+                last_pid = Some(fg.pid);
+                Some(Request::ReportForeground {
+                    pid: fg.pid,
+                    exe_name: fg.exe_name,
+                    path: fg.path,
+                    title: fg.title,
+                })
+            }
+            Ok(None) => {
+                let needs_report = last_pid.is_some();
+                last_pid = None;
+                if needs_report {
+                    Some(Request::ReportNoForeground)
+                } else {
+                    // Still no foreground; don't spam the service with
+                    // duplicate "no foreground" reports. The engine
+                    // already saw the last None.
+                    None
+                }
+            }
+            Err(_) => None,
+        };
+        if let Some(req) = req {
+            // Best-effort: drop the result. Service might be starting,
+            // not yet running, restarting, etc. The next tick will retry.
+            let _ = send_request_blocking(framesage_ipc::PIPE_NAME_ADMIN, &req);
+        }
+        std::thread::sleep(interval);
+    }
 }
 
 /// One-shot blocking IPC: open the named pipe, send a single request,

@@ -7,6 +7,7 @@ use framesage_core::{CpuTopology, Profile};
 
 pub mod foreground {
     use super::*;
+    #[derive(Debug, Clone)]
     pub struct ForegroundInfo {
         pub pid: u32,
         pub exe_name: String,
