@@ -951,7 +951,7 @@ impl FramesageApp {
                     (Tab::Profiles, "Profiles"),
                 ];
                 for (t, label) in tabs {
-                    let marker = if self.tab == t { "✔ " } else { "  " };
+                    let marker = if self.tab == t { "* " } else { "  " };
                     if ui.button(format!("{marker}{label}")).clicked() {
                         self.tab = t;
                         ui.close_menu();
@@ -1016,8 +1016,10 @@ impl FramesageApp {
     fn render_toolbar(&mut self, ui: &mut egui::Ui, paused: bool, manual_active: bool) {
         ui.horizontal(|ui| {
             // Pause / Resume — text shifts based on engine state so the
-            // button always reads as the next action.
-            let pause_label = if paused { "▶ Resume" } else { "❚❚ Pause" };
+            // button always reads as the next action. Plain ASCII labels —
+            // egui's default font doesn't have triangle / pause-bar glyphs
+            // (they render as empty boxes), and the verb alone is clear.
+            let pause_label = if paused { "Resume" } else { "Pause" };
             let pause_color = if paused { theme::WARNING } else { theme::TEXT };
             if ui
                 .add(egui::Button::new(
@@ -1052,7 +1054,7 @@ impl FramesageApp {
             // when manual mode is actually engaged.
             if manual_active
                 && ui
-                    .button("✖ Clear manual")
+                    .button("X Clear manual")
                     .on_hover_text("Leave manual mode; foreground apply returns to Rules")
                     .clicked()
             {
@@ -1137,7 +1139,7 @@ impl FramesageApp {
         if let Some(manual_id) = &s.manual_override {
             theme::banner(theme::WARNING).show(ui, |ui| {
                 ui.horizontal(|ui| {
-                    ui.colored_label(theme::WARNING, egui::RichText::new("⏵").strong().size(13.0));
+                    ui.colored_label(theme::WARNING, egui::RichText::new("!").strong().size(13.0));
                     ui.label(
                         egui::RichText::new("Manual mode")
                             .strong()
@@ -1264,7 +1266,7 @@ impl FramesageApp {
                 ui.colored_label(
                     theme::TEXT,
                     format!(
-                        "system CPU ≥ {}% AND non-foreground hog ≥ {}% of one core",
+                        "system CPU >= {}% AND non-foreground hog >= {}% of one core",
                         cfg.system_cpu_threshold_percent, cfg.hog_cpu_threshold_percent
                     ),
                 );
@@ -1323,7 +1325,7 @@ impl FramesageApp {
         if !self.elevated {
             theme::banner(theme::WARNING).show(ui, |ui| {
                 ui.horizontal(|ui| {
-                    ui.colored_label(theme::WARNING, egui::RichText::new("⚠").strong().size(14.0));
+                    ui.colored_label(theme::WARNING, egui::RichText::new("!").strong().size(14.0));
                     ui.label(
                         egui::RichText::new("Read-only mode")
                             .strong()
@@ -1755,7 +1757,7 @@ impl FramesageApp {
         if let Some(manual_id) = &s.manual_override {
             theme::banner(theme::WARNING).show(ui, |ui| {
                 ui.horizontal(|ui| {
-                    ui.colored_label(theme::WARNING, egui::RichText::new("⏵").strong().size(13.0));
+                    ui.colored_label(theme::WARNING, egui::RichText::new("!").strong().size(13.0));
                     ui.label(
                         egui::RichText::new("Manual mode")
                             .strong()
@@ -2208,7 +2210,7 @@ impl FramesageApp {
                     format!("{} mem", format_bytes(total_mem)),
                 );
                 ui.separator();
-                ui.colored_label(theme::TEXT_MUTED, format!("Σ CPU {total_cpu_one_cpu}%"));
+                ui.colored_label(theme::TEXT_MUTED, format!("Total CPU {total_cpu_one_cpu}%"));
                 if managed > 0 {
                     ui.separator();
                     ui.colored_label(theme::ACCENT, format!("{managed} managed"));
@@ -2443,12 +2445,18 @@ impl FramesageApp {
                                     }
                                     if tr.has_children {
                                         let collapsed_now = self.processes.collapsed.contains(&pid);
-                                        let glyph = if collapsed_now { "▶" } else { "▼" };
+                                        // ASCII glyphs — the unicode triangles
+                                        // ▶/▼ render as empty boxes in egui's
+                                        // default font (no glyph coverage),
+                                        // which the user reported as "stupid
+                                        // squares" everywhere. ASCII renders
+                                        // identically on every font.
+                                        let glyph = if collapsed_now { "+" } else { "-" };
                                         let tri = ui.add(
                                             egui::Label::new(
                                                 egui::RichText::new(glyph)
                                                     .color(theme::TEXT_MUTED)
-                                                    .small(),
+                                                    .monospace(),
                                             )
                                             .sense(egui::Sense::click()),
                                         );
@@ -2465,10 +2473,12 @@ impl FramesageApp {
                                     // Foreground rows get a small right-pointing triangle
                                     // prefix so the eye picks them out instantly even
                                     // when the user has scrolled away from the colored
-                                    // marker. ▸ is U+25B8, a geometric-shapes-block
-                                    // glyph supported by virtually every font.
+                                    // marker. ASCII `> ` instead of unicode triangle —
+                                    // egui's default font doesn't include the
+                                    // Geometric Shapes block, and unicode triangles
+                                    // render as empty boxes.
                                     let label_text = if state == RowState::Foreground {
-                                        format!("▸ {}", p.exe_name)
+                                        format!("> {}", p.exe_name)
                                     } else {
                                         p.exe_name.clone()
                                     };
@@ -2653,6 +2663,32 @@ impl FramesageApp {
                                                 ui.close_menu();
                                             }
                                         });
+                                        ui.separator();
+                                        let trim_label = if bulk {
+                                            format!(
+                                                "Trim working set on {} processes",
+                                                targets.len()
+                                            )
+                                        } else {
+                                            "Trim working set".to_string()
+                                        };
+                                        if ui
+                                            .button(trim_label)
+                                            .on_hover_text(
+                                                "Release the process's resident pages back \
+                                                 to the kernel — frees RAM for a heavy launch. \
+                                                 The process's working set re-grows on next \
+                                                 page-touch, so use as a pre-launch nudge.",
+                                            )
+                                            .clicked()
+                                        {
+                                            for (t_pid, _) in &targets {
+                                                action_queue.push(ProcessAction::TrimWorkingSet {
+                                                    pid: *t_pid,
+                                                });
+                                            }
+                                            ui.close_menu();
+                                        }
                                         ui.separator();
                                         let suspend_label = if bulk {
                                             format!("Suspend {} processes", targets.len())
@@ -3043,6 +3079,9 @@ impl FramesageApp {
                 ProcessAction::Resume { pid } => {
                     self.send_admin_request(Request::ResumeProcess { pid }, "resume process");
                 }
+                ProcessAction::TrimWorkingSet { pid } => {
+                    self.send_admin_request(Request::TrimWorkingSet { pid }, "trim working set");
+                }
                 ProcessAction::RequestTerminate { pid, exe_name } => {
                     // Don't fire the IPC yet — open the confirm modal first.
                     // The modal's "Confirm" click is what actually terminates.
@@ -3079,12 +3118,14 @@ impl FramesageApp {
     /// active column.
     fn sortable_header(&mut self, ui: &mut egui::Ui, label: &str, key: ProcessSortKey) {
         let active = self.processes.sort_by == Some(key);
+        // ASCII arrows for the same reason as the tree toggles: ▲/▼ are
+        // outside the default font's coverage and render as empty squares.
         let suffix = if !active {
             ""
         } else if self.processes.sort_desc {
-            " ▼"
+            " v"
         } else {
-            " ▲"
+            " ^"
         };
         if ui
             .add(egui::Label::new(format!("{label}{suffix}")).sense(egui::Sense::click()))
@@ -3121,6 +3162,9 @@ enum ProcessAction {
         pid: u32,
     },
     Resume {
+        pid: u32,
+    },
+    TrimWorkingSet {
         pid: u32,
     },
     /// Opens the Terminate confirmation modal — DOES NOT directly send the

@@ -332,6 +332,29 @@ pub fn set_priority_class_for_pid(pid: u32, class: PriorityClass) -> Result<()> 
     r
 }
 
+/// Empty the working set of `pid` — releases the resident pages back to
+/// the kernel's free pool. Same primitive Sysinternals' RAMMap and
+/// Process Lasso's "Trim working set" use. Useful before launching a
+/// heavy app, to push memory-fat background processes (browsers, mail
+/// clients) out of physical RAM so the new game has more headroom.
+/// One-shot — the working set grows back as the trimmed process touches
+/// pages, so use sparingly.
+pub fn trim_working_set_for_pid(pid: u32) -> Result<()> {
+    use windows::Win32::System::ProcessStatus::K32EmptyWorkingSet;
+    let handle = open_for_write(pid)?;
+    // SAFETY: handle is valid (we just opened it). K32EmptyWorkingSet
+    // returns a BOOL; non-zero = success.
+    let ok = unsafe { K32EmptyWorkingSet(handle) }.as_bool();
+    let _ = unsafe { CloseHandle(handle) };
+    if ok {
+        Ok(())
+    } else {
+        Err(anyhow!(
+            "K32EmptyWorkingSet({pid}) returned FALSE (process probably exited)"
+        ))
+    }
+}
+
 /// One-shot affinity-mask write against any live PID, bypassing the
 /// profile system entirely. Backs the Processes tab's right-click
 /// "Set CPU affinity" submenu and the persistent steam-pin workflow
