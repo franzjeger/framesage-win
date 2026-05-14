@@ -150,6 +150,15 @@ pub fn create_admin_pipe(name: &str, first_instance: bool) -> Result<NamedPipeSe
     ServerOptions::new()
         .pipe_mode(PipeMode::Byte)
         .first_pipe_instance(first_instance)
+        // PIPE_UNLIMITED_INSTANCES (255 is the documented "unlimited"
+        // sentinel in CreateNamedPipeW). The tray's foreground reporter
+        // fires every 250ms on the admin pipe; without this cap raise
+        // any concurrent client (CLI status query, second tray, etc.)
+        // would hit ERROR_PIPE_BUSY for the brief window between
+        // accept-and-spawn and the next listener instantiation. With
+        // unlimited instances every concurrent caller gets its own
+        // instance.
+        .max_instances(255)
         .create(name)
         .with_context(|| format!("create admin pipe {name}"))
 }

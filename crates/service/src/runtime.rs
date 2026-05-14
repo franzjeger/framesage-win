@@ -235,21 +235,35 @@ async fn serve_ipc(engine: Arc<Engine>, kind: PipeKind) -> Result<()> {
     };
     info!(pipe = %pipe_name, kind = ?kind, "ipc server listening");
 
-    // First pipe instance uses FILE_FLAG_FIRST_PIPE_INSTANCE to defeat
-    // squatting; subsequent accept-loop instances do not.
-    let mut first_instance = true;
+    // Pre-create the FIRST instance with FILE_FLAG_FIRST_PIPE_INSTANCE to
+    // defeat name squatting. Each loop iteration then creates the NEXT
+    // instance BEFORE handing the current one off — this closes a
+    // microsecond gap that hits clients connecting in the window between
+    // accept and re-create as ERROR_PIPE_BUSY. The tray's foreground
+    // reporter connects every 250ms; under that load the gap was hit
+    // often enough to make `framesage status` and concurrent IPC calls
+    // intermittently fail.
+    let mut next_server = match kind {
+        PipeKind::Admin => crate::pipe::create_admin_pipe(pipe_name, true)?,
+        PipeKind::Status => crate::pipe::create_status_pipe(pipe_name, true)?,
+    };
     loop {
-        let server = match kind {
-            PipeKind::Admin => crate::pipe::create_admin_pipe(pipe_name, first_instance)?,
-            PipeKind::Status => crate::pipe::create_status_pipe(pipe_name, first_instance)?,
+        // Move the listener we're about to accept on into `current`,
+        // immediately stand up its replacement.
+        let current = next_server;
+        next_server = match kind {
+            PipeKind::Admin => crate::pipe::create_admin_pipe(pipe_name, false)?,
+            PipeKind::Status => crate::pipe::create_status_pipe(pipe_name, false)?,
         };
-        first_instance = false;
 
-        server.connect().await.context("accept named pipe client")?;
+        current
+            .connect()
+            .await
+            .context("accept named pipe client")?;
 
         let engine = engine.clone();
         tokio::spawn(async move {
-            if let Err(e) = handle_client(server, engine, kind).await {
+            if let Err(e) = handle_client(current, engine, kind).await {
                 debug!(error = %e, "client connection ended");
             }
         });
