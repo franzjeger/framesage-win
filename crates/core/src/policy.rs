@@ -201,10 +201,14 @@ impl Default for Policy {
 
         // "game-x3d" — the marquee profile. Pin CPU Sets to the X3D / Cache CCD.
         // No hard affinity — CPU Sets let the scheduler spill if the CCD is
-        // pinned by something else, which is the desired behavior. Also
-        // requests a conservative Game Mode (services + power plan); these
-        // are all opt-in via safe-list so a user who removes the requests
-        // gets back the pure per-process behavior.
+        // pinned by something else, which is the desired behavior.
+        //
+        // Game Mode here is aggressive on purpose. Every entry is gated by the
+        // engine's curated safe-list (denylist blocks AV / anti-cheat /
+        // kernel / shell / audio / GPU drivers), and the journal makes the
+        // whole batch crash-safe-revertible. A user who wants less should
+        // edit the policy; the default leans into "give the game everything
+        // we can give it without breaking the system."
         let game = Profile {
             id: "game-x3d".into(),
             description: "Pin to AMD X3D CCD (or P-cores on Intel hybrid).".to_owned(),
@@ -214,11 +218,50 @@ impl Default for Policy {
             io_priority: Some(IoPriority::High),
             game_mode: Some(GameModeActions {
                 hide_taskbar: true,
-                stop_services: vec!["SysMain".into(), "WSearch".into(), "DiagTrack".into()],
-                suspend_processes: vec!["OneDrive.exe".into(), "Dropbox.exe".into()],
+                stop_services: vec![
+                    // Search / prefetch / telemetry — the canonical three.
+                    "SysMain".into(),
+                    "WSearch".into(),
+                    "DiagTrack".into(),
+                    // Update / background-download bandwidth and CPU.
+                    "BITS".into(),
+                    "DoSvc".into(),
+                    "WaaSMedicSvc".into(),
+                    // Notifications + device-platform polling.
+                    "WpnService".into(),
+                    "CDPSvc".into(),
+                    // Diagnostics infrastructure (DPS family).
+                    "DPS".into(),
+                    "WdiServiceHost".into(),
+                    "WdiSystemHost".into(),
+                    // Vestigial / IoT services that are pure background.
+                    "MapsBroker".into(),
+                    "AJRouter".into(),
+                    "WMPNetworkSvc".into(),
+                    "defragsvc".into(),
+                    "Fax".into(),
+                    "RetailDemo".into(),
+                    "PhoneSvc".into(),
+                    "RemoteRegistry".into(),
+                    "icssvc".into(),
+                ],
+                suspend_processes: vec![
+                    // Cloud-storage syncs — heaviest disk + network bursts.
+                    "OneDrive.exe".into(),
+                    "FileCoAuth.exe".into(),
+                    "Dropbox.exe".into(),
+                    "googledrivesync.exe".into(),
+                    "GoogleDriveFS.exe".into(),
+                    "pCloud.exe".into(),
+                    "MEGAsync.exe".into(),
+                    // Auto-updaters polling in the background.
+                    "OneDriveStandaloneUpdater.exe".into(),
+                    "GoogleUpdate.exe".into(),
+                    "lghub_updater.exe".into(),
+                ],
                 power_plan: Some(PowerPlanId::HighPerformance),
                 focus_assist: None,
-                pause_windows_update: false,
+                pause_windows_update: true,
             }),
             ..Default::default()
         };
