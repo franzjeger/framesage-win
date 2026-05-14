@@ -374,48 +374,75 @@ impl eframe::App for FramesageApp {
             )
         };
 
-        // Header with brand mark, tabs, connection badge. The OS title bar
-        // already says "framesage" so the inline label is styled small and
-        // colored — it's a brand mark, not a duplicate heading.
-        egui::TopBottomPanel::top("framesage-header")
+        // Snapshot derived bits used by the shell panels. Computed before any
+        // panel runs so the borrow checker doesn't have to navigate `&mut self`
+        // through the closures below.
+        let paused = status_snapshot.as_ref().map(|s| s.paused).unwrap_or(false);
+        let manual_override = status_snapshot
+            .as_ref()
+            .and_then(|s| s.manual_override.clone());
+        let process_count = self.processes.rows.len();
+        let managed_count = self
+            .processes
+            .rows
+            .iter()
+            .filter(|p| p.managed_profile.is_some())
+            .count();
+        let last_action_text = self.last_action.lock().unwrap().clone();
+
+        // ─── Menu bar ──────────────────────────────────────────────────────
+        // File / Engine / View / Tools / Help on the left, FrameSage brand
+        // mark + connection badge on the right. Matches the Process Lasso /
+        // Process Hacker convention for a desktop utility.
+        egui::TopBottomPanel::top("framesage-menubar")
             .frame(
                 egui::Frame::none()
                     .fill(theme::SURFACE)
-                    .inner_margin(egui::Margin::symmetric(12.0, 8.0))
+                    .inner_margin(egui::Margin::symmetric(8.0, 4.0))
                     .stroke(egui::Stroke::new(1.0, theme::BORDER)),
             )
             .show(ctx, |ui| {
-                ui.horizontal(|ui| {
-                    ui.label(
-                        egui::RichText::new("FrameSage")
-                            .color(theme::ACCENT)
-                            .size(15.0)
-                            .strong(),
-                    );
-                    ui.add_space(8.0);
-                    ui.separator();
-                    ui.add_space(4.0);
-                    ui.selectable_value(&mut self.tab, Tab::Processes, "Processes");
-                    ui.selectable_value(&mut self.tab, Tab::Status, "Status");
-                    ui.selectable_value(&mut self.tab, Tab::Rules, "Rules");
-                    ui.selectable_value(&mut self.tab, Tab::Profiles, "Profiles");
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        let (color, text) = if connected {
-                            (theme::SUCCESS, "Connected")
-                        } else {
-                            (theme::ERROR, "Disconnected")
-                        };
-                        theme::status_badge(color).show(ui, |ui| {
-                            ui.colored_label(color, text);
-                        });
-                    });
-                });
+                self.render_menubar(ui, connected, paused);
             });
 
-        // Permanent performance band — second top panel below the header.
-        // CPU% + Mem% + sliding 60s sparkline, visible regardless of which
-        // tab is active. The "what is my machine doing right now?" answer
-        // is always one glance away.
+        // ─── Toolbar ───────────────────────────────────────────────────────
+        // Iconic quick actions for the most common one-clicks: pause/resume
+        // the engine, panic-revert Game Mode, open the policy file, jump
+        // into the config folder. Stays light — anything that needs args
+        // belongs in a menu, not here.
+        egui::TopBottomPanel::top("framesage-toolbar")
+            .frame(
+                egui::Frame::none()
+                    .fill(theme::BG)
+                    .inner_margin(egui::Margin::symmetric(8.0, 4.0))
+                    .stroke(egui::Stroke::new(1.0, theme::BORDER)),
+            )
+            .show(ctx, |ui| {
+                self.render_toolbar(ui, paused, manual_override.is_some());
+            });
+
+        // ─── Tab strip ─────────────────────────────────────────────────────
+        // Chunky bordered tabs with a 2px accent underline on the active one.
+        // Below the toolbar so the visual hierarchy is menu → tools → tabs.
+        egui::TopBottomPanel::top("framesage-tab-strip")
+            .frame(
+                egui::Frame::none()
+                    .fill(theme::BG)
+                    .inner_margin(egui::Margin {
+                        left: 8.0,
+                        right: 8.0,
+                        top: 0.0,
+                        bottom: 0.0,
+                    })
+                    .stroke(egui::Stroke::new(1.0, theme::BORDER)),
+            )
+            .show(ctx, |ui| {
+                self.render_tab_strip(ui);
+            });
+
+        // ─── Performance band ──────────────────────────────────────────────
+        // CPU% + Mem% + sliding 60s sparkline. Visible on every tab so the
+        // "what is the box doing right now" answer is always one glance away.
         egui::TopBottomPanel::top("framesage-perf-band")
             .frame(
                 egui::Frame::none()
@@ -426,10 +453,33 @@ impl eframe::App for FramesageApp {
                 render_perf_band(ui, &system_metrics, &system_history);
             });
 
-        // Permanent activity strip — bottom panel, last 5 engine actions.
-        // Same Recent Activity content the Status tab shows in full; here
-        // it's a single horizontal scroller so you can see what FrameSage
-        // is doing without leaving the Processes tab.
+        // ─── Status bar ────────────────────────────────────────────────────
+        // Single thin line at the very bottom: engine state, process count,
+        // app version, last-action echo. Bottom panels stack from the bottom
+        // up by show-order — this one is shown FIRST so it lands on the
+        // window's bottom edge with the activity strip above it.
+        egui::TopBottomPanel::bottom("framesage-status-bar")
+            .frame(
+                egui::Frame::none()
+                    .fill(theme::SURFACE)
+                    .inner_margin(egui::Margin::symmetric(10.0, 3.0))
+                    .stroke(egui::Stroke::new(1.0, theme::BORDER)),
+            )
+            .show(ctx, |ui| {
+                render_status_bar(
+                    ui,
+                    connected,
+                    paused,
+                    manual_override.as_ref(),
+                    process_count,
+                    managed_count,
+                    last_action_text.as_deref(),
+                );
+            });
+
+        // ─── Activity strip ────────────────────────────────────────────────
+        // Last 5 engine actions, horizontal scroller. Shown AFTER the status
+        // bar so it lands above it.
         egui::TopBottomPanel::bottom("framesage-activity-strip")
             .frame(
                 egui::Frame::none()
@@ -460,6 +510,216 @@ impl eframe::App for FramesageApp {
 }
 
 impl FramesageApp {
+    /// Render the menu bar. Items dispatch to the same `send_admin_request`
+    /// helper the toolbar uses, or to a small set of shell-out helpers
+    /// (`open_in_shell`) for file/folder/URL launches. View → tab items
+    /// duplicate the tab strip below — that's deliberate; menu users and
+    /// click-tab users both expect the option.
+    fn render_menubar(&mut self, ui: &mut egui::Ui, connected: bool, paused: bool) {
+        egui::menu::bar(ui, |ui| {
+            ui.menu_button("File", |ui| {
+                if ui.button("Open policy file…").clicked() {
+                    open_in_shell(&framesage_core::paths::policy_path().to_string_lossy());
+                    ui.close_menu();
+                }
+                if ui.button("Open config folder").clicked() {
+                    open_in_shell(&framesage_core::paths::config_dir().to_string_lossy());
+                    ui.close_menu();
+                }
+                ui.separator();
+                if ui.button("Exit FrameSage").clicked() {
+                    self.commands.exit_requested.store(true, Ordering::Relaxed);
+                    ui.close_menu();
+                }
+            });
+
+            ui.menu_button("Engine", |ui| {
+                let pause_label = if paused { "Resume" } else { "Pause" };
+                if ui.button(pause_label).clicked() {
+                    let req = if paused {
+                        Request::Resume
+                    } else {
+                        Request::Pause
+                    };
+                    self.send_admin_request(req, if paused { "resume" } else { "pause" });
+                    ui.close_menu();
+                }
+                ui.separator();
+                if ui.button("Game Mode off (panic)").clicked() {
+                    self.send_admin_request(Request::GameModeOff, "game-mode off");
+                    ui.close_menu();
+                }
+                if ui.button("Show Game Mode journal").clicked() {
+                    open_in_shell(
+                        &framesage_core::paths::config_dir()
+                            .join("game-mode.journal")
+                            .to_string_lossy(),
+                    );
+                    ui.close_menu();
+                }
+                ui.separator();
+                if ui.button("Clear manual override").clicked() {
+                    self.send_admin_request(Request::ClearManualOverride, "clear manual override");
+                    ui.close_menu();
+                }
+            });
+
+            ui.menu_button("View", |ui| {
+                let tabs = [
+                    (Tab::Processes, "Processes"),
+                    (Tab::Status, "Status"),
+                    (Tab::Rules, "Rules"),
+                    (Tab::Profiles, "Profiles"),
+                ];
+                for (t, label) in tabs {
+                    let marker = if self.tab == t { "✔ " } else { "  " };
+                    if ui.button(format!("{marker}{label}")).clicked() {
+                        self.tab = t;
+                        ui.close_menu();
+                    }
+                }
+            });
+
+            ui.menu_button("Tools", |ui| {
+                if ui.button("Open policy file…").clicked() {
+                    open_in_shell(&framesage_core::paths::policy_path().to_string_lossy());
+                    ui.close_menu();
+                }
+                if ui.button("Open config folder").clicked() {
+                    open_in_shell(&framesage_core::paths::config_dir().to_string_lossy());
+                    ui.close_menu();
+                }
+                if ui.button("Run topology in terminal").clicked() {
+                    // Run `framesage topology` from the same dir as the tray
+                    // exe, in a new terminal window so the user can read the
+                    // output. Best-effort: ignore failure.
+                    spawn_framesage_subcommand("topology");
+                    ui.close_menu();
+                }
+            });
+
+            ui.menu_button("Help", |ui| {
+                if ui.button("GitHub repository").clicked() {
+                    open_in_shell("https://github.com/franzjeger/framesage-win");
+                    ui.close_menu();
+                }
+                if ui.button("Report an issue").clicked() {
+                    open_in_shell("https://github.com/franzjeger/framesage-win/issues");
+                    ui.close_menu();
+                }
+                ui.separator();
+                ui.label(format!("FrameSage v{}", env!("CARGO_PKG_VERSION")));
+            });
+
+            // Brand mark + connection badge on the right side of the bar.
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                let (color, text) = if connected {
+                    (theme::SUCCESS, "Connected")
+                } else {
+                    (theme::ERROR, "Disconnected")
+                };
+                theme::status_badge(color).show(ui, |ui| {
+                    ui.colored_label(color, text);
+                });
+                ui.add_space(8.0);
+                ui.label(
+                    egui::RichText::new("FrameSage")
+                        .color(theme::ACCENT)
+                        .strong(),
+                );
+            });
+        });
+    }
+
+    /// Quick-action toolbar. Visible regardless of which tab is active.
+    /// Buttons echo the most common menu choices for users who don't want to
+    /// pop a menu just to pause the engine.
+    fn render_toolbar(&mut self, ui: &mut egui::Ui, paused: bool, manual_active: bool) {
+        ui.horizontal(|ui| {
+            // Pause / Resume — text shifts based on engine state so the
+            // button always reads as the next action.
+            let pause_label = if paused { "▶ Resume" } else { "❚❚ Pause" };
+            let pause_color = if paused { theme::WARNING } else { theme::TEXT };
+            if ui
+                .add(egui::Button::new(
+                    egui::RichText::new(pause_label).color(pause_color),
+                ))
+                .on_hover_text(if paused {
+                    "Resume the engine — apply profiles on foreground change"
+                } else {
+                    "Pause the engine — stop applying anything until resumed"
+                })
+                .clicked()
+            {
+                let req = if paused {
+                    Request::Resume
+                } else {
+                    Request::Pause
+                };
+                self.send_admin_request(req, if paused { "resume" } else { "pause" });
+            }
+
+            // Game Mode panic button. Always-on; idempotent if no session is
+            // active.
+            if ui
+                .button("🎮 Game Mode off")
+                .on_hover_text("Force-revert any active Game Mode session")
+                .clicked()
+            {
+                self.send_admin_request(Request::GameModeOff, "game-mode off");
+            }
+
+            // Clear manual override is conditional — only worth surfacing
+            // when manual mode is actually engaged.
+            if manual_active
+                && ui
+                    .button("✖ Clear manual")
+                    .on_hover_text("Leave manual mode; foreground apply returns to Rules")
+                    .clicked()
+            {
+                self.send_admin_request(Request::ClearManualOverride, "clear manual override");
+            }
+
+            ui.separator();
+
+            if ui
+                .button("📂 Open config folder")
+                .on_hover_text("Reveal the FrameSage config directory in Explorer")
+                .clicked()
+            {
+                open_in_shell(&framesage_core::paths::config_dir().to_string_lossy());
+            }
+
+            if ui
+                .button("📝 Edit policy")
+                .on_hover_text("Open policy.json in the system editor")
+                .clicked()
+            {
+                open_in_shell(&framesage_core::paths::policy_path().to_string_lossy());
+            }
+        });
+    }
+
+    /// Tab strip below the toolbar. Uses the chunky `theme::tab_button` so
+    /// the active tab reads with a strong visual anchor (filled background
+    /// + accent underline) instead of egui's faint selectable label.
+    fn render_tab_strip(&mut self, ui: &mut egui::Ui) {
+        ui.horizontal(|ui| {
+            ui.spacing_mut().item_spacing.x = 0.0;
+            let tabs = [
+                (Tab::Processes, "Processes"),
+                (Tab::Status, "Status"),
+                (Tab::Rules, "Rules"),
+                (Tab::Profiles, "Profiles"),
+            ];
+            for (t, label) in tabs {
+                if theme::tab_button(ui, label, self.tab == t).clicked() {
+                    self.tab = t;
+                }
+            }
+        });
+    }
+
     fn render_active_tab(
         &mut self,
         ctx: &egui::Context,
@@ -2160,6 +2420,72 @@ fn draw_sparkline(painter: &egui::Painter, rect: egui::Rect, history: &[(u8, u8)
 /// Permanent activity strip — last ~5 engine actions in one horizontal
 /// scroller at the bottom. Mirrors the Status tab's Recent Activity, but
 /// compact and always visible regardless of which tab is open.
+/// One-line status bar at the very bottom of the window. Shows engine state,
+/// process counts, version, and the last-action echo. Sections are separated
+/// by thin dividers in `TEXT_DIM` so the eye groups them naturally.
+fn render_status_bar(
+    ui: &mut egui::Ui,
+    connected: bool,
+    paused: bool,
+    manual_override: Option<&framesage_core::ProfileId>,
+    process_count: usize,
+    managed_count: usize,
+    last_action: Option<&str>,
+) {
+    ui.horizontal(|ui| {
+        // Engine state — anchors the bar on the left.
+        let (state_color, state_text) = if !connected {
+            (theme::ERROR, "Disconnected")
+        } else if paused {
+            (theme::WARNING, "Paused")
+        } else if manual_override.is_some() {
+            (theme::ACCENT, "Manual")
+        } else {
+            (theme::SUCCESS, "Running")
+        };
+        ui.colored_label(
+            state_color,
+            egui::RichText::new(format!("● {state_text}")).strong(),
+        );
+
+        if let Some(id) = manual_override {
+            ui.colored_label(theme::TEXT_MUTED, "·");
+            ui.colored_label(theme::TEXT_MUTED, format!("override: {}", id.0));
+        }
+
+        ui.colored_label(theme::TEXT_MUTED, "·");
+        let managed_str = if managed_count > 0 {
+            format!("{process_count} processes ({managed_count} managed)")
+        } else {
+            format!("{process_count} processes")
+        };
+        ui.colored_label(theme::TEXT_MUTED, managed_str);
+
+        // Last action echo on the right; trims long messages so a noisy
+        // error doesn't break the layout. Version anchors the far right.
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            ui.colored_label(theme::TEXT_MUTED, format!("v{}", env!("CARGO_PKG_VERSION")));
+            if let Some(text) = last_action {
+                ui.colored_label(theme::TEXT_MUTED, "·");
+                let max_chars = 80;
+                let trimmed = if text.chars().count() > max_chars {
+                    let mut t: String = text.chars().take(max_chars - 1).collect();
+                    t.push('…');
+                    t
+                } else {
+                    text.to_string()
+                };
+                let color = if text.contains("error") {
+                    theme::ERROR
+                } else {
+                    theme::TEXT_MUTED
+                };
+                ui.colored_label(color, trimmed);
+            }
+        });
+    });
+}
+
 fn render_activity_strip(ui: &mut egui::Ui, recent: &[String]) {
     ui.horizontal(|ui| {
         ui.label(
@@ -3395,5 +3721,53 @@ fn build_window_icon() -> egui::IconData {
         rgba,
         width: w,
         height: h,
+    }
+}
+
+/// Open a file, folder, or URL in the OS shell handler. Best-effort: we
+/// silently drop spawn errors because there's no useful recovery — the user
+/// can always navigate manually. The `cmd /c start "" <target>` form is the
+/// reliable cross-input way to do this on Windows (handles paths with
+/// spaces and URLs identically). On non-Windows hosts this is a no-op so
+/// the rest of the binary still cross-compiles.
+fn open_in_shell(target: &str) {
+    #[cfg(windows)]
+    {
+        let _ = std::process::Command::new("cmd")
+            .args(["/c", "start", "", target])
+            .spawn();
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = target; // keep the param used on non-Windows
+    }
+}
+
+/// Run `framesage.exe <subcommand>` in a new console window so the user can
+/// read its output. Used by `Tools → Run topology` — we don't have a tab
+/// for topology yet, and the CLI's pretty-printed table is the canonical
+/// view. Best-effort; silently no-ops if framesage.exe isn't next to the
+/// tray binary.
+fn spawn_framesage_subcommand(subcommand: &str) {
+    #[cfg(windows)]
+    {
+        let Some(framesage) = std::env::current_exe()
+            .ok()
+            .and_then(|p| p.parent().map(|d| d.join("framesage.exe")))
+        else {
+            return;
+        };
+        if !framesage.exists() {
+            return;
+        }
+        let _ = std::process::Command::new("cmd")
+            .args(["/c", "start", "cmd", "/k"])
+            .arg(framesage)
+            .arg(subcommand)
+            .spawn();
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = subcommand;
     }
 }

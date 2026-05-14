@@ -177,3 +177,50 @@ pub fn section_heading(text: &str) -> egui::RichText {
         .color(TEXT_MUTED)
         .extra_letter_spacing(1.0)
 }
+
+/// Process Lasso–style tab button. Renders a chunky labelled rectangle with a
+/// 2-pixel accent underline when selected. Returns the click response so the
+/// caller can drive its own selection state — keeps this widget composable
+/// without baking in a particular `Tab` enum.
+///
+/// Visual states:
+/// * **selected**   — surface-active fill, accent underline, full-strength text
+/// * **hovered**    — surface-hover fill, muted underline
+/// * **idle**       — transparent, muted text
+pub fn tab_button(ui: &mut egui::Ui, label: &str, selected: bool) -> egui::Response {
+    let text = if selected {
+        egui::RichText::new(label).strong().color(TEXT)
+    } else {
+        egui::RichText::new(label).color(TEXT_MUTED)
+    };
+    let galley = egui::WidgetText::RichText(text).into_galley(
+        ui,
+        Some(egui::TextWrapMode::Extend),
+        f32::INFINITY,
+        egui::TextStyle::Button,
+    );
+    let padding = egui::vec2(12.0, 8.0);
+    let desired = galley.size() + padding * 2.0;
+    let (rect, response) = ui.allocate_exact_size(desired, egui::Sense::click());
+
+    let painter = ui.painter();
+    if selected {
+        painter.rect_filled(rect, Rounding::same(0.0), SURFACE_ACTIVE);
+    } else if response.hovered() {
+        painter.rect_filled(rect, Rounding::same(0.0), SURFACE_HOVER);
+    }
+
+    // Centre the label inside the slot.
+    let text_pos = rect.center() - galley.size() * 0.5;
+    painter.galley(text_pos, galley, TEXT);
+
+    if selected {
+        let underline = egui::Rect::from_min_max(
+            egui::pos2(rect.left(), rect.bottom() - 2.0),
+            egui::pos2(rect.right(), rect.bottom()),
+        );
+        painter.rect_filled(underline, Rounding::same(0.0), ACCENT);
+    }
+
+    response
+}
