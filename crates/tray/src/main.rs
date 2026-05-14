@@ -295,16 +295,45 @@ impl eframe::App for FramesageApp {
                 ui.colored_label(theme::ERROR, err);
             }
 
-            match self.tab {
-                Tab::Status => self.render_status_tab(ctx, ui, &status_snapshot, &recent_events),
-                Tab::Rules => self.render_rules_tab(ui, &status_snapshot),
-                Tab::Profiles => self.render_profiles_tab(ui, &status_snapshot),
+            // Cap content width so the UI doesn't stretch into "a single
+            // 3440-pixel line of widgets" territory on ultra-wide monitors.
+            // Centers within the available width.
+            const MAX_CONTENT_WIDTH: f32 = 980.0;
+            let available = ui.available_width();
+            let pad = ((available - MAX_CONTENT_WIDTH).max(0.0) / 2.0).floor();
+            if pad > 0.0 {
+                ui.horizontal(|ui| {
+                    ui.add_space(pad);
+                    ui.allocate_ui_with_layout(
+                        egui::vec2(MAX_CONTENT_WIDTH, ui.available_height()),
+                        egui::Layout::top_down(egui::Align::Min),
+                        |ui| {
+                            self.render_active_tab(ctx, ui, &status_snapshot, &recent_events);
+                        },
+                    );
+                });
+            } else {
+                self.render_active_tab(ctx, ui, &status_snapshot, &recent_events);
             }
         });
     }
 }
 
 impl FramesageApp {
+    fn render_active_tab(
+        &mut self,
+        ctx: &egui::Context,
+        ui: &mut egui::Ui,
+        status: &Option<StatusSnapshot>,
+        recent: &[String],
+    ) {
+        match self.tab {
+            Tab::Status => self.render_status_tab(ctx, ui, status, recent),
+            Tab::Rules => self.render_rules_tab(ui, status),
+            Tab::Profiles => self.render_profiles_tab(ui, status),
+        }
+    }
+
     fn render_status_tab(
         &mut self,
         ctx: &egui::Context,
@@ -312,121 +341,175 @@ impl FramesageApp {
         status: &Option<StatusSnapshot>,
         recent: &[String],
     ) {
-        if let Some(s) = status {
-            theme::card().show(ui, |ui| {
-                kv_row(
-                    ui,
-                    "Engine",
-                    if s.paused {
-                        "paused".into()
-                    } else {
-                        "running".into()
-                    },
-                );
-                kv_row(ui, "Rules", s.policy.rules.len().to_string());
-                kv_row(
-                    ui,
-                    "Default profile",
-                    display_profile_id(&s.policy.default_profile.0),
-                );
-                if let Some(manual) = &s.manual_override {
-                    kv_row(ui, "Manual mode", display_profile_id(&manual.0));
-                }
-                match &s.active_profile {
-                    Some(p) => {
-                        kv_row(ui, "Active profile", display_profile_id(&p.id.0));
-                        if !p.description.is_empty() {
-                            ui.add_space(2.0);
-                            ui.colored_label(theme::TEXT_MUTED, &p.description);
-                        }
+        let Some(s) = status else {
+            ui.add_space(40.0);
+            ui.vertical_centered(|ui| {
+                ui.colored_label(theme::TEXT_MUTED, "Waiting for the service to respond…");
+            });
+            return;
+        };
+
+        // ─── Hero: engine state at a glance ─────────────────────────────
+        render_status_hero(ui, s);
+        ui.add_space(10.0);
+
+        // ─── Manual-mode banner (only when active) ──────────────────────
+        if let Some(manual_id) = &s.manual_override {
+            theme::banner(theme::WARNING).show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    ui.colored_label(theme::WARNING, egui::RichText::new("⏵").strong().size(13.0));
+                    ui.label(
+                        egui::RichText::new("Manual mode")
+                            .strong()
+                            .color(theme::TEXT),
+                    );
+                    ui.colored_label(theme::TEXT_MUTED, "·");
+                    ui.label(
+                        egui::RichText::new(display_profile_id(&manual_id.0))
+                            .strong()
+                            .color(theme::WARNING),
+                    );
+                    ui.colored_label(theme::TEXT_MUTED, "is pinned to every foreground app");
+                    if self.elevated {
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            if ui.button("Exit manual mode").clicked() {
+                                self.send_admin_request(
+                                    Request::ClearManualOverride,
+                                    "clear manual override",
+                                );
+                            }
+                        });
                     }
+                });
+            });
+            ui.add_space(10.0);
+        }
+
+        // ─── Side-by-side: Active profile · Foreground ──────────────────
+        ui.columns(2, |cols| {
+            theme::card().show(&mut cols[0], |ui| {
+                ui.label(theme::section_heading("Active profile"));
+                ui.add_space(6.0);
+                render_active_profile_summary(ui, s);
+            });
+            theme::card().show(&mut cols[1], |ui| {
+                ui.label(theme::section_heading("Foreground"));
+                ui.add_space(6.0);
+                match &s.foreground {
+                    Some(fg) => render_foreground_summary(ui, fg),
                     None => {
-                        kv_row(ui, "Active profile", "—".into());
+                        ui.colored_label(theme::TEXT_MUTED, "No foreground process detected.");
                     }
                 }
             });
-            ui.add_space(6.0);
-            match &s.foreground {
-                Some(fg) => render_foreground(ui, fg),
-                None => {
-                    theme::card().show(ui, |ui| {
-                        ui.colored_label(theme::TEXT_MUTED, "No foreground process detected.");
-                    });
-                }
-            }
-        } else {
-            ui.colored_label(theme::TEXT_MUTED, "Waiting for the service to respond…");
-        }
+        });
 
-        ui.separator();
+        ui.add_space(10.0);
 
-        // ─── Controls (admin-only) ──────────────────────────────────────
-        //
-        // Non-elevated tray: show a "Read-only" banner with a button
-        // to relaunch elevated. Elevated tray: enable Pause/Resume/
-        // Game-Mode-Off buttons that hit the admin pipe directly.
+        // ─── Quick actions ──────────────────────────────────────────────
         #[cfg(windows)]
         {
-            let paused = status.as_ref().map(|s| s.paused).unwrap_or(false);
-            let active_profile = status.as_ref().and_then(|s| s.active_profile.as_ref());
-            let in_game_mode = active_profile
+            let paused = s.paused;
+            let in_game_mode = s
+                .active_profile
+                .as_ref()
                 .map(|p| p.game_mode.is_some())
                 .unwrap_or(false);
+            self.render_quick_actions(ctx, ui, paused, in_game_mode);
+            ui.add_space(10.0);
+        }
 
-            if self.elevated {
-                ui.colored_label(theme::SUCCESS, "Admin controls enabled");
+        // ─── Recent activity ────────────────────────────────────────────
+        ui.label(theme::section_heading("Recent activity"));
+        ui.add_space(4.0);
+        render_recent_activity(ui, recent);
+    }
+
+    /// Quick-actions strip: elevation prompt when not elevated, or
+    /// Pause/Resume + Game-Mode-off when we are. Wrapped in a card so it
+    /// reads as a distinct section rather than loose buttons.
+    #[cfg(windows)]
+    fn render_quick_actions(
+        &mut self,
+        ctx: &egui::Context,
+        ui: &mut egui::Ui,
+        paused: bool,
+        in_game_mode: bool,
+    ) {
+        if !self.elevated {
+            theme::banner(theme::WARNING).show(ui, |ui| {
                 ui.horizontal(|ui| {
-                    if paused {
-                        if ui.button("Resume engine").clicked() {
-                            self.send_admin_request(Request::Resume, "resume");
+                    ui.colored_label(theme::WARNING, egui::RichText::new("⚠").strong().size(14.0));
+                    ui.label(
+                        egui::RichText::new("Read-only mode")
+                            .strong()
+                            .color(theme::TEXT),
+                    );
+                    ui.colored_label(
+                        theme::TEXT_MUTED,
+                        "— Pause, Resume, and Game Mode controls need admin.",
+                    );
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if ui
+                            .button("Enable controls (UAC)…")
+                            .on_hover_text(
+                                "Relaunch FrameSage elevated so admin actions go through.",
+                            )
+                            .clicked()
+                        {
+                            match win32::relaunch_as_admin() {
+                                Ok(()) => {
+                                    ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                                    self.commands.exit_requested.store(true, Ordering::Relaxed);
+                                }
+                                Err(e) => {
+                                    *self.last_action.lock().unwrap() =
+                                        Some(format!("relaunch failed: {e}"));
+                                }
+                            }
                         }
-                    } else if ui.button("Pause engine").clicked() {
+                    });
+                });
+            });
+            if let Some(msg) = self.last_action.lock().unwrap().as_ref() {
+                ui.add_space(2.0);
+                ui.small(msg);
+            }
+            return;
+        }
+
+        theme::card().show(ui, |ui| {
+            ui.label(theme::section_heading("Quick actions"));
+            ui.add_space(6.0);
+            ui.horizontal(|ui| {
+                let label = if paused {
+                    "Resume engine"
+                } else {
+                    "Pause engine"
+                };
+                if ui.button(label).clicked() {
+                    if paused {
+                        self.send_admin_request(Request::Resume, "resume");
+                    } else {
                         self.send_admin_request(Request::Pause, "pause");
                     }
-                    let gm_button = egui::Button::new("Game Mode off");
-                    if ui.add_enabled(in_game_mode, gm_button).clicked() {
-                        self.send_admin_request(Request::GameModeOff, "game-mode off");
-                    }
-                });
-                if let Some(msg) = self.last_action.lock().unwrap().as_ref() {
-                    ui.small(msg);
                 }
-            } else {
-                ui.colored_label(theme::WARNING, "Read-only — admin pipe needs UAC");
                 if ui
-                    .button("Enable controls (UAC)…")
+                    .add_enabled(in_game_mode, egui::Button::new("Exit Game Mode"))
                     .on_hover_text(
-                        "Relaunch framesage-tray elevated so Pause/Resume/Game-Mode-Off work.",
+                        "Force any active Game Mode session to revert immediately — restores \
+                         the taskbar, restarts paused services, resumes suspended processes.",
                     )
                     .clicked()
                 {
-                    match win32::relaunch_as_admin() {
-                        Ok(()) => {
-                            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
-                            self.commands.exit_requested.store(true, Ordering::Relaxed);
-                        }
-                        Err(e) => {
-                            *self.last_action.lock().unwrap() =
-                                Some(format!("relaunch failed: {e}"));
-                        }
-                    }
+                    self.send_admin_request(Request::GameModeOff, "game-mode off");
                 }
-                if let Some(msg) = self.last_action.lock().unwrap().as_ref() {
-                    ui.small(msg);
-                }
-            }
-        }
-
-        ui.separator();
-        ui.heading("Recent events");
-        egui::ScrollArea::vertical().show(ui, |ui| {
-            for label in recent {
-                ui.label(label);
+            });
+            if let Some(msg) = self.last_action.lock().unwrap().as_ref() {
+                ui.add_space(4.0);
+                ui.small(msg);
             }
         });
-
-        ui.separator();
-        ui.small("Closing this window hides to tray. Right-click the tray icon to fully exit.");
     }
 
     /// Render the Rules tab — view and edit `Policy::rules` via batched
@@ -754,58 +837,46 @@ impl FramesageApp {
         let displayed_policy = self.policy_draft.as_ref().unwrap_or(&s.policy).clone();
         let dirty = self.policy_draft.is_some();
 
-        // ─── Toolbar ────────────────────────────────────────────────────────
-        ui.horizontal(|ui| {
-            let active_id = s.active_profile.as_ref().map(|p| p.id.0.as_str());
-            ui.label(egui::RichText::new("Default:").weak());
-            ui.label(display_profile_id(&displayed_policy.default_profile.0));
-            if let Some(bg) = &displayed_policy.background_profile {
-                ui.label(egui::RichText::new("·").weak());
-                ui.label(egui::RichText::new("Background:").weak());
-                ui.label(display_profile_id(&bg.0));
-            }
-            if let Some(active) = active_id {
-                ui.label(egui::RichText::new("·").weak());
-                ui.label(egui::RichText::new("Active:").weak());
-                ui.label(display_profile_id(active));
-            }
-        });
-        ui.add_space(2.0);
+        // Section caption — sets context once, doesn't repeat the hero's
+        // policy summary (that's in Status tab).
         ui.colored_label(
             theme::TEXT_MUTED,
-            "Profiles auto-apply by foreground app via the Rules tab. \
-             \u{201c}Apply to foreground\u{201d} overrides the rule match for the current app \
-             until you focus a different one. \u{201c}Set as manual mode\u{201d} forces every \
-             foreground app to use the chosen profile until you exit manual mode.",
+            "Profiles auto-apply per foreground app via Rules. \
+             \u{201c}Apply to foreground\u{201d} overrides the rule for the current app only. \
+             \u{201c}Set as manual mode\u{201d} pins a profile to every foreground app until you exit.",
         );
+        ui.add_space(8.0);
 
-        // Manual-mode banner. Renders prominently above the profile list so
-        // the user sees at a glance that rules + default_profile are being
-        // bypassed, and can exit with one click. Click handler dispatches
-        // directly (not via the `ops` collector below) because the banner
-        // is outside the per-profile iteration's borrow scope.
+        // Manual-mode banner. Matches the Status tab's design so the same
+        // state reads consistently no matter which tab you land on.
         let mut clear_manual_clicked = false;
         if let Some(manual_id) = &s.manual_override {
-            ui.add_space(6.0);
-            theme::status_badge(theme::WARNING).show(ui, |ui| {
+            theme::banner(theme::WARNING).show(ui, |ui| {
                 ui.horizontal(|ui| {
-                    ui.colored_label(theme::WARNING, "Manual mode:");
-                    ui.colored_label(
-                        theme::WARNING,
-                        egui::RichText::new(display_profile_id(&manual_id.0)).strong(),
+                    ui.colored_label(theme::WARNING, egui::RichText::new("⏵").strong().size(13.0));
+                    ui.label(
+                        egui::RichText::new("Manual mode")
+                            .strong()
+                            .color(theme::TEXT),
                     );
-                    ui.add_space(8.0);
-                    if ui
-                        .add_enabled(self.elevated, egui::Button::new("Exit manual mode"))
-                        .on_hover_text(
-                            "Return to rule-driven auto-apply (Rules tab + default profile).",
-                        )
-                        .clicked()
-                    {
-                        clear_manual_clicked = true;
-                    }
+                    ui.colored_label(theme::TEXT_MUTED, "·");
+                    ui.label(
+                        egui::RichText::new(display_profile_id(&manual_id.0))
+                            .strong()
+                            .color(theme::WARNING),
+                    );
+                    ui.colored_label(theme::TEXT_MUTED, "is pinned to every foreground app");
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if ui
+                            .add_enabled(self.elevated, egui::Button::new("Exit manual mode"))
+                            .clicked()
+                        {
+                            clear_manual_clicked = true;
+                        }
+                    });
                 });
             });
+            ui.add_space(8.0);
         }
         if clear_manual_clicked {
             self.send_admin_request(Request::ClearManualOverride, "clear manual override");
@@ -1010,115 +1081,313 @@ impl FramesageApp {
     }
 }
 
-fn render_foreground(ui: &mut egui::Ui, fg: &ForegroundSnapshot) {
+/// Hero strip at the top of the Status tab. One row, three signals: engine
+/// state (with colored dot), policy summary (rules + default profile),
+/// FrameSage-wide "what's happening right now" sentence on the right.
+fn render_status_hero(ui: &mut egui::Ui, s: &StatusSnapshot) {
+    theme::hero().show(ui, |ui| {
+        ui.horizontal(|ui| {
+            let (dot_color, headline) = if s.paused {
+                (theme::WARNING, "Paused")
+            } else {
+                (theme::SUCCESS, "Running")
+            };
+            // Engine state with a coloured dot.
+            ui.label(egui::RichText::new("\u{25cf}").color(dot_color).size(14.0));
+            ui.label(
+                egui::RichText::new(headline)
+                    .size(18.0)
+                    .strong()
+                    .color(theme::TEXT),
+            );
+            ui.add_space(12.0);
+            ui.separator();
+            ui.add_space(12.0);
+            ui.label(
+                egui::RichText::new(format!("{} rules", s.policy.rules.len()))
+                    .color(theme::TEXT_MUTED),
+            );
+            ui.label(egui::RichText::new("·").color(theme::TEXT_MUTED));
+            ui.label(
+                egui::RichText::new(format!(
+                    "default: {}",
+                    display_profile_id(&s.policy.default_profile.0)
+                ))
+                .color(theme::TEXT_MUTED),
+            );
+            if let Some(bg) = &s.policy.background_profile {
+                ui.label(egui::RichText::new("·").color(theme::TEXT_MUTED));
+                ui.label(
+                    egui::RichText::new(format!("background: {}", display_profile_id(&bg.0)))
+                        .color(theme::TEXT_MUTED),
+                );
+            }
+        });
+    });
+}
+
+/// Single-card summary of the active profile: name, description, and the
+/// three knobs the user cares about most at a glance.
+fn render_active_profile_summary(ui: &mut egui::Ui, s: &StatusSnapshot) {
+    let Some(p) = &s.active_profile else {
+        ui.colored_label(theme::TEXT_MUTED, "No profile applied yet.");
+        return;
+    };
+    ui.label(
+        egui::RichText::new(display_profile_id(&p.id.0))
+            .size(17.0)
+            .strong()
+            .color(theme::ACCENT),
+    );
+    if !p.description.is_empty() {
+        ui.add_space(2.0);
+        ui.colored_label(theme::TEXT_MUTED, &p.description);
+    }
+    ui.add_space(8.0);
+    egui::Grid::new("active-profile-grid")
+        .num_columns(2)
+        .spacing([12.0, 4.0])
+        .show(ui, |ui| {
+            kv_grid_row(ui, "CPU sets", format_cpu_selector(p.cpu_sets.as_ref()));
+            kv_grid_row(
+                ui,
+                "Throttling",
+                p.power_throttling
+                    .map(|v| v.to_string())
+                    .unwrap_or_else(|| "—".into()),
+            );
+            kv_grid_row(
+                ui,
+                "Priority",
+                p.priority_class
+                    .map(|v| v.to_string())
+                    .unwrap_or_else(|| "—".into()),
+            );
+            kv_grid_row(
+                ui,
+                "Game Mode",
+                if p.game_mode.is_some() {
+                    "Enabled".into()
+                } else {
+                    "—".into()
+                },
+            );
+        });
+}
+
+/// Single-card summary of the currently-foregrounded process.
+fn render_foreground_summary(ui: &mut egui::Ui, fg: &ForegroundSnapshot) {
+    ui.label(
+        egui::RichText::new(&fg.exe_name)
+            .size(17.0)
+            .strong()
+            .color(theme::TEXT),
+    );
+    ui.add_space(2.0);
+    if !fg.title.is_empty() {
+        ui.colored_label(theme::TEXT_MUTED, &fg.title);
+        ui.add_space(8.0);
+    } else {
+        ui.add_space(8.0);
+    }
+    egui::Grid::new("foreground-grid")
+        .num_columns(2)
+        .spacing([12.0, 4.0])
+        .show(ui, |ui| {
+            kv_grid_row(ui, "PID", fg.pid.to_string());
+            if !fg.path.is_empty() {
+                kv_grid_row(ui, "Path", short_path(&fg.path));
+            }
+        });
+}
+
+/// Truncate long paths for display — keep the drive letter and the final
+/// two components, ellipsise the middle. Avoids the path field exploding
+/// the card width on deep installs.
+fn short_path(path: &str) -> String {
+    if path.len() <= 60 {
+        return path.to_owned();
+    }
+    let parts: Vec<&str> = path.split(['\\', '/']).filter(|p| !p.is_empty()).collect();
+    if parts.len() < 4 {
+        return path.to_owned();
+    }
+    let first = parts[0];
+    let last_two = &parts[parts.len() - 2..];
+    format!("{}\\…\\{}\\{}", first, last_two[0], last_two[1])
+}
+
+/// Compact KV row inside an egui::Grid. Caller is responsible for ending
+/// each row with `ui.end_row()` — this helper does it.
+fn kv_grid_row(ui: &mut egui::Ui, key: &str, value: String) {
+    ui.label(egui::RichText::new(key).color(theme::TEXT_MUTED).size(12.0));
+    ui.label(value);
+    ui.end_row();
+}
+
+/// Recent activity feed. Treats consecutive identical lines as one (with a
+/// "× N" suffix) so the user sees signal not noise. Most recent first.
+fn render_recent_activity(ui: &mut egui::Ui, recent: &[String]) {
+    if recent.is_empty() {
+        ui.colored_label(theme::TEXT_MUTED, "No activity yet.");
+        return;
+    }
     theme::card().show(ui, |ui| {
-        kv_row(ui, "Foreground PID", fg.pid.to_string());
-        kv_row(ui, "Executable", fg.exe_name.clone());
-        if !fg.title.is_empty() {
-            kv_row(ui, "Window title", fg.title.clone());
-        }
+        egui::ScrollArea::vertical()
+            .max_height(220.0)
+            .show(ui, |ui| {
+                // De-dupe consecutive identical labels. The engine fires
+                // ForegroundChanged on every focus shift, including spurious
+                // self-shifts when popups close — without dedup the feed
+                // gets noisy fast.
+                let mut last: Option<&String> = None;
+                let mut count = 1usize;
+                let mut grouped: Vec<(&String, usize)> = Vec::new();
+                for label in recent.iter().rev() {
+                    if last == Some(label) {
+                        count += 1;
+                    } else {
+                        if let Some(l) = last {
+                            grouped.push((l, count));
+                        }
+                        last = Some(label);
+                        count = 1;
+                    }
+                }
+                if let Some(l) = last {
+                    grouped.push((l, count));
+                }
+
+                for (i, (label, n)) in grouped.iter().enumerate() {
+                    if i > 0 {
+                        ui.add_space(2.0);
+                    }
+                    ui.horizontal(|ui| {
+                        ui.label(egui::RichText::new("›").color(theme::TEXT_DIM).monospace());
+                        ui.label(*label);
+                        if *n > 1 {
+                            ui.colored_label(
+                                theme::TEXT_MUTED,
+                                egui::RichText::new(format!("× {n}")).small(),
+                            );
+                        }
+                    });
+                }
+            });
     });
 }
 
 fn render_profile_body(ui: &mut egui::Ui, p: &Profile) {
     if !p.description.is_empty() {
-        ui.label(&p.description);
-        ui.add_space(4.0);
+        ui.colored_label(theme::TEXT_MUTED, &p.description);
+        ui.add_space(8.0);
     }
-    ui.group(|ui| {
-        ui.heading("Per-process");
-        kv_row(ui, "CPU sets", format_cpu_selector(p.cpu_sets.as_ref()));
-        kv_row(
-            ui,
-            "Affinity mask",
-            format_cpu_selector(p.affinity_mask.as_ref()),
-        );
-        kv_row(
-            ui,
-            "Power throttling",
-            p.power_throttling
-                .map(|v| v.to_string())
-                .unwrap_or_else(|| "—".to_owned()),
-        );
-        kv_row(
-            ui,
-            "Priority class",
-            p.priority_class
-                .map(|v| v.to_string())
-                .unwrap_or_else(|| "—".to_owned()),
-        );
-        kv_row(
-            ui,
-            "I/O priority",
-            p.io_priority
-                .map(|v| v.to_string())
-                .unwrap_or_else(|| "—".to_owned()),
-        );
-        kv_row(
-            ui,
-            "Memory priority",
-            p.memory_priority
-                .map(|v| v.to_string())
-                .unwrap_or_else(|| "—".to_owned()),
-        );
-        kv_row(ui, "Trim working set", yes_no(p.trim_working_set).into());
-    });
 
-    if let Some(gm) = &p.game_mode {
-        ui.add_space(4.0);
-        ui.group(|ui| {
-            ui.heading("Game Mode (system-wide)");
-            kv_row(ui, "Hide taskbar", yes_no(gm.hide_taskbar).into());
-            kv_row(
+    // Per-process knobs in a tight grid.
+    ui.label(theme::section_heading("Per-process"));
+    ui.add_space(4.0);
+    egui::Grid::new(("profile-perproc-grid", p.id.0.as_str()))
+        .num_columns(2)
+        .spacing([16.0, 4.0])
+        .show(ui, |ui| {
+            kv_grid_row(ui, "CPU sets", format_cpu_selector(p.cpu_sets.as_ref()));
+            kv_grid_row(
                 ui,
-                "Stop services",
-                if gm.stop_services.is_empty() {
-                    "—".to_owned()
-                } else {
-                    gm.stop_services.join(", ")
-                },
+                "Affinity mask",
+                format_cpu_selector(p.affinity_mask.as_ref()),
             );
-            kv_row(
+            kv_grid_row(
                 ui,
-                "Suspend processes",
-                if gm.suspend_processes.is_empty() {
-                    "—".to_owned()
-                } else {
-                    gm.suspend_processes.join(", ")
-                },
+                "Power throttling",
+                p.power_throttling
+                    .map(|v| v.to_string())
+                    .unwrap_or_else(|| "—".into()),
             );
-            kv_row(
+            kv_grid_row(
                 ui,
-                "Power plan",
-                gm.power_plan
-                    .as_ref()
-                    .map(|p| p.to_string())
-                    .unwrap_or_else(|| "—".to_owned()),
+                "Priority class",
+                p.priority_class
+                    .map(|v| v.to_string())
+                    .unwrap_or_else(|| "—".into()),
             );
-            kv_row(
+            kv_grid_row(
                 ui,
-                "Focus assist",
-                gm.focus_assist
-                    .map(|m| format!("{m} (stub)"))
-                    .unwrap_or_else(|| "—".to_owned()),
+                "I/O priority",
+                p.io_priority
+                    .map(|v| v.to_string())
+                    .unwrap_or_else(|| "—".into()),
             );
-            kv_row(
+            kv_grid_row(
                 ui,
-                "Pause Windows Update",
-                if gm.pause_windows_update {
-                    "Yes (stub)".to_owned()
-                } else {
-                    "No".to_owned()
-                },
+                "Memory priority",
+                p.memory_priority
+                    .map(|v| v.to_string())
+                    .unwrap_or_else(|| "—".into()),
             );
+            kv_grid_row(ui, "Trim working set", yes_no(p.trim_working_set).into());
         });
-    } else {
+
+    ui.add_space(10.0);
+
+    // Game Mode section.
+    if let Some(gm) = &p.game_mode {
+        ui.label(theme::section_heading("Game Mode (system-wide)"));
         ui.add_space(4.0);
-        ui.colored_label(
-            theme::TEXT_MUTED,
-            "Game Mode: not requested by this profile.",
-        );
+        egui::Grid::new(("profile-gamemode-grid", p.id.0.as_str()))
+            .num_columns(2)
+            .spacing([16.0, 4.0])
+            .show(ui, |ui| {
+                kv_grid_row(ui, "Hide taskbar", yes_no(gm.hide_taskbar).into());
+                kv_grid_row(
+                    ui,
+                    "Stop services",
+                    if gm.stop_services.is_empty() {
+                        "—".into()
+                    } else {
+                        format_count_summary(&gm.stop_services)
+                    },
+                );
+                kv_grid_row(
+                    ui,
+                    "Suspend processes",
+                    if gm.suspend_processes.is_empty() {
+                        "—".into()
+                    } else {
+                        format_count_summary(&gm.suspend_processes)
+                    },
+                );
+                kv_grid_row(
+                    ui,
+                    "Power plan",
+                    gm.power_plan
+                        .as_ref()
+                        .map(|p| p.to_string())
+                        .unwrap_or_else(|| "—".into()),
+                );
+                kv_grid_row(
+                    ui,
+                    "Pause Windows Update",
+                    if gm.pause_windows_update {
+                        "Yes".into()
+                    } else {
+                        "No".into()
+                    },
+                );
+            });
+    } else {
+        ui.colored_label(theme::TEXT_DIM, "Game Mode not requested by this profile.");
     }
+}
+
+/// Summarise a long list of ids as "N items: first, second, third…" so the
+/// profile card stays compact. Full list is visible in the editor anyway.
+fn format_count_summary(items: &[String]) -> String {
+    let n = items.len();
+    if n <= 3 {
+        return items.join(", ");
+    }
+    let preview: Vec<&str> = items.iter().take(3).map(|s| s.as_str()).collect();
+    format!("{n} entries — {}, …", preview.join(", "))
 }
 
 /// Human label for booleans shown to users. Used in the read-only profile
@@ -1173,6 +1442,10 @@ mod tests {
     }
 }
 
+/// Legacy fixed-width KV row, kept around in case a future editor section
+/// needs it (mixed widget rows where `egui::Grid` doesn't help). Currently
+/// unused since the polish pass; `#[allow(dead_code)]` avoids a warning.
+#[allow(dead_code)]
 fn kv_row(ui: &mut egui::Ui, key: &str, value: String) {
     ui.horizontal(|ui| {
         ui.add_sized(
