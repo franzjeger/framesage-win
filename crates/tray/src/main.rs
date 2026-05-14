@@ -32,6 +32,8 @@ use tray_icon::{
 #[cfg(windows)]
 mod win32;
 
+mod theme;
+
 #[derive(Default)]
 struct AppState {
     connected: bool,
@@ -142,7 +144,11 @@ struct FramesageApp {
 }
 
 impl FramesageApp {
-    fn new(_cc: &eframe::CreationContext<'_>, commands: TrayCommands, elevated: bool) -> Self {
+    fn new(cc: &eframe::CreationContext<'_>, commands: TrayCommands, elevated: bool) -> Self {
+        // Install our custom dark theme before the first frame renders so
+        // the user never sees the egui-default flash.
+        theme::apply(&cc.egui_ctx);
+
         let state = Arc::new(Mutex::new(AppState::default()));
         let bg_state = state.clone();
         std::thread::spawn(move || {
@@ -247,27 +253,46 @@ impl eframe::App for FramesageApp {
             )
         };
 
-        // Header with title + tabs.
-        egui::TopBottomPanel::top("framesage-header").show(ctx, |ui| {
-            ui.horizontal(|ui| {
-                ui.heading("framesage");
-                ui.separator();
-                ui.selectable_value(&mut self.tab, Tab::Status, "Status");
-                ui.selectable_value(&mut self.tab, Tab::Rules, "Rules");
-                ui.selectable_value(&mut self.tab, Tab::Profiles, "Profiles");
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if connected {
-                        ui.colored_label(egui::Color32::from_rgb(80, 200, 120), "● connected");
-                    } else {
-                        ui.colored_label(egui::Color32::from_rgb(200, 80, 80), "● disconnected");
-                    }
+        // Header with brand mark, tabs, connection badge. The OS title bar
+        // already says "framesage" so the inline label is styled small and
+        // colored — it's a brand mark, not a duplicate heading.
+        egui::TopBottomPanel::top("framesage-header")
+            .frame(
+                egui::Frame::none()
+                    .fill(theme::SURFACE)
+                    .inner_margin(egui::Margin::symmetric(12.0, 8.0))
+                    .stroke(egui::Stroke::new(1.0, theme::BORDER)),
+            )
+            .show(ctx, |ui| {
+                ui.horizontal(|ui| {
+                    ui.label(
+                        egui::RichText::new("FRAMESAGE")
+                            .color(theme::ACCENT)
+                            .size(14.0)
+                            .strong(),
+                    );
+                    ui.add_space(8.0);
+                    ui.separator();
+                    ui.add_space(4.0);
+                    ui.selectable_value(&mut self.tab, Tab::Status, "Status");
+                    ui.selectable_value(&mut self.tab, Tab::Rules, "Rules");
+                    ui.selectable_value(&mut self.tab, Tab::Profiles, "Profiles");
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        let (color, text) = if connected {
+                            (theme::SUCCESS, "connected")
+                        } else {
+                            (theme::ERROR, "disconnected")
+                        };
+                        theme::status_badge(color).show(ui, |ui| {
+                            ui.colored_label(color, text);
+                        });
+                    });
                 });
             });
-        });
 
         egui::CentralPanel::default().show(ctx, |ui| {
             if let Some(err) = &last_error {
-                ui.colored_label(egui::Color32::from_rgb(200, 120, 80), err);
+                ui.colored_label(theme::ERROR, err);
             }
 
             match self.tab {
@@ -288,35 +313,49 @@ impl FramesageApp {
         recent: &[String],
     ) {
         if let Some(s) = status {
-            ui.label(format!("paused: {}", s.paused));
-            ui.label(format!("rules: {}", s.policy.rules.len()));
-            ui.label(format!("default profile: {}", s.policy.default_profile));
+            theme::card().show(ui, |ui| {
+                kv_row(
+                    ui,
+                    "Engine",
+                    if s.paused {
+                        "paused".into()
+                    } else {
+                        "running".into()
+                    },
+                );
+                kv_row(ui, "Rules", s.policy.rules.len().to_string());
+                kv_row(ui, "Default profile", s.policy.default_profile.to_string());
+                match &s.active_profile {
+                    Some(p) => {
+                        kv_row(ui, "Active profile", p.id.to_string());
+                        if !p.description.is_empty() {
+                            ui.add_space(2.0);
+                            ui.colored_label(theme::TEXT_MUTED, &p.description);
+                        }
+                    }
+                    None => {
+                        kv_row(ui, "Active profile", "—".into());
+                    }
+                }
+            });
+            ui.add_space(6.0);
             match &s.foreground {
                 Some(fg) => render_foreground(ui, fg),
                 None => {
-                    ui.label("foreground: <none>");
-                }
-            }
-            match &s.active_profile {
-                Some(p) => {
-                    ui.label(format!("active profile: {}", p.id));
-                    if !p.description.is_empty() {
-                        ui.small(&p.description);
-                    }
-                }
-                None => {
-                    ui.label("active profile: <none>");
+                    theme::card().show(ui, |ui| {
+                        ui.colored_label(theme::TEXT_MUTED, "No foreground process detected.");
+                    });
                 }
             }
         } else {
-            ui.label("waiting for status…");
+            ui.colored_label(theme::TEXT_MUTED, "Waiting for the service to respond…");
         }
 
         ui.separator();
 
         // ─── Controls (admin-only) ──────────────────────────────────────
         //
-        // Non-elevated tray: show a "🔒 Read-only" banner with a button
+        // Non-elevated tray: show a "Read-only" banner with a button
         // to relaunch elevated. Elevated tray: enable Pause/Resume/
         // Game-Mode-Off buttons that hit the admin pipe directly.
         #[cfg(windows)]
@@ -328,10 +367,7 @@ impl FramesageApp {
                 .unwrap_or(false);
 
             if self.elevated {
-                ui.colored_label(
-                    egui::Color32::from_rgb(80, 200, 120),
-                    "🔓 admin controls enabled",
-                );
+                ui.colored_label(theme::SUCCESS, "Admin controls enabled");
                 ui.horizontal(|ui| {
                     if paused {
                         if ui.button("Resume engine").clicked() {
@@ -349,10 +385,7 @@ impl FramesageApp {
                     ui.small(msg);
                 }
             } else {
-                ui.colored_label(
-                    egui::Color32::from_rgb(200, 150, 80),
-                    "🔒 read-only — admin pipe needs UAC",
-                );
+                ui.colored_label(theme::WARNING, "Read-only — admin pipe needs UAC");
                 if ui
                     .button("Enable controls (UAC)…")
                     .on_hover_text(
@@ -399,8 +432,8 @@ impl FramesageApp {
 
         if !self.elevated {
             ui.colored_label(
-                egui::Color32::from_rgb(200, 150, 80),
-                "🔒 read-only — switch to Status tab and click Enable controls to edit rules.",
+                theme::WARNING,
+                "Read-only — switch to Status tab and click Enable controls to edit rules.",
             );
             ui.separator();
         }
@@ -421,7 +454,7 @@ impl FramesageApp {
         ui.horizontal(|ui| {
             let add_enabled = self.elevated && self.rules.form.is_none();
             if ui
-                .add_enabled(add_enabled, egui::Button::new("➕ Add rule"))
+                .add_enabled(add_enabled, egui::Button::new("Add rule"))
                 .clicked()
             {
                 let default_profile = profile_ids
@@ -442,7 +475,7 @@ impl FramesageApp {
 
             let save_enabled = self.elevated && dirty && self.rules.form.is_none();
             if ui
-                .add_enabled(save_enabled, egui::Button::new("💾 Save changes"))
+                .add_enabled(save_enabled, egui::Button::new("Save changes"))
                 .clicked()
             {
                 if let Some(draft) = self.policy_draft.take() {
@@ -452,7 +485,7 @@ impl FramesageApp {
 
             let discard_enabled = dirty && self.rules.form.is_none();
             if ui
-                .add_enabled(discard_enabled, egui::Button::new("↩ Discard"))
+                .add_enabled(discard_enabled, egui::Button::new("Discard"))
                 .clicked()
             {
                 self.policy_draft = None;
@@ -460,7 +493,9 @@ impl FramesageApp {
             }
 
             if dirty {
-                ui.colored_label(egui::Color32::from_rgb(220, 170, 60), "● unsaved");
+                theme::status_badge(theme::WARNING).show(ui, |ui| {
+                    ui.colored_label(theme::WARNING, "unsaved");
+                });
             }
         });
 
@@ -586,7 +621,7 @@ impl FramesageApp {
                             AppMatch::WindowTitleContains(s) => ("title~", s.as_str()),
                         };
                         ui.label(format!(
-                            "{:6}  {} → {}{}",
+                            "{:6}  {}  ->  {}{}",
                             kind,
                             value,
                             rule.profile,
@@ -599,14 +634,14 @@ impl FramesageApp {
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                             let actions_enabled = self.elevated && self.rules.form.is_none();
                             if ui
-                                .add_enabled(actions_enabled, egui::Button::new("✖"))
+                                .add_enabled(actions_enabled, egui::Button::new("Delete"))
                                 .on_hover_text("Delete rule")
                                 .clicked()
                             {
                                 delete_index = Some(i);
                             }
                             if ui
-                                .add_enabled(actions_enabled, egui::Button::new("✎"))
+                                .add_enabled(actions_enabled, egui::Button::new("Edit"))
                                 .on_hover_text("Edit rule")
                                 .clicked()
                             {
@@ -643,7 +678,7 @@ impl FramesageApp {
     }
 
     /// Render the Profiles tab. Profiles are shown as collapsible cards;
-    /// each can be flipped into edit mode via the ✎ button. Editing
+    /// each can be flipped into edit mode via the Edit button. Editing
     /// targets the shared `policy_draft`, so a Save here commits both
     /// rule edits and profile edits in one round-trip.
     fn render_profiles_tab(&mut self, ui: &mut egui::Ui, status: &Option<StatusSnapshot>) {
@@ -673,7 +708,7 @@ impl FramesageApp {
                 && self.profiles.editing_id.is_none()
                 && self.rules.form.is_none();
             if ui
-                .add_enabled(save_enabled, egui::Button::new("💾 Save changes"))
+                .add_enabled(save_enabled, egui::Button::new("Save changes"))
                 .clicked()
             {
                 if let Some(draft) = self.policy_draft.take() {
@@ -682,21 +717,23 @@ impl FramesageApp {
             }
             let discard_enabled = dirty && self.profiles.editing_id.is_none();
             if ui
-                .add_enabled(discard_enabled, egui::Button::new("↩ Discard"))
+                .add_enabled(discard_enabled, egui::Button::new("Discard"))
                 .clicked()
             {
                 self.policy_draft = None;
                 self.profiles.editing_id = None;
             }
             if dirty {
-                ui.colored_label(egui::Color32::from_rgb(220, 170, 60), "● unsaved");
+                theme::status_badge(theme::WARNING).show(ui, |ui| {
+                    ui.colored_label(theme::WARNING, "unsaved");
+                });
             }
         });
 
         if !self.elevated {
             ui.colored_label(
-                egui::Color32::from_rgb(200, 150, 80),
-                "🔒 read-only — Status tab → Enable controls to edit.",
+                theme::WARNING,
+                "Read-only — open the Status tab and click Enable controls.",
             );
         }
         if let Some(msg) = self.last_action.lock().unwrap().as_ref() {
@@ -726,12 +763,19 @@ impl FramesageApp {
                 };
                 let is_active = s.active_profile.as_ref().is_some_and(|ap| ap.id == *id);
                 let is_editing = self.profiles.editing_id.as_deref() == Some(id.0.as_str());
-                let header = format!(
-                    "{}{}{}",
-                    if is_active { "● " } else { "  " },
-                    id.0,
-                    if is_editing { "  (editing)" } else { "" },
-                );
+                let header_text = if is_editing {
+                    format!("{}  (editing)", id.0)
+                } else if is_active {
+                    format!("{}  (active)", id.0)
+                } else {
+                    id.0.clone()
+                };
+                let header_color = if is_active {
+                    theme::ACCENT
+                } else {
+                    theme::TEXT
+                };
+                let header = egui::RichText::new(header_text).color(header_color);
                 egui::CollapsingHeader::new(header)
                     .default_open(is_active || is_editing)
                     .id_source(("profile-card", id.0.as_str()))
@@ -742,7 +786,7 @@ impl FramesageApp {
                                 && self.rules.form.is_none();
                             if !is_editing
                                 && ui
-                                    .add_enabled(edit_enabled, egui::Button::new("✎ Edit"))
+                                    .add_enabled(edit_enabled, egui::Button::new("Edit"))
                                     .clicked()
                             {
                                 ops.push(Op::EnterEdit(id.0.clone()));
@@ -785,11 +829,11 @@ impl FramesageApp {
 }
 
 fn render_foreground(ui: &mut egui::Ui, fg: &ForegroundSnapshot) {
-    ui.group(|ui| {
-        ui.label(format!("foreground pid: {}", fg.pid));
-        ui.label(format!("exe: {}", fg.exe_name));
+    theme::card().show(ui, |ui| {
+        kv_row(ui, "Foreground PID", fg.pid.to_string());
+        kv_row(ui, "Executable", fg.exe_name.clone());
         if !fg.title.is_empty() {
-            ui.label(format!("title: {}", fg.title));
+            kv_row(ui, "Window title", fg.title.clone());
         }
     });
 }
@@ -801,84 +845,84 @@ fn render_profile_body(ui: &mut egui::Ui, p: &Profile) {
     }
     ui.group(|ui| {
         ui.heading("Per-process");
-        kv_row(ui, "cpu_sets", format_cpu_selector(p.cpu_sets.as_ref()));
+        kv_row(ui, "CPU sets", format_cpu_selector(p.cpu_sets.as_ref()));
         kv_row(
             ui,
-            "affinity_mask",
+            "Affinity mask",
             format_cpu_selector(p.affinity_mask.as_ref()),
         );
         kv_row(
             ui,
-            "power_throttling",
+            "Power throttling",
             p.power_throttling
                 .map(|v| format!("{v:?}"))
-                .unwrap_or_else(|| "<unset>".to_owned()),
+                .unwrap_or_else(|| "—".to_owned()),
         );
         kv_row(
             ui,
-            "priority_class",
+            "Priority class",
             p.priority_class
                 .map(|v| format!("{v:?}"))
-                .unwrap_or_else(|| "<unset>".to_owned()),
+                .unwrap_or_else(|| "—".to_owned()),
         );
         kv_row(
             ui,
-            "io_priority",
+            "I/O priority",
             p.io_priority
                 .map(|v| format!("{v:?}"))
-                .unwrap_or_else(|| "<unset>".to_owned()),
+                .unwrap_or_else(|| "—".to_owned()),
         );
         kv_row(
             ui,
-            "memory_priority",
+            "Memory priority",
             p.memory_priority
                 .map(|v| format!("{v:?}"))
-                .unwrap_or_else(|| "<unset>".to_owned()),
+                .unwrap_or_else(|| "—".to_owned()),
         );
-        kv_row(ui, "trim_working_set", p.trim_working_set.to_string());
+        kv_row(ui, "Trim working set", p.trim_working_set.to_string());
     });
 
     if let Some(gm) = &p.game_mode {
         ui.add_space(4.0);
         ui.group(|ui| {
             ui.heading("Game Mode (system-wide)");
-            kv_row(ui, "hide_taskbar", gm.hide_taskbar.to_string());
+            kv_row(ui, "Hide taskbar", gm.hide_taskbar.to_string());
             kv_row(
                 ui,
-                "stop_services",
+                "Stop services",
                 if gm.stop_services.is_empty() {
-                    "<none>".to_owned()
+                    "—".to_owned()
                 } else {
                     gm.stop_services.join(", ")
                 },
             );
             kv_row(
                 ui,
-                "suspend_processes",
+                "Suspend processes",
                 if gm.suspend_processes.is_empty() {
-                    "<none>".to_owned()
+                    "—".to_owned()
                 } else {
                     gm.suspend_processes.join(", ")
                 },
             );
             kv_row(
                 ui,
-                "power_plan",
+                "Power plan",
                 gm.power_plan
                     .as_ref()
                     .map(|p| format!("{p:?}"))
-                    .unwrap_or_else(|| "<unset>".to_owned()),
+                    .unwrap_or_else(|| "—".to_owned()),
             );
             kv_row(
                 ui,
-                "focus_assist",
+                "Focus assist",
                 gm.focus_assist
                     .map(|m| format!("{m:?} (stub)"))
-                    .unwrap_or_else(|| "<unset>".to_owned()),
+                    .unwrap_or_else(|| "—".to_owned()),
             );
             kv_row(
                 ui,
-                "pause_windows_update",
+                "Pause Windows Update",
                 format!(
                     "{}{}",
                     gm.pause_windows_update,
@@ -893,7 +937,7 @@ fn render_profile_body(ui: &mut egui::Ui, p: &Profile) {
     } else {
         ui.add_space(4.0);
         ui.colored_label(
-            egui::Color32::from_gray(150),
+            theme::TEXT_MUTED,
             "Game Mode: not requested by this profile.",
         );
     }
@@ -928,7 +972,7 @@ fn render_profile_editor(ui: &mut egui::Ui, p: &mut Profile) {
         ui.heading("Per-process (editable)");
         option_combo(
             ui,
-            "power_throttling",
+            "Power throttling",
             &mut p.power_throttling,
             &[
                 PowerThrottlingMode::Eco,
@@ -939,7 +983,7 @@ fn render_profile_editor(ui: &mut egui::Ui, p: &mut Profile) {
         );
         option_combo(
             ui,
-            "priority_class",
+            "Priority class",
             &mut p.priority_class,
             &[
                 PriorityClass::Idle,
@@ -952,7 +996,7 @@ fn render_profile_editor(ui: &mut egui::Ui, p: &mut Profile) {
         );
         option_combo(
             ui,
-            "io_priority",
+            "I/O priority",
             &mut p.io_priority,
             &[
                 IoPriority::VeryLow,
@@ -965,7 +1009,7 @@ fn render_profile_editor(ui: &mut egui::Ui, p: &mut Profile) {
         );
         option_combo(
             ui,
-            "memory_priority",
+            "Memory priority",
             &mut p.memory_priority,
             &[
                 MemoryPriority::VeryLow,
@@ -979,7 +1023,7 @@ fn render_profile_editor(ui: &mut egui::Ui, p: &mut Profile) {
         ui.horizontal(|ui| {
             ui.add_sized(
                 [150.0, 16.0],
-                egui::Label::new(egui::RichText::new("trim_working_set").monospace().weak()),
+                egui::Label::new(egui::RichText::new("Trim working set").weak()),
             );
             ui.checkbox(&mut p.trim_working_set, "");
         });
@@ -988,8 +1032,8 @@ fn render_profile_editor(ui: &mut egui::Ui, p: &mut Profile) {
     ui.add_space(4.0);
     ui.group(|ui| {
         ui.heading("CPU targeting (editable)");
-        cpu_selector_edit(ui, "cpu_sets", &mut p.cpu_sets);
-        cpu_selector_edit(ui, "affinity_mask", &mut p.affinity_mask);
+        cpu_selector_edit(ui, "CPU sets", &mut p.cpu_sets);
+        cpu_selector_edit(ui, "Affinity mask", &mut p.affinity_mask);
     });
 
     ui.add_space(4.0);
@@ -1024,14 +1068,14 @@ fn game_mode_editor(ui: &mut egui::Ui, gm: &mut GameModeActions) {
     ui.horizontal(|ui| {
         ui.add_sized(
             [150.0, 16.0],
-            egui::Label::new(egui::RichText::new("hide_taskbar").monospace().weak()),
+            egui::Label::new(egui::RichText::new("Hide taskbar").weak()),
         );
         ui.checkbox(&mut gm.hide_taskbar, "");
     });
 
     option_combo(
         ui,
-        "focus_assist",
+        "Focus assist",
         &mut gm.focus_assist,
         &[
             FocusAssistMode::Off,
@@ -1043,28 +1087,24 @@ fn game_mode_editor(ui: &mut egui::Ui, gm: &mut GameModeActions) {
 
     string_list_edit(
         ui,
-        "stop_services",
+        "Stop services",
         &mut gm.stop_services,
         "One service short-name per line (e.g. SysMain, WSearch, DiagTrack).\nSafe-list gate at apply time — unknown ids are logged and skipped.",
     );
 
     string_list_edit(
         ui,
-        "suspend_processes",
+        "Suspend processes",
         &mut gm.suspend_processes,
         "One exe name per line (e.g. OneDrive.exe, Dropbox.exe).\nSafe-list gate at apply time — shell/kernel/AV/anti-cheat are denied.",
     );
 
-    power_plan_edit(ui, "power_plan", &mut gm.power_plan);
+    power_plan_edit(ui, "Power plan", &mut gm.power_plan);
 
     ui.horizontal(|ui| {
         ui.add_sized(
             [150.0, 16.0],
-            egui::Label::new(
-                egui::RichText::new("pause_windows_update")
-                    .monospace()
-                    .weak(),
-            ),
+            egui::Label::new(egui::RichText::new("Pause Windows Update").weak()),
         );
         ui.checkbox(&mut gm.pause_windows_update, "(stub in v0.1)");
     });
@@ -1515,7 +1555,7 @@ fn try_connect_and_serve(state: Arc<Mutex<AppState>>) -> anyhow::Result<()> {
                     foreground,
                     profile,
                 } => format!(
-                    "{} → {} (pid {})",
+                    "{} -> {} (pid {})",
                     foreground.exe_name, profile, foreground.pid
                 ),
                 Event::Paused => "paused".into(),
