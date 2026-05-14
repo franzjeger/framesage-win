@@ -18,7 +18,10 @@ use std::sync::{Arc, Mutex};
 
 use eframe::egui;
 
-use framesage_core::{AppMatch, AppRule, CpuSelector, Policy, Profile, ProfileId};
+use framesage_core::{
+    AppMatch, AppRule, CpuSelector, IoPriority, MemoryPriority, Policy, PowerThrottlingMode,
+    PriorityClass, Profile, ProfileId,
+};
 use framesage_ipc::{Event, ForegroundSnapshot, Request, Response, StatusSnapshot};
 #[cfg(windows)]
 use tray_icon::{
@@ -61,19 +64,24 @@ enum Tab {
     Profiles,
 }
 
-/// State for the Rules-tab inline editor. The model is "edit a local clone
-/// of the policy, then commit via SetPolicy on Save." This lets the user
-/// batch multiple add/delete operations into a single round-trip and gives
-/// them a clear Discard escape hatch if they change their mind.
+/// State for the Rules-tab inline editor. Holds only the open form; the
+/// draft policy lives on `FramesageApp` so Rules and Profiles can edit
+/// the same buffer.
 #[derive(Default)]
 struct RulesEditor {
-    /// Local clone of the policy with any in-flight edits applied. `None`
-    /// means "view mode" — the UI mirrors the service's current policy
-    /// from the status snapshot. Lazily populated on first edit.
-    draft: Option<Policy>,
     /// Currently editing the add/edit form for a specific rule (or a new
     /// one). `None` means no form is open.
     form: Option<RuleForm>,
+}
+
+/// State for the Profiles-tab inline editor. Like `RulesEditor`, the draft
+/// itself lives on `FramesageApp` so a Save in either tab persists changes
+/// made in both.
+#[derive(Default)]
+struct ProfilesEditor {
+    /// Profile id currently in edit mode (only one at a time). `None`
+    /// means all profiles are in view-only mode.
+    editing_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -116,8 +124,14 @@ struct FramesageApp {
     last_action: Arc<Mutex<Option<String>>>,
     /// Active top-level tab.
     tab: Tab,
+    /// Shared policy draft. `None` = no in-flight edits, UI mirrors the
+    /// service's current policy. Lazily populated on first edit in either
+    /// the Rules tab or the Profiles tab. Save sends one SetPolicy.
+    policy_draft: Option<Policy>,
     /// Rules-tab editor state.
     rules: RulesEditor,
+    /// Profiles-tab editor state.
+    profiles: ProfilesEditor,
     /// Holding the tray icon for its lifetime — drop = icon disappears.
     /// `#[allow(dead_code)]` because we never read it after construction;
     /// the field exists purely to extend the icon's lifetime to match the
@@ -144,7 +158,9 @@ impl FramesageApp {
             elevated,
             last_action: Arc::new(Mutex::new(None)),
             tab: Tab::default(),
+            policy_draft: None,
             rules: RulesEditor::default(),
+            profiles: ProfilesEditor::default(),
             #[cfg(windows)]
             tray,
         }
@@ -257,7 +273,7 @@ impl eframe::App for FramesageApp {
             match self.tab {
                 Tab::Status => self.render_status_tab(ctx, ui, &status_snapshot, &recent_events),
                 Tab::Rules => self.render_rules_tab(ui, &status_snapshot),
-                Tab::Profiles => render_profiles_tab(ui, &status_snapshot),
+                Tab::Profiles => self.render_profiles_tab(ui, &status_snapshot),
             }
         });
     }
@@ -393,8 +409,8 @@ impl FramesageApp {
         // otherwise the service's current policy. The view-vs-edit
         // distinction matters because the service can push a status
         // update mid-edit; we don't want that to clobber unsaved work.
-        let displayed_policy = self.rules.draft.as_ref().unwrap_or(&s.policy).clone();
-        let dirty = self.rules.draft.is_some();
+        let displayed_policy = self.policy_draft.as_ref().unwrap_or(&s.policy).clone();
+        let dirty = self.policy_draft.is_some();
         let profile_ids: Vec<ProfileId> = {
             let mut ids: Vec<_> = displayed_policy.profiles.keys().cloned().collect();
             ids.sort_by(|a, b| a.0.cmp(&b.0));
@@ -419,8 +435,8 @@ impl FramesageApp {
                     profile_id: default_profile,
                     note: String::new(),
                 });
-                if self.rules.draft.is_none() {
-                    self.rules.draft = Some(s.policy.clone());
+                if self.policy_draft.is_none() {
+                    self.policy_draft = Some(s.policy.clone());
                 }
             }
 
@@ -429,7 +445,7 @@ impl FramesageApp {
                 .add_enabled(save_enabled, egui::Button::new("💾 Save changes"))
                 .clicked()
             {
-                if let Some(draft) = self.rules.draft.take() {
+                if let Some(draft) = self.policy_draft.take() {
                     self.send_admin_request(Request::SetPolicy { policy: draft }, "save policy");
                 }
             }
@@ -439,7 +455,7 @@ impl FramesageApp {
                 .add_enabled(discard_enabled, egui::Button::new("↩ Discard"))
                 .clicked()
             {
-                self.rules.draft = None;
+                self.policy_draft = None;
                 self.rules.form = None;
             }
 
@@ -542,7 +558,7 @@ impl FramesageApp {
                 };
                 let editing_index = form.editing_index;
                 self.rules.form = None;
-                let draft = self.rules.draft.get_or_insert_with(|| s.policy.clone());
+                let draft = self.policy_draft.get_or_insert_with(|| s.policy.clone());
                 match editing_index {
                     Some(i) if i < draft.rules.len() => draft.rules[i] = new_rule,
                     _ => draft.rules.push(new_rule),
@@ -601,13 +617,13 @@ impl FramesageApp {
                 }
 
                 if let Some(i) = delete_index {
-                    let draft = self.rules.draft.get_or_insert_with(|| s.policy.clone());
+                    let draft = self.policy_draft.get_or_insert_with(|| s.policy.clone());
                     if i < draft.rules.len() {
                         draft.rules.remove(i);
                     }
                 }
                 if let Some(i) = edit_index {
-                    let draft = self.rules.draft.get_or_insert_with(|| s.policy.clone());
+                    let draft = self.policy_draft.get_or_insert_with(|| s.policy.clone());
                     if let Some(rule) = draft.rules.get(i).cloned() {
                         self.rules.form = Some(RuleForm {
                             editing_index: Some(i),
@@ -625,6 +641,147 @@ impl FramesageApp {
             });
         }
     }
+
+    /// Render the Profiles tab. Profiles are shown as collapsible cards;
+    /// each can be flipped into edit mode via the ✎ button. Editing
+    /// targets the shared `policy_draft`, so a Save here commits both
+    /// rule edits and profile edits in one round-trip.
+    fn render_profiles_tab(&mut self, ui: &mut egui::Ui, status: &Option<StatusSnapshot>) {
+        let Some(s) = status else {
+            ui.label("waiting for status…");
+            return;
+        };
+
+        let displayed_policy = self.policy_draft.as_ref().unwrap_or(&s.policy).clone();
+        let dirty = self.policy_draft.is_some();
+
+        // ─── Toolbar ────────────────────────────────────────────────────────
+        ui.horizontal(|ui| {
+            let active_id = s.active_profile.as_ref().map(|p| p.id.0.as_str());
+            ui.label("Profiles:");
+            ui.label(format!("default = {}", displayed_policy.default_profile));
+            if let Some(bg) = &displayed_policy.background_profile {
+                ui.label(format!("background = {bg}"));
+            }
+            if let Some(active) = active_id {
+                ui.label(format!("active = {active}"));
+            }
+        });
+        ui.horizontal(|ui| {
+            let save_enabled = self.elevated
+                && dirty
+                && self.profiles.editing_id.is_none()
+                && self.rules.form.is_none();
+            if ui
+                .add_enabled(save_enabled, egui::Button::new("💾 Save changes"))
+                .clicked()
+            {
+                if let Some(draft) = self.policy_draft.take() {
+                    self.send_admin_request(Request::SetPolicy { policy: draft }, "save policy");
+                }
+            }
+            let discard_enabled = dirty && self.profiles.editing_id.is_none();
+            if ui
+                .add_enabled(discard_enabled, egui::Button::new("↩ Discard"))
+                .clicked()
+            {
+                self.policy_draft = None;
+                self.profiles.editing_id = None;
+            }
+            if dirty {
+                ui.colored_label(egui::Color32::from_rgb(220, 170, 60), "● unsaved");
+            }
+        });
+
+        if !self.elevated {
+            ui.colored_label(
+                egui::Color32::from_rgb(200, 150, 80),
+                "🔒 read-only — Status tab → Enable controls to edit.",
+            );
+        }
+        if let Some(msg) = self.last_action.lock().unwrap().as_ref() {
+            ui.small(msg);
+        }
+        ui.separator();
+
+        let mut profile_ids: Vec<ProfileId> = displayed_policy.profiles.keys().cloned().collect();
+        profile_ids.sort_by(|a, b| a.0.cmp(&b.0));
+
+        // Collect the deferred mutations so we can apply them outside the
+        // borrowing scope of the iteration over `profile_ids`.
+        enum Op {
+            EnterEdit(String),
+            ExitEdit,
+            // Boxed because Profile (with its Policy-shape internals) is
+            // much larger than the other variants. Clippy enforces this so
+            // we don't pay the cost on every Op enum value.
+            UpdateProfile(String, Box<Profile>),
+        }
+        let mut ops: Vec<Op> = Vec::new();
+
+        egui::ScrollArea::vertical().show(ui, |ui| {
+            for id in &profile_ids {
+                let Some(p) = displayed_policy.profiles.get(id) else {
+                    continue;
+                };
+                let is_active = s.active_profile.as_ref().is_some_and(|ap| ap.id == *id);
+                let is_editing = self.profiles.editing_id.as_deref() == Some(id.0.as_str());
+                let header = format!(
+                    "{}{}{}",
+                    if is_active { "● " } else { "  " },
+                    id.0,
+                    if is_editing { "  (editing)" } else { "" },
+                );
+                egui::CollapsingHeader::new(header)
+                    .default_open(is_active || is_editing)
+                    .id_source(("profile-card", id.0.as_str()))
+                    .show(ui, |ui| {
+                        ui.horizontal(|ui| {
+                            let edit_enabled = self.elevated
+                                && self.profiles.editing_id.is_none()
+                                && self.rules.form.is_none();
+                            if !is_editing
+                                && ui
+                                    .add_enabled(edit_enabled, egui::Button::new("✎ Edit"))
+                                    .clicked()
+                            {
+                                ops.push(Op::EnterEdit(id.0.clone()));
+                            }
+                            if is_editing && ui.button("Done").clicked() {
+                                ops.push(Op::ExitEdit);
+                            }
+                        });
+                        if is_editing {
+                            let mut edited = p.clone();
+                            render_profile_editor(ui, &mut edited);
+                            if edited != *p {
+                                ops.push(Op::UpdateProfile(id.0.clone(), Box::new(edited)));
+                            }
+                        } else {
+                            render_profile_body(ui, p);
+                        }
+                    });
+            }
+        });
+
+        for op in ops {
+            match op {
+                Op::EnterEdit(id) => {
+                    self.profiles.editing_id = Some(id);
+                    if self.policy_draft.is_none() {
+                        self.policy_draft = Some(s.policy.clone());
+                    }
+                }
+                Op::ExitEdit => {
+                    self.profiles.editing_id = None;
+                }
+                Op::UpdateProfile(id, new_profile) => {
+                    let draft = self.policy_draft.get_or_insert_with(|| s.policy.clone());
+                    draft.profiles.insert(ProfileId(id), *new_profile);
+                }
+            }
+        }
+    }
 }
 
 fn render_foreground(ui: &mut egui::Ui, fg: &ForegroundSnapshot) {
@@ -633,56 +790,6 @@ fn render_foreground(ui: &mut egui::Ui, fg: &ForegroundSnapshot) {
         ui.label(format!("exe: {}", fg.exe_name));
         if !fg.title.is_empty() {
             ui.label(format!("title: {}", fg.title));
-        }
-    });
-}
-
-/// Render the Profiles tab — a read-only listing of every profile in the
-/// active policy with all its knobs spelled out. Discoverability surface:
-/// the user can see exactly what each profile does without reading the
-/// `policy.json` schema or the source. Editing comes in a follow-up commit.
-fn render_profiles_tab(ui: &mut egui::Ui, status: &Option<StatusSnapshot>) {
-    let Some(s) = status else {
-        ui.label("waiting for status…");
-        return;
-    };
-
-    ui.horizontal(|ui| {
-        ui.label("Profiles in active policy:");
-        let active_id = s.active_profile.as_ref().map(|p| p.id.0.as_str());
-        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            ui.label(format!("default: {}", s.policy.default_profile));
-            if let Some(bg) = &s.policy.background_profile {
-                ui.label(format!("background: {bg}"));
-            }
-            if let Some(active) = active_id {
-                ui.label(format!("active: {active}"));
-            }
-        });
-    });
-    ui.small("read-only for now — edit via Rules tab or policy.json. Per-profile editing is the next planned commit.");
-    ui.separator();
-
-    let mut profile_ids: Vec<&ProfileId> = s.policy.profiles.keys().collect();
-    profile_ids.sort_by(|a, b| a.0.cmp(&b.0));
-
-    egui::ScrollArea::vertical().show(ui, |ui| {
-        for id in profile_ids {
-            let Some(p) = s.policy.profiles.get(id) else {
-                continue;
-            };
-            // Mark the active profile with a marker for quick visual scan.
-            let is_active = s.active_profile.as_ref().is_some_and(|ap| ap.id == *id);
-            let header = if is_active {
-                format!("● {}", id.0)
-            } else {
-                format!("  {}", id.0)
-            };
-            egui::CollapsingHeader::new(header)
-                .default_open(is_active)
-                .show(ui, |ui| {
-                    render_profile_body(ui, p);
-                });
         }
     });
 }
@@ -799,6 +906,136 @@ fn kv_row(ui: &mut egui::Ui, key: &str, value: String) {
             egui::Label::new(egui::RichText::new(key).monospace().weak()),
         );
         ui.label(value);
+    });
+}
+
+/// Per-profile editor for the simple fields. CpuSelector (cpu_sets,
+/// affinity_mask) and game_mode are shown read-only; their editors land
+/// in a follow-up commit.
+fn render_profile_editor(ui: &mut egui::Ui, p: &mut Profile) {
+    ui.group(|ui| {
+        ui.heading("Description");
+        ui.add(
+            egui::TextEdit::multiline(&mut p.description)
+                .hint_text("Human description of what this profile does.")
+                .desired_rows(2)
+                .desired_width(f32::INFINITY),
+        );
+    });
+
+    ui.add_space(4.0);
+    ui.group(|ui| {
+        ui.heading("Per-process (editable)");
+        option_combo(
+            ui,
+            "power_throttling",
+            &mut p.power_throttling,
+            &[
+                PowerThrottlingMode::Eco,
+                PowerThrottlingMode::Performance,
+                PowerThrottlingMode::SystemDefault,
+            ],
+            |v| format!("{v:?}"),
+        );
+        option_combo(
+            ui,
+            "priority_class",
+            &mut p.priority_class,
+            &[
+                PriorityClass::Idle,
+                PriorityClass::BelowNormal,
+                PriorityClass::Normal,
+                PriorityClass::AboveNormal,
+                PriorityClass::High,
+            ],
+            |v| format!("{v:?}"),
+        );
+        option_combo(
+            ui,
+            "io_priority",
+            &mut p.io_priority,
+            &[
+                IoPriority::VeryLow,
+                IoPriority::Low,
+                IoPriority::Normal,
+                IoPriority::High,
+                IoPriority::Critical,
+            ],
+            |v| format!("{v:?}"),
+        );
+        option_combo(
+            ui,
+            "memory_priority",
+            &mut p.memory_priority,
+            &[
+                MemoryPriority::VeryLow,
+                MemoryPriority::Low,
+                MemoryPriority::Medium,
+                MemoryPriority::BelowNormal,
+                MemoryPriority::Normal,
+            ],
+            |v| format!("{v:?}"),
+        );
+        ui.horizontal(|ui| {
+            ui.add_sized(
+                [150.0, 16.0],
+                egui::Label::new(egui::RichText::new("trim_working_set").monospace().weak()),
+            );
+            ui.checkbox(&mut p.trim_working_set, "");
+        });
+    });
+
+    ui.add_space(4.0);
+    ui.group(|ui| {
+        ui.heading("Read-only (edit via policy.json — UI editors land in a follow-up)");
+        kv_row(ui, "cpu_sets", format_cpu_selector(p.cpu_sets.as_ref()));
+        kv_row(
+            ui,
+            "affinity_mask",
+            format_cpu_selector(p.affinity_mask.as_ref()),
+        );
+        kv_row(
+            ui,
+            "game_mode",
+            if p.game_mode.is_some() {
+                "configured (read-only)".to_owned()
+            } else {
+                "<unset>".to_owned()
+            },
+        );
+    });
+}
+
+/// Helper widget for `Option<Enum>` fields. Renders a labeled ComboBox
+/// where the first entry is "<unset>" (maps to `None`) followed by the
+/// concrete variants. Generic on T so each enum gets its own widget at
+/// compile time with no boxing.
+fn option_combo<T>(
+    ui: &mut egui::Ui,
+    label: &str,
+    current: &mut Option<T>,
+    variants: &[T],
+    fmt: impl Fn(&T) -> String,
+) where
+    T: Copy + PartialEq,
+{
+    ui.horizontal(|ui| {
+        ui.add_sized(
+            [150.0, 16.0],
+            egui::Label::new(egui::RichText::new(label).monospace().weak()),
+        );
+        let selected_text = match current {
+            None => "<unset>".to_owned(),
+            Some(v) => fmt(v),
+        };
+        egui::ComboBox::from_id_source(("option-combo", label))
+            .selected_text(selected_text)
+            .show_ui(ui, |ui| {
+                ui.selectable_value(current, None, "<unset>");
+                for v in variants {
+                    ui.selectable_value(current, Some(*v), fmt(v));
+                }
+            });
     });
 }
 
