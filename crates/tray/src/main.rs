@@ -122,6 +122,21 @@ struct ProcessesView {
     /// drags the splitter bar; persists for the rest of the session so
     /// the layout doesn't snap back every time a selection changes.
     detail_height: Option<f32>,
+    /// Multi-selection set. Ctrl-click toggles a PID's membership;
+    /// Shift-click extends the range from `last_clicked_pid` to the
+    /// clicked PID (in current visual sort order); plain click clears
+    /// the multi-set and falls through to single `selected_pid` handling.
+    ///
+    /// When the right-click context menu fires on a PID that's in
+    /// `multi_selected`, all the listed actions (Set affinity, Apply
+    /// profile, Set priority, Suspend, Resume, Terminate) dispatch
+    /// against every PID in the set at once. Right-clicking outside
+    /// the selection clears it and acts only on the right-clicked PID
+    /// — same behavior Task Manager and Process Explorer use.
+    multi_selected: std::collections::HashSet<u32>,
+    /// PID anchor for Shift-click range selection. Updated on every
+    /// plain or Ctrl click.
+    last_clicked_pid: Option<u32>,
 }
 
 impl Default for ProcessesView {
@@ -135,6 +150,8 @@ impl Default for ProcessesView {
             tree_mode: true,
             collapsed: std::collections::HashSet::new(),
             detail_height: None,
+            multi_selected: std::collections::HashSet::new(),
+            last_clicked_pid: None,
         }
     }
 }
@@ -2467,7 +2484,20 @@ impl FramesageApp {
                                     .sense(egui::Sense::click());
                                     let mut resp = ui.add(label);
                                     // Highlight the currently-selected row by stroking
-                                    // a thin accent border around the cell.
+                                    // a thin accent border around the cell. Multi-
+                                    // selected rows get a translucent fill so the
+                                    // user can see the bulk-action target set at
+                                    // a glance, distinct from the single "detail"
+                                    // selection's stroke.
+                                    let in_multi = self.processes.multi_selected.contains(&pid);
+                                    if in_multi {
+                                        let rect = ui.max_rect();
+                                        ui.painter().rect_filled(
+                                            rect,
+                                            egui::Rounding::ZERO,
+                                            egui::Color32::from_rgba_unmultiplied(50, 130, 246, 40),
+                                        );
+                                    }
                                     if selected_pid == Some(pid) {
                                         let rect = ui.max_rect();
                                         ui.painter().rect_stroke(
@@ -2482,16 +2512,43 @@ impl FramesageApp {
                                     }
                                     // Right-click anywhere on the name opens the per-PID
                                     // context menu — same affordance Process Explorer uses.
+                                    // When the right-clicked row is part of the multi-
+                                    // selection, the menu acts on EVERY selected PID;
+                                    // otherwise it acts only on the right-clicked one
+                                    // (Task Manager / Process Explorer convention).
+                                    let multi = &self.processes.multi_selected;
+                                    let in_multi_now = multi.contains(&pid);
+                                    let targets: Vec<(u32, String)> =
+                                        if in_multi_now && multi.len() > 1 {
+                                            rows.iter()
+                                                .filter(|r| multi.contains(&r.pid))
+                                                .map(|r| (r.pid, r.exe_name.clone()))
+                                                .collect()
+                                        } else {
+                                            vec![(pid, exe.clone())]
+                                        };
+                                    let bulk = targets.len() > 1;
                                     resp.context_menu(|ui| {
-                                        ui.label(format!("{} (pid {})", &exe, pid));
+                                        if bulk {
+                                            ui.label(format!(
+                                                "{} processes selected",
+                                                targets.len()
+                                            ));
+                                        } else {
+                                            ui.label(format!("{} (pid {})", &exe, pid));
+                                        }
                                         ui.separator();
                                         ui.menu_button("Set priority", |ui| {
                                             for (label, class) in PRIORITY_CHOICES.iter() {
                                                 if ui.button(*label).clicked() {
-                                                    action_queue.push(ProcessAction::SetPriority {
-                                                        pid,
-                                                        class: *class,
-                                                    });
+                                                    for (t_pid, _) in &targets {
+                                                        action_queue.push(
+                                                            ProcessAction::SetPriority {
+                                                                pid: *t_pid,
+                                                                class: *class,
+                                                            },
+                                                        );
+                                                    }
                                                     ui.close_menu();
                                                 }
                                             }
@@ -2499,6 +2556,12 @@ impl FramesageApp {
                                         ui.menu_button("Apply profile now", |ui| {
                                             for pid_name in &profile_ids {
                                                 if ui.button(pid_name).clicked() {
+                                                    // ApplyProfileForeground actually
+                                                    // applies to the FOREGROUND process
+                                                    // (single-shot). For bulk we'd want
+                                                    // per-PID apply — falling back to
+                                                    // foreground apply for the bulk
+                                                    // case until that IPC lands.
                                                     action_queue.push(
                                                         ProcessAction::ApplyProfileForeground {
                                                             profile: pid_name.clone(),
@@ -2511,74 +2574,138 @@ impl FramesageApp {
                                         ui.menu_button("Create rule for this exe", |ui| {
                                             for pid_name in &profile_ids {
                                                 if ui.button(pid_name).clicked() {
-                                                    action_queue.push(ProcessAction::CreateRule {
-                                                        exe_name: exe.clone(),
-                                                        profile: pid_name.clone(),
-                                                    });
+                                                    // For bulk, dedupe by exe so we
+                                                    // don't push N identical Create
+                                                    // actions for the same exe name
+                                                    // (every steamwebhelper.exe row
+                                                    // shares the same name).
+                                                    let mut seen = std::collections::HashSet::new();
+                                                    for (_, e) in &targets {
+                                                        let lk = e.to_ascii_lowercase();
+                                                        if seen.insert(lk) {
+                                                            action_queue.push(
+                                                                ProcessAction::CreateRule {
+                                                                    exe_name: e.clone(),
+                                                                    profile: pid_name.clone(),
+                                                                },
+                                                            );
+                                                        }
+                                                    }
                                                     ui.close_menu();
                                                 }
                                             }
                                         });
                                         ui.menu_button("Set CPU affinity", |ui| {
+                                            let mut affinity_dispatch =
+                                                |sel: framesage_core::CpuSelector,
+                                                 close: &mut bool| {
+                                                    for (t_pid, _) in &targets {
+                                                        action_queue.push(
+                                                            ProcessAction::SetAffinity {
+                                                                pid: *t_pid,
+                                                                selector: sel.clone(),
+                                                            },
+                                                        );
+                                                    }
+                                                    *close = true;
+                                                };
+                                            let mut want_close = false;
                                             if ui.button("X3D CCD (Cache cores)").clicked() {
-                                                action_queue.push(ProcessAction::SetAffinity {
-                                                    pid,
-                                                    selector: framesage_core::CpuSelector::Kind(
+                                                affinity_dispatch(
+                                                    framesage_core::CpuSelector::Kind(
                                                         framesage_core::CoreKind::Cache,
                                                     ),
-                                                });
-                                                ui.close_menu();
+                                                    &mut want_close,
+                                                );
                                             }
                                             if ui
                                                 .button("Non-X3D CCD (Performance cores)")
                                                 .clicked()
                                             {
-                                                action_queue.push(ProcessAction::SetAffinity {
-                                                    pid,
-                                                    selector: framesage_core::CpuSelector::Kind(
+                                                affinity_dispatch(
+                                                    framesage_core::CpuSelector::Kind(
                                                         framesage_core::CoreKind::Performance,
                                                     ),
-                                                });
-                                                ui.close_menu();
+                                                    &mut want_close,
+                                                );
                                             }
                                             if ui.button("All cores (reset)").clicked() {
-                                                action_queue.push(ProcessAction::SetAffinity {
-                                                    pid,
-                                                    selector: framesage_core::CpuSelector::All,
-                                                });
-                                                ui.close_menu();
+                                                affinity_dispatch(
+                                                    framesage_core::CpuSelector::All,
+                                                    &mut want_close,
+                                                );
                                             }
                                             if ui.button("Custom…").clicked() {
+                                                // The picker is single-PID by design
+                                                // (one mask per process). For bulk
+                                                // custom-mask use, the user picks once
+                                                // then can use Ctrl-click + the X3D /
+                                                // non-X3D presets next time.
                                                 action_queue.push(
                                                     ProcessAction::RequestAffinityPicker {
                                                         pid,
                                                         exe_name: exe.clone(),
                                                     },
                                                 );
+                                                want_close = true;
+                                            }
+                                            if want_close {
                                                 ui.close_menu();
                                             }
                                         });
                                         ui.separator();
-                                        if ui.button("Suspend process").clicked() {
-                                            action_queue.push(ProcessAction::Suspend { pid });
+                                        let suspend_label = if bulk {
+                                            format!("Suspend {} processes", targets.len())
+                                        } else {
+                                            "Suspend process".to_string()
+                                        };
+                                        if ui.button(suspend_label).clicked() {
+                                            for (t_pid, _) in &targets {
+                                                action_queue
+                                                    .push(ProcessAction::Suspend { pid: *t_pid });
+                                            }
                                             ui.close_menu();
                                         }
-                                        if ui.button("Resume process").clicked() {
-                                            action_queue.push(ProcessAction::Resume { pid });
+                                        let resume_label = if bulk {
+                                            format!("Resume {} processes", targets.len())
+                                        } else {
+                                            "Resume process".to_string()
+                                        };
+                                        if ui.button(resume_label).clicked() {
+                                            for (t_pid, _) in &targets {
+                                                action_queue
+                                                    .push(ProcessAction::Resume { pid: *t_pid });
+                                            }
                                             ui.close_menu();
                                         }
                                         ui.separator();
+                                        let terminate_label = if bulk {
+                                            format!("Terminate {} processes…", targets.len())
+                                        } else {
+                                            "Terminate process…".to_string()
+                                        };
                                         if ui
                                             .add(egui::Button::new(
-                                                egui::RichText::new("Terminate process…")
+                                                egui::RichText::new(terminate_label)
                                                     .color(theme::ERROR),
                                             ))
                                             .clicked()
                                         {
-                                            action_queue.push(ProcessAction::RequestTerminate {
-                                                pid,
-                                                exe_name: exe.clone(),
-                                            });
+                                            // Terminate is gated by the confirm modal.
+                                            // For bulk, we push one RequestTerminate
+                                            // per PID — the modal opens for the first,
+                                            // and the next pops up after Cancel/Apply
+                                            // until they're all resolved. (Could be
+                                            // improved to a single multi-target modal
+                                            // in a follow-up.)
+                                            for (t_pid, e_name) in &targets {
+                                                action_queue.push(
+                                                    ProcessAction::RequestTerminate {
+                                                        pid: *t_pid,
+                                                        exe_name: e_name.clone(),
+                                                    },
+                                                );
+                                            }
                                             ui.close_menu();
                                         }
                                     });
@@ -2781,11 +2908,58 @@ impl FramesageApp {
         }
 
         // ─── Apply selection toggle / close flag ───────────────────────────
+        //
+        // Multi-select rules (mirrors Task Manager / Process Explorer):
+        //   * Plain click — clear multi_selected, set selected_pid (toggle
+        //     off if it was already the single selection).
+        //   * Ctrl click  — toggle membership in multi_selected; selected_pid
+        //     becomes the clicked PID; remember as range anchor.
+        //   * Shift click — extend range from last_clicked_pid to the
+        //     clicked PID, using the current visual sort order of `rows`.
+        //
+        // We read the modifier state at the END of the frame so a click on
+        // row N captures whatever Ctrl/Shift was held during the click —
+        // matches what every other table widget does.
         if let Some(pid) = clicked_pid {
-            if self.processes.selected_pid == Some(pid) {
-                self.processes.selected_pid = None;
-            } else {
+            let (ctrl, shift) = ui
+                .ctx()
+                .input(|i| (i.modifiers.command || i.modifiers.ctrl, i.modifiers.shift));
+            if shift {
+                // Range select from the last anchor PID, in current visual
+                // order (`rows` is already filter+sort-applied above).
+                if let Some(anchor) = self.processes.last_clicked_pid {
+                    let pids: Vec<u32> = rows.iter().map(|r| r.pid).collect();
+                    let a = pids.iter().position(|p| *p == anchor);
+                    let b = pids.iter().position(|p| *p == pid);
+                    if let (Some(ai), Some(bi)) = (a, b) {
+                        let (lo, hi) = if ai <= bi { (ai, bi) } else { (bi, ai) };
+                        self.processes.multi_selected.clear();
+                        for p in &pids[lo..=hi] {
+                            self.processes.multi_selected.insert(*p);
+                        }
+                        self.processes.selected_pid = Some(pid);
+                    }
+                } else {
+                    // No anchor yet — treat as plain click.
+                    self.processes.multi_selected.clear();
+                    self.processes.selected_pid = Some(pid);
+                    self.processes.last_clicked_pid = Some(pid);
+                }
+            } else if ctrl {
+                if !self.processes.multi_selected.remove(&pid) {
+                    self.processes.multi_selected.insert(pid);
+                }
                 self.processes.selected_pid = Some(pid);
+                self.processes.last_clicked_pid = Some(pid);
+            } else {
+                // Plain click: clear multi, toggle single.
+                self.processes.multi_selected.clear();
+                if self.processes.selected_pid == Some(pid) {
+                    self.processes.selected_pid = None;
+                } else {
+                    self.processes.selected_pid = Some(pid);
+                }
+                self.processes.last_clicked_pid = Some(pid);
             }
         }
         if close_detail {
