@@ -60,7 +60,48 @@ struct AppState {
 const SYSTEM_HISTORY_LEN: usize = 60;
 
 struct RecentEvent {
+    /// Wall-clock time the event was received. Rendered as `HH:MM:SS` in
+    /// the Activity Log; the strip + Status-tab recent activity ignore it.
+    at: std::time::SystemTime,
+    /// Coarse category for filter chips + color-coding. `Other` is the
+    /// catch-all so a new IPC event variant doesn't get silently lost.
+    kind: EventKind,
     label: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum EventKind {
+    Foreground,
+    Engine, // Paused / Resumed
+    ProBalanceRestrained,
+    ProBalanceRestored,
+    /// Forward-compat catch-all. The IPC `Event` enum is exhaustively
+    /// matched today; this variant is kept so a new event added on the
+    /// service side without an immediate tray-side update still slots in
+    /// somewhere instead of being silently dropped.
+    #[allow(dead_code)]
+    Other,
+}
+
+impl EventKind {
+    fn display(self) -> &'static str {
+        match self {
+            EventKind::Foreground => "Foreground",
+            EventKind::Engine => "Engine",
+            EventKind::ProBalanceRestrained => "ProBalance demote",
+            EventKind::ProBalanceRestored => "ProBalance restore",
+            EventKind::Other => "Other",
+        }
+    }
+    fn color(self) -> egui::Color32 {
+        match self {
+            EventKind::Foreground => theme::ACCENT,
+            EventKind::Engine => theme::TEXT_MUTED,
+            EventKind::ProBalanceRestrained => theme::WARNING,
+            EventKind::ProBalanceRestored => theme::SUCCESS,
+            EventKind::Other => theme::TEXT,
+        }
+    }
 }
 
 /// Signals raised by the tray icon's menu/click handlers, read by the egui
@@ -80,6 +121,7 @@ enum Tab {
     Status,
     #[default]
     Processes,
+    Activity,
     Rules,
     Profiles,
 }
@@ -152,6 +194,35 @@ impl Default for ProcessesView {
             detail_height: None,
             multi_selected: std::collections::HashSet::new(),
             last_clicked_pid: None,
+        }
+    }
+}
+
+/// Activity Log tab UI state. The event buffer itself lives in
+/// `AppState.recent` (so the IPC subscribe thread can push without
+/// reaching into the UI tree); this struct just holds filter chip
+/// toggles + the search-substring textbox.
+struct ActivityLogView {
+    /// Filter chip per kind — when `false` the kind is hidden from the
+    /// table. Defaults: everything visible.
+    show_foreground: bool,
+    show_engine: bool,
+    show_probalance_restrain: bool,
+    show_probalance_restore: bool,
+    show_other: bool,
+    /// Substring search across the rendered label. Case-insensitive.
+    filter: String,
+}
+
+impl Default for ActivityLogView {
+    fn default() -> Self {
+        Self {
+            show_foreground: true,
+            show_engine: true,
+            show_probalance_restrain: true,
+            show_probalance_restore: true,
+            show_other: true,
+            filter: String::new(),
         }
     }
 }
@@ -319,6 +390,11 @@ struct FramesageApp {
     profiles: ProfilesEditor,
     /// Processes-tab live view + UI state (filter, sort).
     processes: ProcessesView,
+    /// Activity Log tab state — visible event-kind filter set + substring
+    /// search. Independent of the `recent` event buffer itself (which lives
+    /// in `AppState` so the network thread can push into it without
+    /// touching the UI tree).
+    activity: ActivityLogView,
     /// `Some` while the Terminate confirmation modal is open. Setting this
     /// from a context-menu click opens the modal; the modal's Confirm /
     /// Cancel buttons clear it and (for Confirm) fire the IPC.
@@ -394,6 +470,7 @@ impl FramesageApp {
             rules: RulesEditor::default(),
             profiles: ProfilesEditor::default(),
             processes: ProcessesView::default(),
+            activity: ActivityLogView::default(),
             terminate_confirm: None,
             affinity_picker: None,
             #[cfg(windows)]
@@ -947,6 +1024,7 @@ impl FramesageApp {
                 let tabs = [
                     (Tab::Processes, "Processes"),
                     (Tab::Status, "Status"),
+                    (Tab::Activity, "Activity"),
                     (Tab::Rules, "Rules"),
                     (Tab::Profiles, "Profiles"),
                 ];
@@ -1090,6 +1168,7 @@ impl FramesageApp {
             let tabs = [
                 (Tab::Processes, "Processes"),
                 (Tab::Status, "Status"),
+                (Tab::Activity, "Activity"),
                 (Tab::Rules, "Rules"),
                 (Tab::Profiles, "Profiles"),
             ];
@@ -1111,6 +1190,7 @@ impl FramesageApp {
         match self.tab {
             Tab::Status => self.render_status_tab(ctx, ui, status, recent),
             Tab::Processes => self.render_processes_tab(ui, status),
+            Tab::Activity => self.render_activity_tab(ui),
             Tab::Rules => self.render_rules_tab(ui, status),
             Tab::Profiles => self.render_profiles_tab(ui, status),
         }
@@ -1396,6 +1476,131 @@ impl FramesageApp {
                 ui.small(msg);
             }
         });
+    }
+
+    /// Activity Log tab — full history of every engine event the IPC
+    /// subscribe stream has delivered. Filter chips per event kind plus a
+    /// substring search make it easy to ask "what did ProBalance do for
+    /// the last 5 minutes" or "did the rule for steam.exe ever fire?".
+    ///
+    /// Buffer is capped at 1000 entries; oldest evicted first (the strip
+    /// + Status-tab recent activity already read from the same buffer).
+    fn render_activity_tab(&mut self, ui: &mut egui::Ui) {
+        use egui_extras::{Column, TableBuilder};
+
+        // Snapshot the event buffer + clear flag under a short lock so the
+        // render closure doesn't hold the mutex across the table walk.
+        let events: Vec<RecentEvent> = {
+            let s = self.state.lock().unwrap();
+            s.recent
+                .iter()
+                .map(|e| RecentEvent {
+                    at: e.at,
+                    kind: e.kind,
+                    label: e.label.clone(),
+                })
+                .collect()
+        };
+
+        // Filter UI — kind chips + substring search.
+        ui.horizontal(|ui| {
+            ui.label("Show:");
+            ui.checkbox(&mut self.activity.show_foreground, "Foreground");
+            ui.checkbox(&mut self.activity.show_engine, "Engine");
+            ui.checkbox(
+                &mut self.activity.show_probalance_restrain,
+                "ProBalance demote",
+            );
+            ui.checkbox(
+                &mut self.activity.show_probalance_restore,
+                "ProBalance restore",
+            );
+            ui.checkbox(&mut self.activity.show_other, "Other");
+            ui.add_space(8.0);
+            ui.label("Find:");
+            ui.add(
+                egui::TextEdit::singleline(&mut self.activity.filter)
+                    .hint_text("substring (case-insensitive)")
+                    .desired_width(220.0),
+            );
+            if ui.button("Clear").clicked() {
+                self.activity.filter.clear();
+            }
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                let total = events.len();
+                ui.colored_label(theme::TEXT_MUTED, format!("{total} events"));
+                if ui.button("Clear log").clicked() {
+                    self.state.lock().unwrap().recent.clear();
+                }
+            });
+        });
+        ui.add_space(4.0);
+
+        // Apply filters (in newest-first order so the most recent event
+        // sits at the top — opposite of the underlying buffer's append
+        // order). Filter chips compose with substring match.
+        let want_kind = |k: EventKind| -> bool {
+            match k {
+                EventKind::Foreground => self.activity.show_foreground,
+                EventKind::Engine => self.activity.show_engine,
+                EventKind::ProBalanceRestrained => self.activity.show_probalance_restrain,
+                EventKind::ProBalanceRestored => self.activity.show_probalance_restore,
+                EventKind::Other => self.activity.show_other,
+            }
+        };
+        let needle = self.activity.filter.to_ascii_lowercase();
+        let filtered: Vec<&RecentEvent> = events
+            .iter()
+            .rev()
+            .filter(|e| want_kind(e.kind))
+            .filter(|e| needle.is_empty() || e.label.to_ascii_lowercase().contains(&needle))
+            .collect();
+
+        if filtered.is_empty() {
+            ui.colored_label(
+                theme::TEXT_MUTED,
+                if events.is_empty() {
+                    "No events yet. Activity will appear here as the engine reconciles."
+                } else {
+                    "No events match the current filter."
+                },
+            );
+            return;
+        }
+
+        // Table: Time | Kind | Message. Wide message column on the right.
+        TableBuilder::new(ui)
+            .striped(true)
+            .resizable(true)
+            .cell_layout(egui::Layout::left_to_right(egui::Align::Center))
+            .column(Column::initial(95.0).at_least(80.0))
+            .column(Column::initial(180.0).at_least(120.0))
+            .column(Column::remainder().at_least(160.0))
+            .header(20.0, |mut header| {
+                header.col(|ui| {
+                    ui.label("Time");
+                });
+                header.col(|ui| {
+                    ui.label("Kind");
+                });
+                header.col(|ui| {
+                    ui.label("Event");
+                });
+            })
+            .body(|body| {
+                body.rows(18.0, filtered.len(), |mut row| {
+                    let e = filtered[row.index()];
+                    row.col(|ui| {
+                        ui.monospace(format_local_hms(e.at));
+                    });
+                    row.col(|ui| {
+                        ui.colored_label(e.kind.color(), e.kind.display());
+                    });
+                    row.col(|ui| {
+                        ui.label(&e.label);
+                    });
+                });
+            });
     }
 
     /// Render the Rules tab — view and edit `Policy::rules` via batched
@@ -3651,6 +3856,60 @@ fn detail_kv(ui: &mut egui::Ui, key: &str, value: String) {
     });
 }
 
+/// Format a `SystemTime` as `HH:MM:SS` in the current timezone for the
+/// Activity Log "Time" column. We deliberately avoid the chrono crate to
+/// keep the dep tree small — a `SystemTime` → UNIX seconds → manual h/m/s
+/// breakdown is enough for a UI clock readout (no calendar math, no DST
+/// edge cases that matter on a one-day-or-less event buffer).
+fn format_local_hms(t: std::time::SystemTime) -> String {
+    use std::time::UNIX_EPOCH;
+    let secs = t
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+
+    // Local offset, seconds east of UTC. Win32 `GetTimeZoneInformation`
+    // would give the precise value; for the activity log we just need
+    // something that matches the user's wall clock, so use the
+    // SystemTime → DateTime difference reported by `chrono`-less means:
+    // Windows returns the *current* offset via `_timezone` + DST flag at
+    // process startup. As a simpler approximation, ask the OS for the
+    // local time of `t` directly via Win32.
+    #[cfg(windows)]
+    {
+        use windows::Win32::Foundation::FILETIME;
+        use windows::Win32::System::Time::{FileTimeToSystemTime, SystemTimeToTzSpecificLocalTime};
+        // SystemTime epoch is 1970-01-01; FILETIME epoch is 1601-01-01.
+        // Difference in 100-ns ticks: 116444736000000000.
+        let ticks = secs
+            .saturating_mul(10_000_000)
+            .saturating_add(116_444_736_000_000_000);
+        let ft = FILETIME {
+            dwLowDateTime: (ticks & 0xFFFF_FFFF) as u32,
+            dwHighDateTime: (ticks >> 32) as u32,
+        };
+        let mut utc = windows::Win32::Foundation::SYSTEMTIME::default();
+        // SAFETY: ft is a fully-initialised FILETIME, utc is a valid
+        // out-parameter for the matching struct.
+        if unsafe { FileTimeToSystemTime(&ft, &mut utc) }.is_ok() {
+            let mut local = windows::Win32::Foundation::SYSTEMTIME::default();
+            // SAFETY: utc is fully initialised, local is a valid out-param.
+            if unsafe { SystemTimeToTzSpecificLocalTime(None, &utc, &mut local) }.is_ok() {
+                return format!(
+                    "{:02}:{:02}:{:02}",
+                    local.wHour, local.wMinute, local.wSecond
+                );
+            }
+        }
+    }
+    // Fallback: UTC h/m/s. Better than nothing on non-Windows or if the
+    // timezone conversion ever fails.
+    let h = (secs / 3600) % 24;
+    let m = (secs / 60) % 60;
+    let s = secs % 60;
+    format!("{h:02}:{m:02}:{s:02}")
+}
+
 fn format_bytes(b: u64) -> String {
     if b >= 1024 * 1024 * 1024 {
         format!("{:.1} GB", b as f64 / (1024.0 * 1024.0 * 1024.0))
@@ -5262,36 +5521,49 @@ fn try_connect_and_serve(state: Arc<Mutex<AppState>>) -> anyhow::Result<()> {
     line.clear();
     while reader.read_line(&mut line)? > 0 {
         if let Ok(event) = serde_json::from_str::<framesage_ipc::Event>(&line) {
-            let label = match &event {
+            let (kind, label) = match &event {
                 Event::ForegroundChanged {
                     foreground,
                     profile,
-                } => format!(
-                    "{} -> {} (pid {})",
-                    foreground.exe_name, profile, foreground.pid
+                } => (
+                    EventKind::Foreground,
+                    format!(
+                        "{} -> {} (pid {})",
+                        foreground.exe_name, profile, foreground.pid
+                    ),
                 ),
-                Event::Paused => "paused".into(),
-                Event::Resumed => "resumed".into(),
+                Event::Paused => (EventKind::Engine, "engine paused".into()),
+                Event::Resumed => (EventKind::Engine, "engine resumed".into()),
                 Event::ProBalanceRestrained {
                     pid,
                     exe_name,
                     from_class,
                     to_class,
-                } => format!(
-                    "probalance restrained {} (pid {}) {:#x} -> {:#x}",
-                    exe_name, pid, from_class, to_class
+                } => (
+                    EventKind::ProBalanceRestrained,
+                    format!(
+                        "probalance restrained {} (pid {}) {:#x} -> {:#x}",
+                        exe_name, pid, from_class, to_class
+                    ),
                 ),
                 Event::ProBalanceRestored {
                     pid,
                     exe_name,
                     restored_class,
-                } => format!(
-                    "probalance restored {} (pid {}) -> {:#x}",
-                    exe_name, pid, restored_class
+                } => (
+                    EventKind::ProBalanceRestored,
+                    format!(
+                        "probalance restored {} (pid {}) -> {:#x}",
+                        exe_name, pid, restored_class
+                    ),
                 ),
             };
             let mut s = state.lock().unwrap();
-            s.recent.push(RecentEvent { label });
+            s.recent.push(RecentEvent {
+                at: std::time::SystemTime::now(),
+                kind,
+                label,
+            });
             // Cap the event buffer. Without this it grows forever (one
             // entry per foreground change, every 250 ms in the worst case).
             // 1000 entries is ~5 minutes of constant flicker — plenty for
