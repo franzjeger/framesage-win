@@ -4775,6 +4775,16 @@ fn try_connect_and_serve(state: Arc<Mutex<AppState>>) -> anyhow::Result<()> {
             };
             let mut s = state.lock().unwrap();
             s.recent.push(RecentEvent { label });
+            // Cap the event buffer. Without this it grows forever (one
+            // entry per foreground change, every 250 ms in the worst case).
+            // 1000 entries is ~5 minutes of constant flicker — plenty for
+            // any UI consumer (the Activity strip shows 5, the Recent
+            // Activity panel shows 20).
+            const MAX_RECENT: usize = 1000;
+            if s.recent.len() > MAX_RECENT {
+                let drop = s.recent.len() - MAX_RECENT;
+                s.recent.drain(0..drop);
+            }
             if let (Event::ForegroundChanged { foreground, .. }, Some(snap)) =
                 (&event, s.status.as_mut())
             {
@@ -4816,20 +4826,23 @@ fn background_loop(state: Arc<Mutex<AppState>>) {
 fn processes_poll_loop(state: Arc<Mutex<AppState>>, ctx: egui::Context) {
     let interval = std::time::Duration::from_millis(1000);
     loop {
-        match send_list_processes_blocking() {
-            Ok((snapshots, system)) => {
+        match send_processes_and_status_blocking() {
+            Ok((snapshots, system, status)) => {
                 let mem_percent: u8 = if system.memory_total_bytes > 0 {
                     ((system.memory_used_bytes as u128 * 100 / system.memory_total_bytes as u128)
                         .min(100)) as u8
                 } else {
                     0
                 };
-                // Pull the scalar fields out before moving `system` — Vec
-                // inside SystemMetrics means SystemMetrics is no longer Copy.
                 let cpu_for_history = system.cpu_percent;
                 let mut s = state.lock().unwrap();
                 s.processes = snapshots;
                 s.system = system;
+                // Refresh the cached Status every tick so the UI never
+                // shows stale paused/policy state. Without this, clicking
+                // Pause/Resume or Enable-ProBalance updates the engine but
+                // the UI keeps showing the value cached at first connect.
+                s.status = Some(status);
                 s.system_history.push_back((cpu_for_history, mem_percent));
                 while s.system_history.len() > SYSTEM_HISTORY_LEN {
                     s.system_history.pop_front();
@@ -4848,10 +4861,16 @@ fn processes_poll_loop(state: Arc<Mutex<AppState>>, ctx: egui::Context) {
     }
 }
 
+/// One status-pipe round-trip per tick: send ListProcesses, then Status,
+/// read both responses. Reuses a single pipe instance so we only burn one
+/// ACL check per second. The Status fetch is what keeps the tray's view
+/// of `paused` + `policy.probalance.enabled` in sync with the engine —
+/// without it, the UI shows whatever values were current at first connect.
 #[cfg(windows)]
-fn send_list_processes_blocking() -> anyhow::Result<(
+fn send_processes_and_status_blocking() -> anyhow::Result<(
     Vec<framesage_ipc::ProcessSnapshot>,
     framesage_ipc::SystemMetrics,
+    framesage_ipc::StatusSnapshot,
 )> {
     use std::fs::OpenOptions;
     use std::io::{BufRead, BufReader, Write};
@@ -4863,19 +4882,35 @@ fn send_list_processes_blocking() -> anyhow::Result<(
     let mut writer = pipe.try_clone()?;
     let mut reader = BufReader::new(pipe);
 
+    // ListProcesses
     let mut buf = serde_json::to_vec(&framesage_ipc::Request::ListProcesses)?;
     buf.push(b'\n');
     writer.write_all(&buf)?;
     writer.flush()?;
-
     let mut line = String::new();
     reader.read_line(&mut line)?;
-    match serde_json::from_str::<framesage_ipc::Response>(&line)? {
-        framesage_ipc::Response::Processes { snapshots, system } => Ok((snapshots, system)),
-        other => Err(anyhow::anyhow!(
-            "expected Processes response, got {other:?}"
-        )),
-    }
+    let (snapshots, system) = match serde_json::from_str::<framesage_ipc::Response>(&line)? {
+        framesage_ipc::Response::Processes { snapshots, system } => (snapshots, system),
+        other => {
+            return Err(anyhow::anyhow!(
+                "expected Processes response, got {other:?}"
+            ))
+        }
+    };
+
+    // Status — same pipe, same handler, just a second request.
+    let mut buf = serde_json::to_vec(&framesage_ipc::Request::Status)?;
+    buf.push(b'\n');
+    writer.write_all(&buf)?;
+    writer.flush()?;
+    line.clear();
+    reader.read_line(&mut line)?;
+    let status = match serde_json::from_str::<framesage_ipc::Response>(&line)? {
+        framesage_ipc::Response::Status(s) => *s,
+        other => return Err(anyhow::anyhow!("expected Status response, got {other:?}")),
+    };
+
+    Ok((snapshots, system, status))
 }
 
 /// even if the service is down for minutes.
