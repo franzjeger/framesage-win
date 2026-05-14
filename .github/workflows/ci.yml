@@ -1,0 +1,100 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: -D warnings
+  RUST_BACKTRACE: 1
+
+jobs:
+  # Cross-platform smoke test: cargo check the whole workspace targeting
+  # Windows from Ubuntu. Fast, catches the bulk of mistakes before the heavier
+  # native Windows job runs.
+  cross-check:
+    name: cross-check (ubuntu -> x86_64-pc-windows-gnu)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-gnu
+      - uses: Swatinem/rust-cache@v2
+      - name: cargo check (Windows target)
+        run: cargo check --workspace --target x86_64-pc-windows-gnu --all-targets
+
+  # Tests on the platform-agnostic crates can run anywhere; ubuntu is cheapest.
+  # We exclude the binary crates that pull in Windows-only deps.
+  tests-portable:
+    name: tests (portable crates)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: cargo test (host)
+        run: |
+          cargo test \
+            -p framesage-core \
+            -p framesage-ipc \
+            -p framesage-sim
+      - name: framesage-sim demo (smoke)
+        run: cargo run -p framesage-sim --quiet -- demo
+
+  # The real deal: native Windows build + test, all crates.
+  windows-build:
+    name: native build + test (windows)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+      - uses: Swatinem/rust-cache@v2
+      - name: cargo test (workspace)
+        run: cargo test --workspace
+      - name: cargo build --release
+        run: cargo build --release --workspace --bins
+      - name: Stage release binaries
+        shell: pwsh
+        run: |
+          $stage = "framesage-win-${{ github.sha }}"
+          New-Item -ItemType Directory -Path $stage | Out-Null
+          Copy-Item target\release\framesage.exe       $stage\
+          Copy-Item target\release\framesage-svc.exe   $stage\
+          Copy-Item target\release\framesage-tray.exe  $stage\
+          Copy-Item target\release\framesage-sim.exe   $stage\
+          Copy-Item README.md $stage\
+          Copy-Item LICENSE   $stage\
+      - name: Upload release artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: framesage-win-${{ github.sha }}
+          path: framesage-win-${{ github.sha }}/
+          if-no-files-found: error
+          retention-days: 14
+
+  lints:
+    name: rustfmt + clippy
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+          targets: x86_64-pc-windows-gnu
+      - uses: Swatinem/rust-cache@v2
+      - name: cargo fmt --check
+        run: cargo fmt --all -- --check
+      - name: cargo clippy (Windows target)
+        run: |
+          cargo clippy \
+            --workspace \
+            --target x86_64-pc-windows-gnu \
+            --all-targets \
+            -- -D warnings
