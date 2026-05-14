@@ -266,9 +266,9 @@ impl eframe::App for FramesageApp {
             .show(ctx, |ui| {
                 ui.horizontal(|ui| {
                     ui.label(
-                        egui::RichText::new("FRAMESAGE")
+                        egui::RichText::new("FrameSage")
                             .color(theme::ACCENT)
-                            .size(14.0)
+                            .size(15.0)
                             .strong(),
                     );
                     ui.add_space(8.0);
@@ -279,9 +279,9 @@ impl eframe::App for FramesageApp {
                     ui.selectable_value(&mut self.tab, Tab::Profiles, "Profiles");
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         let (color, text) = if connected {
-                            (theme::SUCCESS, "connected")
+                            (theme::SUCCESS, "Connected")
                         } else {
-                            (theme::ERROR, "disconnected")
+                            (theme::ERROR, "Disconnected")
                         };
                         theme::status_badge(color).show(ui, |ui| {
                             ui.colored_label(color, text);
@@ -324,10 +324,14 @@ impl FramesageApp {
                     },
                 );
                 kv_row(ui, "Rules", s.policy.rules.len().to_string());
-                kv_row(ui, "Default profile", s.policy.default_profile.to_string());
+                kv_row(
+                    ui,
+                    "Default profile",
+                    display_profile_id(&s.policy.default_profile.0),
+                );
                 match &s.active_profile {
                     Some(p) => {
-                        kv_row(ui, "Active profile", p.id.to_string());
+                        kv_row(ui, "Active profile", display_profile_id(&p.id.0));
                         if !p.description.is_empty() {
                             ui.add_space(2.0);
                             ui.colored_label(theme::TEXT_MUTED, &p.description);
@@ -694,18 +698,25 @@ impl FramesageApp {
         ui.horizontal(|ui| {
             let active_id = s.active_profile.as_ref().map(|p| p.id.0.as_str());
             ui.label(egui::RichText::new("Default:").weak());
-            ui.label(displayed_policy.default_profile.to_string());
+            ui.label(display_profile_id(&displayed_policy.default_profile.0));
             if let Some(bg) = &displayed_policy.background_profile {
                 ui.label(egui::RichText::new("·").weak());
                 ui.label(egui::RichText::new("Background:").weak());
-                ui.label(bg.to_string());
+                ui.label(display_profile_id(&bg.0));
             }
             if let Some(active) = active_id {
                 ui.label(egui::RichText::new("·").weak());
                 ui.label(egui::RichText::new("Active:").weak());
-                ui.label(active);
+                ui.label(display_profile_id(active));
             }
         });
+        ui.add_space(2.0);
+        ui.colored_label(
+            theme::TEXT_MUTED,
+            "Profiles auto-apply by foreground app via the Rules tab. \
+             Use \u{201c}Apply to foreground\u{201d} on a profile below to override the rule \
+             match for the currently-focused app.",
+        );
         ui.horizontal(|ui| {
             let save_enabled = self.elevated
                 && dirty
@@ -768,12 +779,13 @@ impl FramesageApp {
                 };
                 let is_active = s.active_profile.as_ref().is_some_and(|ap| ap.id == *id);
                 let is_editing = self.profiles.editing_id.as_deref() == Some(id.0.as_str());
+                let pretty = display_profile_id(&id.0);
                 let header_text = if is_editing {
-                    format!("{}  (editing)", id.0)
+                    format!("{pretty}  (editing)")
                 } else if is_active {
-                    format!("{}  (active)", id.0)
+                    format!("{pretty}  (active)")
                 } else {
-                    id.0.clone()
+                    pretty
                 };
                 let header_color = if is_active {
                     theme::ACCENT
@@ -803,13 +815,21 @@ impl FramesageApp {
                             // pipe. Disabled in edit mode (the user should
                             // Save first) and on the already-active profile
                             // (no-op vs. the normal rule-match path).
-                            let apply_enabled =
-                                self.elevated && !is_editing && self.rules.form.is_none();
+                            let apply_enabled = self.elevated
+                                && !is_editing
+                                && !is_active
+                                && self.rules.form.is_none();
+                            let apply_btn = egui::Button::new(
+                                egui::RichText::new("Apply to foreground").strong(),
+                            )
+                            .fill(theme::ACCENT)
+                            .stroke(egui::Stroke::new(1.0, theme::ACCENT_HOVER));
                             if ui
-                                .add_enabled(apply_enabled, egui::Button::new("Apply now"))
+                                .add_enabled(apply_enabled, apply_btn)
                                 .on_hover_text(
-                                    "Apply this profile to the current foreground process. \
-                                     Overrides the rule matcher until focus changes.",
+                                    "Apply this profile to the current foreground app right now. \
+                                     The override holds until you focus a different app, at which \
+                                     point the Rules tab decides what profile to apply next.",
                                 )
                                 .clicked()
                             {
@@ -975,6 +995,48 @@ fn yes_no(b: bool) -> &'static str {
         "Yes"
     } else {
         "No"
+    }
+}
+
+/// Title-case a profile id for display. The underlying id stays as the user
+/// authored it (e.g. `"game-x3d"` so rules and policy.json round-trip
+/// stably), but the UI shows `"Game X3D"`. Splits on `-` and `_`, upper-cases
+/// the first letter of each token, and special-cases hardware acronyms like
+/// `x3d` so the display reads as branded text instead of slug. Pure function.
+fn display_profile_id(raw: &str) -> String {
+    raw.split(['-', '_'])
+        .filter(|s| !s.is_empty())
+        .map(|token| {
+            // Acronyms / vendor jargon that should stay shouty.
+            let upper = token.to_ascii_uppercase();
+            if matches!(
+                upper.as_str(),
+                "X3D" | "CPU" | "GPU" | "RAM" | "IO" | "CCD" | "AMD" | "NV" | "DLSS"
+            ) {
+                return upper;
+            }
+            let mut chars = token.chars();
+            match chars.next() {
+                Some(first) => first.to_ascii_uppercase().to_string() + chars.as_str(),
+                None => String::new(),
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::display_profile_id;
+
+    #[test]
+    fn profile_id_display_handles_common_cases() {
+        assert_eq!(display_profile_id("perf"), "Perf");
+        assert_eq!(display_profile_id("eco"), "Eco");
+        assert_eq!(display_profile_id("game-x3d"), "Game X3D");
+        assert_eq!(display_profile_id("low_power"), "Low Power");
+        assert_eq!(display_profile_id("cpu-bound"), "CPU Bound");
+        assert_eq!(display_profile_id(""), "");
     }
 }
 
@@ -1422,40 +1484,128 @@ fn cpu_selector_edit(ui: &mut egui::Ui, label: &str, sel: &mut Option<CpuSelecto
     });
 }
 
-// ─── Tray icon ───────────────────────────────────────────────────────────────
+// ─── FrameSage logo ─────────────────────────────────────────────────────────
 
-/// 32×32 hand-rolled framesage tray icon: a radial blue gradient on a
-/// transparent background. Replaceable with a designed .ico later — keeping
-/// it programmatic for now avoids shipping a binary asset for v0.2.
-#[cfg(windows)]
-fn build_icon() -> Icon {
-    const SIZE: u32 = 32;
+/// Render the FrameSage brand mark at 64×64: dark navy disc, accent-cyan
+/// ring, large stylised "F" sitting on the disc. Used as the source for
+/// every visual that needs the logo — system-tray icon, eframe window icon,
+/// build-time .ico for the .exe's taskbar / Alt-Tab thumbnail.
+///
+/// Returns (rgba_bytes, width, height). RGBA is row-major, top-down, 8-bit
+/// per channel, premultiplied-by-alpha-friendly (egui and tray-icon both
+/// expect plain RGBA8888).
+fn framesage_logo_rgba() -> (Vec<u8>, u32, u32) {
+    const SIZE: u32 = 64;
+    let s = SIZE as f32;
+    let center = (s - 1.0) / 2.0;
+
+    // Palette pulled from theme so the icon reads as part of the same UI.
+    let bg = [0x16u8, 0x1b, 0x22]; // theme::SURFACE
+    let ring = [0x58u8, 0xa6, 0xff]; // theme::ACCENT
+    let f_color = [0x9bu8, 0xca, 0xff]; // bright cyan/white for legibility
+
+    // Geometric parameters. All in pixel space; tuned by eye.
+    let disc_outer = 30.5_f32; // outer edge of the cyan ring
+    let disc_inner = 27.5_f32; // inner edge of the ring (= disc fill boundary)
+
+    // "F" glyph layout (bitmap-style; coordinates relative to the canvas):
+    let f_left = 21.0;
+    let f_right = 45.0;
+    let f_top = 16.0;
+    let f_bot = 48.0;
+    let bar_thick = 7.0;
+    let top_bar_h = 7.0;
+    let mid_bar_y_top = 30.0;
+    let mid_bar_h = 6.0;
+    let mid_bar_right = 40.0;
+
     let mut rgba: Vec<u8> = Vec::with_capacity((SIZE * SIZE * 4) as usize);
-    let center = (SIZE as f32 - 1.0) / 2.0;
-    let max_r = center;
     for y in 0..SIZE {
         for x in 0..SIZE {
-            let dx = x as f32 - center;
-            let dy = y as f32 - center;
-            let r = (dx * dx + dy * dy).sqrt() / max_r;
-            if r <= 1.0 {
-                let t = (1.0 - r).clamp(0.0, 1.0);
-                // Soft anti-aliased edge: fade alpha in the outer 6% of radius.
-                let alpha = if r > 0.94 {
-                    ((1.0 - r) / 0.06 * 255.0).clamp(0.0, 255.0) as u8
-                } else {
-                    255
-                };
-                let red = (30.0 + 30.0 * t) as u8;
-                let green = (90.0 + 70.0 * t) as u8;
-                let blue = (140.0 + 100.0 * t) as u8;
-                rgba.extend_from_slice(&[red, green, blue, alpha]);
-            } else {
-                rgba.extend_from_slice(&[0, 0, 0, 0]);
+            let fx = x as f32 + 0.5;
+            let fy = y as f32 + 0.5;
+            let dx = fx - center - 0.5;
+            let dy = fy - center - 0.5;
+            let r = (dx * dx + dy * dy).sqrt();
+
+            // Start fully transparent; we'll layer in disc → ring → glyph.
+            let mut pixel = [0u8, 0, 0, 0];
+
+            if r <= disc_outer {
+                let disc_alpha = smoothstep(disc_outer + 0.5, disc_outer - 0.5, r);
+                let ring_alpha = smoothstep(disc_inner - 0.5, disc_inner + 0.5, r).min(smoothstep(
+                    disc_outer + 0.5,
+                    disc_outer - 0.5,
+                    r,
+                ));
+
+                // Disc fill.
+                let a = (disc_alpha * 255.0).clamp(0.0, 255.0) as u8;
+                pixel = [bg[0], bg[1], bg[2], a];
+
+                // Ring overlay (replaces disc fill near the outer band).
+                if ring_alpha > 0.0 {
+                    let a = (ring_alpha * 255.0).clamp(0.0, 255.0) as u8;
+                    pixel = over(pixel, [ring[0], ring[1], ring[2], a]);
+                }
+
+                // Glyph: "F" — a vertical bar + two horizontal bars.
+                let on_vertical_bar = in_rect(fx, fy, f_left, f_top, f_left + bar_thick, f_bot);
+                let on_top_bar = in_rect(fx, fy, f_left, f_top, f_right, f_top + top_bar_h);
+                let on_mid_bar = in_rect(
+                    fx,
+                    fy,
+                    f_left,
+                    mid_bar_y_top,
+                    mid_bar_right,
+                    mid_bar_y_top + mid_bar_h,
+                );
+                if on_vertical_bar || on_top_bar || on_mid_bar {
+                    pixel = over(pixel, [f_color[0], f_color[1], f_color[2], 255]);
+                }
             }
+
+            rgba.extend_from_slice(&pixel);
         }
     }
-    Icon::from_rgba(rgba, SIZE, SIZE).expect("hand-rolled icon is valid RGBA")
+
+    (rgba, SIZE, SIZE)
+}
+
+fn smoothstep(edge0: f32, edge1: f32, x: f32) -> f32 {
+    let t = ((x - edge0) / (edge1 - edge0)).clamp(0.0, 1.0);
+    t * t * (3.0 - 2.0 * t)
+}
+
+fn in_rect(px: f32, py: f32, x0: f32, y0: f32, x1: f32, y1: f32) -> bool {
+    px >= x0 && px < x1 && py >= y0 && py < y1
+}
+
+/// Source-over alpha compositing on a single pixel. Mutates `dst` toward
+/// `src`. Both are straight (non-premultiplied) RGBA8888.
+fn over(dst: [u8; 4], src: [u8; 4]) -> [u8; 4] {
+    let sa = src[3] as f32 / 255.0;
+    let da = dst[3] as f32 / 255.0;
+    let out_a = sa + da * (1.0 - sa);
+    if out_a <= f32::EPSILON {
+        return [0, 0, 0, 0];
+    }
+    let blend = |s: u8, d: u8| -> u8 {
+        let v = (s as f32 * sa + d as f32 * da * (1.0 - sa)) / out_a;
+        v.clamp(0.0, 255.0) as u8
+    };
+    [
+        blend(src[0], dst[0]),
+        blend(src[1], dst[1]),
+        blend(src[2], dst[2]),
+        (out_a * 255.0).clamp(0.0, 255.0) as u8,
+    ]
+}
+
+#[cfg(windows)]
+fn build_icon() -> Icon {
+    let (rgba, w, h) = framesage_logo_rgba();
+    Icon::from_rgba(rgba, w, h).expect("hand-rolled icon is valid RGBA")
 }
 
 /// IDs of the dynamically-created menu items so the background event thread
@@ -1685,18 +1835,32 @@ fn main() -> eframe::Result<()> {
             .with_inner_size([640.0, 560.0])
             .with_min_inner_size([520.0, 420.0])
             .with_title(if elevated {
-                "framesage (admin)"
+                "FrameSage (admin)"
             } else {
-                "framesage"
+                "FrameSage"
             })
+            .with_icon(build_window_icon())
             .with_close_button(true),
         ..Default::default()
     };
 
     let cmds_for_app = commands.clone();
     eframe::run_native(
-        "framesage",
+        "FrameSage",
         options,
         Box::new(move |cc| Ok(Box::new(FramesageApp::new(cc, cmds_for_app, elevated)))),
     )
+}
+
+/// Build the eframe viewport icon shown in the title bar + taskbar. Mirrors
+/// the tray-icon rendering so the brand reads consistently. Returns an
+/// `egui::IconData` instead of `tray_icon::Icon` because eframe owns that
+/// type; the pixel data is otherwise identical to `build_icon()`.
+fn build_window_icon() -> egui::IconData {
+    let (rgba, w, h) = framesage_logo_rgba();
+    egui::IconData {
+        rgba,
+        width: w,
+        height: h,
+    }
 }
