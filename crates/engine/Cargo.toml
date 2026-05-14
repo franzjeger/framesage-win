@@ -12,6 +12,8 @@ description = "framesage-win policy engine: watches foreground app, applies and 
 framesage-core = { workspace = true }
 framesage-sys = { workspace = true }
 framesage-ipc = { workspace = true }
+framesage-gamemode = { workspace = true }
+uuid = { workspace = true }
 tokio = { workspace = true }
 parking_lot = { workspace = true }
 serde = { workspace = true }

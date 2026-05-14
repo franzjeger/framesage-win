@@ -18,8 +18,14 @@ The repo currently contains a working architecture and a first vertical slice. I
   - **Memory priority**
   - **Hard affinity mask** (fallback, rarely needed)
   - **Working-set trim** on apply
-- When focus moves away, it reverts the changes it made to that PID.
-- Default policy ships with rules for Battlefield 6, Valorant, and Fortnite that target the AMD X3D (or Intel P-core) CCD via `CpuSelector::Kind(CoreKind::Cache)`.
+- A profile can additionally request **Game Mode**: system-wide actions that go beyond a single process.
+  - **Hide taskbar** (primary + multi-monitor secondaries via documented `ShowWindow`).
+  - **Stop services** from a curated safe-list (SysMain, WSearch, DiagTrack, …). Anti-virus and anti-cheat services are explicitly denied.
+  - **Suspend background processes** from a curated safe-list (OneDrive, Dropbox, RGB tools, …). Shell and kernel processes are explicitly denied.
+  - **Switch power plan** (Balanced / High Performance / Power Saver / Ultimate Performance / custom GUID).
+- When focus moves away, every change is reverted automatically. A **crash-safe journal** at `%ProgramData%\framesage\game-mode.journal` lets the service recover stranded sessions on restart.
+- Panic button: `framesage game-mode off` reverts any active Game Mode session immediately.
+- Default policy ships with rules for Battlefield 6, Valorant, and Fortnite that target the AMD X3D (or Intel P-core) CCD via `CpuSelector::Kind(CoreKind::Cache)` and enables a conservative Game Mode (hide taskbar, stop SysMain/WSearch/DiagTrack, switch to High Performance, suspend OneDrive/Dropbox).
 
 ## What it doesn't do yet
 
@@ -64,6 +70,7 @@ Crate layout:
 | [`framesage-cli`](crates/cli) | `framesage.exe` — install/uninstall, status, control. |
 | [`framesage-tray`](crates/tray) | `framesage-tray.exe` — egui monitoring window. |
 | [`framesage-sim`](crates/sim) | `framesage-sim.exe` — dev harness; resolves policy + topology against synthetic foreground events on any host. |
+| [`framesage-gamemode`](crates/gamemode) | Curated safe-list (services + processes), action planner, crash-safe revert journal. Platform-agnostic. |
 
 ## Building
 
@@ -139,11 +146,14 @@ Ctrl+C stops it.
 - [x] **Policy file at `%ProgramData%\framesage\policy.json`**, hot-reloaded by the service. Bootstraps `Policy::default()` on first run.
 - [x] **Dev harness** (`framesage-sim`) for cross-platform iteration on rules, profiles, and selectors.
 - [x] **Unit tests + GitHub Actions CI** (cross-check, native Windows build, clippy, rustfmt).
+- [x] **Game Mode**: hide taskbar, stop curated services, suspend curated processes, switch power plan. Crash-safe journal at `%ProgramData%\framesage\game-mode.journal`. Curated safe-list with explicit denylist for AV / anti-cheat / shell / kernel processes. `framesage game-mode off` panic button.
 - [ ] **CPPC perf-rank readout** via `CallNtPowerInformation` → `PROCESSOR_POWER_INFORMATION`. Lets `CpuSelector::TopRanked(N)` actually pin to the fastest silicon on this specific chip.
 - [ ] **X3D/Cache CCD detection.** Use the CPPC rank distribution: on dual-CCD X3D parts the X3D CCD has lower max frequency.
 - [ ] **Background process enforcement.** Walk `CreateToolhelp32Snapshot` once per N seconds, apply `background_profile` to processes that don't match any rule.
 - [ ] **True tray icon** via the `tray-icon` crate, minimise-to-tray, autostart-tray.
 - [ ] **I/O priority** via `NtSetInformationProcess(ProcessIoPriority, …)`.
+- [ ] **Focus Assist** (Do Not Disturb) toggle for the duration of Game Mode.
+- [ ] **Pause Windows Update** during Game Mode.
 - [ ] **Pipe ACL** — split read-only status access (for an unprivileged tray) from admin-only control access.
 
 ### v0.3 — the differentiators

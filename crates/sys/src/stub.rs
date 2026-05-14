@@ -46,3 +46,42 @@ pub mod process {
         Ok(None)
     }
 }
+
+pub mod game_mode {
+    //! Non-Windows stubs. Game Mode actions are no-ops on a developer host;
+    //! the planner and journal still exercise end-to-end via `framesage-sim`,
+    //! but actual state changes only happen on real Windows.
+
+    use anyhow::{anyhow, Result};
+    use framesage_core::PowerPlanId;
+    use framesage_gamemode::{
+        planner::{PlannedAction, SystemStateQuery},
+        state::{AppliedActions, PreviousState, ServiceStatus},
+    };
+
+    #[derive(Debug, Default, Clone, Copy)]
+    pub struct Win32StateQuery;
+
+    impl SystemStateQuery for Win32StateQuery {
+        fn taskbar_visible(&self) -> Result<bool> {
+            Err(anyhow!("framesage-sys: not supported on this host"))
+        }
+        fn active_power_plan(&self) -> Result<Option<PowerPlanId>> {
+            Err(anyhow!("framesage-sys: not supported on this host"))
+        }
+        fn service_status(&self, _id: &str) -> Result<ServiceStatus> {
+            Err(anyhow!("framesage-sys: not supported on this host"))
+        }
+        fn pids_by_exe(&self, _exe: &str) -> Result<Vec<(u32, String)>> {
+            Err(anyhow!("framesage-sys: not supported on this host"))
+        }
+    }
+
+    pub fn apply_action(_action: &PlannedAction, _applied: &mut AppliedActions) -> Result<()> {
+        Err(anyhow!("framesage-sys: not supported on this host"))
+    }
+
+    pub fn revert_all(_applied: &AppliedActions, _previous: &PreviousState) {
+        // No-op on non-Windows.
+    }
+}

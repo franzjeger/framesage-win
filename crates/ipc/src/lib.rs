@@ -26,6 +26,9 @@ pub enum Request {
     Pause,
     /// Resume after a pause.
     Resume,
+    /// Panic button — force any active Game Mode session to revert immediately.
+    /// Idempotent: no-op if no session is active.
+    GameModeOff,
     /// Subscribe to live status events. The server keeps the connection open
     /// and streams `Event` records.
     Subscribe,

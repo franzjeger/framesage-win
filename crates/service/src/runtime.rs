@@ -12,7 +12,8 @@ use tokio::sync::oneshot;
 use tracing::{debug, error, info, warn};
 
 use framesage_core::{paths, Policy};
-use framesage_engine::Engine;
+use framesage_engine::{Engine, EngineDeps};
+use framesage_gamemode::{journal::Journal, safe_list::SafeList};
 use framesage_ipc::{Event, Request, Response, PIPE_NAME};
 
 /// Synchronous entry point used by the Windows service main fn. Owns its
@@ -40,7 +41,17 @@ pub async fn run(shutdown: oneshot::Receiver<()>) -> Result<()> {
         "framesage engine starting"
     );
 
-    let engine = Arc::new(Engine::new(policy, topology));
+    let engine = Arc::new(Engine::new(EngineDeps {
+        policy,
+        topology,
+        safe_list: SafeList::bundled(),
+        journal: Journal::at_default_path(),
+    }));
+
+    // Recover anything a previous (possibly crashed) session left behind
+    // before we start applying new state. This MUST happen before the tick
+    // loop launches.
+    engine.recover_orphan_journal();
     let tick_engine = engine.clone();
     let tick_handle = tokio::spawn(async move {
         let mut interval = tokio::time::interval(Duration::from_millis(300));
@@ -270,6 +281,10 @@ async fn handle_client(
             }
             Request::Pause => {
                 engine.pause();
+                write_response(&mut write_half, &Response::Ok).await?;
+            }
+            Request::GameModeOff => {
+                engine.exit_system_mode_now();
                 write_response(&mut write_half, &Response::Ok).await?;
             }
             Request::Resume => {

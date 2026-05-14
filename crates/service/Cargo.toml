@@ -15,6 +15,7 @@ path = "src/main.rs"
 [dependencies]
 framesage-core = { workspace = true }
 framesage-engine = { workspace = true }
+framesage-gamemode = { workspace = true }
 framesage-ipc = { workspace = true }
 framesage-sys = { workspace = true }
 tokio = { workspace = true }

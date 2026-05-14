@@ -55,6 +55,22 @@ enum Cmd {
         /// Profile id, e.g. `game-x3d`.
         profile: String,
     },
+    /// Game Mode controls — status, panic-off, safe-list inspection.
+    #[command(subcommand)]
+    GameMode(GameModeCmd),
+}
+
+#[derive(Subcommand, Debug)]
+enum GameModeCmd {
+    /// Show whether Game Mode is currently active, and what the curated
+    /// safe-list contains.
+    Status,
+    /// Panic button — force-revert any active Game Mode session immediately.
+    /// Same effect as the service noticing focus left the game, but
+    /// triggerable by hand if the engine got stuck or the user wants out.
+    Off,
+    /// Print the curated safe-list (services + processes) with rationale.
+    SafeList,
 }
 
 fn main() -> Result<()> {
@@ -75,7 +91,55 @@ fn main() -> Result<()> {
             })
             .await
         }),
+        Cmd::GameMode(sub) => match sub {
+            GameModeCmd::Status => tokio_block(async { print_game_mode_status().await }),
+            GameModeCmd::Off => tokio_block(async { send_simple(Request::GameModeOff).await }),
+            GameModeCmd::SafeList => {
+                print_safe_list();
+                Ok(())
+            }
+        },
     }
+}
+
+fn print_safe_list() {
+    let list = framesage_gamemode::safe_list::SafeList::bundled();
+    println!("Services (allow-listed for stop):");
+    let mut services: Vec<_> = list.services().collect();
+    services.sort_by(|a, b| a.id.cmp(&b.id));
+    for s in services {
+        let recommended = if s.default_stop { " *" } else { "  " };
+        println!("  {}{}  ({})", recommended, s.id, s.display_name);
+        println!("      {}", s.rationale);
+    }
+    println!();
+    println!("Processes (allow-listed for suspend):");
+    let mut processes: Vec<_> = list.processes().collect();
+    processes.sort_by(|a, b| a.exe.cmp(&b.exe));
+    for p in processes {
+        let recommended = if p.default_suspend { " *" } else { "  " };
+        println!("  {}{}  ({})", recommended, p.exe, p.display_name);
+        println!("      {}", p.rationale);
+    }
+    println!();
+    println!("* = recommended default. Add to a profile's `stop_services` / `suspend_processes` to apply.");
+}
+
+async fn print_game_mode_status() -> Result<()> {
+    // Game Mode active-state isn't yet a first-class field in StatusSnapshot;
+    // for v0.1 we surface the active profile and let the user infer. The
+    // engine logs and the journal file are authoritative; we print the
+    // journal path for visibility.
+    print_status().await?;
+    let journal_path = framesage_core::paths::config_dir().join("game-mode.journal");
+    if journal_path.exists() {
+        println!("\ngame-mode journal: PRESENT ({})", journal_path.display());
+        println!("  Game Mode appears active. Run `framesage game-mode off` to revert.");
+    } else {
+        println!("\ngame-mode journal: absent ({})", journal_path.display());
+        println!("  No Game Mode session active.");
+    }
+    Ok(())
 }
 
 fn tokio_block<F: std::future::Future<Output = Result<()>>>(fut: F) -> Result<()> {

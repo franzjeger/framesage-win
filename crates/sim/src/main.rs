@@ -187,6 +187,117 @@ fn print_match(policy: &Policy, topology: &CpuTopology, exe: &str, path: &str, t
     if let Some(mp) = profile.memory_priority {
         println!("    memory_priority: {mp:?}");
     }
+
+    if let Some(actions) = &profile.game_mode {
+        print_game_mode_dry_run(actions);
+    }
+}
+
+/// Show what Game Mode *would* do given a synthetic OS state. Resolves
+/// against the curated safe-list (which is identical to what the engine sees
+/// at runtime) but uses an in-memory `SystemStateQuery` fake — so we can
+/// inspect plans without touching the real OS.
+fn print_game_mode_dry_run(actions: &framesage_core::GameModeActions) {
+    use framesage_gamemode::{
+        planner::{plan, PlannedAction, SystemStateQuery},
+        safe_list::SafeList,
+        state::ServiceStatus,
+    };
+
+    println!("    game-mode actions requested:");
+    if actions.hide_taskbar {
+        println!("      - hide_taskbar");
+    }
+    if let Some(plan_id) = &actions.power_plan {
+        println!("      - power_plan: {:?} ({})", plan_id, plan_id.guid());
+    }
+    if let Some(fa) = actions.focus_assist {
+        println!("      - focus_assist: {fa:?} (stubbed in v0.1)");
+    }
+    if actions.pause_windows_update {
+        println!("      - pause_windows_update (stubbed in v0.1)");
+    }
+    if !actions.stop_services.is_empty() {
+        println!(
+            "      - stop_services: {}",
+            actions.stop_services.join(", ")
+        );
+    }
+    if !actions.suspend_processes.is_empty() {
+        println!(
+            "      - suspend_processes: {}",
+            actions.suspend_processes.join(", ")
+        );
+    }
+
+    // Synthetic state: everything is in "ready for game mode" position so
+    // every requested action gets planned.
+    struct SyntheticQuery;
+    impl SystemStateQuery for SyntheticQuery {
+        fn taskbar_visible(&self) -> anyhow::Result<bool> {
+            Ok(true)
+        }
+        fn active_power_plan(&self) -> anyhow::Result<Option<framesage_core::PowerPlanId>> {
+            Ok(Some(framesage_core::PowerPlanId::Balanced))
+        }
+        fn service_status(&self, _id: &str) -> anyhow::Result<ServiceStatus> {
+            Ok(ServiceStatus::Running)
+        }
+        fn pids_by_exe(&self, exe: &str) -> anyhow::Result<Vec<(u32, String)>> {
+            // Pretend each safe-listed exe has one running PID; derive it
+            // from the exe name so distinct exes get distinct synthetic PIDs
+            // (the planner dedupes by PID, so collisions would hide cases).
+            let pid = 10_000 + (exe.bytes().map(|b| b as u32).sum::<u32>() % 9000);
+            Ok(vec![(pid, exe.to_string())])
+        }
+    }
+
+    let result = plan(actions, SafeList::bundled(), &SyntheticQuery);
+    match result {
+        Ok(plan_out) => {
+            if plan_out.is_empty() && plan_out.rejections.is_empty() {
+                println!("    game-mode: no actionable items after safe-list filter");
+            } else {
+                println!("    game-mode plan ({} actions):", plan_out.actions.len());
+                for a in &plan_out.actions {
+                    let line = match a {
+                        PlannedAction::HideTaskbar => "hide taskbar".to_string(),
+                        PlannedAction::SetPowerPlan { from, to } => format!(
+                            "power plan {} → {}",
+                            from.as_ref()
+                                .map(|p| format!("{p:?}"))
+                                .unwrap_or_else(|| "<unknown>".into()),
+                            format_args!("{to:?}")
+                        ),
+                        PlannedAction::StopService { id, was_status } => {
+                            format!("stop service {id} (was {was_status:?})")
+                        }
+                        PlannedAction::SuspendProcess { pid, exe } => {
+                            format!("suspend process {exe} pid={pid}")
+                        }
+                        PlannedAction::SetFocusAssist(mode) => {
+                            format!("set focus assist {mode:?} [stub]")
+                        }
+                        PlannedAction::PauseWindowsUpdate => {
+                            "pause Windows Update [stub]".to_string()
+                        }
+                    };
+                    println!("      - {line}");
+                }
+                for r in &plan_out.rejections {
+                    println!(
+                        "      ! rejected {}: {} ({})",
+                        r.id,
+                        r.reason,
+                        format!("{:?}", r.kind).to_lowercase()
+                    );
+                }
+            }
+        }
+        Err(e) => {
+            println!("    game-mode plan failed: {e}");
+        }
+    }
 }
 
 fn run_demo(policy: &Policy, topology: &CpuTopology) {
