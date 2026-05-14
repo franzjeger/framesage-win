@@ -222,6 +222,9 @@ impl Default for Policy {
             power_throttling: Some(PowerThrottlingMode::Performance),
             priority_class: Some(PriorityClass::AboveNormal),
             io_priority: Some(IoPriority::High),
+            // The pin sticks for the lifetime of the game process. Alt-tabbing
+            // to a browser or task manager must NOT relinquish the X3D CCD.
+            persistent: true,
             game_mode: Some(GameModeActions {
                 hide_taskbar: true,
                 stop_services: vec![

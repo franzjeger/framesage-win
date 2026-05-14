@@ -79,6 +79,10 @@ struct EngineState {
     /// `None` until the first scan; subsequent scans honour
     /// `BACKGROUND_SCAN_INTERVAL`.
     last_background_scan: Option<Instant>,
+    /// Last time we re-pushed kernel state for every persistent-profile PID.
+    /// `None` until the first sweep; subsequent sweeps honour
+    /// `PERSISTENT_REASSERT_INTERVAL`.
+    last_persistent_reassert: Option<Instant>,
     /// Manual mode: when set, every foreground reconcile applies this
     /// profile instead of consulting Rules. Stays set across focus
     /// changes until explicitly cleared via `clear_manual_override` /
@@ -109,6 +113,17 @@ struct EngineState {
 /// every tick." Each scan touches only PIDs not already in `applied`, so the
 /// steady-state cost is one ToolHelp snapshot + a Vec membership check.
 const BACKGROUND_SCAN_INTERVAL: Duration = Duration::from_secs(10);
+
+/// How often the engine re-pushes kernel state (affinity, CPU sets, priority,
+/// I/O priority) for every PID running under a `persistent` profile. Some
+/// games (POE2, EVE, several Unreal titles) call `SetProcessAffinityMask` on
+/// themselves at startup or on resolution changes, "fixing" what they think
+/// is a misconfiguration. CPU Sets are also advisory — the scheduler can
+/// override them under contention. Re-pushing every 2 s defeats both modes
+/// of override and is cheap: each sweep is one `SetProcess*` call per knob
+/// per managed PID, and persistent-profile PIDs are typically 1–3 (games,
+/// not background apps).
+const PERSISTENT_REASSERT_INTERVAL: Duration = Duration::from_secs(2);
 
 struct AppliedRecord {
     profile_id: ProfileId,
@@ -145,6 +160,7 @@ impl Engine {
                 active_profile: None,
                 system_mode: None,
                 last_background_scan: None,
+                last_persistent_reassert: None,
                 manual_override: None,
                 reported_foreground: None,
                 foreground_reporter_seen: false,
@@ -444,7 +460,58 @@ impl Engine {
         let mut s = self.state.write();
         self.reconcile(&mut s, foreground)?;
         Self::maybe_scan_background_locked(&mut s, self.safe_list);
+        Self::maybe_reassert_persistent_locked(&mut s);
         Ok(())
+    }
+
+    /// Re-push kernel state (affinity, CPU sets, priority, I/O priority) onto
+    /// every PID currently running under a `persistent` profile. Defeats
+    /// runtime overrides — games that call `SetProcessAffinityMask` on
+    /// themselves, plus CPU-Set advisory drift under scheduler contention.
+    ///
+    /// Bounded by `PERSISTENT_REASSERT_INTERVAL` (2 s). Each sweep just calls
+    /// the per-knob setters; no prev-state capture, no revert plan rewrite —
+    /// the original `AppliedRecord` continues to describe what to undo.
+    fn maybe_reassert_persistent_locked(s: &mut EngineState) {
+        let now = Instant::now();
+        if let Some(last) = s.last_persistent_reassert {
+            if now.duration_since(last) < PERSISTENT_REASSERT_INTERVAL {
+                return;
+            }
+        }
+        s.last_persistent_reassert = Some(now);
+
+        // Snapshot first; we can't iterate `s.applied` while also re-borrowing
+        // `s.policy` / `s.topology` immutably (the borrow checker isn't smart
+        // enough to see that `applied` and the other fields are disjoint).
+        let pids_to_reassert: Vec<(u32, Profile)> = s
+            .applied
+            .iter()
+            .filter_map(|(pid, record)| {
+                let profile = s.policy.profile(&record.profile_id)?;
+                if profile.persistent {
+                    Some((*pid, profile.clone()))
+                } else {
+                    None
+                }
+            })
+            .collect();
+
+        if pids_to_reassert.is_empty() {
+            return;
+        }
+
+        let topology = s.topology.clone();
+        for (pid, profile) in pids_to_reassert {
+            #[cfg(windows)]
+            if let Err(e) = framesage_sys::apply::reassert(pid, &profile, &topology) {
+                debug!(pid, error = %e, "persistent re-assert failed (process probably exited)");
+            }
+            #[cfg(not(windows))]
+            {
+                let _ = (pid, profile, &topology);
+            }
+        }
     }
 
     /// Walk every running PID and apply `Policy::background_profile` to any
@@ -570,10 +637,26 @@ impl Engine {
             return Ok(());
         }
 
-        // Revert per-process state on the previous foreground.
+        // Revert per-process state on the previous foreground, UNLESS the
+        // profile that was applied is marked `persistent`. Persistent pins
+        // (game-x3d is the canonical example) outlive focus loss: a game
+        // must stay on the X3D CCD while the user briefly alt-tabs to a
+        // browser, a chat client, or Task Manager. Without this guard,
+        // every focus flicker (loading screens, splash transitions, the
+        // user popping Task Manager) ripped the X3D pin off and put the
+        // game back on all cores.
         if let Some(prev_pid) = s.current_foreground.take() {
-            if let Some(record) = s.applied.remove(&prev_pid) {
-                revert_record(prev_pid, record);
+            if let Some(record) = s.applied.get(&prev_pid) {
+                let keep = s
+                    .policy
+                    .profile(&record.profile_id)
+                    .map(|p| p.persistent)
+                    .unwrap_or(false);
+                if !keep {
+                    if let Some(record) = s.applied.remove(&prev_pid) {
+                        revert_record(prev_pid, record);
+                    }
+                }
             }
         }
 
@@ -614,16 +697,51 @@ impl Engine {
             title: fg.title.clone(),
         };
 
-        // If the new foreground was already managed by us (most commonly via
-        // the background scan, e.g. user alt-tabbed back into a long-running
-        // browser), revert that record first. Without this step, the new
-        // apply would capture bg-modified state as `prev`, and an eventual
-        // revert would restore to bg-eco instead of kernel default.
-        if let Some(prev_record) = s.applied.remove(&fg.pid) {
-            revert_record(fg.pid, prev_record);
+        // If the new foreground was already managed by us with the SAME
+        // profile, skip the revert+reapply churn — the state is already
+        // correct. (This is the common path for a persistent profile: the
+        // user alt-tabs away and back; we kept the state in place, and
+        // now we just need to update tracking.)
+        //
+        // If it was managed with a DIFFERENT profile, revert first so the
+        // next apply captures clean prev-state.
+        let already_correct = s
+            .applied
+            .get(&fg.pid)
+            .map(|r| r.profile_id == profile_id)
+            .unwrap_or(false);
+        if !already_correct {
+            if let Some(prev_record) = s.applied.remove(&fg.pid) {
+                revert_record(fg.pid, prev_record);
+            }
         }
 
-        // Per-process apply.
+        // Per-process apply (idempotent: if already_correct, just update tracking).
+        if already_correct {
+            info!(
+                pid = fg.pid,
+                exe = %fg.exe_name,
+                profile = %profile_id,
+                "re-foregrounded persistent pin — state preserved"
+            );
+            s.current_foreground = Some(fg.pid);
+            s.foreground_snapshot = Some(snapshot.clone());
+            s.active_profile = Some(profile_id.clone());
+            let _ = self.events.send(Event::ForegroundChanged {
+                foreground: snapshot.clone(),
+                profile: profile_id.clone(),
+            });
+            // Fall through to system-mode reconcile below.
+            let new_actions = profile.game_mode.clone();
+            Self::reconcile_system_mode_locked(
+                s,
+                &self.journal,
+                self.safe_list,
+                &profile_id,
+                new_actions,
+            );
+            return Ok(());
+        }
         match apply_profile(fg.pid, &profile, &topology) {
             Ok(record) => {
                 info!(pid = fg.pid, exe = %fg.exe_name, profile = %profile_id, "applied");

@@ -153,6 +153,57 @@ pub fn apply(pid: u32, profile: &Profile, topology: &CpuTopology) -> Result<Appl
     Ok(state)
 }
 
+/// Re-push the kernel state described by `profile` onto `pid` without
+/// changing the revert plan in `AppliedState`. Used by the engine's periodic
+/// re-assert loop on persistent profiles — some games (POE2, EVE, a few
+/// Unreal titles) call `SetProcessAffinityMask` on themselves after our
+/// initial apply, and CPU Sets are advisory under contention. Re-pushing
+/// every couple seconds is cheap and defeats those overrides.
+///
+/// Returns Ok(()) if the process is gone — there's nothing to re-assert.
+pub fn reassert(pid: u32, profile: &Profile, topology: &CpuTopology) -> Result<()> {
+    let handle = match open_for_write(pid) {
+        Ok(h) => h,
+        // Process exited; caller will sweep it on the next dead-PID scan.
+        Err(_) => return Ok(()),
+    };
+
+    if let Some(class) = profile.priority_class {
+        let _ = set_priority_class(handle, class);
+    }
+    if let Some(mode) = profile.power_throttling {
+        let _ = set_power_throttling(handle, mode);
+    }
+    if let Some(prio) = profile.memory_priority {
+        let _ = set_memory_priority(handle, prio);
+    }
+    if let Some(prio) = profile.io_priority {
+        let _ = io_priority::set(handle, prio);
+    }
+    if let Some(sel) = &profile.cpu_sets {
+        let indices = topology.resolve(sel);
+        if let Ok(set_ids) = cpuset_ids_for_indices(&indices) {
+            let _ = set_default_cpu_sets(handle, &set_ids);
+            let _ = apply_thread_cpu_sets(pid, &set_ids);
+            let hard_mask = mask_from_indices(&indices);
+            if hard_mask != 0 {
+                let _ = set_affinity_mask(handle, hard_mask);
+            }
+        }
+    }
+    if let Some(sel) = &profile.affinity_mask {
+        let indices = topology.resolve(sel);
+        let mask = mask_from_indices(&indices);
+        if mask != 0 {
+            let _ = set_affinity_mask(handle, mask);
+        }
+    }
+
+    // SAFETY: handle is valid and not used again.
+    let _ = unsafe { CloseHandle(handle) };
+    Ok(())
+}
+
 pub fn revert(pid: u32, state: AppliedState) -> Result<()> {
     // Try to reopen the process. If it's gone (PID reused / exited), that's
     // fine — nothing to revert. Use a more permissive open since we might

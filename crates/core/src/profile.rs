@@ -183,6 +183,18 @@ pub struct Profile {
     /// during planning, not at apply time.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub game_mode: Option<GameModeActions>,
+
+    /// When the foreground moves OFF a process holding this profile, leave
+    /// the per-process state in place (affinity, priority, I/O priority) and
+    /// keep the process tracked. The pin only releases when the process
+    /// itself exits. This is the right behavior for game pins — a game
+    /// should stay on the X3D CCD even while the user briefly alt-tabs to
+    /// a browser, a chat client, or Task Manager.
+    ///
+    /// Non-persistent profiles (e.g. `perf` for casual foreground tracking)
+    /// revert on focus loss, matching the original short-lived semantics.
+    #[serde(default)]
+    pub persistent: bool,
 }
 
 impl Profile {

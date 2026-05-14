@@ -36,6 +36,9 @@ pub mod apply {
     pub fn revert(_pid: u32, _state: AppliedState) -> Result<()> {
         Err(anyhow!("framesage-sys: not supported on this host"))
     }
+    pub fn reassert(_pid: u32, _profile: &Profile, _topology: &CpuTopology) -> Result<()> {
+        Err(anyhow!("framesage-sys: not supported on this host"))
+    }
 }
 
 pub mod process {
