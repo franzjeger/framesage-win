@@ -1,26 +1,27 @@
-//! Detect CPU topology via `GetLogicalProcessorInformationEx`.
+//! Detect CPU topology via `GetLogicalProcessorInformationEx`, then enrich
+//! each logical CPU with a coarse perf rank from `CallNtPowerInformation`.
 //!
 //! Notes on what this code does and doesn't do today:
 //!
 //! * **Processor groups.** Windows splits >64-logical-processor systems into
 //!   "processor groups." Threadripper PRO 96-core counts. We currently flatten
 //!   group 0 only — anything beyond is a v0.2 concern.
-//! * **X3D / Cache CCD detection.** Windows doesn't tell us which CCD has 3D
-//!   V-Cache. The reliable signal is CPPC perf-rank distribution: on a dual-CCD
-//!   X3D part, the X3D CCD has lower top CPPC rank (lower max frequency). We
-//!   keep that detection out of `detect()` and tag every CCD as `Performance`
-//!   here; a higher layer can mark one CCD as `Cache` after looking at the
-//!   ranks. This file's job is just to enumerate.
-//! * **CPPC ranks.** Read via `Get-WmiObject Win32_Processor.NumberOfCores` /
-//!   the perf-state-info MSR isn't exposed cleanly to user-mode. The proper
-//!   path is `CallNtPowerInformation(ProcessorInformation, …)` which yields
-//!   `PROCESSOR_POWER_INFORMATION` per logical CPU — that gives us
-//!   `CurrentMhz` and `MaxMhz`. We use MaxMhz as a coarse rank proxy until we
-//!   wire up the proper CPPC readout via Windows PPM perf-control MSRs (which
-//!   needs the WMI provider `MSAcpi_ThermalZoneTemperature`-class trick or a
-//!   small driver — out of scope for v0.1).
+//! * **CPPC ranks.** We read `PROCESSOR_POWER_INFORMATION` via
+//!   `CallNtPowerInformation(ProcessorInformation, …)` and use `MaxMhz` as the
+//!   per-CPU rank. That's not a true CPPC perf-class read (which lives in
+//!   MSRs not cleanly exposed to user-mode), but it's a high-quality proxy:
+//!   P-cores beat E-cores, non-X3D CCDs beat X3D CCDs, and within a CCD the
+//!   ranks order cleanly by silicon quality.
+//! * **X3D / Cache CCD detection.** Once ranks are populated, we use the
+//!   per-CCD max rank: when there are exactly two CCDs and one is a clear
+//!   margin slower, retag the slower CCD's cores as `CoreKind::Cache`. This
+//!   is what makes `CpuSelector::Kind(CoreKind::Cache)` work on a real X3D
+//!   machine without manual configuration.
+//! * **Intel hybrid (P/E split)** is *not* detected here yet — the proper
+//!   signal is `PROCESSOR_RELATIONSHIP::EfficiencyClass`, a v0.2 task.
 
 use anyhow::{anyhow, Result};
+use tracing::{debug, warn};
 use windows::Win32::System::SystemInformation::{
     GetLogicalProcessorInformationEx, RelationProcessorCore, LOGICAL_PROCESSOR_RELATIONSHIP,
     SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX,
@@ -28,7 +29,11 @@ use windows::Win32::System::SystemInformation::{
 
 use framesage_core::{CoreKind, CpuTopology, LogicalCpu};
 
-/// Enumerate logical processors and their physical-core groupings.
+use super::cppc;
+
+/// Enumerate logical processors and their physical-core groupings, then enrich
+/// with CPPC ranks and retag the X3D CCD if we can spot it from the rank
+/// distribution.
 ///
 /// The OS reports each physical core as one record with a bitmask of its
 /// logical processors. We expand those into `LogicalCpu` entries and assign
@@ -59,7 +64,33 @@ pub fn detect() -> Result<CpuTopology> {
         }
     }
 
-    Ok(CpuTopology { cpus })
+    // Enrich with per-CPU MaxMhz. The CPPC readout is a single syscall that
+    // returns one record per logical processor in Windows-index order; we
+    // tolerate a failure here because the topology is still usable (selectors
+    // that don't reference TopRanked / Kind(Cache) keep working) and we don't
+    // want a stale Windows build to brick the service.
+    match cppc::read(cpus.len()) {
+        Ok(power_info) => {
+            for cpu in &mut cpus {
+                if let Some(info) = power_info.get(cpu.index as usize) {
+                    if info.MaxMhz > 0 {
+                        cpu.cppc_rank = Some(info.MaxMhz);
+                    }
+                }
+            }
+            debug!(
+                cpus = cpus.len(),
+                "cppc ranks populated from PROCESSOR_POWER_INFORMATION"
+            );
+        }
+        Err(e) => {
+            warn!(error = %e, "CPPC readout failed; TopRanked / X3D detection will degrade");
+        }
+    }
+
+    let mut topo = CpuTopology { cpus };
+    topo.retag_ccds_from_ranks();
+    Ok(topo)
 }
 
 struct PhysicalCore {

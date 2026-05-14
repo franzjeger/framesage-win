@@ -75,6 +75,57 @@ impl CpuTopology {
         self.cpus.iter().filter(move |c| c.kind == kind)
     }
 
+    /// Infer which CCD carries 3D V-Cache from the CPPC rank distribution and
+    /// retag its cores as `CoreKind::Cache`.
+    ///
+    /// Heuristic: on dual-CCD AMD parts (7950X3D, 9950X3D, …) the X3D CCD has
+    /// a measurably lower top frequency than the non-X3D CCD — the cache stack
+    /// costs ~500 MHz of headroom. When we see exactly two CCDs whose top
+    /// ranks differ by ≥ `CACHE_CCD_RANK_MARGIN_PCT` percent, the slower CCD
+    /// is the X3D one.
+    ///
+    /// We deliberately leave alone:
+    /// * Single-CCD topologies — can't distinguish 7800X3D from 7700X here;
+    ///   user can configure manually.
+    /// * 3+ CCD topologies (Threadripper) — not a desktop X3D scenario, and a
+    ///   pairwise heuristic would be fragile.
+    /// * Cores already tagged as `Efficiency` — those came from a different
+    ///   signal (Intel hybrid) and outrank this heuristic.
+    pub fn retag_ccds_from_ranks(&mut self) {
+        const CACHE_CCD_RANK_MARGIN_PCT: u64 = 5;
+
+        let ccds: Vec<u8> = self.ccds().collect();
+        if ccds.len() != 2 {
+            return;
+        }
+
+        let r_a = self.cpus_on_ccd(ccds[0]).filter_map(|c| c.cppc_rank).max();
+        let r_b = self.cpus_on_ccd(ccds[1]).filter_map(|c| c.cppc_rank).max();
+        let (Some(r_a), Some(r_b)) = (r_a, r_b) else {
+            return;
+        };
+        if r_a == r_b {
+            return;
+        }
+        let (cache_ccd, perf_rank, cache_rank) = if r_a > r_b {
+            (ccds[1], r_a, r_b)
+        } else {
+            (ccds[0], r_b, r_a)
+        };
+
+        // Require a meaningful gap: perf > cache * (1 + margin/100). Done in
+        // u64 to dodge any chance of overflow with implausibly large MaxMhz.
+        if (perf_rank as u64) * 100 < (cache_rank as u64) * (100 + CACHE_CCD_RANK_MARGIN_PCT) {
+            return;
+        }
+
+        for cpu in &mut self.cpus {
+            if cpu.ccd == cache_ccd && cpu.kind == CoreKind::Performance {
+                cpu.kind = CoreKind::Cache;
+            }
+        }
+    }
+
     /// Resolve a `CpuSelector` against this topology into the concrete set of
     /// logical-processor indices the policy targets.
     pub fn resolve(&self, sel: &CpuSelector) -> Vec<u32> {
@@ -236,6 +287,93 @@ mod tests {
         let topo = x3d_dual_ccd();
         let ccds: Vec<u8> = topo.ccds().collect();
         assert_eq!(ccds, vec![0, 1]);
+    }
+
+    /// Two CCDs of 4 cores * 2 SMT each, both initially tagged as
+    /// `Performance`. CCD `slow` gets a lower top rank; `fast` gets a higher
+    /// top rank. Mirrors what `framesage-sys::topology::detect()` produces
+    /// before `retag_ccds_from_ranks` runs.
+    fn two_ccds(fast_max_mhz: u32, slow_max_mhz: u32) -> CpuTopology {
+        let mut cpus = Vec::new();
+        let mut idx = 0u32;
+        for ccd in 0u8..2 {
+            let top = if ccd == 0 { slow_max_mhz } else { fast_max_mhz };
+            for core in 0..4u32 {
+                for smt in 0..2u32 {
+                    cpus.push(LogicalCpu {
+                        index: idx,
+                        physical_core: (ccd as u32) * 4 + core,
+                        ccd,
+                        kind: CoreKind::Performance,
+                        cppc_rank: Some(top.saturating_sub(core * 25)),
+                        is_smt_sibling: smt == 1,
+                    });
+                    idx += 1;
+                }
+            }
+        }
+        CpuTopology { cpus }
+    }
+
+    #[test]
+    fn retag_marks_slower_ccd_as_cache_when_gap_is_large_enough() {
+        // 5.7 GHz vs 5.0 GHz — the classic 7950X3D distribution.
+        let mut topo = two_ccds(5700, 5000);
+        topo.retag_ccds_from_ranks();
+
+        let ccd0: Vec<CoreKind> = topo.cpus_on_ccd(0).map(|c| c.kind).collect();
+        let ccd1: Vec<CoreKind> = topo.cpus_on_ccd(1).map(|c| c.kind).collect();
+        assert!(
+            ccd0.iter().all(|k| *k == CoreKind::Cache),
+            "slower CCD 0 should be retagged as Cache"
+        );
+        assert!(
+            ccd1.iter().all(|k| *k == CoreKind::Performance),
+            "faster CCD 1 should remain Performance"
+        );
+    }
+
+    #[test]
+    fn retag_leaves_topology_alone_when_ccds_are_close() {
+        // Within ~2% — could be the same silicon binned slightly differently.
+        let mut topo = two_ccds(5700, 5600);
+        topo.retag_ccds_from_ranks();
+        assert!(
+            topo.cpus.iter().all(|c| c.kind == CoreKind::Performance),
+            "no retag when the rank gap is below the X3D threshold"
+        );
+    }
+
+    #[test]
+    fn retag_is_a_noop_on_single_ccd_topology() {
+        // 7800X3D-like: one CCD, all Cache cores. Even with ranks present, we
+        // can't distinguish X3D from non-X3D with a single CCD, so the
+        // heuristic leaves the existing tags alone.
+        let mut topo = CpuTopology {
+            cpus: (0..8)
+                .map(|i| LogicalCpu {
+                    index: i,
+                    physical_core: i / 2,
+                    ccd: 0,
+                    kind: CoreKind::Cache,
+                    cppc_rank: Some(5000),
+                    is_smt_sibling: i % 2 == 1,
+                })
+                .collect(),
+        };
+        topo.retag_ccds_from_ranks();
+        assert!(topo.cpus.iter().all(|c| c.kind == CoreKind::Cache));
+    }
+
+    #[test]
+    fn retag_is_a_noop_when_ranks_are_missing() {
+        let mut topo = two_ccds(5700, 5000);
+        // Strip ranks — simulates a host where CallNtPowerInformation failed.
+        for cpu in &mut topo.cpus {
+            cpu.cppc_rank = None;
+        }
+        topo.retag_ccds_from_ranks();
+        assert!(topo.cpus.iter().all(|c| c.kind == CoreKind::Performance));
     }
 
     #[test]

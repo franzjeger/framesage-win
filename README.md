@@ -147,8 +147,8 @@ Ctrl+C stops it.
 - [x] **Dev harness** (`framesage-sim`) for cross-platform iteration on rules, profiles, and selectors.
 - [x] **Unit tests + GitHub Actions CI** (cross-check, native Windows build, clippy, rustfmt).
 - [x] **Game Mode**: hide taskbar, stop curated services, suspend curated processes, switch power plan. Crash-safe journal at `%ProgramData%\framesage\game-mode.journal`. Curated safe-list with explicit denylist for AV / anti-cheat / shell / kernel processes. `framesage game-mode off` panic button.
-- [ ] **CPPC perf-rank readout** via `CallNtPowerInformation` → `PROCESSOR_POWER_INFORMATION`. Lets `CpuSelector::TopRanked(N)` actually pin to the fastest silicon on this specific chip.
-- [ ] **X3D/Cache CCD detection.** Use the CPPC rank distribution: on dual-CCD X3D parts the X3D CCD has lower max frequency.
+- [x] **CPPC perf-rank readout** via `CallNtPowerInformation` → `PROCESSOR_POWER_INFORMATION`. Per-CPU `MaxMhz` is folded into `cppc_rank`, which is what `CpuSelector::TopRanked(N)` resolves against.
+- [x] **X3D/Cache CCD detection.** `CpuTopology::retag_ccds_from_ranks` looks at the per-CCD top rank and retags the slower CCD as `CoreKind::Cache` when the gap is ≥ 5% — that's the X3D / non-X3D split on dual-CCD AMD parts. Called automatically from `topology::detect()`.
 - [ ] **Background process enforcement.** Walk `CreateToolhelp32Snapshot` once per N seconds, apply `background_profile` to processes that don't match any rule.
 - [ ] **True tray icon** via the `tray-icon` crate, minimise-to-tray, autostart-tray.
 - [ ] **I/O priority** via `NtSetInformationProcess(ProcessIoPriority, …)`.
