@@ -32,3 +32,13 @@ windows = { workspace = true, features = [
     "Win32_UI_Shell",
     "Win32_UI_WindowsAndMessaging",
 ] }
+
+# Windows-host-only: synthesise an .ico from the same logo math used at
+# runtime and embed it into the .exe so Explorer / Start / Alt-Tab show the
+# FrameSage mark. We don't enable this for Linux-host cross-builds because
+# embed-resource invokes windres there, and CI's cross-check job doesn't
+# install mingw-w64 — gating on cfg(target_os = "windows") and host_os via
+# build.rs keeps that job lean.
+[build-dependencies]
+ico = "0.3"
+embed-resource = "3"
