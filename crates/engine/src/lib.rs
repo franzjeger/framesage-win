@@ -37,9 +37,9 @@ use tracing::{debug, info, warn};
 use framesage_core::{CpuTopology, GameModeActions, Policy, Profile, ProfileId};
 use framesage_gamemode::{
     journal::{Journal, JournalEntry},
-    planner::{plan as plan_game_mode, ActionPlan, SystemStateQuery},
+    planner::{plan as plan_game_mode, ActionPlan, PlannedAction, SystemStateQuery},
     safe_list::SafeList,
-    state::{AppliedActions, PreviousState},
+    state::{AppliedActions, PreviousState, SuspendedProcessSnapshot},
 };
 use framesage_ipc::{Event, ForegroundSnapshot, StatusSnapshot};
 
@@ -352,37 +352,44 @@ impl Engine {
         profile_id: &ProfileId,
         plan: ActionPlan,
     ) {
-        let mut entry = JournalEntry::new(profile_id.clone(), plan.previous_state.clone());
+        // Journal the full *intent* before any kernel mutation. This closes a
+        // crash-recovery race that surfaced during first hardware validation:
+        // sys_apply_action mutates kernel state synchronously (e.g. SCM marks
+        // a service stopped), but the journal write that records "we stopped
+        // it" happens after. A SIGKILL between the two left the kernel ahead
+        // of the journal, and recovery missed the unjournaled mutation.
+        //
+        // With intent journaled up-front, recovery reverts everything we
+        // *planned* to do. A failed sys_apply_action means recovery reverts a
+        // change that was never made — an idempotent no-op (start an already-
+        // running service, resume an already-running process).
+        let intended = applied_from_plan(&plan);
 
-        // Write the journal *before* any state change. If this fails, we
-        // refuse to apply — no journal means no safe revert path.
+        let mut entry = JournalEntry::new(profile_id.clone(), plan.previous_state.clone());
+        entry.applied = intended.clone();
+
         if let Err(e) = journal.write(&entry) {
             warn!(error = %e, "initial journal write failed; refusing to enter game mode");
             return;
         }
 
-        let mut applied = AppliedActions::default();
+        // Apply. Partial failures are logged locally; the journal does not
+        // need to be rewritten because it already records the full intent.
         let mut any_failed = false;
-
+        let mut applied_count: usize = 0;
         for action in &plan.actions {
-            match sys_apply_action(action, &mut applied) {
-                Ok(()) => {}
+            // sys_apply_action takes `&mut AppliedActions` for legacy reasons;
+            // we route to a throwaway sink because the authoritative record is
+            // `intended`, persisted before we got here.
+            let mut sink = AppliedActions::default();
+            match sys_apply_action(action, &mut sink) {
+                Ok(()) => {
+                    applied_count += 1;
+                }
                 Err(e) => {
                     warn!(?action, error = %e, "game mode action failed; continuing with rest of plan");
                     any_failed = true;
                 }
-            }
-            // Update the journal incrementally so a crash leaves the most
-            // accurate possible revert plan.
-            entry.applied = applied.clone();
-            if let Err(je) = journal.write(&entry) {
-                // We've already started applying actions; we can't safely
-                // continue without journaling, but rolling back what we did
-                // is essentially "revert now." Do exactly that.
-                warn!(error = %je, "journal update failed mid-apply; reverting");
-                sys_revert_all(&applied, &plan.previous_state);
-                let _ = journal.delete();
-                return;
             }
         }
 
@@ -394,7 +401,7 @@ impl Engine {
 
         info!(
             profile = %profile_id,
-            actions = applied.applied_count(),
+            actions = applied_count,
             partial = any_failed,
             session = %entry.session_id,
             "game mode entered"
@@ -403,7 +410,7 @@ impl Engine {
         s.system_mode = Some(ActiveSystemMode {
             profile_id: profile_id.clone(),
             previous: plan.previous_state,
-            applied,
+            applied: intended,
             journal_session_id: entry.session_id,
         });
     }
@@ -433,29 +440,32 @@ fn revert_record(pid: u32, record: AppliedRecord) {
     let _ = record;
 }
 
-trait AppliedActionsExt {
-    fn applied_count(&self) -> usize;
-}
-
-impl AppliedActionsExt for AppliedActions {
-    fn applied_count(&self) -> usize {
-        let mut n = 0;
-        if self.hid_taskbar {
-            n += 1;
+/// Project a plan's actions onto an `AppliedActions` record describing what
+/// every action would touch if it ran successfully. The engine journals this
+/// up-front so that even a SIGKILL mid-apply leaves a complete revert plan on
+/// disk.
+///
+/// Every `PlannedAction` variant must contribute to at least one field — if a
+/// new variant is added later and this match grows a hole, the unit test
+/// `applied_from_plan_covers_every_planned_action_variant` will catch it.
+fn applied_from_plan(plan: &ActionPlan) -> AppliedActions {
+    let mut a = AppliedActions::default();
+    for action in &plan.actions {
+        match action {
+            PlannedAction::HideTaskbar => a.hid_taskbar = true,
+            PlannedAction::SetPowerPlan { .. } => a.switched_power_plan = true,
+            PlannedAction::StopService { id, .. } => a.stopped_services.push(id.clone()),
+            PlannedAction::SuspendProcess { pid, exe } => {
+                a.suspended_pids.push(SuspendedProcessSnapshot {
+                    pid: *pid,
+                    exe: exe.clone(),
+                });
+            }
+            PlannedAction::SetFocusAssist(_) => a.set_focus_assist = true,
+            PlannedAction::PauseWindowsUpdate => a.paused_windows_update = true,
         }
-        n += self.stopped_services.len();
-        n += self.suspended_pids.len();
-        if self.switched_power_plan {
-            n += 1;
-        }
-        if self.set_focus_assist {
-            n += 1;
-        }
-        if self.paused_windows_update {
-            n += 1;
-        }
-        n
     }
+    a
 }
 
 #[cfg(windows)]
@@ -541,5 +551,79 @@ impl SystemStateQuery for PlatformQuery {
     }
     fn pids_by_exe(&self, exe: &str) -> anyhow::Result<Vec<(u32, String)>> {
         framesage_sys::game_mode::Win32StateQuery.pids_by_exe(exe)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use framesage_core::{FocusAssistMode, PowerPlanId};
+    use framesage_gamemode::state::ServiceStatus;
+
+    fn empty_previous() -> PreviousState {
+        PreviousState {
+            taskbar_visible: true,
+            active_power_plan: None,
+            services: vec![],
+            suspended_pids: vec![],
+        }
+    }
+
+    /// Locks the load-bearing invariant for crash recovery: every concrete
+    /// `PlannedAction` variant must contribute to `AppliedActions`. If a new
+    /// variant is added but the helper isn't extended, recovery will silently
+    /// miss it — exactly the bug this test exists to prevent regressing.
+    #[test]
+    fn applied_from_plan_covers_every_planned_action_variant() {
+        let plan = ActionPlan {
+            previous_state: empty_previous(),
+            actions: vec![
+                PlannedAction::HideTaskbar,
+                PlannedAction::SetPowerPlan {
+                    from: Some(PowerPlanId::Balanced),
+                    to: PowerPlanId::HighPerformance,
+                },
+                PlannedAction::StopService {
+                    id: "SysMain".into(),
+                    was_status: ServiceStatus::Running,
+                },
+                PlannedAction::StopService {
+                    id: "WSearch".into(),
+                    was_status: ServiceStatus::Running,
+                },
+                PlannedAction::SuspendProcess {
+                    pid: 1234,
+                    exe: "OneDrive.exe".into(),
+                },
+                PlannedAction::SetFocusAssist(FocusAssistMode::PriorityOnly),
+                PlannedAction::PauseWindowsUpdate,
+            ],
+            rejections: vec![],
+        };
+
+        let applied = applied_from_plan(&plan);
+
+        assert!(applied.hid_taskbar);
+        assert!(applied.switched_power_plan);
+        assert_eq!(
+            applied.stopped_services,
+            vec!["SysMain".to_string(), "WSearch".to_string()]
+        );
+        assert_eq!(applied.suspended_pids.len(), 1);
+        assert_eq!(applied.suspended_pids[0].pid, 1234);
+        assert_eq!(applied.suspended_pids[0].exe, "OneDrive.exe");
+        assert!(applied.set_focus_assist);
+        assert!(applied.paused_windows_update);
+        assert!(applied.anything_applied());
+    }
+
+    #[test]
+    fn applied_from_plan_yields_empty_for_no_actions() {
+        let plan = ActionPlan {
+            previous_state: empty_previous(),
+            actions: vec![],
+            rejections: vec![],
+        };
+        assert_eq!(applied_from_plan(&plan), AppliedActions::default());
     }
 }
