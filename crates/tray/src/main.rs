@@ -173,8 +173,12 @@ impl FramesageApp {
             .spawn(foreground_reporter_loop)
             .expect("spawn foreground reporter thread");
 
+        // The tray runs in a separate thread; pass an egui::Context clone so
+        // the menu/click handlers can wake the runtime. Without this, hiding
+        // the window parks the message loop and tray clicks fall on the floor
+        // — flags get set, but `update()` never runs to read them.
         #[cfg(windows)]
-        let tray = build_tray(&commands).expect("build tray icon");
+        let tray = build_tray(&commands, cc.egui_ctx.clone()).expect("build tray icon");
 
         Self {
             state,
@@ -2216,7 +2220,7 @@ struct TrayMenuIds {
 }
 
 #[cfg(windows)]
-fn build_tray(commands: &TrayCommands) -> anyhow::Result<TrayIcon> {
+fn build_tray(commands: &TrayCommands, egui_ctx: egui::Context) -> anyhow::Result<TrayIcon> {
     let menu = Menu::new();
     let open = MenuItem::new("Open window", true, None);
     let hide = MenuItem::new("Hide window", true, None);
@@ -2244,8 +2248,15 @@ fn build_tray(commands: &TrayCommands) -> anyhow::Result<TrayIcon> {
     // receivers. Bridge to our atomic flags from dedicated threads. The
     // receivers are static references; cloning them is cheap and gives the
     // spawned threads owned handles.
+    //
+    // After raising a flag we ALWAYS call `egui_ctx.request_repaint()`. When
+    // the window is hidden, eframe parks the message loop and `update()`
+    // stops running — without an explicit wake, a tray click sets the flag
+    // and nothing reads it. `egui::Context` is internally Arc-based, so
+    // cloning it for each thread is cheap.
     let cmds_menu = commands.clone();
     let menu_rx = MenuEvent::receiver().clone();
+    let wake_menu = egui_ctx.clone();
     std::thread::Builder::new()
         .name("framesage-tray-menu".into())
         .spawn(move || {
@@ -2256,7 +2267,10 @@ fn build_tray(commands: &TrayCommands) -> anyhow::Result<TrayIcon> {
                     cmds_menu.hide_window.store(true, Ordering::Relaxed);
                 } else if ev.id == ids.exit {
                     cmds_menu.exit_requested.store(true, Ordering::Relaxed);
+                } else {
+                    continue;
                 }
+                wake_menu.request_repaint();
             }
         })?;
 
@@ -2264,6 +2278,7 @@ fn build_tray(commands: &TrayCommands) -> anyhow::Result<TrayIcon> {
     // with `button: MouseButton::Left, button_state: Up` on click release.
     let cmds_click = commands.clone();
     let click_rx = TrayIconEvent::receiver().clone();
+    let wake_click = egui_ctx;
     std::thread::Builder::new()
         .name("framesage-tray-click".into())
         .spawn(move || {
@@ -2278,6 +2293,7 @@ fn build_tray(commands: &TrayCommands) -> anyhow::Result<TrayIcon> {
                     // A redundant show signal when the window is already up
                     // just re-focuses it, which matches user expectation.
                     cmds_click.show_window.store(true, Ordering::Relaxed);
+                    wake_click.request_repaint();
                 }
             }
         })?;
