@@ -1,39 +1,65 @@
-# framesage-win
+# FrameSage
 
 A better-than-Process-Lasso scheduler supervisor for Windows. Watches the foreground app and applies per-process scheduling policy through documented user-mode Win32 APIs — anti-cheat-clean by construction.
 
 > Companion to [process-lasso-linux-rs](https://github.com/franzjeger/process-lasso-linux-rs). The Linux tool can do something Windows architecturally won't permit (truly remove a CPU from the scheduler at runtime). This Windows tool does the next-best thing legally, and tries to do it smarter than the incumbents.
 
-## Status: v0.1 scaffold
+## Status
 
-The repo currently contains a working architecture and a first vertical slice. It compiles on Windows; on other hosts only `framesage-core`, `framesage-ipc`, and stubs build. Not yet runtime-tested end-to-end on Windows hardware — see [Roadmap](#roadmap).
+Runtime-tested on real Windows hardware. Ships as a Windows service (`framesage-svc.exe`) + a polished egui tray UI (`framesage-tray.exe`) + a CLI (`framesage.exe`) + a cross-platform dev harness (`framesage-sim.exe`).
 
-## What it does (today)
+The Processes tab is at feature parity with Process Lasso's main process list: live table with state-coloured row gutter, shell icons, sortable Description / Company / User / PID / CPU / Memory / Threads / Priority / Affinity / Profile / Status columns, parent-child tree view with expand/collapse, click-to-open detail card with resizable splitter, hover tooltips on Affinity (decoded CPU list), CPU% (top-5 cores), and Memory (working-set / peak / private). The perf band shows live aggregate CPU% / RAM% plus a per-logical-CPU bar matrix and a sliding 60-second sparkline.
 
-- A Windows service (`framesage-svc.exe`) running as LocalSystem watches the foreground window every 300 ms.
-- When the foreground process changes, it applies a profile that overrides:
-  - **CPU Sets** (soft affinity — scheduler hint, no starvation)
-  - **Power Throttling** (Eco / Performance / SystemDefault)
-  - **Priority class**
-  - **Memory priority**
-  - **Hard affinity mask** (fallback, rarely needed)
-  - **Working-set trim** on apply
-- A profile can additionally request **Game Mode**: system-wide actions that go beyond a single process.
-  - **Hide taskbar** (primary + multi-monitor secondaries via documented `ShowWindow`).
-  - **Stop services** from a curated safe-list (SysMain, WSearch, DiagTrack, …). Anti-virus and anti-cheat services are explicitly denied.
-  - **Suspend background processes** from a curated safe-list (OneDrive, Dropbox, RGB tools, …). Shell and kernel processes are explicitly denied.
-  - **Switch power plan** (Balanced / High Performance / Power Saver / Ultimate Performance / custom GUID).
-- When focus moves away, every change is reverted automatically. A **crash-safe journal** at `%ProgramData%\framesage\game-mode.journal` lets the service recover stranded sessions on restart.
-- Panic button: `framesage game-mode off` reverts any active Game Mode session immediately.
-- Default policy ships with rules for Battlefield 6, Valorant, and Fortnite that target the AMD X3D (or Intel P-core) CCD via `CpuSelector::Kind(CoreKind::Cache)` and enables a conservative Game Mode (hide taskbar, stop SysMain/WSearch/DiagTrack, switch to High Performance, suspend OneDrive/Dropbox).
+## What it does
 
-## What it doesn't do yet
+### Foreground reconcile loop
+A Windows service (`framesage-svc.exe`) running as LocalSystem watches the foreground window every 300 ms. When the foreground process changes, it applies a profile and reverts on focus change. Per-process knobs:
 
-See [Roadmap](#roadmap). Short list: ETW consumption, PresentMon integration, DPC latency attribution, CPPC perf-rank reads, auto-profile learning, true system tray icon.
+- **CPU Sets** (soft affinity — scheduler hint, no starvation)
+- **Power Throttling** (Eco / Performance / SystemDefault)
+- **Priority class**
+- **Memory priority**
+- **I/O priority** via `NtSetInformationProcess(ProcessIoPriority, …)`
+- **Hard affinity mask** (fallback, rarely needed)
+- **Working-set trim** on apply
+
+### Game Mode (system-level)
+A profile can additionally request **Game Mode**: system-wide actions that go beyond a single process.
+
+- **Hide taskbar** (primary + multi-monitor secondaries via documented `ShowWindow`)
+- **Stop services** from a curated safe-list (SysMain, WSearch, DiagTrack, …). Anti-virus and anti-cheat services are explicitly denied.
+- **Suspend background processes** from a curated safe-list (OneDrive, Dropbox, RGB tools, …). Shell and kernel processes are explicitly denied.
+- **Switch power plan** (Balanced / High Performance / Power Saver / Ultimate Performance / custom GUID)
+- **Pause Windows Update** (writes the same `HKLM\SOFTWARE\Microsoft\WindowsUpdate\UX\Settings\PauseUpdates*` keys the Settings app uses)
+
+A **crash-safe journal** at `%ProgramData%\framesage\game-mode.journal` lets the service recover stranded sessions on restart. Panic button: `framesage game-mode off` reverts any active Game Mode session immediately.
+
+### Topology awareness
+- **CPPC perf-rank readout** via `CallNtPowerInformation` → `PROCESSOR_POWER_INFORMATION`. Per-CPU `MaxMhz` is folded into `cppc_rank`, which is what `CpuSelector::TopRanked(N)` resolves against.
+- **X3D / Cache CCD detection** uses per-CCD L3 cache size as the primary signal (X3D CCD's 96 MB vs non-X3D's 32 MB) with CPPC rank as a fallback for parts that don't expose asymmetric L3.
+
+### ProBalance
+Dynamic priority management on CPU contention. When the box is contended, ProBalance demotes background CPU hogs to free headroom for the foreground; restores priorities when contention passes.
+
+### Background process enforcement
+The tick loop walks `CreateToolhelp32Snapshot` every 10 s and applies `Policy::background_profile` to every PID that isn't the foreground / our own / on the safe-list denylist.
+
+### Tray UI
+Real system-tray icon with right-click menu and minimise-to-tray. The main window has four tabs:
+
+- **Processes** — Process-Lasso-class live process viewer (see [Status](#status))
+- **Status** — engine state, active profile, foreground app, recent activity, ProBalance status
+- **Rules** — view / add / edit / delete AppRules, persisted via SetPolicy
+- **Profiles** — per-profile editor for every knob (CpuSelector, GameModeActions, etc.)
+
+Single-launch elevation: the tray detects whether it's running with the elevated token and disables admin controls when not. Run as user for status-only view; relaunch elevated for control.
+
+### Default policy
+Ships rules for Battlefield 6, Valorant, and Fortnite that target the AMD X3D (or Intel P-core) CCD via `CpuSelector::Kind(CoreKind::Cache)` and enable a conservative Game Mode (hide taskbar, stop SysMain/WSearch/DiagTrack, switch to High Performance, suspend OneDrive/Dropbox).
 
 ## Anti-cheat policy
 
-Everything framesage does is documented user-mode Win32. No kernel driver, no process memory reads/writes, no DLL injection, no Nt-prefix syscall games. The APIs used here are the same ones Process Lasso, Razer Cortex, and Xbox Game Bar use — Vanguard, EAC, Javelin, and Ricochet all coexist with them. Anything that would put us into BYOVD / driver-hack territory is out of scope, permanently.
+Everything FrameSage does is documented user-mode Win32. No kernel driver, no process memory reads/writes, no DLL injection, no Nt-prefix syscall games beyond the small documented set Task Manager / Process Explorer use (`NtSetInformationProcess(ProcessIoPriority)`, `NtQuerySystemInformation(SystemProcessorPerformanceInformation)`). The APIs used here are the same ones Process Lasso, Razer Cortex, and Xbox Game Bar use — Vanguard, EAC, Javelin, and Ricochet all coexist with them. Anything that would put us into BYOVD / driver-hack territory is out of scope, permanently.
 
 ## Architecture
 
@@ -45,75 +71,54 @@ Everything framesage does is documented user-mode Win32. No kernel driver, no pr
 │   ┌─────────────┐    ┌───────────────────────────────┐   │
 │   │   engine    │◀──▶│      framesage-sys            │   │
 │   │ (tick loop, │    │  (Win32: foreground, apply,   │   │
-│   │  reconcile) │    │   topology, process enum)     │   │
-│   └─────────────┘    └───────────────────────────────┘   │
-│         ▲                                                │
-│         │  named pipe (\\.\pipe\framesage)               │
+│   │  reconcile) │    │   topology, process enum,     │   │
+│   │  ProBalance)│    │   game-mode, version-info,    │   │
+│   └─────────────┘    │   user SIDs, per-CPU times)   │   │
+│         ▲            └───────────────────────────────┘   │
+│         │  named pipes (admin + status, split ACL)       │
 └─────────┼────────────────────────────────────────────────┘
           │
    ┌──────┴──────┐         ┌───────────────────┐
    │ framesage   │         │  framesage-tray   │
-   │   .exe      │         │  (egui monitor)   │
-   │  (CLI)      │         └───────────────────┘
-   └─────────────┘
+   │   .exe      │         │  (egui process    │
+   │  (CLI)      │         │   viewer + tray)  │
+   └─────────────┘         └───────────────────┘
 ```
 
 Crate layout:
 
 | Crate | Purpose |
 |---|---|
-| [`framesage-core`](crates/core) | Domain types: `Profile`, `Policy`, `CpuTopology`, `CpuSelector`. Platform-agnostic. |
-| [`framesage-sys`](crates/sys) | Win32 wrappers. `cfg(windows)`-only; stubs elsewhere. |
-| [`framesage-ipc`](crates/ipc) | Wire types and pipe name for service↔client RPC. |
-| [`framesage-engine`](crates/engine) | Reconciliation loop, apply/revert bookkeeping. |
-| [`framesage-service`](crates/service) | `framesage-svc.exe` — SCM-hosted service binary. |
-| [`framesage-cli`](crates/cli) | `framesage.exe` — install/uninstall, status, control. |
-| [`framesage-tray`](crates/tray) | `framesage-tray.exe` — egui monitoring window. |
-| [`framesage-sim`](crates/sim) | `framesage-sim.exe` — dev harness; resolves policy + topology against synthetic foreground events on any host. |
+| [`framesage-core`](crates/core) | Domain types: `Profile`, `Policy`, `CpuTopology`, `CpuSelector`, `GameModeActions`. Platform-agnostic. |
+| [`framesage-sys`](crates/sys) | Win32 wrappers. `cfg(windows)`-only; stubs elsewhere. Covers foreground, topology, CPU Sets, Power Throttling, I/O priority, process enum, version info, user SIDs, per-CPU performance, memory info, Game Mode actions. |
+| [`framesage-ipc`](crates/ipc) | Wire types and pipe names for service↔client RPC (split admin + status pipes). |
+| [`framesage-engine`](crates/engine) | Reconciliation loop, apply/revert bookkeeping, ProBalance, background enforcement. |
 | [`framesage-gamemode`](crates/gamemode) | Curated safe-list (services + processes), action planner, crash-safe revert journal. Platform-agnostic. |
+| [`framesage-service`](crates/service) | `framesage-svc.exe` — SCM-hosted service binary. |
+| [`framesage-cli`](crates/cli) | `framesage.exe` — install/uninstall, status, control, topology dump. |
+| [`framesage-tray`](crates/tray) | `framesage-tray.exe` — egui process viewer + system tray. |
+| [`framesage-sim`](crates/sim) | `framesage-sim.exe` — dev harness; resolves policy + topology against synthetic foreground events on any host. |
 
-## Building
+## Installing
 
-### On Windows
+### Recommended: one-shot installer
 
 ```pwsh
-# Once
-rustup default stable
-rustup target add x86_64-pc-windows-msvc
-
-# Build everything
-cargo build --release
+# Right-click install.ps1 → "Run with PowerShell" (it self-elevates).
+# Or from a normal PowerShell:
+powershell -ExecutionPolicy Bypass -File .\install.ps1
 ```
 
-The default build target is `x86_64-pc-windows-msvc` (set in `.cargo/config.toml`).
+The installer:
+1. Self-elevates via UAC if needed.
+2. Kills any running FrameSage tray / console-mode service.
+3. Builds release binaries via `cargo build --release`.
+4. Copies the binaries to `%LOCALAPPDATA%\Programs\FrameSage\`.
+5. Creates Start Menu + Desktop shortcuts.
+6. Re-installs the SCM service as LocalSystem (autostart on boot).
+7. Launches the tray.
 
-### From macOS / Linux (cross-compile check)
-
-You can `cargo check` and run tests on the platform-agnostic crates directly:
-
-```sh
-cargo test -p framesage-core -p framesage-ipc -p framesage-sim
-```
-
-And run the dev harness to see what the engine would decide on any host:
-
-```sh
-cargo run -p framesage-sim -- demo
-cargo run -p framesage-sim -- match bf6.exe
-cargo run -p framesage-sim -- --topology hybrid24 match bf6.exe
-cargo run -p framesage-sim -- topology
-```
-
-For a full Windows cross-compile, the recommended path is [`cargo-xwin`](https://github.com/rust-cross/cargo-xwin) which downloads the Windows SDK on demand:
-
-```sh
-cargo install cargo-xwin
-cargo xwin build --release --target x86_64-pc-windows-msvc
-```
-
-Alternatively the GNU target works with `brew install mingw-w64` (macOS) — comment out the default target in `.cargo/config.toml` and pass `--target x86_64-pc-windows-gnu` explicitly.
-
-## Installing the service (on a Windows machine)
+### Manual
 
 ```pwsh
 # In an elevated PowerShell, in the directory containing the built binaries:
@@ -129,7 +134,7 @@ To remove:
 .\framesage.exe uninstall
 ```
 
-## Running in console mode (for development)
+### Running in console mode (for development)
 
 The service binary can run as a foreground console process for development, bypassing the SCM:
 
@@ -139,22 +144,66 @@ The service binary can run as a foreground console process for development, bypa
 
 Ctrl+C stops it.
 
+## Building
+
+### On Windows
+
+```pwsh
+# Once
+rustup default stable
+rustup target add x86_64-pc-windows-msvc
+
+# Build everything
+cargo build --release
+```
+
+### From macOS / Linux (cross-compile check)
+
+The platform-agnostic crates run tests on any host:
+
+```sh
+cargo test -p framesage-core -p framesage-gamemode -p framesage-ipc -p framesage-sim
+```
+
+The dev harness exercises policy + topology end-to-end without needing a Windows machine:
+
+```sh
+cargo run -p framesage-sim -- demo
+cargo run -p framesage-sim -- match bf6.exe
+cargo run -p framesage-sim -- --topology hybrid24 match bf6.exe
+cargo run -p framesage-sim -- topology
+```
+
+Cross-check the full workspace against the Windows target:
+
+```sh
+rustup target add x86_64-pc-windows-gnu
+cargo check --workspace --target x86_64-pc-windows-gnu
+```
+
 ## Roadmap
 
-### v0.2
+### Shipped
 
-- [x] **Policy file at `%ProgramData%\framesage\policy.json`**, hot-reloaded by the service. Bootstraps `Policy::default()` on first run.
-- [x] **Dev harness** (`framesage-sim`) for cross-platform iteration on rules, profiles, and selectors.
-- [x] **Unit tests + GitHub Actions CI** (cross-check, native Windows build, clippy, rustfmt).
-- [x] **Game Mode**: hide taskbar, stop curated services, suspend curated processes, switch power plan. Crash-safe journal at `%ProgramData%\framesage\game-mode.journal`. Curated safe-list with explicit denylist for AV / anti-cheat / shell / kernel processes. `framesage game-mode off` panic button.
-- [x] **CPPC perf-rank readout** via `CallNtPowerInformation` → `PROCESSOR_POWER_INFORMATION`. Per-CPU `MaxMhz` is folded into `cppc_rank`, which is what `CpuSelector::TopRanked(N)` resolves against.
-- [x] **X3D/Cache CCD detection.** `CpuTopology::retag_ccds_from_signals` uses per-CCD L3 cache size as the primary signal (X3D CCD's 96 MB vs non-X3D's 32 MB, a clean 3× ratio), with CPPC rank as a fallback for parts that don't expose asymmetric L3. Called automatically from `topology::detect()`.
-- [x] **Background process enforcement.** Engine's tick loop walks `CreateToolhelp32Snapshot` every 10 s and applies `Policy::background_profile` to every PID that isn't the foreground / our own / on the safe-list denylist.
-- [x] **True tray icon** via the `tray-icon` crate, minimise-to-tray, single-instance launch with admin-elevation handoff.
-- [x] **I/O priority** via `NtSetInformationProcess(ProcessIoPriority, …)`. Real implementation in `framesage-sys::io_priority`, wired into apply/revert. Round-trip test against the current process locks the NT signature.
-- [x] **Focus Assist** — rejected at plan time with `RejectionKind::NotImplemented` and surfaced in the tray UI. Microsoft hasn't shipped a documented user-mode API; the field stays in the serde schema for forward compatibility.
-- [x] **Pause Windows Update** during Game Mode. `windows_update::pause` writes the same `HKLM\SOFTWARE\Microsoft\WindowsUpdate\UX\Settings\PauseUpdates*` keys the Settings app uses, for a default one-hour window; `resume` deletes them.
-- [x] **Pipe ACL** — split read-only status access (for an unprivileged tray) from admin-only control access.
+- [x] Workspace scaffold, CI (cross-check, native Windows build, clippy, rustfmt)
+- [x] Policy file at `%ProgramData%\framesage\policy.json` with hot-reload
+- [x] Game Mode (taskbar, services, processes, power plan, Windows Update pause, crash-safe journal, panic button)
+- [x] CPPC perf-rank readout + X3D / Cache CCD auto-detection
+- [x] I/O priority via `NtSetInformationProcess`
+- [x] Background process enforcement (10 s tick, walks ToolHelp)
+- [x] Real system tray icon with menu + minimise-to-tray
+- [x] Split named-pipe ACL (admin pipe + read-only status pipe)
+- [x] ProBalance — dynamic priority management on CPU contention
+- [x] Per-logical-CPU performance sampling + perf-band matrix
+- [x] Processes-tab UX parity with Process Lasso:
+  - Shell icons per row
+  - State-coloured row gutter (foreground / managed / ProBalance-restrained)
+  - Description + Company + User columns (with version-info / SID caches)
+  - Working-set + peak + private memory with hover tooltip
+  - Affinity hex column with decoded CPU-list tooltip
+  - Parent-child tree view with expand / collapse and sibling-only sort
+  - Click-to-open detail card with resizable splitter
+- [x] Dev harness (`framesage-sim`) for cross-platform iteration
 
 ### v0.3 — the differentiators
 
@@ -162,12 +211,15 @@ Ctrl+C stops it.
 - [ ] **PresentMon integration.** Per-frame timing via DXGI ETW → frame-stutter detection → targeted countermeasure.
 - [ ] **DPC latency attribution.** Identify the offending driver by name, cross-reference a community database, suggest specific roll-forward/back versions. The single most-requested gaming-tweak feature that nobody productises.
 - [ ] **Auto-profile learning.** Over the first N sessions of a game, learn working-set size, thread scaling, NUMA sensitivity, frame-pacing fragility. Generate a per-game profile automatically; user can override.
+- [ ] **Per-core history heatmap** in the perf band (60s of per-core load as a stacked time strip).
 - [ ] **Storage / Network QoS tagging** for the foreground process.
 - [ ] **Telemetry / Indexer / Defender-scan gating** during gameplay sessions.
+- [ ] **Column-config menu** in the Processes tab (right-click header → show/hide individual columns).
 
 ### Future / maybe
 
 - [ ] **"Pure X3D boot mode"** via `bcdedit /set numproc N` + a dedicated boot entry. The actually-invisible-CCD option for benchmark sessions; trades a reboot for a real topology change. Anti-cheat-safe (boot config, not runtime hook).
+- [ ] **MSIX / signed installer.** Distribution polish.
 
 ## Why not just use Process Lasso / Xbox Game Bar / AMD's 3D V-Cache Optimizer?
 
