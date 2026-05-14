@@ -30,6 +30,8 @@ use tray_icon::{
 };
 
 #[cfg(windows)]
+mod icons;
+#[cfg(windows)]
 mod win32;
 
 mod theme;
@@ -254,6 +256,11 @@ struct FramesageApp {
     profiles: ProfilesEditor,
     /// Processes-tab live view + UI state (filter, sort).
     processes: ProcessesView,
+    /// Per-exe icon cache, populated lazily as rows render. Lives outside
+    /// `ProcessesView` because the egui textures it holds want to be reused
+    /// across tab switches (cheaper than re-extracting on tab return).
+    #[cfg(windows)]
+    icons: icons::IconCache,
     /// Holding the tray icon for its lifetime — drop = icon disappears.
     /// `#[allow(dead_code)]` because we never read it after construction;
     /// the field exists purely to extend the icon's lifetime to match the
@@ -316,6 +323,8 @@ impl FramesageApp {
             rules: RulesEditor::default(),
             profiles: ProfilesEditor::default(),
             processes: ProcessesView::default(),
+            #[cfg(windows)]
+            icons: icons::IconCache::new(),
             #[cfg(windows)]
             tray,
         }
@@ -1947,9 +1956,20 @@ impl FramesageApp {
         // The leading 6px "marker" column paints a colored vertical bar per
         // row state — like the "modified" gutter in code editors. Empty in
         // default rows so colored rows pop without the table looking busy.
+        // The 22px icon column sits between the marker and the exe name and
+        // renders each process's shell icon (extracted lazily on the UI
+        // thread, bounded by `icon_budget`).
         let mut action_queue: Vec<ProcessAction> = Vec::new();
         let mut clicked_pid: Option<u32> = None;
         let mut close_detail = false;
+        // Per-frame icon extraction budget. Caps the worst-case cost when a
+        // wave of new processes hits the table for the first time — without
+        // this a fresh poll could trigger 200 SHGetFileInfoW calls in one
+        // frame and stall the runtime.
+        #[cfg_attr(not(windows), allow(unused_mut, unused_variables))]
+        let mut icon_budget: u32 = 4;
+        #[cfg(windows)]
+        let ctx_for_icons = ui.ctx().clone();
         ui.allocate_ui_with_layout(
             egui::vec2(ui.available_width(), table_h),
             egui::Layout::top_down(egui::Align::LEFT),
@@ -1959,6 +1979,7 @@ impl FramesageApp {
                     .resizable(true)
                     .cell_layout(egui::Layout::left_to_right(egui::Align::Center))
                     .column(Column::exact(6.0)) // State marker (no header)
+                    .column(Column::exact(22.0)) // Icon (no header)
                     .column(Column::initial(220.0).at_least(120.0)) // Exe
                     .column(Column::initial(60.0).at_least(50.0)) // PID
                     .column(Column::initial(60.0).at_least(45.0)) // CPU%
@@ -1970,6 +1991,7 @@ impl FramesageApp {
                     .column(Column::remainder().at_least(70.0)) // Status
                     .header(20.0, |mut header| {
                         header.col(|_ui| {}); // marker column — no header glyph
+                        header.col(|_ui| {}); // icon column — no header glyph
                         header
                             .col(|ui| self.sortable_header(ui, "Process", ProcessSortKey::ExeName));
                         header.col(|ui| self.sortable_header(ui, "PID", ProcessSortKey::Pid));
@@ -2008,6 +2030,33 @@ impl FramesageApp {
                                         egui::vec2(3.0, rect.height()),
                                     );
                                     ui.painter().rect_filled(bar, egui::Rounding::ZERO, color);
+                                }
+                            });
+
+                            // Icon column: render the shell icon for this exe.
+                            // Cache-miss extractions are bounded by `icon_budget`
+                            // (per-frame) so a fresh poll never stalls the UI.
+                            // On non-Windows hosts the column stays blank — same
+                            // result as a miss.
+                            row.col(|ui| {
+                                #[cfg(windows)]
+                                {
+                                    if !p.exe_path.is_empty() {
+                                        if let Some(tex) = self.icons.get_or_load(
+                                            &ctx_for_icons,
+                                            &p.exe_path,
+                                            &mut icon_budget,
+                                        ) {
+                                            ui.add(
+                                                egui::Image::new(&tex)
+                                                    .fit_to_exact_size(egui::vec2(16.0, 16.0)),
+                                            );
+                                        }
+                                    }
+                                }
+                                #[cfg(not(windows))]
+                                {
+                                    let _ = ui;
                                 }
                             });
 
@@ -3146,6 +3195,7 @@ mod tests {
         framesage_ipc::ProcessSnapshot {
             pid,
             exe_name: "test.exe".into(),
+            exe_path: String::new(),
             priority_class_raw: 0x20, // NORMAL_PRIORITY_CLASS
             affinity_mask: 0xFFFF,
             cpu_percent: 0,

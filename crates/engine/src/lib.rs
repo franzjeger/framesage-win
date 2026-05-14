@@ -340,11 +340,19 @@ impl Engine {
                     continue;
                 }
 
-                // exe path → bare filename
-                let exe_name = match framesage_sys::process::exe_for_pid(pid) {
-                    Ok(Some(path)) => path.rsplit(['\\', '/']).next().unwrap_or(&path).to_owned(),
+                // exe path + bare filename. We surface BOTH in the snapshot:
+                // the tray uses the filename for the table label and matching,
+                // and the full path to extract the exe's icon via
+                // `SHGetFileInfoW`.
+                let exe_path = match framesage_sys::process::exe_for_pid(pid) {
+                    Ok(Some(path)) => path,
                     Ok(None) | Err(_) => continue,
                 };
+                let exe_name = exe_path
+                    .rsplit(['\\', '/'])
+                    .next()
+                    .unwrap_or(&exe_path)
+                    .to_owned();
 
                 let priority_class_raw = framesage_sys::apply::get_priority_class_for_pid(pid)
                     .ok()
@@ -401,6 +409,7 @@ impl Engine {
                 out.push(ProcessSnapshot {
                     pid,
                     exe_name,
+                    exe_path,
                     priority_class_raw,
                     affinity_mask,
                     cpu_percent,

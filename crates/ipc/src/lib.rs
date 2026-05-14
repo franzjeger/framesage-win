@@ -181,6 +181,13 @@ pub struct ProcessSnapshot {
     pub pid: u32,
     /// Image filename only (no path), original case as the kernel reports.
     pub exe_name: String,
+    /// Full image path. Carried alongside `exe_name` so the tray can extract
+    /// the exe's icon via `SHGetFileInfoW` without round-tripping. Empty
+    /// string when the engine couldn't resolve it (protected process, exited
+    /// between enumerate and query). `serde(default)` so older clients still
+    /// parse responses written by newer servers and vice-versa.
+    #[serde(default)]
+    pub exe_path: String,
     /// Live `GetPriorityClass` value (raw Win32 constant).
     pub priority_class_raw: u32,
     /// Live `GetProcessAffinityMask` value. `u64` so we can grow past 32 CPUs.
