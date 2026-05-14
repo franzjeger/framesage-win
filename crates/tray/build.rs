@@ -68,13 +68,18 @@ fn write_rc(
     std::fs::write(rc_path, body).expect("write framesage.rc");
 }
 
-/// Application manifest declaring per-monitor v2 DPI awareness so Windows
-/// hands us WM_DPICHANGED events and lets eframe rescale on its own when the
-/// window crosses a monitor boundary. Without this, dragging the window
-/// between two monitors with different DPI scaling causes the OS to
-/// auto-rescale the window contents — egui then re-rescales them on the
-/// next frame, and the result is the "expands randomly, goes crazy"
-/// behaviour reported during hardware validation.
+/// Application manifest declaring **System** DPI awareness.
+///
+/// History: this used to declare PerMonitorV2 awareness so the app would
+/// rescale itself on monitor changes. That's the "correct" modern model —
+/// but eframe 0.28 / winit 0.29 has a multi-monitor DPI regression where
+/// WM_DPICHANGED triggers a window-size feedback loop that grows the
+/// window unboundedly across the second monitor. Until we move to
+/// egui 0.30+ (which uses winit 0.30 with the fix), declaring System
+/// awareness instead asks Windows to do the bitmap rescale via DWM. The
+/// content gets slightly blurrier on a monitor with a different DPI than
+/// the launch monitor, but the window doesn't grow or jitter — strictly
+/// the better trade-off for end users.
 fn write_manifest(path: &std::path::Path) {
     let body = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 <assembly xmlns="urn:schemas-microsoft-com:asm.v1" manifestVersion="1.0">
@@ -85,8 +90,8 @@ fn write_manifest(path: &std::path::Path) {
       processorArchitecture="*"/>
   <application xmlns="urn:schemas-microsoft-com:asm.v3">
     <windowsSettings>
-      <dpiAwareness xmlns="http://schemas.microsoft.com/SMI/2016/WindowsSettings">PerMonitorV2,PerMonitor</dpiAwareness>
-      <dpiAware xmlns="http://schemas.microsoft.com/SMI/2005/WindowsSettings">true/PM</dpiAware>
+      <dpiAwareness xmlns="http://schemas.microsoft.com/SMI/2016/WindowsSettings">System</dpiAwareness>
+      <dpiAware xmlns="http://schemas.microsoft.com/SMI/2005/WindowsSettings">true</dpiAware>
       <longPathAware xmlns="http://schemas.microsoft.com/SMI/2016/WindowsSettings">true</longPathAware>
     </windowsSettings>
   </application>
