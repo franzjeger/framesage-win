@@ -156,11 +156,18 @@ pub enum Response {
 /// System-wide point-in-time metrics, attached to each `Processes`
 /// response. The performance band at the top of the tray UI consumes
 /// these to render the sliding sparkline + current values.
-#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct SystemMetrics {
     /// Total CPU utilisation across all logical processors, 0-100. Derived
     /// from `GetSystemTimes` deltas between two engine ticks.
     pub cpu_percent: u8,
+    /// Per-logical-CPU utilisation, 0-100 each. Index `i` is logical CPU `i`
+    /// in Windows' numbering (group 0). Empty until the engine has two
+    /// samples to diff, or on machines where the kernel refused the
+    /// `NtQuerySystemInformation(SystemProcessorPerformanceInformation)`
+    /// call. Tray renders this as a row of per-core bars in the perf band.
+    #[serde(default)]
+    pub per_core_cpu_percent: Vec<u8>,
     /// Physical RAM in use, bytes (total - available).
     pub memory_used_bytes: u64,
     /// Physical RAM installed, bytes.

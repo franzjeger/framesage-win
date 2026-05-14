@@ -105,6 +105,23 @@ pub mod process {
     pub fn system_cpu_times() -> Result<SystemCpuTimes> {
         Ok(SystemCpuTimes::default())
     }
+    #[derive(Debug, Clone, Copy, Default)]
+    pub struct PerCpuTimes {
+        pub idle_100ns: u64,
+        pub kernel_100ns: u64,
+        pub user_100ns: u64,
+    }
+    impl PerCpuTimes {
+        pub fn busy_100ns(&self) -> u64 {
+            0
+        }
+        pub fn total_100ns(&self) -> u64 {
+            0
+        }
+    }
+    pub fn per_cpu_times() -> Result<Vec<PerCpuTimes>> {
+        Ok(Vec::new())
+    }
     pub fn memory_status() -> Result<(u64, u64)> {
         Ok((0, 0))
     }

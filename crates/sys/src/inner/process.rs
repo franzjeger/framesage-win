@@ -263,6 +263,135 @@ pub fn system_cpu_times() -> Result<SystemCpuTimes> {
     })
 }
 
+/// CPU times for a single logical processor. Layout-compatible with the
+/// fields of `SYSTEM_PROCESSOR_PERFORMANCE_INFORMATION` that we care about;
+/// the rest of that struct (`DpcTime`, `InterruptTime`, `InterruptCount`)
+/// would be useful for a future "interrupt-storm" indicator but is dropped
+/// for now to keep the IPC payload tight.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct PerCpuTimes {
+    pub idle_100ns: u64,
+    /// `KernelTime` from the NT struct. Microsoft's convention: this INCLUDES
+    /// `IdleTime`. The "busy" portion is `kernel + user - idle`.
+    pub kernel_100ns: u64,
+    pub user_100ns: u64,
+}
+
+impl PerCpuTimes {
+    pub fn busy_100ns(&self) -> u64 {
+        self.kernel_100ns
+            .saturating_add(self.user_100ns)
+            .saturating_sub(self.idle_100ns)
+    }
+    pub fn total_100ns(&self) -> u64 {
+        self.kernel_100ns.saturating_add(self.user_100ns)
+    }
+}
+
+/// Layout of `SYSTEM_PROCESSOR_PERFORMANCE_INFORMATION` (one element per
+/// logical CPU). Fields and order from public WDK headers (`ntexapi.h`);
+/// stable since Windows XP. Padded so the struct is 8-aligned, matching
+/// what the kernel writes.
+#[repr(C)]
+#[derive(Default, Clone, Copy)]
+struct SystemProcessorPerformanceInformation {
+    idle_time: i64,
+    kernel_time: i64,
+    user_time: i64,
+    dpc_time: i64,
+    interrupt_time: i64,
+    interrupt_count: u32,
+    _padding: u32,
+}
+
+/// `SYSTEM_INFORMATION_CLASS::SystemProcessorPerformanceInformation` — value
+/// from public WDK headers. Stable since XP.
+const SYSTEM_PROCESSOR_PERFORMANCE_INFORMATION: u32 = 8;
+
+#[link(name = "ntdll")]
+extern "system" {
+    fn NtQuerySystemInformation(
+        SystemInformationClass: u32,
+        SystemInformation: *mut core::ffi::c_void,
+        SystemInformationLength: u32,
+        ReturnLength: *mut u32,
+    ) -> windows::Win32::Foundation::NTSTATUS;
+}
+
+/// Sample CPU times for every logical processor.
+///
+/// Implementation: `NtQuerySystemInformation(SystemProcessorPerformanceInformation)`.
+/// Same call Task Manager, Process Explorer, and every Windows process
+/// viewer uses for per-core CPU%. Documented well enough in public WDK
+/// headers (and stable for two decades) that anti-cheats coexist with it.
+///
+/// Strategy: we don't know the logical-CPU count a priori, so we do the
+/// classic two-call dance — first call with a small buffer to read the
+/// required length, then a second call with the real buffer. Both calls
+/// are cheap (< 100µs on a typical box). Capped at 256 logical CPUs to
+/// keep the worst-case allocation bounded.
+pub fn per_cpu_times() -> Result<Vec<PerCpuTimes>> {
+    const STRIDE: usize = std::mem::size_of::<SystemProcessorPerformanceInformation>();
+    const MAX_CPUS: usize = 256;
+
+    // First call: small buffer just to learn the size. NtQuerySystemInformation
+    // returns STATUS_INFO_LENGTH_MISMATCH (0xC0000004) in this case, which we
+    // ignore — we only care about ReturnLength.
+    let mut needed: u32 = 0;
+    // SAFETY: documented call; passing a 1-byte buffer guarantees mismatch,
+    // and ReturnLength is a valid out-pointer. We discard the NTSTATUS.
+    let _ = unsafe {
+        NtQuerySystemInformation(
+            SYSTEM_PROCESSOR_PERFORMANCE_INFORMATION,
+            std::ptr::null_mut(),
+            0,
+            &mut needed,
+        )
+    };
+    if needed == 0 {
+        return Err(anyhow!(
+            "NtQuerySystemInformation reported 0 bytes for per-CPU performance info"
+        ));
+    }
+    let cpus = needed as usize / STRIDE;
+    if cpus == 0 || cpus > MAX_CPUS {
+        return Err(anyhow!(
+            "implausible logical-CPU count from kernel: {cpus} (max {MAX_CPUS})"
+        ));
+    }
+
+    let mut buf: Vec<SystemProcessorPerformanceInformation> =
+        vec![SystemProcessorPerformanceInformation::default(); cpus];
+    let mut written: u32 = 0;
+    // SAFETY: buf has exactly `cpus * STRIDE` bytes, matching the size the
+    // kernel asked for. ReturnLength is valid.
+    let status = unsafe {
+        NtQuerySystemInformation(
+            SYSTEM_PROCESSOR_PERFORMANCE_INFORMATION,
+            buf.as_mut_ptr() as *mut core::ffi::c_void,
+            (cpus * STRIDE) as u32,
+            &mut written,
+        )
+    };
+    if status.0 < 0 {
+        return Err(anyhow!(
+            "NtQuerySystemInformation(per-CPU) failed: NTSTATUS 0x{:08x}",
+            status.0 as u32
+        ));
+    }
+    let returned = (written as usize / STRIDE).min(cpus);
+
+    let mut out = Vec::with_capacity(returned);
+    for entry in &buf[..returned] {
+        out.push(PerCpuTimes {
+            idle_100ns: entry.idle_time as u64,
+            kernel_100ns: entry.kernel_time as u64,
+            user_100ns: entry.user_time as u64,
+        });
+    }
+    Ok(out)
+}
+
 /// Total + available physical memory in bytes via `GlobalMemoryStatusEx`.
 /// Returns `(total, available)`. Caller computes used = total - available
 /// (or "load%" via the same struct's `dwMemoryLoad` field — but we want

@@ -420,7 +420,7 @@ impl eframe::App for FramesageApp {
         let (system_metrics, system_history, recent_for_strip) = {
             let s = self.state.lock().unwrap();
             (
-                s.system,
+                s.system.clone(),
                 s.system_history.iter().copied().collect::<Vec<_>>(),
                 s.recent
                     .iter()
@@ -2700,16 +2700,81 @@ fn render_perf_band(
             ),
         );
 
-        // Right cluster: the sparkline. Fills the remaining horizontal
-        // space and renders inline next to the readouts.
+        // Right cluster: per-core CPU matrix (if available) + the sparkline.
+        // Sparkline drawn first from the right edge; per-core matrix slots
+        // in between the MEM text and the sparkline.
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            // Width: take a chunk of available space, leave room for the
-            // left readouts.
-            let desired = egui::vec2(360.0, 22.0);
+            let desired = egui::vec2(280.0, 22.0);
             let (rect, _) = ui.allocate_exact_size(desired, egui::Sense::hover());
             draw_sparkline(ui.painter(), rect, history);
+
+            // Per-core matrix between sparkline and MEM. Right-to-left
+            // layout means this allocation appears to the *left* of the
+            // sparkline. Skipped on first sample (engine hasn't accumulated
+            // two yet) or if the kernel refused per-CPU info.
+            if !metrics.per_core_cpu_percent.is_empty() {
+                ui.add_space(12.0);
+                draw_per_core_matrix(ui, &metrics.per_core_cpu_percent);
+            }
         });
     });
+}
+
+/// Width and styling for one bar in the per-core matrix. Constants so the
+/// hit-test math in the hover handler stays in sync with the painter.
+const PER_CORE_BAR_W: f32 = 5.0;
+const PER_CORE_BAR_GAP: f32 = 1.0;
+const PER_CORE_MAX_BARS: usize = 64;
+
+/// Render one vertical bar per logical CPU. Bar height tracks utilisation
+/// (0-100 ≡ 0% to full cell height); bar color reuses `cpu_percent_color`
+/// so the matrix and the aggregate number speak the same color language.
+/// Hover shows "Core N: M%" via an at-pointer tooltip — same affordance
+/// Task Manager's grid view uses.
+fn draw_per_core_matrix(ui: &mut egui::Ui, percents: &[u8]) {
+    let cores = percents.len().min(PER_CORE_MAX_BARS);
+    let total_w = (PER_CORE_BAR_W + PER_CORE_BAR_GAP) * cores as f32 - PER_CORE_BAR_GAP;
+    let desired = egui::vec2(total_w.max(1.0), 22.0);
+    let (rect, response) = ui.allocate_exact_size(desired, egui::Sense::hover());
+    let painter = ui.painter();
+
+    // Background tray for the bars — visual anchor so bars at 0% still
+    // appear inside a "well" rather than floating against the band.
+    painter.rect_filled(rect, 3.0, theme::SURFACE);
+
+    let pad_y = 2.0;
+    let max_h = rect.height() - pad_y * 2.0;
+    let stride = PER_CORE_BAR_W + PER_CORE_BAR_GAP;
+    for (i, &pct) in percents.iter().take(cores).enumerate() {
+        let x = rect.left() + i as f32 * stride;
+        let h = (max_h * (pct as f32 / 100.0)).clamp(1.0, max_h);
+        let bar_rect = egui::Rect::from_min_size(
+            egui::pos2(x, rect.bottom() - pad_y - h),
+            egui::vec2(PER_CORE_BAR_W, h),
+        );
+        painter.rect_filled(
+            bar_rect,
+            egui::Rounding::ZERO,
+            cpu_percent_color(pct as u16),
+        );
+    }
+
+    // Tooltip: identify the core under the cursor + its percent. We compute
+    // the label first (cheap, off the hover position) and attach via
+    // `Response::on_hover_text` so egui handles tooltip placement, fade-in,
+    // and dismissal automatically.
+    let label = response.hover_pos().and_then(|pos| {
+        let x_in_rect = (pos.x - rect.left()).max(0.0);
+        let idx = (x_in_rect / stride) as usize;
+        if idx < cores {
+            Some(format!("Core {idx}: {}%", percents[idx]))
+        } else {
+            None
+        }
+    });
+    if let Some(text) = label {
+        let _ = response.on_hover_text(text);
+    }
 }
 
 /// Render two overlaid lines (CPU + memory) inside `rect` from the
@@ -3945,11 +4010,13 @@ fn processes_poll_loop(state: Arc<Mutex<AppState>>, ctx: egui::Context) {
                 } else {
                     0
                 };
+                // Pull the scalar fields out before moving `system` — Vec
+                // inside SystemMetrics means SystemMetrics is no longer Copy.
+                let cpu_for_history = system.cpu_percent;
                 let mut s = state.lock().unwrap();
                 s.processes = snapshots;
                 s.system = system;
-                s.system_history
-                    .push_back((system.cpu_percent, mem_percent));
+                s.system_history.push_back((cpu_for_history, mem_percent));
                 while s.system_history.len() > SYSTEM_HISTORY_LEN {
                     s.system_history.pop_front();
                 }

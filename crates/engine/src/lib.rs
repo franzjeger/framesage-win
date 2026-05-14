@@ -110,6 +110,13 @@ struct EngineState {
     /// from the current sample inside `list_process_snapshots` to derive
     /// the live system CPU% surfaced in the performance band.
     list_processes_prev_system_cpu: Option<framesage_sys::process::SystemCpuTimes>,
+    /// Previous per-logical-CPU sample, parallel to
+    /// `list_processes_prev_system_cpu` but populated from
+    /// `framesage_sys::process::per_cpu_times`. `None` until the first
+    /// successful sample; we only emit `per_core_cpu_percent` once we have
+    /// two samples to diff. Empty Vec on platforms / hardware where the NT
+    /// per-CPU query failed.
+    list_processes_prev_per_cpu: Option<Vec<framesage_sys::process::PerCpuTimes>>,
     /// Manual mode: when set, every foreground reconcile applies this
     /// profile instead of consulting Rules. Stays set across focus
     /// changes until explicitly cleared via `clear_manual_override` /
@@ -213,6 +220,7 @@ impl Engine {
                 list_processes_prev_samples: HashMap::new(),
                 list_processes_last_sample_at: None,
                 list_processes_prev_system_cpu: None,
+                list_processes_prev_per_cpu: None,
                 manual_override: None,
                 reported_foreground: None,
                 foreground_reporter_seen: false,
@@ -429,11 +437,40 @@ impl Engine {
             };
             s.list_processes_prev_system_cpu = sys_cpu_now;
 
+            // Per-logical-CPU sample. Same idiom as the aggregate above: take
+            // a fresh sample, diff against the previous one (if any) to
+            // produce a per-core utilisation 0-100, then store the fresh
+            // sample for next time. Length mismatches between samples (rare
+            // — would require a hot-plug) fall through to an empty Vec so
+            // the tray draws no per-core matrix until two compatible samples
+            // accumulate.
+            let per_cpu_now = framesage_sys::process::per_cpu_times().ok();
+            let per_core_cpu_percent: Vec<u8> = match (&per_cpu_now, &s.list_processes_prev_per_cpu)
+            {
+                (Some(now_v), Some(prev_v)) if now_v.len() == prev_v.len() => now_v
+                    .iter()
+                    .zip(prev_v.iter())
+                    .map(|(n, p)| {
+                        let total = n.total_100ns().saturating_sub(p.total_100ns());
+                        let idle = n.idle_100ns.saturating_sub(p.idle_100ns);
+                        if total == 0 {
+                            0u8
+                        } else {
+                            let busy = total.saturating_sub(idle);
+                            ((busy as u128 * 100 / total as u128).min(100)) as u8
+                        }
+                    })
+                    .collect(),
+                _ => Vec::new(),
+            };
+            s.list_processes_prev_per_cpu = per_cpu_now;
+
             let (mem_total, mem_avail) = framesage_sys::process::memory_status().unwrap_or((0, 0));
             let mem_used = mem_total.saturating_sub(mem_avail);
 
             let metrics = SystemMetrics {
                 cpu_percent: system_cpu_percent,
+                per_core_cpu_percent,
                 memory_used_bytes: mem_used,
                 memory_total_bytes: mem_total,
             };
