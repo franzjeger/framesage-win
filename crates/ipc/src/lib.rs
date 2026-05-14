@@ -196,6 +196,12 @@ pub struct ProcessSnapshot {
     /// `serde(default)` so the field is optional on the wire.
     #[serde(default)]
     pub description: Option<String>,
+    /// "CompanyName" string from the exe's version resource ("Microsoft
+    /// Corporation", "Valve", "Electronic Arts"). Useful for telling
+    /// publisher at a glance when an unfamiliar binary appears. Cached
+    /// alongside `description` from the same resource read.
+    #[serde(default)]
+    pub company: Option<String>,
     /// Live `GetPriorityClass` value (raw Win32 constant).
     pub priority_class_raw: u32,
     /// Live `GetProcessAffinityMask` value. `u64` so we can grow past 32 CPUs.

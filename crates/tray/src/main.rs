@@ -128,6 +128,7 @@ enum ProcessSortKey {
     Priority,
     Profile,
     Description,
+    Company,
 }
 
 /// Visual classification for a Processes-tab row. Drives the colored leading
@@ -1923,6 +1924,11 @@ impl FramesageApp {
                         let bv = b.description.as_deref().unwrap_or("\u{ffff}");
                         av.to_ascii_lowercase().cmp(&bv.to_ascii_lowercase())
                     }
+                    ProcessSortKey::Company => {
+                        let av = a.company.as_deref().unwrap_or("\u{ffff}");
+                        let bv = b.company.as_deref().unwrap_or("\u{ffff}");
+                        av.to_ascii_lowercase().cmp(&bv.to_ascii_lowercase())
+                    }
                 };
                 if self.processes.sort_desc {
                     ord.reverse()
@@ -1991,6 +1997,7 @@ impl FramesageApp {
                     .column(Column::exact(22.0)) // Icon (no header)
                     .column(Column::initial(220.0).at_least(120.0)) // Exe
                     .column(Column::initial(200.0).at_least(120.0)) // Description
+                    .column(Column::initial(140.0).at_least(80.0)) // Company
                     .column(Column::initial(60.0).at_least(50.0)) // PID
                     .column(Column::initial(60.0).at_least(45.0)) // CPU%
                     .column(Column::initial(85.0).at_least(60.0)) // Memory
@@ -2007,6 +2014,8 @@ impl FramesageApp {
                         header.col(|ui| {
                             self.sortable_header(ui, "Description", ProcessSortKey::Description)
                         });
+                        header
+                            .col(|ui| self.sortable_header(ui, "Company", ProcessSortKey::Company));
                         header.col(|ui| self.sortable_header(ui, "PID", ProcessSortKey::Pid));
                         header.col(|ui| self.sortable_header(ui, "CPU %", ProcessSortKey::Cpu));
                         header.col(|ui| self.sortable_header(ui, "Memory", ProcessSortKey::Memory));
@@ -2165,6 +2174,19 @@ impl FramesageApp {
                                     ui.weak("—");
                                 }
                             });
+                            // Company: publisher string from the same version
+                            // resource the description came from.
+                            row.col(|ui| match &p.company {
+                                Some(co) => {
+                                    let resp = ui.add(egui::Label::new(co).truncate());
+                                    if co.len() > 18 {
+                                        let _ = resp.on_hover_text(co);
+                                    }
+                                }
+                                None => {
+                                    ui.weak("—");
+                                }
+                            });
                             row.col(|ui| {
                                 ui.monospace(p.pid.to_string());
                             });
@@ -2186,7 +2208,14 @@ impl FramesageApp {
                                 ui.label(priority_class_label(p.priority_class_raw));
                             });
                             row.col(|ui| {
-                                ui.monospace(format!("{:#x}", p.affinity_mask));
+                                // Show the affinity mask in hex (compact) but
+                                // expand to a human-friendly CPU range list on
+                                // hover ("CPUs: 0–7, 14"). 0x0 collapses to
+                                // "(none)" which is what an inaccessible
+                                // process yields.
+                                let resp = ui.monospace(format!("{:#x}", p.affinity_mask));
+                                let decoded = decode_affinity_mask(p.affinity_mask);
+                                let _ = resp.on_hover_text(decoded);
                             });
                             row.col(|ui| match &p.managed_profile {
                                 Some(id) => {
@@ -2385,6 +2414,66 @@ fn cpu_percent_color(cpu: u16) -> egui::Color32 {
         51..=80 => theme::WARNING,
         _ => theme::ERROR,
     }
+}
+
+/// Decode a process affinity bitmask into a human-readable CPU-range list:
+/// `0x000000ff → "CPUs: 0–7"`, `0x0000800f → "CPUs: 0–3, 15"`. Renders
+/// `"(none)"` for an empty mask. Used as the affinity column's hover
+/// tooltip so the hex is scannable and the decode is on demand.
+fn decode_affinity_mask(mask: u64) -> String {
+    if mask == 0 {
+        return "(none)".to_string();
+    }
+    let mut groups: Vec<String> = Vec::new();
+    let mut run_start: Option<u32> = None;
+    let mut last_set: Option<u32> = None;
+    for i in 0..64u32 {
+        let bit_set = (mask >> i) & 1 == 1;
+        if bit_set {
+            if run_start.is_none() {
+                run_start = Some(i);
+            }
+            last_set = Some(i);
+        } else if let Some(start) = run_start {
+            let end = last_set.unwrap_or(start);
+            push_run(&mut groups, start, end);
+            run_start = None;
+        }
+    }
+    // Final run if the highest bits are set.
+    if let Some(start) = run_start {
+        let end = last_set.unwrap_or(start);
+        push_run(&mut groups, start, end);
+    }
+    format!("CPUs: {}", groups.join(", "))
+}
+
+fn push_run(out: &mut Vec<String>, start: u32, end: u32) {
+    if start == end {
+        out.push(start.to_string());
+    } else {
+        // En-dash, not hyphen — Process Lasso uses the same and it reads
+        // better as a range.
+        out.push(format!("{start}–{end}"));
+    }
+}
+
+/// Top-N cores by load, formatted as a multi-line tooltip body:
+/// `"Core 4: 87%\nCore 8: 73%\n..."`. Used as the perf-band aggregate
+/// CPU% tooltip so a busy aggregate has obvious provenance — which
+/// cores are actually hot.
+fn format_top_cores(percents: &[u8], n: usize) -> String {
+    if percents.is_empty() {
+        return "(per-core data not available yet)".to_string();
+    }
+    let mut pairs: Vec<(usize, u8)> = percents.iter().copied().enumerate().collect();
+    pairs.sort_by_key(|(_, p)| std::cmp::Reverse(*p));
+    pairs
+        .into_iter()
+        .take(n)
+        .map(|(i, p)| format!("Core {i}: {p}%"))
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 fn priority_class_label(raw: u32) -> &'static str {
@@ -2743,12 +2832,16 @@ fn render_perf_band(
                 .size(11.0),
         );
         let cpu_color = cpu_percent_color(metrics.cpu_percent as u16);
-        ui.label(
+        let cpu_resp = ui.label(
             egui::RichText::new(format!("{}%", metrics.cpu_percent))
                 .color(cpu_color)
                 .strong()
                 .size(15.0),
         );
+        // Hover the aggregate CPU% to see which cores are doing the work —
+        // helpful for X3D-class machines where you want to confirm the
+        // load actually landed on the favoured CCD.
+        let _ = cpu_resp.on_hover_text(format_top_cores(&metrics.per_core_cpu_percent, 5));
         ui.add_space(16.0);
 
         let mem_percent: u8 = if metrics.memory_total_bytes > 0 {
@@ -3214,7 +3307,10 @@ fn display_profile_id(raw: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{classify_row, display_profile_id, row_marker_color, RowState};
+    use super::{
+        classify_row, decode_affinity_mask, display_profile_id, format_top_cores, row_marker_color,
+        RowState,
+    };
 
     #[test]
     fn profile_id_display_handles_common_cases() {
@@ -3232,6 +3328,7 @@ mod tests {
             exe_name: "test.exe".into(),
             exe_path: String::new(),
             description: None,
+            company: None,
             priority_class_raw: 0x20, // NORMAL_PRIORITY_CLASS
             affinity_mask: 0xFFFF,
             cpu_percent: 0,
@@ -3285,6 +3382,44 @@ mod tests {
         assert!(row_marker_color(RowState::Foreground).is_some());
         assert!(row_marker_color(RowState::Restrained).is_some());
         assert!(row_marker_color(RowState::Managed).is_some());
+    }
+
+    #[test]
+    fn decode_affinity_mask_collapses_contiguous_runs() {
+        assert_eq!(decode_affinity_mask(0x0000_00ff), "CPUs: 0–7");
+        assert_eq!(decode_affinity_mask(0x0000_800f), "CPUs: 0–3, 15");
+        assert_eq!(decode_affinity_mask(0x0000_0001), "CPUs: 0");
+        assert_eq!(decode_affinity_mask(0xffff_ffff), "CPUs: 0–31");
+        // Singletons separated by gaps don't collapse.
+        assert_eq!(decode_affinity_mask(0b1010_1010), "CPUs: 1, 3, 5, 7");
+    }
+
+    #[test]
+    fn decode_affinity_mask_empty_renders_none() {
+        assert_eq!(decode_affinity_mask(0), "(none)");
+    }
+
+    #[test]
+    fn decode_affinity_mask_includes_high_bits() {
+        // Bit 63 alone — last-run handling at the loop boundary.
+        assert_eq!(decode_affinity_mask(1u64 << 63), "CPUs: 63");
+        // Top byte set as a contiguous block.
+        assert_eq!(decode_affinity_mask(0xff00_0000_0000_0000), "CPUs: 56–63");
+    }
+
+    #[test]
+    fn format_top_cores_sorts_descending_and_caps() {
+        let pct = vec![10, 80, 30, 95, 5, 50, 70, 20];
+        let s = format_top_cores(&pct, 3);
+        assert_eq!(s, "Core 3: 95%\nCore 1: 80%\nCore 6: 70%");
+    }
+
+    #[test]
+    fn format_top_cores_handles_empty() {
+        assert_eq!(
+            format_top_cores(&[], 5),
+            "(per-core data not available yet)"
+        );
     }
 }
 

@@ -117,13 +117,15 @@ struct EngineState {
     /// two samples to diff. Empty Vec on platforms / hardware where the NT
     /// per-CPU query failed.
     list_processes_prev_per_cpu: Option<Vec<framesage_sys::process::PerCpuTimes>>,
-    /// Per-exe-path version-info cache. `Some(Some(desc))` = we read the
-    /// resource and got a description; `Some(None)` = we read it and it had
-    /// no FileDescription field (negative-cached so we don't re-read); a
-    /// missing key = never tried. We never evict — paths are stable for the
-    /// lifetime of an installed binary, and the cache stays small
-    /// (~200 entries × ~100 bytes).
-    version_info_cache: HashMap<String, Option<String>>,
+    /// Per-exe-path version-info cache. A `Some(VersionInfo)` entry means
+    /// "we tried to read the binary's version resource and here's what we
+    /// got" — any of the inner `Option<String>` fields can be `None` if
+    /// the resource omitted that specific field; an empty `VersionInfo`
+    /// (all fields `None`) means the binary has no resource at all. A
+    /// missing key means we haven't tried yet. We never evict — paths are
+    /// stable for the lifetime of an installed binary, and the cache stays
+    /// small (~200 entries × ~150 bytes).
+    version_info_cache: HashMap<String, framesage_sys::version_info::VersionInfo>,
     /// Manual mode: when set, every foreground reconcile applies this
     /// profile instead of consulting Rules. Stays set across focus
     /// changes until explicitly cleared via `clear_manual_override` /
@@ -420,24 +422,24 @@ impl Engine {
                 let managed_profile = s.applied.get(&pid).map(|r| r.profile_id.0.clone());
                 let restrained_by_probalance = s.probalance_restrained.contains_key(&pid);
 
-                // Version-info description, cached by full exe path. On a
-                // miss we spend one of this tick's reads on a synchronous
-                // version-resource read; once the budget is exhausted, new
-                // paths render with `description = None` and fill in over
-                // subsequent ticks. Negative-caching: `Some(None)` means we
-                // tried and the binary has no FileDescription.
-                let description = match s.version_info_cache.get(&exe_path) {
-                    Some(opt) => opt.clone(),
+                // Version-info description + company, cached by full exe
+                // path. On a miss we spend one of this tick's reads on a
+                // synchronous version-resource read; once the budget is
+                // exhausted, new paths render with `None` fields and fill
+                // in over subsequent ticks. We cache the whole VersionInfo
+                // (not just the description) so Company comes for free —
+                // both fields are decoded from the same resource buffer.
+                let info = match s.version_info_cache.get(&exe_path) {
+                    Some(v) => v.clone(),
                     None => {
                         if version_info_budget > 0 {
                             version_info_budget -= 1;
-                            let desc = framesage_sys::version_info::read_version_info(&exe_path)
-                                .ok()
-                                .and_then(|v| v.description);
-                            s.version_info_cache.insert(exe_path.clone(), desc.clone());
-                            desc
+                            let v = framesage_sys::version_info::read_version_info(&exe_path)
+                                .unwrap_or_default();
+                            s.version_info_cache.insert(exe_path.clone(), v.clone());
+                            v
                         } else {
-                            None
+                            framesage_sys::version_info::VersionInfo::default()
                         }
                     }
                 };
@@ -446,7 +448,8 @@ impl Engine {
                     pid,
                     exe_name,
                     exe_path,
-                    description,
+                    description: info.description,
+                    company: info.company,
                     priority_class_raw,
                     affinity_mask,
                     cpu_percent,
