@@ -89,6 +89,15 @@ pub mod process {
     pub fn working_set_bytes(_pid: u32) -> Result<Option<u64>> {
         Ok(None)
     }
+    #[derive(Debug, Clone, Copy, Default)]
+    pub struct MemoryInfo {
+        pub working_set_bytes: u64,
+        pub peak_working_set_bytes: u64,
+        pub private_bytes: u64,
+    }
+    pub fn memory_info(_pid: u32) -> Result<Option<MemoryInfo>> {
+        Ok(None)
+    }
     pub fn affinity_mask(_pid: u32) -> Result<Option<u64>> {
         Ok(None)
     }

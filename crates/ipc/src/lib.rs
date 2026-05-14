@@ -223,8 +223,20 @@ pub struct ProcessSnapshot {
     /// "% of one logical CPU" over the engine's last sample window. 0 if
     /// the engine hasn't sampled the process yet (e.g. just spawned).
     pub cpu_percent: u16,
-    /// Working set, bytes.
+    /// Working set, bytes. Live RAM the process is currently using; drops
+    /// when the OS trims under pressure.
     pub memory_bytes: u64,
+    /// Highest working set this process has reached during its lifetime.
+    /// A growing gap between peak and current is the classic memory-leak
+    /// signal. Surfaced in the Memory cell's hover tooltip.
+    #[serde(default)]
+    pub peak_working_set_bytes: u64,
+    /// Committed private bytes — memory uniquely owned by this process
+    /// (not file-mapped, not shared). The closest single number to "how
+    /// much RAM this process is *responsible* for." Surfaced in the
+    /// Memory cell's hover tooltip + the detail pane.
+    #[serde(default)]
+    pub private_bytes: u64,
     /// Thread count.
     pub threads: u32,
     /// Note text from the rule that matched this exe, if any. `None` means

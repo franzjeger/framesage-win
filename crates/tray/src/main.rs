@@ -117,6 +117,11 @@ struct ProcessesView {
     /// inherit the "expanded" default automatically — no enumeration of
     /// every fresh PID required.
     collapsed: std::collections::HashSet<u32>,
+    /// Height in pixels the detail panel occupies when something is
+    /// selected. `None` means "use the default 210". Set when the user
+    /// drags the splitter bar; persists for the rest of the session so
+    /// the layout doesn't snap back every time a selection changes.
+    detail_height: Option<f32>,
 }
 
 impl Default for ProcessesView {
@@ -129,6 +134,7 @@ impl Default for ProcessesView {
             selected_pid: None,
             tree_mode: true,
             collapsed: std::collections::HashSet::new(),
+            detail_height: None,
         }
     }
 }
@@ -1988,15 +1994,31 @@ impl FramesageApp {
         let selected_pid = self.processes.selected_pid;
 
         // ─── Layout split: reserve space for the detail panel ──────────────
-        // When a row is selected we carve ~200px from the bottom of the
-        // central area for the detail card; the table fills the rest.
-        // Process Lasso / Process Explorer both use this pattern.
+        // When a row is selected we carve a strip from the bottom of the
+        // central area for the detail card; the table fills the rest. A
+        // draggable splitter bar between the two lets the user adjust the
+        // ratio — Process Lasso / Process Explorer both ship the same
+        // affordance. The chosen height persists for the rest of the
+        // session via `ProcessesView.detail_height`.
+        const DETAIL_H_DEFAULT: f32 = 210.0;
+        const DETAIL_H_MIN: f32 = 100.0;
+        const DETAIL_H_MAX: f32 = 600.0;
+        const SPLITTER_H: f32 = 6.0;
         let detail_open = self.processes.selected_pid.is_some();
         let avail_h = ui.available_height();
-        let detail_h = if detail_open { 210.0_f32 } else { 0.0 };
+        let detail_h = if detail_open {
+            self.processes
+                .detail_height
+                .unwrap_or(DETAIL_H_DEFAULT)
+                .clamp(DETAIL_H_MIN, DETAIL_H_MAX)
+        } else {
+            0.0
+        };
+        let splitter_h = if detail_open { SPLITTER_H } else { 0.0 };
         // Always leave the table at least 120px tall so even a tiny window
         // stays usable. The detail panel will scroll internally if cramped.
-        let table_h = (avail_h - detail_h - 8.0).max(120.0);
+        let table_h = (avail_h - detail_h - splitter_h - 4.0).max(120.0);
+        let mut splitter_drag_delta: f32 = 0.0;
 
         // ─── Table ─────────────────────────────────────────────────────────
         //
@@ -2297,7 +2319,20 @@ impl FramesageApp {
                                 ui.colored_label(color, format!("{}", p.cpu_percent));
                             });
                             row.col(|ui| {
-                                ui.monospace(format_bytes(p.memory_bytes));
+                                let resp = ui.monospace(format_bytes(p.memory_bytes));
+                                // Hover the working-set figure to see the
+                                // wider memory story: how high the working
+                                // set has ever climbed (peak) and how much
+                                // is uniquely this process's (private).
+                                // A growing peak-vs-current gap is the
+                                // classic memory-leak signal.
+                                let tip = format!(
+                                    "Working set: {}\nPeak working set: {}\nPrivate bytes: {}",
+                                    format_bytes(p.memory_bytes),
+                                    format_bytes(p.peak_working_set_bytes),
+                                    format_bytes(p.private_bytes),
+                                );
+                                let _ = resp.on_hover_text(tip);
                             });
                             row.col(|ui| {
                                 ui.monospace(p.threads.to_string());
@@ -2358,13 +2393,43 @@ impl FramesageApp {
             }, // close allocate_ui_with_layout for the table region
         );
 
-        // ─── Detail panel ──────────────────────────────────────────────────
-        // Renders below the table when a row is selected. Looks up the PID
-        // in the rendered (filtered+sorted) list so the panel matches what
-        // the user clicked; if the PID disappeared between polls the panel
-        // auto-closes via `close_detail`.
+        // ─── Splitter + Detail panel ──────────────────────────────────────
+        // Splitter bar between the table and the detail panel. Drag the bar
+        // to resize. Width is the full available width; height is
+        // SPLITTER_H. Hovered/dragged states tint the bar with the accent
+        // colour and switch the cursor to vertical-resize so the affordance
+        // reads at a glance.
         if let Some(pid) = selected_pid {
-            ui.separator();
+            let (splitter_rect, splitter_resp) = ui.allocate_exact_size(
+                egui::vec2(ui.available_width(), SPLITTER_H),
+                egui::Sense::drag(),
+            );
+            let active = splitter_resp.hovered() || splitter_resp.dragged();
+            let bar_color = if active { theme::ACCENT } else { theme::BORDER };
+            // Paint a thin centred 1px line so the bar reads as a divider
+            // when idle and a target when hovered. The full-height rect
+            // catches drag events comfortably even if the user grabs near
+            // the edge.
+            let line_y = splitter_rect.center().y;
+            ui.painter().rect_filled(
+                egui::Rect::from_min_max(
+                    egui::pos2(splitter_rect.left(), line_y - 0.5),
+                    egui::pos2(splitter_rect.right(), line_y + 0.5),
+                ),
+                egui::Rounding::ZERO,
+                bar_color,
+            );
+            if active {
+                ui.ctx().set_cursor_icon(egui::CursorIcon::ResizeVertical);
+            }
+            if splitter_resp.dragged() {
+                // Dragging down shrinks the detail panel (table grows);
+                // dragging up enlarges it. drag_delta().y is positive when
+                // moving the cursor down — invert so the detail-height
+                // delta matches the user's mental model.
+                splitter_drag_delta = -splitter_resp.drag_delta().y;
+            }
+
             ui.allocate_ui_with_layout(
                 egui::vec2(ui.available_width(), detail_h),
                 egui::Layout::top_down(egui::Align::LEFT),
@@ -2399,6 +2464,14 @@ impl FramesageApp {
             if !self.processes.collapsed.remove(&pid) {
                 self.processes.collapsed.insert(pid);
             }
+        }
+        // Apply any splitter drag accumulated this frame. Clamping to
+        // [MIN, MAX] keeps the detail strip from collapsing to invisible
+        // or eating the entire window. Stored as `Some(h)` so the next
+        // frame uses the user's chosen size instead of the default.
+        if splitter_drag_delta != 0.0 {
+            let new_h = (detail_h + splitter_drag_delta).clamp(DETAIL_H_MIN, DETAIL_H_MAX);
+            self.processes.detail_height = Some(new_h);
         }
 
         // ─── Dispatch context-menu actions outside the render closure ─────
@@ -2796,7 +2869,21 @@ fn render_process_detail(
                     // Left column: metrics.
                     ui.vertical(|ui| {
                         detail_kv(ui, "CPU", format!("{} %", p.cpu_percent));
-                        detail_kv(ui, "Memory", format_bytes(p.memory_bytes));
+                        // Working set + the supporting peak / private values.
+                        // The "growth gap" between current working set and
+                        // peak working set is the classic memory-leak signal.
+                        let memory_summary = if p.peak_working_set_bytes > 0 || p.private_bytes > 0
+                        {
+                            format!(
+                                "{}  (peak {} · private {})",
+                                format_bytes(p.memory_bytes),
+                                format_bytes(p.peak_working_set_bytes),
+                                format_bytes(p.private_bytes),
+                            )
+                        } else {
+                            format_bytes(p.memory_bytes)
+                        };
+                        detail_kv(ui, "Memory", memory_summary);
                         detail_kv(ui, "Threads", p.threads.to_string());
                         detail_kv(
                             ui,
@@ -3590,6 +3677,8 @@ mod tests {
             affinity_mask: 0xFFFF,
             cpu_percent: 0,
             memory_bytes: 0,
+            peak_working_set_bytes: 0,
+            private_bytes: 0,
             threads: 1,
             matched_rule_note: None,
             managed_profile: None,

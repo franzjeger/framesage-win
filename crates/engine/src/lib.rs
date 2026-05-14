@@ -393,10 +393,17 @@ impl Engine {
                     .flatten()
                     .unwrap_or(0);
 
-                let memory_bytes = framesage_sys::process::working_set_bytes(pid)
+                // Multi-field memory snapshot. Same syscall as the old
+                // working-set-only path; PROCESS_MEMORY_COUNTERS_EX just
+                // gets us peak + private bytes for free, which feeds the
+                // tray's hover tooltip and the detail pane.
+                let mem = framesage_sys::process::memory_info(pid)
                     .ok()
                     .flatten()
-                    .unwrap_or(0);
+                    .unwrap_or_default();
+                let memory_bytes = mem.working_set_bytes;
+                let peak_working_set_bytes = mem.peak_working_set_bytes;
+                let private_bytes = mem.private_bytes;
 
                 let total_cpu = framesage_sys::process::cpu_times(pid)
                     .ok()
@@ -487,6 +494,8 @@ impl Engine {
                     affinity_mask,
                     cpu_percent,
                     memory_bytes,
+                    peak_working_set_bytes,
+                    private_bytes,
                     threads: ps.thread_count,
                     matched_rule_note: rule_note,
                     managed_profile,

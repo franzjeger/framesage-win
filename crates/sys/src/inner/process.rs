@@ -381,9 +381,41 @@ fn filetime_to_u64(ft: &FILETIME) -> u64 {
 }
 
 /// Live working-set size in bytes via `GetProcessMemoryInfo`. `None` if the
-/// PID is gone or we can't open it for query.
+/// PID is gone or we can't open it for query. Thin shim over `memory_info`
+/// — preserved as the fast-path for callers that only need working-set
+/// (e.g. ProBalance's per-tick sample loop, which doesn't need peak or
+/// private byte counts).
 pub fn working_set_bytes(pid: u32) -> Result<Option<u64>> {
-    use windows::Win32::System::ProcessStatus::{GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS};
+    Ok(memory_info(pid)?.map(|m| m.working_set_bytes))
+}
+
+/// Multi-field memory snapshot for one process. All values in bytes.
+///
+/// Sourced from `GetProcessMemoryInfo` populating
+/// `PROCESS_MEMORY_COUNTERS_EX` — the EX variant adds `PrivateUsage`
+/// (committed-private-bytes) to what the base struct already carries.
+/// Process Lasso's Memory column shows working-set live, and its hover
+/// expands to peak + private; we mirror that.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct MemoryInfo {
+    /// Resident working set right now. Drops when the OS trims the
+    /// process under pressure; rises when the process touches pages.
+    pub working_set_bytes: u64,
+    /// Highest working set the process has ever reached this session.
+    /// A growing peak-vs-current gap is the classic memory-leak signal.
+    pub peak_working_set_bytes: u64,
+    /// Committed private bytes (memory uniquely owned by this process —
+    /// not file-mapped, not shared). The closest single number to "how
+    /// much RAM this process is responsible for."
+    pub private_bytes: u64,
+}
+
+/// One-shot multi-field memory snapshot. `None` for PID 0 or for
+/// processes the engine can't open (protected, exited).
+pub fn memory_info(pid: u32) -> Result<Option<MemoryInfo>> {
+    use windows::Win32::System::ProcessStatus::{
+        GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS, PROCESS_MEMORY_COUNTERS_EX,
+    };
     if pid == 0 {
         return Ok(None);
     }
@@ -391,13 +423,30 @@ pub fn working_set_bytes(pid: u32) -> Result<Option<u64>> {
         Ok(h) => h,
         Err(_) => return Ok(None),
     };
-    let mut counters = PROCESS_MEMORY_COUNTERS::default();
-    let size = std::mem::size_of::<PROCESS_MEMORY_COUNTERS>() as u32;
-    // SAFETY: handle valid; counters out-param valid; size matches struct.
-    let r = unsafe { GetProcessMemoryInfo(handle, &mut counters, size) };
+
+    // The EX variant is layout-compatible with the base — its first
+    // members match `PROCESS_MEMORY_COUNTERS`, with `PrivateUsage`
+    // appended at the end. `GetProcessMemoryInfo` accepts a
+    // `*mut PROCESS_MEMORY_COUNTERS` and writes up to `cb` bytes.
+    let mut ex = PROCESS_MEMORY_COUNTERS_EX::default();
+    let size = std::mem::size_of::<PROCESS_MEMORY_COUNTERS_EX>() as u32;
+    // SAFETY: ex is a valid PROCESS_MEMORY_COUNTERS_EX; cast to the base
+    // pointer type is layout-safe per Win32 docs; size matches the EX
+    // struct so the kernel knows to populate PrivateUsage.
+    let r = unsafe {
+        GetProcessMemoryInfo(
+            handle,
+            &mut ex as *mut _ as *mut PROCESS_MEMORY_COUNTERS,
+            size,
+        )
+    };
     close_handle(handle);
     match r {
-        Ok(()) => Ok(Some(counters.WorkingSetSize as u64)),
+        Ok(()) => Ok(Some(MemoryInfo {
+            working_set_bytes: ex.WorkingSetSize as u64,
+            peak_working_set_bytes: ex.PeakWorkingSetSize as u64,
+            private_bytes: ex.PrivateUsage as u64,
+        })),
         Err(_) => Ok(None),
     }
 }
