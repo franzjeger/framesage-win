@@ -110,6 +110,14 @@ impl EventKind {
 struct TrayCommands {
     show_window: Arc<AtomicBool>,
     hide_window: Arc<AtomicBool>,
+    /// `true` while the main window is visible (set in `update()` every
+    /// frame, cleared when a hide-to-tray completes). Background poller
+    /// threads gate their `ctx.request_repaint()` calls on this so they
+    /// don't burn CPU drawing into an invisible window. Visible-state is
+    /// derived from "is update() running" rather than asking egui directly
+    /// because eframe 0.28 doesn't expose viewport visibility to background
+    /// threads.
+    window_visible: Arc<AtomicBool>,
     /// `true` once a quit was requested via the tray's *Exit* menu. The egui
     /// close-requested handler reads this to distinguish "user clicked the
     /// window X" (hide to tray) from "user clicked Exit" (actually quit).
@@ -448,9 +456,10 @@ impl FramesageApp {
         // poll can use the status pipe's short-lived semantics.
         let proc_state = state.clone();
         let proc_ctx = cc.egui_ctx.clone();
+        let proc_visible = commands.window_visible.clone();
         std::thread::Builder::new()
             .name("framesage-tray-processes-poller".into())
-            .spawn(move || processes_poll_loop(proc_state, proc_ctx))
+            .spawn(move || processes_poll_loop(proc_state, proc_ctx, proc_visible))
             .expect("spawn processes poller thread");
 
         // The tray runs in a separate thread; pass an egui::Context clone so
@@ -509,7 +518,22 @@ impl FramesageApp {
 
 impl eframe::App for FramesageApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        ctx.request_repaint_after(std::time::Duration::from_millis(500));
+        // Idle keep-alive: 2 s instead of 500 ms. Background threads
+        // (processes poller @ 1 Hz, IPC event subscribe on demand) drive
+        // the actually-useful repaints via `ctx.request_repaint()`; this
+        // value is the floor that catches anything those threads miss
+        // (animation easing, hover-state transitions). 500 ms forced a
+        // full table re-render twice a second even when nothing changed,
+        // which on the Processes tab with 120 rows + per-row context_menu
+        // adds up. 2 s leaves the UI feeling instant while cutting the
+        // idle CPU floor roughly in half.
+        ctx.request_repaint_after(std::time::Duration::from_secs(2));
+
+        // Mark window visible for background threads. Cleared when we
+        // process a hide-to-tray request below. Background poll threads
+        // gate their `ctx.request_repaint()` calls on this — no point
+        // burning CPU drawing a window the user can't see.
+        self.commands.window_visible.store(true, Ordering::Relaxed);
 
         // ─── Tray command bridge ────────────────────────────────────────────
         //
@@ -522,6 +546,7 @@ impl eframe::App for FramesageApp {
         }
         if self.commands.hide_window.swap(false, Ordering::Relaxed) {
             ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
+            self.commands.window_visible.store(false, Ordering::Relaxed);
         }
 
         // ─── Close-to-tray ──────────────────────────────────────────────────
@@ -536,6 +561,7 @@ impl eframe::App for FramesageApp {
             } else {
                 ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
                 ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
+                self.commands.window_visible.store(false, Ordering::Relaxed);
             }
         }
         if self.commands.exit_requested.load(Ordering::Relaxed) && !close_requested {
@@ -5612,9 +5638,20 @@ fn background_loop(state: Arc<Mutex<AppState>>) {
 /// runtime each refresh so the Processes tab and the performance band
 /// update even when no other input arrives.
 #[cfg(windows)]
-fn processes_poll_loop(state: Arc<Mutex<AppState>>, ctx: egui::Context) {
-    let interval = std::time::Duration::from_millis(1000);
+fn processes_poll_loop(
+    state: Arc<Mutex<AppState>>,
+    ctx: egui::Context,
+    window_visible: Arc<AtomicBool>,
+) {
+    // Cadence depends on whether the window is visible. Hidden window =
+    // poll 8× less often (and skip the egui repaint wake entirely). The
+    // user reported FrameSage burning CPU; this is the largest single
+    // contributor — 120-row table render every 1 s × always-on = the
+    // bulk of the idle CPU floor.
+    let visible_interval = std::time::Duration::from_millis(1000);
+    let hidden_interval = std::time::Duration::from_millis(8000);
     loop {
+        let visible = window_visible.load(Ordering::Relaxed);
         match send_processes_and_status_blocking() {
             Ok((snapshots, system, status)) => {
                 let mem_percent: u8 = if system.memory_total_bytes > 0 {
@@ -5637,7 +5674,9 @@ fn processes_poll_loop(state: Arc<Mutex<AppState>>, ctx: egui::Context) {
                     s.system_history.pop_front();
                 }
                 drop(s);
-                ctx.request_repaint();
+                if visible {
+                    ctx.request_repaint();
+                }
             }
             Err(_) => {
                 // Service down or pipe busy — skip this tick. The connect
@@ -5646,7 +5685,11 @@ fn processes_poll_loop(state: Arc<Mutex<AppState>>, ctx: egui::Context) {
                 // here too.
             }
         }
-        std::thread::sleep(interval);
+        std::thread::sleep(if visible {
+            visible_interval
+        } else {
+            hidden_interval
+        });
     }
 }
 
