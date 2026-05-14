@@ -1,11 +1,15 @@
-# Default to Windows MSVC target so cross-compilation from a non-Windows host
-# does the right thing. Override locally with --target if you need a different
-# triple. On a Windows host this is the native target and is a no-op.
-[build]
-target = "x86_64-pc-windows-msvc"
-
-# For developers on macOS/Linux: install the target with
-#   rustup target add x86_64-pc-windows-msvc
-# and use cargo-xwin (`cargo install cargo-xwin`) to provide the MSVC SDK, or
-# switch to the GNU target (`x86_64-pc-windows-gnu` + mingw-w64) by commenting
-# out the line above. See README for details.
+# Intentionally empty.
+#
+# We do NOT set `build.target` here even though we'd like Windows-MSVC to be
+# the default — doing so makes `cargo test` on macOS / Linux try to compile
+# the test binaries for Windows, and the host platform's std isn't installed
+# for that target. The CI Windows job and the cross-check job both pass
+# `--target` explicitly, which is the right discipline.
+#
+# Developer recipes:
+#   * On Windows:                cargo build / cargo test (uses native host)
+#   * Cross-check from macOS:    cargo check --target x86_64-pc-windows-gnu
+#   * Cross-build from macOS:    cargo install cargo-xwin
+#                                cargo xwin build --target x86_64-pc-windows-msvc
+#   * Run portable crates:       cargo test -p framesage-core -p framesage-ipc
+#                                              -p framesage-sim -p framesage-gamemode

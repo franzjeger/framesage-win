@@ -41,6 +41,7 @@ jobs:
         run: |
           cargo test \
             -p framesage-core \
+            -p framesage-gamemode \
             -p framesage-ipc \
             -p framesage-sim
       - name: framesage-sim demo (smoke)
