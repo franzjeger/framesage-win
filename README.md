@@ -148,13 +148,13 @@ Ctrl+C stops it.
 - [x] **Unit tests + GitHub Actions CI** (cross-check, native Windows build, clippy, rustfmt).
 - [x] **Game Mode**: hide taskbar, stop curated services, suspend curated processes, switch power plan. Crash-safe journal at `%ProgramData%\framesage\game-mode.journal`. Curated safe-list with explicit denylist for AV / anti-cheat / shell / kernel processes. `framesage game-mode off` panic button.
 - [x] **CPPC perf-rank readout** via `CallNtPowerInformation` → `PROCESSOR_POWER_INFORMATION`. Per-CPU `MaxMhz` is folded into `cppc_rank`, which is what `CpuSelector::TopRanked(N)` resolves against.
-- [x] **X3D/Cache CCD detection.** `CpuTopology::retag_ccds_from_ranks` looks at the per-CCD top rank and retags the slower CCD as `CoreKind::Cache` when the gap is ≥ 5% — that's the X3D / non-X3D split on dual-CCD AMD parts. Called automatically from `topology::detect()`.
-- [ ] **Background process enforcement.** Walk `CreateToolhelp32Snapshot` once per N seconds, apply `background_profile` to processes that don't match any rule.
-- [ ] **True tray icon** via the `tray-icon` crate, minimise-to-tray, autostart-tray.
-- [ ] **I/O priority** via `NtSetInformationProcess(ProcessIoPriority, …)`.
-- [ ] **Focus Assist** (Do Not Disturb) toggle for the duration of Game Mode.
-- [ ] **Pause Windows Update** during Game Mode.
-- [ ] **Pipe ACL** — split read-only status access (for an unprivileged tray) from admin-only control access.
+- [x] **X3D/Cache CCD detection.** `CpuTopology::retag_ccds_from_signals` uses per-CCD L3 cache size as the primary signal (X3D CCD's 96 MB vs non-X3D's 32 MB, a clean 3× ratio), with CPPC rank as a fallback for parts that don't expose asymmetric L3. Called automatically from `topology::detect()`.
+- [x] **Background process enforcement.** Engine's tick loop walks `CreateToolhelp32Snapshot` every 10 s and applies `Policy::background_profile` to every PID that isn't the foreground / our own / on the safe-list denylist.
+- [x] **True tray icon** via the `tray-icon` crate, minimise-to-tray, single-instance launch with admin-elevation handoff.
+- [x] **I/O priority** via `NtSetInformationProcess(ProcessIoPriority, …)`. Real implementation in `framesage-sys::io_priority`, wired into apply/revert. Round-trip test against the current process locks the NT signature.
+- [x] **Focus Assist** — rejected at plan time with `RejectionKind::NotImplemented` and surfaced in the tray UI. Microsoft hasn't shipped a documented user-mode API; the field stays in the serde schema for forward compatibility.
+- [x] **Pause Windows Update** during Game Mode. `windows_update::pause` writes the same `HKLM\SOFTWARE\Microsoft\WindowsUpdate\UX\Settings\PauseUpdates*` keys the Settings app uses, for a default one-hour window; `resume` deletes them.
+- [x] **Pipe ACL** — split read-only status access (for an unprivileged tray) from admin-only control access.
 
 ### v0.3 — the differentiators
 

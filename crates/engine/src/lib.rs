@@ -447,6 +447,15 @@ impl Engine {
             title: fg.title.clone(),
         };
 
+        // If the new foreground was already managed by us (most commonly via
+        // the background scan, e.g. user alt-tabbed back into a long-running
+        // browser), revert that record first. Without this step, the new
+        // apply would capture bg-modified state as `prev`, and an eventual
+        // revert would restore to bg-eco instead of kernel default.
+        if let Some(prev_record) = s.applied.remove(&fg.pid) {
+            revert_record(fg.pid, prev_record);
+        }
+
         // Per-process apply.
         match apply_profile(fg.pid, &profile, &topology) {
             Ok(record) => {
