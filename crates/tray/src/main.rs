@@ -19,8 +19,8 @@ use std::sync::{Arc, Mutex};
 use eframe::egui;
 
 use framesage_core::{
-    AppMatch, AppRule, CpuSelector, IoPriority, MemoryPriority, Policy, PowerThrottlingMode,
-    PriorityClass, Profile, ProfileId,
+    AppMatch, AppRule, CoreKind, CpuSelector, IoPriority, MemoryPriority, Policy,
+    PowerThrottlingMode, PriorityClass, Profile, ProfileId,
 };
 use framesage_ipc::{Event, ForegroundSnapshot, Request, Response, StatusSnapshot};
 #[cfg(windows)]
@@ -987,13 +987,14 @@ fn render_profile_editor(ui: &mut egui::Ui, p: &mut Profile) {
 
     ui.add_space(4.0);
     ui.group(|ui| {
-        ui.heading("Read-only (edit via policy.json — UI editors land in a follow-up)");
-        kv_row(ui, "cpu_sets", format_cpu_selector(p.cpu_sets.as_ref()));
-        kv_row(
-            ui,
-            "affinity_mask",
-            format_cpu_selector(p.affinity_mask.as_ref()),
-        );
+        ui.heading("CPU targeting (editable)");
+        cpu_selector_edit(ui, "cpu_sets", &mut p.cpu_sets);
+        cpu_selector_edit(ui, "affinity_mask", &mut p.affinity_mask);
+    });
+
+    ui.add_space(4.0);
+    ui.group(|ui| {
+        ui.heading("Game Mode (read-only — editor in a follow-up)");
         kv_row(
             ui,
             "game_mode",
@@ -1049,6 +1050,130 @@ fn format_cpu_selector(sel: Option<&CpuSelector>) -> String {
         Some(CpuSelector::TopRanked(n)) => format!("Top {n} by CPPC rank"),
         Some(CpuSelector::Mask(m)) => format!("Mask 0x{m:016x}"),
     }
+}
+
+/// Discriminant for a `Option<CpuSelector>` field, used to drive the
+/// kind-dropdown in `cpu_selector_edit`. Decoupled from `CpuSelector`
+/// itself so changing the kind doesn't require carrying the old
+/// variant's data around.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CpuSelectorKind {
+    Unset,
+    All,
+    Kind,
+    Ccd,
+    CcdNot,
+    TopRanked,
+    Mask,
+}
+
+impl CpuSelectorKind {
+    fn from_option(sel: Option<&CpuSelector>) -> Self {
+        match sel {
+            None => Self::Unset,
+            Some(CpuSelector::All) => Self::All,
+            Some(CpuSelector::Kind(_)) => Self::Kind,
+            Some(CpuSelector::Ccd(_)) => Self::Ccd,
+            Some(CpuSelector::CcdNot(_)) => Self::CcdNot,
+            Some(CpuSelector::TopRanked(_)) => Self::TopRanked,
+            Some(CpuSelector::Mask(_)) => Self::Mask,
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Unset => "<unset>",
+            Self::All => "All cores",
+            Self::Kind => "Kind (Performance/Efficiency/Cache)",
+            Self::Ccd => "CCD by index",
+            Self::CcdNot => "Everything except CCD",
+            Self::TopRanked => "Top N by CPPC rank",
+            Self::Mask => "Explicit bitmask",
+        }
+    }
+
+    /// Materialise a default `Option<CpuSelector>` for this discriminant.
+    /// When the user switches the dropdown to a new variant we lose the
+    /// previous variant's data — using a stable default for each kind is
+    /// less surprising than trying to coerce values across variants.
+    fn default_value(self) -> Option<CpuSelector> {
+        match self {
+            Self::Unset => None,
+            Self::All => Some(CpuSelector::All),
+            Self::Kind => Some(CpuSelector::Kind(CoreKind::Cache)),
+            Self::Ccd => Some(CpuSelector::Ccd(0)),
+            Self::CcdNot => Some(CpuSelector::CcdNot(1)),
+            Self::TopRanked => Some(CpuSelector::TopRanked(8)),
+            Self::Mask => Some(CpuSelector::Mask(0xffff)),
+        }
+    }
+}
+
+/// Two-cell edit widget for `Option<CpuSelector>`. Left cell is a label.
+/// Right cell is a kind-dropdown followed by a variant-specific value
+/// widget (CoreKind combo for Kind, DragValue for the numeric variants,
+/// hex text input for Mask).
+fn cpu_selector_edit(ui: &mut egui::Ui, label: &str, sel: &mut Option<CpuSelector>) {
+    ui.horizontal(|ui| {
+        ui.add_sized(
+            [150.0, 16.0],
+            egui::Label::new(egui::RichText::new(label).monospace().weak()),
+        );
+
+        let mut kind = CpuSelectorKind::from_option(sel.as_ref());
+        let prev_kind = kind;
+        egui::ComboBox::from_id_source(("cpu-selector-kind", label))
+            .selected_text(kind.label())
+            .show_ui(ui, |ui| {
+                for k in [
+                    CpuSelectorKind::Unset,
+                    CpuSelectorKind::All,
+                    CpuSelectorKind::Kind,
+                    CpuSelectorKind::Ccd,
+                    CpuSelectorKind::CcdNot,
+                    CpuSelectorKind::TopRanked,
+                    CpuSelectorKind::Mask,
+                ] {
+                    ui.selectable_value(&mut kind, k, k.label());
+                }
+            });
+        if kind != prev_kind {
+            *sel = kind.default_value();
+        }
+
+        // Variant-specific value widget. Mutates the contained data in
+        // place so the user sees their typing reflect immediately.
+        match sel {
+            None | Some(CpuSelector::All) => {}
+            Some(CpuSelector::Kind(k)) => {
+                egui::ComboBox::from_id_source(("cpu-selector-corekind", label))
+                    .selected_text(format!("{k:?}"))
+                    .show_ui(ui, |ui| {
+                        ui.selectable_value(k, CoreKind::Performance, "Performance");
+                        ui.selectable_value(k, CoreKind::Efficiency, "Efficiency");
+                        ui.selectable_value(k, CoreKind::Cache, "Cache");
+                    });
+            }
+            Some(CpuSelector::Ccd(c)) | Some(CpuSelector::CcdNot(c)) => {
+                ui.add(egui::DragValue::new(c).range(0..=15).speed(0.1));
+            }
+            Some(CpuSelector::TopRanked(n)) => {
+                ui.add(egui::DragValue::new(n).range(1..=128).speed(0.25));
+            }
+            Some(CpuSelector::Mask(m)) => {
+                // u128 isn't a DragValue primitive on egui 0.28. Render as a
+                // hex text field with parse-on-change; on bad input we keep
+                // the old value rather than zero out destructively.
+                let mut buf = format!("{m:#x}");
+                if ui.text_edit_singleline(&mut buf).changed() {
+                    let trimmed = buf.trim().trim_start_matches("0x");
+                    if let Ok(parsed) = u128::from_str_radix(trimmed, 16) {
+                        *m = parsed;
+                    }
+                }
+            }
+        }
+    });
 }
 
 // ─── Tray icon ───────────────────────────────────────────────────────────────
