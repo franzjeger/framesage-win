@@ -127,12 +127,19 @@ if ($LASTEXITCODE -ne 0) {
     exit 1
 }
 
-# --- Wipe stale policy -------------------------------------------------------
+# --- Preserve existing policy ------------------------------------------------
+# CRITICAL: never delete policy.json on update. It contains the user's rules,
+# profile customisations, and manual edits. The service will load whatever is
+# there; if the file is missing it bootstraps a fresh default policy on its
+# own. We only inform here; we don't touch the file. To intentionally wipe
+# the policy, the user runs `Remove-Item C:\ProgramData\framesage\policy.json`
+# themselves before re-installing.
 $policyPath = "C:\ProgramData\framesage\policy.json"
 if (Test-Path $policyPath) {
     Write-Host ""
-    Write-Host "[install] removing stale policy.json so the new defaults apply..." -ForegroundColor Cyan
-    Remove-Item -Force $policyPath
+    Write-Host "[install] keeping existing policy.json (your rules + profile edits)" -ForegroundColor Cyan
+    Write-Host "  $policyPath"
+    Write-Host "  delete it manually before re-running install.ps1 if you want fresh defaults"
 }
 
 Write-Host ""
