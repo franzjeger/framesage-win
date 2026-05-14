@@ -5,6 +5,7 @@
 //! these types onto Win32 APIs; `framesage-engine` decides which profile to
 //! apply based on observed state.
 
+pub mod paths;
 pub mod policy;
 pub mod profile;
 pub mod topology;

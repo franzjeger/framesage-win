@@ -35,8 +35,13 @@ pub enum Request {
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum Response {
     Ok,
-    Status(StatusSnapshot),
-    Error { message: String },
+    /// Boxed because `StatusSnapshot` carries the full `Policy` and dwarfs the
+    /// other variants — clippy enforces this so we don't blow the response
+    /// enum's stack footprint on every reply.
+    Status(Box<StatusSnapshot>),
+    Error {
+        message: String,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

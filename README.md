@@ -63,6 +63,7 @@ Crate layout:
 | [`framesage-service`](crates/service) | `framesage-svc.exe` — SCM-hosted service binary. |
 | [`framesage-cli`](crates/cli) | `framesage.exe` — install/uninstall, status, control. |
 | [`framesage-tray`](crates/tray) | `framesage-tray.exe` — egui monitoring window. |
+| [`framesage-sim`](crates/sim) | `framesage-sim.exe` — dev harness; resolves policy + topology against synthetic foreground events on any host. |
 
 ## Building
 
@@ -81,11 +82,19 @@ The default build target is `x86_64-pc-windows-msvc` (set in `.cargo/config.toml
 
 ### From macOS / Linux (cross-compile check)
 
-You can `cargo check` the platform-agnostic crates directly:
+You can `cargo check` and run tests on the platform-agnostic crates directly:
 
 ```sh
-cargo check -p framesage-core --target $(rustc -vV | sed -n 's/host: //p')
-cargo check -p framesage-ipc  --target $(rustc -vV | sed -n 's/host: //p')
+cargo test -p framesage-core -p framesage-ipc -p framesage-sim
+```
+
+And run the dev harness to see what the engine would decide on any host:
+
+```sh
+cargo run -p framesage-sim -- demo
+cargo run -p framesage-sim -- match bf6.exe
+cargo run -p framesage-sim -- --topology hybrid24 match bf6.exe
+cargo run -p framesage-sim -- topology
 ```
 
 For a full Windows cross-compile, the recommended path is [`cargo-xwin`](https://github.com/rust-cross/cargo-xwin) which downloads the Windows SDK on demand:
@@ -127,10 +136,12 @@ Ctrl+C stops it.
 
 ### v0.2
 
+- [x] **Policy file at `%ProgramData%\framesage\policy.json`**, hot-reloaded by the service. Bootstraps `Policy::default()` on first run.
+- [x] **Dev harness** (`framesage-sim`) for cross-platform iteration on rules, profiles, and selectors.
+- [x] **Unit tests + GitHub Actions CI** (cross-check, native Windows build, clippy, rustfmt).
 - [ ] **CPPC perf-rank readout** via `CallNtPowerInformation` → `PROCESSOR_POWER_INFORMATION`. Lets `CpuSelector::TopRanked(N)` actually pin to the fastest silicon on this specific chip.
 - [ ] **X3D/Cache CCD detection.** Use the CPPC rank distribution: on dual-CCD X3D parts the X3D CCD has lower max frequency.
 - [ ] **Background process enforcement.** Walk `CreateToolhelp32Snapshot` once per N seconds, apply `background_profile` to processes that don't match any rule.
-- [ ] **Policy file at `%ProgramData%\framesage\policy.json`**, hot-reloaded by the service.
 - [ ] **True tray icon** via the `tray-icon` crate, minimise-to-tray, autostart-tray.
 - [ ] **I/O priority** via `NtSetInformationProcess(ProcessIoPriority, …)`.
 - [ ] **Pipe ACL** — split read-only status access (for an unprivileged tray) from admin-only control access.

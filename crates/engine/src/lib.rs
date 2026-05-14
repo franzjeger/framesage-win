@@ -217,11 +217,7 @@ impl TickContext {
 }
 
 #[cfg(windows)]
-fn apply_profile(
-    pid: u32,
-    profile: &Profile,
-    topology: &CpuTopology,
-) -> Result<AppliedRecord> {
+fn apply_profile(pid: u32, profile: &Profile, topology: &CpuTopology) -> Result<AppliedRecord> {
     let state = framesage_sys::apply::apply(pid, profile, topology)?;
     Ok(AppliedRecord {
         profile_id: profile.id.clone(),

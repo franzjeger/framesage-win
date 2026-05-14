@@ -22,7 +22,7 @@
 
 use anyhow::{anyhow, Result};
 use windows::Win32::System::SystemInformation::{
-    GetLogicalProcessorInformationEx, LOGICAL_PROCESSOR_RELATIONSHIP, RelationProcessorCore,
+    GetLogicalProcessorInformationEx, RelationProcessorCore, LOGICAL_PROCESSOR_RELATIONSHIP,
     SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX,
 };
 
@@ -72,9 +72,7 @@ fn enumerate_cores() -> Result<Vec<PhysicalCore>> {
     // First call sizes the buffer.
     // SAFETY: passing a null ptr with a 0 size; documented to return
     // ERROR_INSUFFICIENT_BUFFER with the required size in `buf_size`.
-    let _ = unsafe {
-        GetLogicalProcessorInformationEx(RelationProcessorCore, None, &mut buf_size)
-    };
+    let _ = unsafe { GetLogicalProcessorInformationEx(RelationProcessorCore, None, &mut buf_size) };
     if buf_size == 0 {
         return Err(anyhow!(
             "GetLogicalProcessorInformationEx returned zero size"
@@ -114,9 +112,8 @@ fn enumerate_cores() -> Result<Vec<PhysicalCore>> {
             let mut logical = Vec::new();
             // SAFETY: GroupMask is a flexible array; we trust the
             // GroupCount-bounded slice given to us.
-            let groups = unsafe {
-                std::slice::from_raw_parts(proc_info.GroupMask.as_ptr(), group_count)
-            };
+            let groups =
+                unsafe { std::slice::from_raw_parts(proc_info.GroupMask.as_ptr(), group_count) };
             for g in groups {
                 if g.Group != 0 {
                     continue; // multi-group not yet supported

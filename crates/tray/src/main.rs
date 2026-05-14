@@ -158,10 +158,10 @@ fn try_connect_and_serve(state: Arc<Mutex<AppState>>) -> anyhow::Result<()> {
     writer.flush()?;
     let mut line = String::new();
     reader.read_line(&mut line)?;
-    if let Ok(resp) = serde_json::from_str::<framesage_ipc::Response>(&line) {
-        if let framesage_ipc::Response::Status(snap) = resp {
-            state.lock().unwrap().status = Some(snap);
-        }
+    if let Ok(framesage_ipc::Response::Status(snap)) =
+        serde_json::from_str::<framesage_ipc::Response>(&line)
+    {
+        state.lock().unwrap().status = Some(*snap);
     }
 
     // Then subscribe to events.
@@ -174,7 +174,10 @@ fn try_connect_and_serve(state: Arc<Mutex<AppState>>) -> anyhow::Result<()> {
     while reader.read_line(&mut line)? > 0 {
         if let Ok(event) = serde_json::from_str::<framesage_ipc::Event>(&line) {
             let label = match &event {
-                Event::ForegroundChanged { foreground, profile } => format!(
+                Event::ForegroundChanged {
+                    foreground,
+                    profile,
+                } => format!(
                     "{} → {} (pid {})",
                     foreground.exe_name, profile, foreground.pid
                 ),

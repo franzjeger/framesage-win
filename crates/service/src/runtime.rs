@@ -2,15 +2,16 @@
 //! loop, and shuts them down cleanly when the SCM (or Ctrl+C in console mode)
 //! signals stop.
 
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::sync::oneshot;
-use tracing::{debug, error, info};
+use tracing::{debug, error, info, warn};
 
-use framesage_core::Policy;
+use framesage_core::{paths, Policy};
 use framesage_engine::Engine;
 use framesage_ipc::{Event, Request, Response, PIPE_NAME};
 
@@ -29,11 +30,13 @@ pub fn run_blocking(shutdown: oneshot::Receiver<()>) -> Result<()> {
 /// Async entry point. Used in console mode (`--console`) where the caller
 /// already has a runtime.
 pub async fn run(shutdown: oneshot::Receiver<()>) -> Result<()> {
-    let policy = load_policy().unwrap_or_default();
+    let policy_path = paths::policy_path();
+    let policy = load_policy_or_default(&policy_path);
     let topology = detect_topology()?;
     info!(
         cpus = topology.count(),
         rules = policy.rules.len(),
+        path = %policy_path.display(),
         "framesage engine starting"
     );
 
@@ -57,18 +60,102 @@ pub async fn run(shutdown: oneshot::Receiver<()>) -> Result<()> {
         }
     });
 
+    let reload_engine = engine.clone();
+    let reload_path = policy_path.clone();
+    let reload_handle = tokio::spawn(async move {
+        if let Err(e) = watch_policy(reload_path, reload_engine).await {
+            warn!(error = %e, "policy watcher stopped");
+        }
+    });
+
     // Wait for shutdown. We don't try to drain in-flight IPC connections —
     // they get cancelled when the task is dropped.
     let _ = shutdown.await;
     info!("shutdown requested");
     tick_handle.abort();
     ipc_handle.abort();
+    reload_handle.abort();
     Ok(())
 }
 
-fn load_policy() -> Option<Policy> {
-    // TODO(v0.2): load from %ProgramData%\framesage\policy.json.
-    None
+fn load_policy_or_default(path: &std::path::Path) -> Policy {
+    match Policy::load_or_create_default(path) {
+        Ok(p) => p,
+        Err(e) => {
+            warn!(
+                error = %e,
+                "failed to load or create policy file — using built-in defaults (not persisted)"
+            );
+            Policy::default()
+        }
+    }
+}
+
+/// File-system watcher that hot-reloads the policy when `policy.json` changes
+/// on disk. Debounces bursts: editors (VS Code, Notepad) often emit several
+/// events for a single save. We coalesce by collecting events into a 250 ms
+/// window and applying at most once per window.
+async fn watch_policy(path: PathBuf, engine: Arc<Engine>) -> Result<()> {
+    use notify::{RecommendedWatcher, RecursiveMode, Watcher};
+
+    let dir = path
+        .parent()
+        .ok_or_else(|| anyhow::anyhow!("policy path has no parent"))?
+        .to_path_buf();
+
+    // notify's callback runs on its own thread; bridge into tokio via an
+    // unbounded mpsc channel.
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<()>();
+    let tx_clone = tx.clone();
+    let mut watcher: RecommendedWatcher =
+        notify::recommended_watcher(move |res: notify::Result<notify::Event>| match res {
+            Ok(_event) => {
+                let _ = tx_clone.send(());
+            }
+            Err(e) => debug!(error = %e, "notify error"),
+        })
+        .context("create watcher")?;
+
+    watcher
+        .watch(&dir, RecursiveMode::NonRecursive)
+        .with_context(|| format!("watch {}", dir.display()))?;
+
+    info!(path = %path.display(), "policy hot-reload watcher active");
+
+    loop {
+        // Block for the first event…
+        if rx.recv().await.is_none() {
+            break;
+        }
+        // …then drain any further events for 250 ms (coalesce).
+        let debounce = tokio::time::sleep(Duration::from_millis(250));
+        tokio::pin!(debounce);
+        loop {
+            tokio::select! {
+                _ = &mut debounce => break,
+                Some(_) = rx.recv() => continue,
+            }
+        }
+        // Only reload if the target file actually exists. Other files in the
+        // dir change (e.g. tmp swap files) — ignore those, we just react to
+        // any signal as a hint to re-check.
+        if !path.exists() {
+            continue;
+        }
+        match Policy::load(&path) {
+            Ok(new_policy) => {
+                info!(
+                    rules = new_policy.rules.len(),
+                    profiles = new_policy.profiles.len(),
+                    "policy reloaded"
+                );
+                engine.set_policy(new_policy);
+            }
+            Err(e) => warn!(error = %e, "policy reload failed; keeping previous"),
+        }
+    }
+    drop(watcher); // keep alive until the loop exits
+    Ok(())
 }
 
 #[cfg(windows)]
@@ -122,10 +209,7 @@ async fn serve_ipc(engine: Arc<Engine>) -> Result<()> {
             .create(PIPE_NAME)
             .with_context(|| format!("create named pipe {PIPE_NAME}"))?;
 
-        server
-            .connect()
-            .await
-            .context("accept named pipe client")?;
+        server.connect().await.context("accept named pipe client")?;
 
         let engine = engine.clone();
         tokio::spawn(async move {
@@ -174,7 +258,7 @@ async fn handle_client(
         match req {
             Request::Status => {
                 let snap = engine.status();
-                write_response(&mut write_half, &Response::Status(snap)).await?;
+                write_response(&mut write_half, &Response::Status(Box::new(snap))).await?;
             }
             Request::SetPolicy { policy } => {
                 engine.set_policy(policy);

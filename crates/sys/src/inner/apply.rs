@@ -16,13 +16,13 @@ use windows::Win32::System::SystemInformation::{
 };
 use windows::Win32::System::Threading::{
     GetPriorityClass, GetProcessAffinityMask, GetProcessInformation, OpenProcess,
-    SetPriorityClass, SetProcessAffinityMask, SetProcessDefaultCpuSets, SetProcessInformation,
-    ABOVE_NORMAL_PRIORITY_CLASS, BELOW_NORMAL_PRIORITY_CLASS, HIGH_PRIORITY_CLASS,
-    IDLE_PRIORITY_CLASS, MEMORY_PRIORITY, MEMORY_PRIORITY_INFORMATION, NORMAL_PRIORITY_CLASS,
-    PROCESS_CREATION_FLAGS, PROCESS_POWER_THROTTLING_CURRENT_VERSION,
-    PROCESS_POWER_THROTTLING_EXECUTION_SPEED, PROCESS_POWER_THROTTLING_STATE,
-    PROCESS_QUERY_INFORMATION, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SET_INFORMATION,
-    PROCESS_SET_LIMITED_INFORMATION, ProcessMemoryPriority, ProcessPowerThrottling,
+    ProcessMemoryPriority, ProcessPowerThrottling, SetPriorityClass, SetProcessAffinityMask,
+    SetProcessDefaultCpuSets, SetProcessInformation, ABOVE_NORMAL_PRIORITY_CLASS,
+    BELOW_NORMAL_PRIORITY_CLASS, HIGH_PRIORITY_CLASS, IDLE_PRIORITY_CLASS, MEMORY_PRIORITY,
+    MEMORY_PRIORITY_INFORMATION, NORMAL_PRIORITY_CLASS, PROCESS_CREATION_FLAGS,
+    PROCESS_POWER_THROTTLING_CURRENT_VERSION, PROCESS_POWER_THROTTLING_EXECUTION_SPEED,
+    PROCESS_POWER_THROTTLING_STATE, PROCESS_QUERY_INFORMATION, PROCESS_QUERY_LIMITED_INFORMATION,
+    PROCESS_SET_INFORMATION, PROCESS_SET_LIMITED_INFORMATION,
 };
 
 use framesage_core::{
@@ -62,13 +62,13 @@ pub fn apply(pid: u32, profile: &Profile, topology: &CpuTopology) -> Result<Appl
     }
 
     if let Some(mode) = profile.power_throttling {
-        state.prev_power_throttling = Some(get_power_throttling(handle).unwrap_or_else(|_| {
+        state.prev_power_throttling = Some(get_power_throttling(handle).unwrap_or(
             PROCESS_POWER_THROTTLING_STATE {
                 Version: PROCESS_POWER_THROTTLING_CURRENT_VERSION,
                 ControlMask: 0,
                 StateMask: 0,
-            }
-        }));
+            },
+        ));
         set_power_throttling(handle, mode).context("set power throttling")?;
     }
 
@@ -322,9 +322,7 @@ fn cpuset_ids_for_indices(indices: &[u32]) -> Result<Vec<u32>> {
     // First call sizes the buffer.
     // SAFETY: null buffer + 0 size returns ERROR_INSUFFICIENT_BUFFER and sets
     // the required size. We deliberately ignore the result and read the size.
-    let _ = unsafe {
-        GetSystemCpuSetInformation(None, 0, &mut buf_size, None, 0)
-    };
+    let _ = unsafe { GetSystemCpuSetInformation(None, 0, &mut buf_size, None, 0) };
     if buf_size == 0 {
         return Err(anyhow!(
             "GetSystemCpuSetInformation returned zero buffer size"
@@ -349,9 +347,7 @@ fn cpuset_ids_for_indices(indices: &[u32]) -> Result<Vec<u32>> {
     let mut offset = 0usize;
     while offset + size_of::<SYSTEM_CPU_SET_INFORMATION>() <= buf_size as usize {
         // SAFETY: offset is in bounds.
-        let info = unsafe {
-            &*(buf.as_ptr().add(offset) as *const SYSTEM_CPU_SET_INFORMATION)
-        };
+        let info = unsafe { &*(buf.as_ptr().add(offset) as *const SYSTEM_CPU_SET_INFORMATION) };
         let size = info.Size as usize;
         if size == 0 {
             break;

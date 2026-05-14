@@ -91,11 +91,14 @@ impl CpuTopology {
             CpuSelector::TopRanked(n) => {
                 let mut ranked: Vec<&LogicalCpu> =
                     self.cpus.iter().filter(|c| c.cppc_rank.is_some()).collect();
-                // Higher rank first; SMT siblings deprioritised so we prefer physical cores.
+                // Primary physical cores first (all of them), then SMT siblings,
+                // each group ordered by CPPC rank descending. Critical for games:
+                // 4 distinct cores beat 2 cores' SMT siblings even when ranks
+                // overlap.
                 ranked.sort_by(|a, b| {
-                    b.cppc_rank
-                        .cmp(&a.cppc_rank)
-                        .then(a.is_smt_sibling.cmp(&b.is_smt_sibling))
+                    a.is_smt_sibling
+                        .cmp(&b.is_smt_sibling)
+                        .then(b.cppc_rank.cmp(&a.cppc_rank))
                 });
                 ranked
                     .into_iter()
@@ -115,10 +118,15 @@ impl CpuTopology {
 /// Stored in profiles instead of raw masks so a profile authored on one machine
 /// (e.g. "use the X3D CCD") still does the right thing on another machine with
 /// a different topology.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(tag = "kind", rename_all = "snake_case")]
+///
+/// JSON wire format uses adjacent tagging (`{"type": "...", "value": ...}`) so
+/// newtype variants serialise cleanly. Internally tagged would force struct
+/// variants, which we don't need.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "type", content = "value", rename_all = "snake_case")]
 pub enum CpuSelector {
     /// All logical processors.
+    #[default]
     All,
     /// Cores of a given kind (Performance, Efficiency, Cache).
     Kind(CoreKind),
@@ -132,8 +140,118 @@ pub enum CpuSelector {
     Mask(u128),
 }
 
-impl Default for CpuSelector {
-    fn default() -> Self {
-        Self::All
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 8-core / 16-thread dual-CCD synthetic chip: CCD 0 is the X3D / Cache
+    /// side (4 cores, lower top CPPC rank); CCD 1 is the non-X3D Performance
+    /// side (4 cores, higher top rank). SMT siblings interleaved per physical
+    /// core. Used by tests below — chosen to look like a Ryzen 7950X3D.
+    fn x3d_dual_ccd() -> CpuTopology {
+        let mut cpus = Vec::new();
+        for core in 0..8u32 {
+            let ccd: u8 = if core < 4 { 0 } else { 1 };
+            let kind = if ccd == 0 {
+                CoreKind::Cache
+            } else {
+                CoreKind::Performance
+            };
+            // Cache CCD has lower top rank than Performance CCD — that's the
+            // signal a real CPPC readout would give us.
+            let base_rank = if ccd == 0 { 80 } else { 120 };
+            for smt in 0..2u32 {
+                cpus.push(LogicalCpu {
+                    index: core * 2 + smt,
+                    physical_core: core,
+                    ccd,
+                    kind,
+                    cppc_rank: Some(base_rank - (core % 4)),
+                    is_smt_sibling: smt == 1,
+                });
+            }
+        }
+        CpuTopology { cpus }
+    }
+
+    #[test]
+    fn resolve_all_returns_every_thread() {
+        let topo = x3d_dual_ccd();
+        let resolved = topo.resolve(&CpuSelector::All);
+        assert_eq!(resolved.len(), 16);
+        assert_eq!(resolved.first().copied(), Some(0));
+        assert_eq!(resolved.last().copied(), Some(15));
+    }
+
+    #[test]
+    fn resolve_cache_picks_only_x3d_ccd() {
+        let topo = x3d_dual_ccd();
+        let resolved = topo.resolve(&CpuSelector::Kind(CoreKind::Cache));
+        // 4 cores * 2 SMT = 8 threads on CCD 0.
+        assert_eq!(resolved, vec![0, 1, 2, 3, 4, 5, 6, 7]);
+    }
+
+    #[test]
+    fn resolve_ccd_zero_and_ccd_not_zero_partition_the_machine() {
+        let topo = x3d_dual_ccd();
+        let on = topo.resolve(&CpuSelector::Ccd(0));
+        let off = topo.resolve(&CpuSelector::CcdNot(0));
+        assert_eq!(on.len() + off.len(), 16);
+        assert!(on.iter().all(|i| !off.contains(i)));
+    }
+
+    #[test]
+    fn resolve_top_ranked_prefers_physical_cores_over_smt_siblings() {
+        let topo = x3d_dual_ccd();
+        // Top 4 ranked threads: the Performance CCD has higher rank than the
+        // Cache CCD; within each physical core, the non-SMT-sibling wins ties.
+        let top4 = topo.resolve(&CpuSelector::TopRanked(4));
+        assert_eq!(top4.len(), 4);
+        // All 4 should be on the Performance CCD (cores 4..=7 → indices 8..=15).
+        for idx in &top4 {
+            let cpu = topo.cpus.iter().find(|c| c.index == *idx).unwrap();
+            assert_eq!(cpu.kind, CoreKind::Performance);
+        }
+        // And none should be SMT siblings (the tie-breaker we documented).
+        for idx in &top4 {
+            let cpu = topo.cpus.iter().find(|c| c.index == *idx).unwrap();
+            assert!(
+                !cpu.is_smt_sibling,
+                "TopRanked picked an SMT sibling over a physical core"
+            );
+        }
+    }
+
+    #[test]
+    fn resolve_mask_picks_only_set_bits() {
+        let topo = x3d_dual_ccd();
+        // Bits 0, 2, 4, 6 → first four even logical indices.
+        let mask: u128 = 0b0101_0101;
+        let resolved = topo.resolve(&CpuSelector::Mask(mask));
+        assert_eq!(resolved, vec![0, 2, 4, 6]);
+    }
+
+    #[test]
+    fn ccds_iterator_dedups_and_orders() {
+        let topo = x3d_dual_ccd();
+        let ccds: Vec<u8> = topo.ccds().collect();
+        assert_eq!(ccds, vec![0, 1]);
+    }
+
+    #[test]
+    fn cpu_selector_roundtrips_through_json() {
+        let cases = vec![
+            CpuSelector::All,
+            CpuSelector::Kind(CoreKind::Cache),
+            CpuSelector::Ccd(1),
+            CpuSelector::CcdNot(0),
+            CpuSelector::TopRanked(4),
+            CpuSelector::Mask(0xCAFE),
+        ];
+        for sel in cases {
+            let json = serde_json::to_string(&sel).expect("serialize");
+            let parsed: CpuSelector = serde_json::from_str(&json).expect("deserialize");
+            assert_eq!(sel, parsed, "round-trip mismatch via {json}");
+        }
     }
 }

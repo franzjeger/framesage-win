@@ -11,7 +11,7 @@ use crate::topology::CpuSelector;
 
 /// Stable identifier for a profile inside a `Policy`. UTF-8 string, opaque to
 /// the engine but human-readable for log lines and CLI output.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct ProfileId(pub String);
 
 impl From<&str> for ProfileId {
@@ -132,11 +132,5 @@ impl Profile {
             id: id.into(),
             ..Default::default()
         }
-    }
-}
-
-impl Default for ProfileId {
-    fn default() -> Self {
-        ProfileId(String::new())
     }
 }
