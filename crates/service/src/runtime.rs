@@ -352,6 +352,42 @@ async fn handle_client(
                     }
                 }
             }
+            Request::SuspendProcess { pid } => match engine.suspend_process(pid) {
+                Ok(()) => write_response(&mut write_half, &Response::Ok).await?,
+                Err(e) => {
+                    write_response(
+                        &mut write_half,
+                        &Response::Error {
+                            message: format!("suspend_process(pid={pid}) failed: {e:#}"),
+                        },
+                    )
+                    .await?;
+                }
+            },
+            Request::ResumeProcess { pid } => match engine.resume_process(pid) {
+                Ok(()) => write_response(&mut write_half, &Response::Ok).await?,
+                Err(e) => {
+                    write_response(
+                        &mut write_half,
+                        &Response::Error {
+                            message: format!("resume_process(pid={pid}) failed: {e:#}"),
+                        },
+                    )
+                    .await?;
+                }
+            },
+            Request::TerminateProcess { pid } => match engine.terminate_process(pid) {
+                Ok(()) => write_response(&mut write_half, &Response::Ok).await?,
+                Err(e) => {
+                    write_response(
+                        &mut write_half,
+                        &Response::Error {
+                            message: format!("terminate_process(pid={pid}) failed: {e:#}"),
+                        },
+                    )
+                    .await?;
+                }
+            },
             Request::SetPolicy { policy } => {
                 // Apply in-memory first so subsequent ticks see the change
                 // immediately, then persist to disk so the edit survives

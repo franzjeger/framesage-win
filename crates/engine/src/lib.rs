@@ -298,6 +298,61 @@ impl Engine {
         Ok(())
     }
 
+    /// Freeze every thread of `pid` via `NtSuspendProcess`. Mirrors what
+    /// the Game Mode `suspend_processes` plan does, but as a one-shot for
+    /// the Processes-tab right-click. Errors bubble back to the caller
+    /// (the service translates into a `Response::Error`) so the user sees
+    /// the reason — usually "PID is protected" or "PID exited".
+    pub fn suspend_process(&self, pid: u32) -> Result<()> {
+        #[cfg(windows)]
+        {
+            framesage_sys::process_actions::suspend(pid)?;
+        }
+        #[cfg(not(windows))]
+        {
+            let _ = pid;
+        }
+        Ok(())
+    }
+
+    /// Release a previous suspend via `NtResumeProcess`. Safe on processes
+    /// that aren't currently suspended (kernel returns success).
+    pub fn resume_process(&self, pid: u32) -> Result<()> {
+        #[cfg(windows)]
+        {
+            framesage_sys::process_actions::resume(pid)?;
+        }
+        #[cfg(not(windows))]
+        {
+            let _ = pid;
+        }
+        Ok(())
+    }
+
+    /// Hard kill via `TerminateProcess(handle, 1)`. The tray confirms the
+    /// user's intent before the request reaches us; the engine performs
+    /// no further confirmation. Also strips our internal bookkeeping for
+    /// the PID so a stale row doesn't haunt the next reconcile.
+    pub fn terminate_process(&self, pid: u32) -> Result<()> {
+        #[cfg(windows)]
+        {
+            framesage_sys::process_actions::terminate(pid)?;
+        }
+        #[cfg(not(windows))]
+        {
+            let _ = pid;
+        }
+        let mut s = self.state.write();
+        s.applied.remove(&pid);
+        s.probalance_restrained.remove(&pid);
+        s.probalance_prev_samples.remove(&pid);
+        s.list_processes_prev_samples.remove(&pid);
+        if s.current_foreground == Some(pid) {
+            s.current_foreground = None;
+        }
+        Ok(())
+    }
+
     pub fn status(&self) -> StatusSnapshot {
         let s = self.state.read();
         let active_profile = s

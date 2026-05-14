@@ -139,6 +139,14 @@ impl Default for ProcessesView {
     }
 }
 
+/// State for the "are you sure?" modal that gates Terminate. Persisted on
+/// `FramesageApp` so a re-render keeps the dialog open until the user
+/// resolves it; cleared on Cancel or after the Confirm fires the IPC.
+struct TerminateConfirm {
+    pid: u32,
+    exe_name: String,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ProcessSortKey {
     ExeName,
@@ -280,6 +288,10 @@ struct FramesageApp {
     profiles: ProfilesEditor,
     /// Processes-tab live view + UI state (filter, sort).
     processes: ProcessesView,
+    /// `Some` while the Terminate confirmation modal is open. Setting this
+    /// from a context-menu click opens the modal; the modal's Confirm /
+    /// Cancel buttons clear it and (for Confirm) fire the IPC.
+    terminate_confirm: Option<TerminateConfirm>,
     /// Per-exe icon cache, populated lazily as rows render. Lives outside
     /// `ProcessesView` because the egui textures it holds want to be reused
     /// across tab switches (cheaper than re-extracting on tab return).
@@ -347,6 +359,7 @@ impl FramesageApp {
             rules: RulesEditor::default(),
             profiles: ProfilesEditor::default(),
             processes: ProcessesView::default(),
+            terminate_confirm: None,
             #[cfg(windows)]
             icons: icons::IconCache::new(),
             #[cfg(windows)]
@@ -596,10 +609,76 @@ impl eframe::App for FramesageApp {
             ui.set_max_width(MAX_CONTENT_WIDTH);
             self.render_active_tab(ctx, ui, &status_snapshot, &recent_events);
         });
+
+        // Modal: Terminate confirmation. Renders on top of every panel; the
+        // surrounding UI keeps drawing so the user can still see the row
+        // they're about to kill. `Window` is the standard egui pattern for
+        // a transient modal-ish overlay.
+        self.render_terminate_confirm_modal(ctx);
     }
 }
 
 impl FramesageApp {
+    /// "Are you sure?" modal that gates `TerminateProcess`. Renders a small
+    /// fixed-size window centered on the screen. Cancel closes without
+    /// firing the IPC; Confirm fires `Request::TerminateProcess` and the
+    /// engine kills the process with exit code 1.
+    fn render_terminate_confirm_modal(&mut self, ctx: &egui::Context) {
+        let Some(pending) = &self.terminate_confirm else {
+            return;
+        };
+        let pid = pending.pid;
+        let exe_name = pending.exe_name.clone();
+
+        // Two output flags so we can drop the borrow before mutating self.
+        let mut do_confirm = false;
+        let mut do_cancel = false;
+
+        let title = "Terminate process?";
+        egui::Window::new(title)
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+            .default_width(380.0)
+            .show(ctx, |ui| {
+                ui.add_space(4.0);
+                ui.colored_label(
+                    theme::ERROR,
+                    egui::RichText::new("This is a hard kill.").strong(),
+                );
+                ui.add_space(2.0);
+                ui.label(format!(
+                    "FrameSage will call TerminateProcess on {exe_name} (pid {pid}). \
+                     The process has no chance to save state. If it owns unsaved \
+                     work or is a system process you'll see immediate side effects."
+                ));
+                ui.add_space(10.0);
+                ui.horizontal(|ui| {
+                    if ui.button("Cancel").clicked() {
+                        do_cancel = true;
+                    }
+                    ui.add_space(4.0);
+                    if ui
+                        .add(egui::Button::new(
+                            egui::RichText::new("Terminate")
+                                .color(theme::ERROR)
+                                .strong(),
+                        ))
+                        .clicked()
+                    {
+                        do_confirm = true;
+                    }
+                });
+            });
+
+        if do_confirm {
+            self.send_admin_request(Request::TerminateProcess { pid }, "terminate process");
+            self.terminate_confirm = None;
+        } else if do_cancel {
+            self.terminate_confirm = None;
+        }
+    }
+
     /// Render the menu bar. Items dispatch to the same `send_admin_request`
     /// helper the toolbar uses, or to a small set of shell-out helpers
     /// (`open_in_shell`) for file/folder/URL launches. View → tab items
@@ -2247,6 +2326,29 @@ impl FramesageApp {
                                                 }
                                             }
                                         });
+                                        ui.separator();
+                                        if ui.button("Suspend process").clicked() {
+                                            action_queue.push(ProcessAction::Suspend { pid });
+                                            ui.close_menu();
+                                        }
+                                        if ui.button("Resume process").clicked() {
+                                            action_queue.push(ProcessAction::Resume { pid });
+                                            ui.close_menu();
+                                        }
+                                        ui.separator();
+                                        if ui
+                                            .add(egui::Button::new(
+                                                egui::RichText::new("Terminate process…")
+                                                    .color(theme::ERROR),
+                                            ))
+                                            .clicked()
+                                        {
+                                            action_queue.push(ProcessAction::RequestTerminate {
+                                                pid,
+                                                exe_name: exe.clone(),
+                                            });
+                                            ui.close_menu();
+                                        }
                                     });
                                 }); // ui.horizontal (tree indent + name)
                             });
@@ -2529,6 +2631,17 @@ impl FramesageApp {
                         }
                     }
                 }
+                ProcessAction::Suspend { pid } => {
+                    self.send_admin_request(Request::SuspendProcess { pid }, "suspend process");
+                }
+                ProcessAction::Resume { pid } => {
+                    self.send_admin_request(Request::ResumeProcess { pid }, "resume process");
+                }
+                ProcessAction::RequestTerminate { pid, exe_name } => {
+                    // Don't fire the IPC yet — open the confirm modal first.
+                    // The modal's "Confirm" click is what actually terminates.
+                    self.terminate_confirm = Some(TerminateConfirm { pid, exe_name });
+                }
             }
         }
     }
@@ -2564,9 +2677,31 @@ impl FramesageApp {
 /// Pending context-menu click captured during the render pass; dispatched
 /// after the render closure releases its borrow on `self`.
 enum ProcessAction {
-    SetPriority { pid: u32, class: PriorityClass },
-    ApplyProfileForeground { profile: String },
-    CreateRule { exe_name: String, profile: String },
+    SetPriority {
+        pid: u32,
+        class: PriorityClass,
+    },
+    ApplyProfileForeground {
+        profile: String,
+    },
+    CreateRule {
+        exe_name: String,
+        profile: String,
+    },
+    Suspend {
+        pid: u32,
+    },
+    Resume {
+        pid: u32,
+    },
+    /// Opens the Terminate confirmation modal — DOES NOT directly send the
+    /// IPC. The modal's "Confirm" button is what fires the actual request.
+    /// Captured separately from `Suspend` / `Resume` because we never want
+    /// a misclick to nuke a process.
+    RequestTerminate {
+        pid: u32,
+        exe_name: String,
+    },
 }
 
 /// (display label, enum value) pairs used by the per-row priority submenu.
@@ -2960,6 +3095,24 @@ fn render_process_detail(
                     }
                 }
             });
+            ui.separator();
+            if ui.button("Suspend").clicked() {
+                action_queue.push(ProcessAction::Suspend { pid });
+            }
+            if ui.button("Resume").clicked() {
+                action_queue.push(ProcessAction::Resume { pid });
+            }
+            if ui
+                .add(egui::Button::new(
+                    egui::RichText::new("Terminate…").color(theme::ERROR),
+                ))
+                .clicked()
+            {
+                action_queue.push(ProcessAction::RequestTerminate {
+                    pid,
+                    exe_name: exe.clone(),
+                });
+            }
         });
     });
 }
