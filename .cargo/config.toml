@@ -1,0 +1,11 @@
+# Default to Windows MSVC target so cross-compilation from a non-Windows host
+# does the right thing. Override locally with --target if you need a different
+# triple. On a Windows host this is the native target and is a no-op.
+[build]
+target = "x86_64-pc-windows-msvc"
+
+# For developers on macOS/Linux: install the target with
+#   rustup target add x86_64-pc-windows-msvc
+# and use cargo-xwin (`cargo install cargo-xwin`) to provide the MSVC SDK, or
+# switch to the GNU target (`x86_64-pc-windows-gnu` + mingw-w64) by commenting
+# out the line above. See README for details.

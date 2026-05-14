@@ -1,0 +1,14 @@
+                                 Apache License
+                           Version 2.0, January 2004
+                        http://www.apache.org/licenses/
+
+This project is dual-licensed under the Apache License 2.0 and the MIT License,
+at your option. See LICENSE-APACHE and LICENSE-MIT for full text. By
+contributing to this repository, you agree that your contributions will be
+licensed under both licenses.
+
+Until LICENSE-APACHE and LICENSE-MIT files are added, this file serves as
+notice that the project is intended to be Apache-2.0 OR MIT dual-licensed,
+matching common Rust ecosystem practice.
+
+Copyright (c) 2026 Frank Lia and framesage-win contributors
