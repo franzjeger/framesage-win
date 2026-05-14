@@ -15,6 +15,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
     GetForegroundWindow, GetWindowTextLengthW, GetWindowTextW, GetWindowThreadProcessId,
 };
 
+#[derive(Debug, Clone)]
 pub struct ForegroundInfo {
     pub pid: u32,
     pub exe_name: String,

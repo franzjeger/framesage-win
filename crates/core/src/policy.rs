@@ -78,6 +78,60 @@ pub struct Policy {
     /// means snappier response to focus changes, higher means less overhead.
     #[serde(default = "Policy::default_tick_ms")]
     pub tick_ms: u64,
+
+    /// Dynamic-priority contention management. When the system is under heavy
+    /// CPU load AND a non-foreground process is the top consumer, temporarily
+    /// lower its priority class one step so the foreground app gets the CPU.
+    /// Restore after a quiet dwell window. Disabled by default — opt in via
+    /// policy.
+    #[serde(default)]
+    pub probalance: ProBalanceConfig,
+}
+
+/// Tunables for dynamic priority management. Modeled after Process Lasso's
+/// ProBalance feature — clean-room reimplementation from public docs and
+/// observed behavior. Defaults to disabled until the user opts in.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ProBalanceConfig {
+    /// Master switch. `false` (default) means the engine does nothing in this
+    /// area — no sampling, no decisions, zero overhead.
+    pub enabled: bool,
+
+    /// System-wide CPU utilisation, expressed as a percentage of total
+    /// across all logical processors, above which we consider the machine
+    /// "under contention" and become eligible to restrain background hogs.
+    /// 75 is a sensible default — below this the system has slack and there's
+    /// nothing to fix.
+    pub system_cpu_threshold_percent: u8,
+
+    /// A single non-foreground process must be consuming at least this much
+    /// of one logical CPU (i.e. "100" means one fully-busy thread) to be
+    /// considered a hog worth restraining. Prevents twitchy restraint of
+    /// processes that briefly spike.
+    pub hog_cpu_threshold_percent: u16,
+
+    /// Minimum dwell, milliseconds, that a process stays restrained before
+    /// we'll even consider restoring it. Avoids ping-ponging the priority
+    /// class on borderline-busy processes.
+    pub min_restrain_ms: u64,
+
+    /// Process names (case-insensitive, no path) that ProBalance never
+    /// touches. Beyond the system-critical denylist enforced internally,
+    /// this is the user's escape hatch.
+    #[serde(default)]
+    pub ignore_processes: Vec<String>,
+}
+
+impl Default for ProBalanceConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            system_cpu_threshold_percent: 75,
+            hog_cpu_threshold_percent: 50,
+            min_restrain_ms: 1500,
+            ignore_processes: Vec::new(),
+        }
+    }
 }
 
 impl Policy {
@@ -102,12 +156,18 @@ impl Policy {
     /// Read a policy from disk. Errors if the file doesn't exist or fails to
     /// parse — for "load if exists, otherwise default" semantics use
     /// `load_or_create_default`.
+    ///
+    /// Tolerates a leading UTF-8 BOM (`EF BB BF`). PowerShell 5.1's
+    /// `Set-Content -Encoding UTF8` always emits one, so any admin editing
+    /// `policy.json` from the shipped Windows shell will produce a BOMed
+    /// file. `serde_json` rejects BOMed input by spec, so we strip it here.
     pub fn load(path: &Path) -> Result<Self, PolicyError> {
         let bytes = std::fs::read(path).map_err(|e| PolicyError::Io {
             path: path.display().to_string(),
             source: e,
         })?;
-        serde_json::from_slice(&bytes).map_err(|e| PolicyError::Parse {
+        let body = bytes.strip_prefix(b"\xEF\xBB\xBF").unwrap_or(&bytes);
+        serde_json::from_slice(body).map_err(|e| PolicyError::Parse {
             path: path.display().to_string(),
             source: e,
         })
@@ -216,6 +276,9 @@ impl Default for Policy {
             power_throttling: Some(PowerThrottlingMode::Performance),
             priority_class: Some(PriorityClass::AboveNormal),
             io_priority: Some(IoPriority::High),
+            // The pin sticks for the lifetime of the game process. Alt-tabbing
+            // to a browser or task manager must NOT relinquish the X3D CCD.
+            persistent: true,
             game_mode: Some(GameModeActions {
                 hide_taskbar: true,
                 stop_services: vec![
@@ -306,6 +369,7 @@ impl Default for Policy {
             default_profile: "perf".into(),
             background_profile: Some("eco".into()),
             tick_ms: Self::default_tick_ms(),
+            probalance: ProBalanceConfig::default(),
         }
     }
 }
@@ -344,6 +408,7 @@ mod tests {
             default_profile: ProfileId("perf".into()),
             background_profile: None,
             tick_ms: 250,
+            probalance: ProBalanceConfig::default(),
         }
     }
 
@@ -456,5 +521,25 @@ mod tests {
             }
             other => panic!("expected NotFound, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn load_strips_utf8_bom() {
+        // PowerShell 5.1's `Set-Content -Encoding UTF8` prepends EF BB BF.
+        // Without BOM tolerance, a hand-edited policy.json silently fails
+        // to parse and the service falls back to defaults — exactly the
+        // failure mode users hit in practice.
+        let dir = std::env::temp_dir().join(format!("framesage-test-bom-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        let path = dir.join("policy.json");
+        let body = serde_json::to_vec_pretty(&Policy::default()).expect("serialize");
+        let mut bomed = vec![0xEF, 0xBB, 0xBF];
+        bomed.extend_from_slice(&body);
+        std::fs::write(&path, &bomed).expect("write");
+
+        let loaded = Policy::load(&path).expect("BOMed file must load");
+        assert_eq!(loaded.rules.len(), Policy::default().rules.len());
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 }

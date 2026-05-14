@@ -194,6 +194,15 @@ impl SafeList {
         self.processes.values()
     }
 
+    /// Names (lower-cased, no path) of every process this list explicitly
+    /// denies. Other safety-critical code paths — like ProBalance's dynamic
+    /// priority restraint — consult this so they never touch dwm, audiodg,
+    /// csrss, kernel-mode drivers, anti-cheat, AV, or other entries the
+    /// curated denylist flagged as dangerous to perturb.
+    pub fn denied_process_names(&self) -> impl Iterator<Item = &str> {
+        self.process_denied.keys().map(String::as_str)
+    }
+
     /// Filter a requested list of service ids into (allowed, rejected) buckets
     /// against this safe-list. Useful for the planner so we batch-validate
     /// once and surface rejections together. The rejected list pairs the id
@@ -279,14 +288,15 @@ pub enum ProcessVerdict<'a> {
     Unlisted,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct Rejection {
     pub id: String,
     pub kind: RejectionKind,
     pub reason: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum RejectionKind {
     /// Explicitly denied — denylist wins over allowlist.
     Denied,

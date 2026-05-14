@@ -36,11 +36,17 @@ fn main() {
 
     let out_dir = PathBuf::from(env::var_os("OUT_DIR").expect("OUT_DIR not set by cargo"));
     let ico_path = out_dir.join("framesage.ico");
+    let manifest_path = out_dir.join("framesage.manifest");
     let rc_path = out_dir.join("framesage.rc");
 
     write_ico(&ico_path);
-    write_rc(&rc_path, &ico_path);
+    write_manifest(&manifest_path);
+    write_rc(&rc_path, &ico_path, &manifest_path);
 
+    // We ship our own DPI-aware manifest as part of framesage.rc, so we
+    // don't ask embed-resource for anything extra. `manifest_optional()` on
+    // the result just turns "no rc compiler in PATH" into Ok rather than a
+    // hard error — useful on systems where mingw / rc.exe isn't installed.
     embed_resource::compile(&rc_path, embed_resource::NONE)
         .manifest_optional()
         .expect("embed-resource: compile FrameSage .rc");
@@ -48,12 +54,56 @@ fn main() {
     println!("cargo:rerun-if-changed=build.rs");
 }
 
-fn write_rc(rc_path: &std::path::Path, ico_path: &std::path::Path) {
+fn write_rc(
+    rc_path: &std::path::Path,
+    ico_path: &std::path::Path,
+    manifest_path: &std::path::Path,
+) {
     // .rc files use backslash escaping; on Windows the path already has them
     // — we need to double-escape so the resource compiler sees a single \.
     let ico_str = ico_path.display().to_string().replace('\\', "\\\\");
-    let body = format!("IDI_ICON1 ICON \"{ico_str}\"\n");
+    let manifest_str = manifest_path.display().to_string().replace('\\', "\\\\");
+    // "1 24" is CREATEPROCESS_MANIFEST_RESOURCE_ID (1) and RT_MANIFEST (24).
+    let body = format!("IDI_ICON1 ICON \"{ico_str}\"\n1 24 \"{manifest_str}\"\n");
     std::fs::write(rc_path, body).expect("write framesage.rc");
+}
+
+/// Application manifest declaring **System** DPI awareness.
+///
+/// History: this used to declare PerMonitorV2 awareness so the app would
+/// rescale itself on monitor changes. That's the "correct" modern model —
+/// but eframe 0.28 / winit 0.29 has a multi-monitor DPI regression where
+/// WM_DPICHANGED triggers a window-size feedback loop that grows the
+/// window unboundedly across the second monitor. Until we move to
+/// egui 0.30+ (which uses winit 0.30 with the fix), declaring System
+/// awareness instead asks Windows to do the bitmap rescale via DWM. The
+/// content gets slightly blurrier on a monitor with a different DPI than
+/// the launch monitor, but the window doesn't grow or jitter — strictly
+/// the better trade-off for end users.
+fn write_manifest(path: &std::path::Path) {
+    let body = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<assembly xmlns="urn:schemas-microsoft-com:asm.v1" manifestVersion="1.0">
+  <assemblyIdentity
+      type="win32"
+      name="FrameSage.Tray"
+      version="1.0.0.0"
+      processorArchitecture="*"/>
+  <application xmlns="urn:schemas-microsoft-com:asm.v3">
+    <windowsSettings>
+      <dpiAwareness xmlns="http://schemas.microsoft.com/SMI/2016/WindowsSettings">System</dpiAwareness>
+      <dpiAware xmlns="http://schemas.microsoft.com/SMI/2005/WindowsSettings">true</dpiAware>
+      <longPathAware xmlns="http://schemas.microsoft.com/SMI/2016/WindowsSettings">true</longPathAware>
+    </windowsSettings>
+  </application>
+  <compatibility xmlns="urn:schemas-microsoft-com:compatibility.v1">
+    <application>
+      <!-- Windows 10 and Windows 11 -->
+      <supportedOS Id="{8e0f7a12-bfb3-4fe8-b9a5-48fd50a15a9a}"/>
+    </application>
+  </compatibility>
+</assembly>
+"#;
+    std::fs::write(path, body).expect("write framesage.manifest");
 }
 
 fn write_ico(out: &std::path::Path) {

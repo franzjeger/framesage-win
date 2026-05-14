@@ -35,6 +35,8 @@ use parking_lot::RwLock;
 use tokio::sync::broadcast;
 use tracing::{debug, info, warn};
 
+pub mod probalance;
+
 use framesage_core::{CpuTopology, GameModeActions, Policy, Profile, ProfileId};
 use framesage_gamemode::{
     journal::{Journal, JournalEntry},
@@ -42,7 +44,7 @@ use framesage_gamemode::{
     safe_list::SafeList,
     state::{AppliedActions, PreviousState, SuspendedProcessSnapshot},
 };
-use framesage_ipc::{Event, ForegroundSnapshot, StatusSnapshot};
+use framesage_ipc::{Event, ForegroundSnapshot, ProcessSnapshot, StatusSnapshot, SystemMetrics};
 
 /// Dependencies the engine needs at construction. Passing as a struct keeps
 /// the call sites readable (we already have policy + topology, and now journal
@@ -79,6 +81,57 @@ struct EngineState {
     /// `None` until the first scan; subsequent scans honour
     /// `BACKGROUND_SCAN_INTERVAL`.
     last_background_scan: Option<Instant>,
+    /// Last time we re-pushed kernel state for every persistent-profile PID.
+    /// `None` until the first sweep; subsequent sweeps honour
+    /// `PERSISTENT_REASSERT_INTERVAL`.
+    last_persistent_reassert: Option<Instant>,
+    /// Per-PID CPU-time + exe-name snapshot from the previous ProBalance
+    /// sample. Used to compute deltas (CPU% over the inter-sample window).
+    /// Keyed by PID; entries for PIDs that have exited are reaped each
+    /// sample. Empty when ProBalance is disabled.
+    probalance_prev_samples: HashMap<u32, ProBalancePrevSample>,
+    /// Timestamp of the last ProBalance sample, paired with
+    /// `probalance_prev_samples`. The wall-clock delta between this and
+    /// `Instant::now()` divides the CPU-time delta into a utilisation %.
+    probalance_last_sample_at: Option<Instant>,
+    /// Active ProBalance restraints — PID → original priority class + exe.
+    /// Populated when `probalance::decide` returns `Decision::Restrain`,
+    /// drained on `Decision::Restore`.
+    probalance_restrained: HashMap<u32, probalance::RestrainedRecord>,
+    /// Per-PID CPU-time snapshot from the previous call to
+    /// `list_process_snapshots`. Independent of `probalance_prev_samples`
+    /// because the Processes tab needs CPU% whether or not the user has
+    /// ProBalance enabled. Updated on every IPC `ListProcesses` request.
+    list_processes_prev_samples: HashMap<u32, u64>,
+    /// Wall-clock instant matching `list_processes_prev_samples`. Used to
+    /// turn CPU-time deltas into a % of one logical CPU.
+    list_processes_last_sample_at: Option<Instant>,
+    /// Previous system-wide CPU-time sample (`GetSystemTimes`). Subtracted
+    /// from the current sample inside `list_process_snapshots` to derive
+    /// the live system CPU% surfaced in the performance band.
+    list_processes_prev_system_cpu: Option<framesage_sys::process::SystemCpuTimes>,
+    /// Manual mode: when set, every foreground reconcile applies this
+    /// profile instead of consulting Rules. Stays set across focus
+    /// changes until explicitly cleared via `clear_manual_override` /
+    /// `Request::ClearManualOverride`.
+    manual_override: Option<ProfileId>,
+    /// Foreground reported by a user-session helper (typically the tray).
+    /// `None` means "the user session is idle / on lock screen / no
+    /// foreground"; the tick should treat it the same as
+    /// `framesage_sys::foreground::current()` returning None.
+    ///
+    /// Set by [`Self::report_foreground`] from the IPC handler. The
+    /// service running as LocalSystem in session 0 can't call
+    /// `GetForegroundWindow` itself — that returns null cross-session —
+    /// so the engine prefers the report when one is fresh, falling back
+    /// to the session-local poll only if no report has ever arrived
+    /// (covers the console-mode dev path).
+    reported_foreground: Option<framesage_sys::foreground::ForegroundInfo>,
+    /// True once at least one IPC ReportForeground arrived. Lets the
+    /// tick path distinguish "user-session helper is connected and the
+    /// desktop is idle" from "no helper has ever reported, fall back to
+    /// session-local polling".
+    foreground_reporter_seen: bool,
 }
 
 /// How often the engine walks all PIDs to apply `Policy::background_profile`.
@@ -88,8 +141,38 @@ struct EngineState {
 /// steady-state cost is one ToolHelp snapshot + a Vec membership check.
 const BACKGROUND_SCAN_INTERVAL: Duration = Duration::from_secs(10);
 
+/// How often the engine re-pushes kernel state (affinity, CPU sets, priority,
+/// I/O priority) for every PID running under a `persistent` profile. Some
+/// games (POE2, EVE, several Unreal titles) call `SetProcessAffinityMask` on
+/// themselves at startup or on resolution changes, "fixing" what they think
+/// is a misconfiguration. CPU Sets are also advisory — the scheduler can
+/// override them under contention. Re-pushing every 2 s defeats both modes
+/// of override and is cheap: each sweep is one `SetProcess*` call per knob
+/// per managed PID, and persistent-profile PIDs are typically 1–3 (games,
+/// not background apps).
+const PERSISTENT_REASSERT_INTERVAL: Duration = Duration::from_secs(2);
+
+/// How often the engine samples per-PID CPU usage for ProBalance. 1 s gives
+/// reasonable accuracy (a process that's busy for 200 ms of every second
+/// shows up at ~20%) without thrashing OpenProcess. Skipped entirely when
+/// `policy.probalance.enabled == false`.
+const PROBALANCE_SAMPLE_INTERVAL: Duration = Duration::from_millis(1000);
+
+/// Cached fields from the previous ProBalance sample.
+#[derive(Debug, Clone, Copy)]
+struct ProBalancePrevSample {
+    /// `kernel + user` 100-ns ticks from `GetProcessTimes` at last sample.
+    total_cpu_100ns: u64,
+}
+
 struct AppliedRecord {
     profile_id: ProfileId,
+    /// Image filename (without path) captured at apply time. Used by the
+    /// periodic re-assert sweep to defend against PID reuse: if the PID's
+    /// current exe doesn't match `exe_name`, the original process is gone
+    /// and Windows reassigned the PID — we drop the record and never push
+    /// our settings onto an unrelated process. Compared case-insensitively.
+    exe_name: String,
     /// Opaque per-platform state used to revert per-process changes.
     #[cfg(windows)]
     state: framesage_sys::apply::AppliedState,
@@ -123,6 +206,16 @@ impl Engine {
                 active_profile: None,
                 system_mode: None,
                 last_background_scan: None,
+                last_persistent_reassert: None,
+                probalance_prev_samples: HashMap::new(),
+                probalance_last_sample_at: None,
+                probalance_restrained: HashMap::new(),
+                list_processes_prev_samples: HashMap::new(),
+                list_processes_last_sample_at: None,
+                list_processes_prev_system_cpu: None,
+                manual_override: None,
+                reported_foreground: None,
+                foreground_reporter_seen: false,
             })),
             events: tx,
             safe_list: deps.safe_list,
@@ -157,6 +250,28 @@ impl Engine {
         info!("policy replaced");
     }
 
+    /// One-off priority change against any live PID. Bypasses the profile
+    /// system — used by the Processes tab's right-click "Set priority"
+    /// submenu. If the PID is currently managed by us via a rule, the
+    /// next reconcile (or re-assert tick for persistent profiles) will
+    /// overwrite this with the rule's class; that's the right semantic —
+    /// the rule still wins.
+    pub fn set_process_priority(
+        &self,
+        pid: u32,
+        class: framesage_core::PriorityClass,
+    ) -> Result<()> {
+        #[cfg(windows)]
+        {
+            framesage_sys::apply::set_priority_class_for_pid(pid, class)?;
+        }
+        #[cfg(not(windows))]
+        {
+            let _ = (pid, class);
+        }
+        Ok(())
+    }
+
     pub fn status(&self) -> StatusSnapshot {
         let s = self.state.read();
         let active_profile = s
@@ -168,7 +283,302 @@ impl Engine {
             policy: s.policy.clone(),
             foreground: s.foreground_snapshot.clone(),
             active_profile,
+            manual_override: s.manual_override.clone(),
         }
+    }
+
+    /// Collect a snapshot row for every visible process plus paired
+    /// system-wide metrics (CPU%, memory). Backs the tray's Processes tab +
+    /// the permanent performance band. Self-contained: opens its own
+    /// handles, manages its own per-PID CPU-time history so the % is
+    /// computed even when ProBalance is disabled.
+    ///
+    /// Costs ~1 ToolHelp snapshot + 4 `OpenProcess`/`CloseHandle` pairs per
+    /// PID (priority, affinity, mem, cpu_times) + 2 cheap system syscalls
+    /// (`GetSystemTimes`, `GlobalMemoryStatusEx`). On a 200-process machine
+    /// that's ~800 syscalls per call — fine at 1 Hz from the tray, not fine
+    /// at 100 Hz, which is why the tray polls.
+    pub fn list_process_snapshots(&self) -> (Vec<ProcessSnapshot>, SystemMetrics) {
+        #[cfg(not(windows))]
+        return (Vec::new(), SystemMetrics::default());
+        #[cfg(windows)]
+        {
+            let now = Instant::now();
+            let mut s = self.state.write();
+            let elapsed = match s.list_processes_last_sample_at {
+                Some(prev) => now.duration_since(prev),
+                None => Duration::ZERO,
+            };
+            let elapsed_100ns = elapsed
+                .as_secs()
+                .saturating_mul(10_000_000)
+                .saturating_add(elapsed.subsec_nanos() as u64 / 100);
+            s.list_processes_last_sample_at = Some(now);
+
+            let pid_snapshots = match framesage_sys::process::iter_pid_snapshots() {
+                Ok(v) => v,
+                Err(e) => {
+                    warn!(error = %e, "list_process_snapshots: iter_pid_snapshots failed");
+                    return (Vec::new(), SystemMetrics::default());
+                }
+            };
+
+            let mut new_prev: HashMap<u32, u64> = HashMap::with_capacity(pid_snapshots.len());
+            let mut out: Vec<ProcessSnapshot> = Vec::with_capacity(pid_snapshots.len());
+
+            for ps in &pid_snapshots {
+                let pid = ps.pid;
+                if pid == 0 {
+                    continue;
+                }
+
+                // exe path → bare filename
+                let exe_name = match framesage_sys::process::exe_for_pid(pid) {
+                    Ok(Some(path)) => path.rsplit(['\\', '/']).next().unwrap_or(&path).to_owned(),
+                    Ok(None) | Err(_) => continue,
+                };
+
+                let priority_class_raw = framesage_sys::apply::get_priority_class_for_pid(pid)
+                    .ok()
+                    .flatten()
+                    .unwrap_or(0);
+
+                let affinity_mask = framesage_sys::process::affinity_mask(pid)
+                    .ok()
+                    .flatten()
+                    .unwrap_or(0);
+
+                let memory_bytes = framesage_sys::process::working_set_bytes(pid)
+                    .ok()
+                    .flatten()
+                    .unwrap_or(0);
+
+                let total_cpu = framesage_sys::process::cpu_times(pid)
+                    .ok()
+                    .flatten()
+                    .map(|t| t.total_100ns())
+                    .unwrap_or(0);
+                let cpu_percent: u16 = if elapsed_100ns > 0 {
+                    let prev = s
+                        .list_processes_prev_samples
+                        .get(&pid)
+                        .copied()
+                        .unwrap_or(0);
+                    if prev == 0 {
+                        0 // first time we see this PID — no delta yet
+                    } else {
+                        let delta = total_cpu.saturating_sub(prev);
+                        ((delta as u128).saturating_mul(100) / elapsed_100ns as u128)
+                            .min(u16::MAX as u128) as u16
+                    }
+                } else {
+                    0
+                };
+                new_prev.insert(pid, total_cpu);
+
+                // Rule match: ask the policy matcher. We don't have window
+                // title here (no foreground info for arbitrary PIDs), so
+                // title-based rules won't fire on the Processes view — that's
+                // fine, they're inherently foreground-scoped.
+                let rule_note = s
+                    .policy
+                    .rules
+                    .iter()
+                    .find(|r| r.r#match.matches(&exe_name, &exe_name, ""))
+                    .map(|r| r.note.clone());
+
+                let managed_profile = s.applied.get(&pid).map(|r| r.profile_id.0.clone());
+                let restrained_by_probalance = s.probalance_restrained.contains_key(&pid);
+
+                out.push(ProcessSnapshot {
+                    pid,
+                    exe_name,
+                    priority_class_raw,
+                    affinity_mask,
+                    cpu_percent,
+                    memory_bytes,
+                    threads: ps.thread_count,
+                    matched_rule_note: rule_note,
+                    managed_profile,
+                    restrained_by_probalance,
+                });
+            }
+
+            s.list_processes_prev_samples = new_prev;
+
+            // ─── System-wide metrics ─────────────────────────────────────
+            //
+            // System CPU% = 100 - (delta_idle / delta_total) over the same
+            // wall-clock interval as the per-process sample. We compute it
+            // from `GetSystemTimes` rather than summing per-process CPU%
+            // because per-process omits whatever fraction of kernel time
+            // we couldn't open (protected processes) and undercounts.
+            let sys_cpu_now = framesage_sys::process::system_cpu_times().ok();
+            let system_cpu_percent: u8 = match (&sys_cpu_now, &s.list_processes_prev_system_cpu) {
+                (Some(now_t), Some(prev_t)) => {
+                    let total_delta = now_t.total_100ns().saturating_sub(prev_t.total_100ns());
+                    let idle_delta = now_t.idle_100ns.saturating_sub(prev_t.idle_100ns);
+                    if total_delta == 0 {
+                        0
+                    } else {
+                        let busy = total_delta.saturating_sub(idle_delta);
+                        ((busy as u128 * 100 / total_delta as u128).min(100)) as u8
+                    }
+                }
+                _ => 0,
+            };
+            s.list_processes_prev_system_cpu = sys_cpu_now;
+
+            let (mem_total, mem_avail) = framesage_sys::process::memory_status().unwrap_or((0, 0));
+            let mem_used = mem_total.saturating_sub(mem_avail);
+
+            let metrics = SystemMetrics {
+                cpu_percent: system_cpu_percent,
+                memory_used_bytes: mem_used,
+                memory_total_bytes: mem_total,
+            };
+
+            (out, metrics)
+        }
+    }
+
+    /// Enter manual mode: every foreground reconcile from now on applies
+    /// `profile_id` regardless of Rules / default_profile, until
+    /// `clear_manual_override` is called. Errors if the profile id isn't
+    /// present in the active policy. Idempotent on a no-change SetManual
+    /// for the same profile.
+    pub fn set_manual_override(&self, profile_id: ProfileId) -> Result<()> {
+        let mut s = self.state.write();
+        if s.policy.profile(&profile_id).is_none() {
+            return Err(anyhow::anyhow!("unknown profile id {profile_id}"));
+        }
+        let changed = s.manual_override.as_ref() != Some(&profile_id);
+        s.manual_override = Some(profile_id.clone());
+        if changed {
+            info!(profile = %profile_id, "manual override set");
+            self.force_recompute_active_profile_locked(&mut s);
+        }
+        Ok(())
+    }
+
+    /// Leave manual mode. Idempotent — no-op if manual mode was already off.
+    /// On change, immediately re-evaluates the current foreground's profile
+    /// (rule-match or default) and runs the full reconcile so the system
+    /// reverts Game Mode + restores the previous-profile knobs without
+    /// waiting for a focus change. This closes a bug where exiting manual
+    /// mode while focused on the same window left the taskbar hidden.
+    pub fn clear_manual_override(&self) {
+        let mut s = self.state.write();
+        if s.manual_override.take().is_some() {
+            info!("manual override cleared");
+            self.force_recompute_active_profile_locked(&mut s);
+        }
+    }
+
+    /// Re-evaluate the current foreground's profile and re-apply it
+    /// end-to-end (per-process + Game Mode), bypassing the
+    /// "new_pid == current_foreground" early-return in `reconcile`.
+    ///
+    /// Called from anywhere that changes the *answer* to "what profile
+    /// should the current foreground get" without changing the foreground
+    /// PID itself — most prominently the manual-override set/clear paths.
+    /// Without this, those paths only took effect at the next focus
+    /// change, which stranded Game Mode state (taskbar hidden, services
+    /// stopped, …) until the user happened to alt-tab.
+    fn force_recompute_active_profile_locked(&self, s: &mut EngineState) {
+        let Some(prev_pid) = s.current_foreground else {
+            return;
+        };
+        let Some(snapshot) = s.foreground_snapshot.clone() else {
+            return;
+        };
+
+        // Resolve the new profile via the same precedence the tick path
+        // uses: manual override wins, else first-match rule, else default.
+        let profile_id = match &s.manual_override {
+            Some(ov) => ov.clone(),
+            None => s
+                .policy
+                .match_foreground(&snapshot.exe_name, &snapshot.path, &snapshot.title)
+                .clone(),
+        };
+        let profile = match s.policy.profile(&profile_id) {
+            Some(p) => p.clone(),
+            None => {
+                warn!(profile = %profile_id, "force_recompute: profile id not in policy");
+                return;
+            }
+        };
+
+        // Same-profile-already-applied: don't churn the kernel state. Mirrors
+        // reconcile + apply_once. Especially important here because
+        // force_recompute fires on manual-override toggles — if the user is
+        // already running game-x3d and toggles "set as manual mode" off
+        // (which leaves them on game-x3d via the rule matcher), we'd
+        // momentarily tear down the X3D pin for no reason.
+        let already_correct = s
+            .applied
+            .get(&prev_pid)
+            .map(|r| r.profile_id == profile_id)
+            .unwrap_or(false);
+        if !already_correct {
+            // Revert old per-PID state so the new apply captures a clean prev.
+            if let Some(record) = s.applied.remove(&prev_pid) {
+                revert_record(prev_pid, record);
+            }
+
+            let topology = s.topology.clone();
+            match apply_profile(prev_pid, &snapshot.exe_name, &profile, &topology) {
+                Ok(record) => {
+                    info!(pid = prev_pid, profile = %profile_id, "force_recompute applied");
+                    s.applied.insert(prev_pid, record);
+                }
+                Err(e) => {
+                    warn!(pid = prev_pid, error = %e, "force_recompute apply failed");
+                }
+            }
+        } else {
+            info!(
+                pid = prev_pid,
+                profile = %profile_id,
+                "force_recompute: already correct, preserving state"
+            );
+        }
+        s.active_profile = Some(profile_id.clone());
+        let _ = self.events.send(Event::ForegroundChanged {
+            foreground: snapshot,
+            profile: profile_id.clone(),
+        });
+
+        // Reconcile system-wide Game Mode against the new profile.
+        let new_actions = profile.game_mode.clone();
+        Self::reconcile_system_mode_locked(
+            s,
+            &self.journal,
+            self.safe_list,
+            &profile_id,
+            new_actions,
+        );
+    }
+
+    /// Accept a foreground report from a user-session helper (the tray).
+    /// See the `reported_foreground` field doc for the why.
+    pub fn report_foreground(&self, pid: u32, exe_name: String, path: String, title: String) {
+        let mut s = self.state.write();
+        s.reported_foreground = Some(framesage_sys::foreground::ForegroundInfo {
+            pid,
+            exe_name,
+            path,
+            title,
+        });
+        s.foreground_reporter_seen = true;
+    }
+
+    /// Accept a "no foreground" report (lock screen, UAC, transition).
+    pub fn report_no_foreground(&self) {
+        let mut s = self.state.write();
+        s.reported_foreground = None;
+        s.foreground_reporter_seen = true;
     }
 
     /// Panic button: revert any active system mode regardless of foreground.
@@ -203,11 +613,23 @@ impl Engine {
             .ok_or_else(|| anyhow::anyhow!("unknown profile id {profile_id}"))?
             .clone();
 
-        // Revert anything we'd previously applied to this same PID (whether
-        // the prior profile was the same or different) so we have a clean
-        // slate to apply onto.
-        if let Some(record) = s.applied.remove(&foreground.pid) {
-            revert_record(foreground.pid, record);
+        // If we already applied the SAME profile to this PID and the new
+        // profile is persistent, the state is in place — don't churn it by
+        // revert+reapply. Mirrors the reconcile fast path. Without this,
+        // hitting "Apply now" on a persistent game-x3d profile briefly tears
+        // down the affinity before re-establishing it — visible UX glitch.
+        let already_correct = s
+            .applied
+            .get(&foreground.pid)
+            .map(|r| r.profile_id == profile_id)
+            .unwrap_or(false);
+        if !already_correct {
+            // Revert anything we'd previously applied to this same PID
+            // (whether the prior profile was the same or different) so we
+            // have a clean slate to apply onto.
+            if let Some(record) = s.applied.remove(&foreground.pid) {
+                revert_record(foreground.pid, record);
+            }
         }
 
         let topology = s.topology.clone();
@@ -218,14 +640,23 @@ impl Engine {
             title: foreground.title.clone(),
         };
 
-        let record = apply_profile(foreground.pid, &profile, &topology)?;
-        info!(
-            pid = foreground.pid,
-            exe = %foreground.exe_name,
-            profile = %profile_id,
-            "apply_once",
-        );
-        s.applied.insert(foreground.pid, record);
+        if !already_correct {
+            let record = apply_profile(foreground.pid, &foreground.exe_name, &profile, &topology)?;
+            info!(
+                pid = foreground.pid,
+                exe = %foreground.exe_name,
+                profile = %profile_id,
+                "apply_once",
+            );
+            s.applied.insert(foreground.pid, record);
+        } else {
+            info!(
+                pid = foreground.pid,
+                exe = %foreground.exe_name,
+                profile = %profile_id,
+                "apply_once: already correct, preserving state",
+            );
+        }
         s.current_foreground = Some(foreground.pid);
         s.foreground_snapshot = Some(snapshot.clone());
         s.active_profile = Some(profile_id.clone());
@@ -279,12 +710,366 @@ impl Engine {
             return Ok(());
         }
 
-        let foreground = framesage_sys::foreground::current()?;
+        // Session 0 isolation: a service running as LocalSystem can't see
+        // the interactive desktop, so `GetForegroundWindow` returns null
+        // from session 0. We prefer a foreground report from the
+        // user-session helper (the tray, via Request::ReportForeground).
+        // If no report has ever arrived (console-mode dev path), we fall
+        // back to the in-process poll.
+        let foreground = {
+            let s = self.state.read();
+            if s.foreground_reporter_seen {
+                s.reported_foreground.clone()
+            } else {
+                drop(s);
+                framesage_sys::foreground::current()?
+            }
+        };
 
         let mut s = self.state.write();
         self.reconcile(&mut s, foreground)?;
         Self::maybe_scan_background_locked(&mut s, self.safe_list);
+        Self::maybe_reassert_persistent_locked(&mut s);
+        self.maybe_run_probalance_locked(&mut s);
         Ok(())
+    }
+
+    /// One ProBalance pass: sample per-PID CPU, compute deltas vs. last
+    /// sample, hand to `probalance::decide`, execute returned `Restrain` /
+    /// `Restore` decisions as kernel calls, emit IPC events.
+    ///
+    /// Bounded by `PROBALANCE_SAMPLE_INTERVAL` (1 s) — the engine ticks much
+    /// faster than that (300 ms by default), so most ticks fall through.
+    /// Zero-cost when `cfg.enabled == false`.
+    fn maybe_run_probalance_locked(&self, s: &mut EngineState) {
+        // Fast-path bail when ProBalance is disabled.
+        let cfg = s.policy.probalance.clone();
+        if !cfg.enabled {
+            // If the user just toggled it OFF while restraints were active,
+            // we still need to release them. One-time drain.
+            if !s.probalance_restrained.is_empty() {
+                let drained: Vec<(u32, probalance::RestrainedRecord)> =
+                    s.probalance_restrained.drain().collect();
+                for (pid, rec) in drained {
+                    #[cfg(windows)]
+                    if let Err(e) = framesage_sys::apply::restore_priority_class_for_pid(
+                        pid,
+                        rec.original_raw_class,
+                    ) {
+                        warn!(pid, error = %e, "probalance: failed to release restraint on disable");
+                    }
+                    let _ = self.events.send(Event::ProBalanceRestored {
+                        pid,
+                        exe_name: rec.exe_name,
+                        restored_class: rec.original_raw_class,
+                    });
+                }
+                s.probalance_prev_samples.clear();
+                s.probalance_last_sample_at = None;
+            }
+            return;
+        }
+
+        let now = Instant::now();
+        let elapsed = match s.probalance_last_sample_at {
+            Some(t) if now.duration_since(t) < PROBALANCE_SAMPLE_INTERVAL => return,
+            Some(t) => now.duration_since(t),
+            None => Duration::from_millis(0), // first sample — seed only
+        };
+
+        // Snapshot per-PID CPU times. Capture the foreground PID first so
+        // we never even consider restraining it.
+        let foreground_pid = s.current_foreground;
+        let managed_pids: HashSet<u32> = s.applied.keys().copied().collect();
+
+        let live_pids: Vec<u32> = match framesage_sys::process::iter_pids() {
+            Ok(v) => v,
+            Err(e) => {
+                debug!(error = %e, "probalance: iter_pids failed; skipping sample");
+                return;
+            }
+        };
+
+        // Sample CPU times for every live PID we can open. PIDs that fail
+        // (protected, exited) are silently skipped — they aren't candidates.
+        let mut current_samples: HashMap<u32, (u64, String)> = HashMap::new();
+        for pid in &live_pids {
+            #[cfg(windows)]
+            {
+                let times = match framesage_sys::process::cpu_times(*pid) {
+                    Ok(Some(t)) => t,
+                    Ok(None) | Err(_) => continue,
+                };
+                let exe_name = match framesage_sys::process::exe_for_pid(*pid) {
+                    Ok(Some(p)) => p
+                        .rsplit(['\\', '/'])
+                        .next()
+                        .unwrap_or(&p)
+                        .to_ascii_lowercase(),
+                    Ok(None) | Err(_) => continue,
+                };
+                current_samples.insert(*pid, (times.total_100ns(), exe_name));
+            }
+            #[cfg(not(windows))]
+            {
+                let _ = pid;
+            }
+        }
+
+        s.probalance_last_sample_at = Some(now);
+
+        // First-sample seed: store, no decision can be made yet (no delta).
+        if elapsed.is_zero() {
+            s.probalance_prev_samples = current_samples
+                .iter()
+                .map(|(pid, (total, _))| {
+                    (
+                        *pid,
+                        ProBalancePrevSample {
+                            total_cpu_100ns: *total,
+                        },
+                    )
+                })
+                .collect();
+            return;
+        }
+
+        // Compute CPU% per PID over `elapsed`. Format is "% of one logical
+        // CPU" — 100 means one fully busy thread, 200 means two, etc.
+        // Both kernel and user CPU time use 100-ns units, so we divide by
+        // `elapsed_100ns / 100` (i.e. elapsed_micros * 10 → percent).
+        let elapsed_100ns =
+            (elapsed.as_secs() * 10_000_000) + (elapsed.subsec_nanos() as u64 / 100);
+        if elapsed_100ns == 0 {
+            return;
+        }
+        let mut decision_samples: Vec<probalance::ProcessSample> =
+            Vec::with_capacity(current_samples.len());
+        let mut system_busy_100ns: u64 = 0;
+        for (pid, (total, exe)) in &current_samples {
+            let prev_total = match s.probalance_prev_samples.get(pid) {
+                Some(p) => p.total_cpu_100ns,
+                None => continue, // first time we saw this PID — wait for next sample
+            };
+            let delta = total.saturating_sub(prev_total);
+            system_busy_100ns = system_busy_100ns.saturating_add(delta);
+            let cpu_percent_of_one = ((delta as u128).saturating_mul(100) / elapsed_100ns as u128)
+                .min(u16::MAX as u128) as u16;
+            // Query the current priority class for the demotion-target gate.
+            #[cfg(windows)]
+            let current_raw_class = match framesage_sys::apply::get_priority_class_for_pid(*pid) {
+                Ok(Some(c)) => c,
+                _ => continue,
+            };
+            #[cfg(not(windows))]
+            let current_raw_class = 0x20u32;
+            decision_samples.push(probalance::ProcessSample {
+                pid: *pid,
+                exe_name: exe.clone(),
+                cpu_percent_of_one_cpu: cpu_percent_of_one,
+                current_raw_class,
+            });
+        }
+
+        // System CPU% = total CPU-time consumed across all sampled PIDs,
+        // normalised to one fully-busy logical CPU, divided by CPU count.
+        let cpu_count = s.topology.cpus.len().max(1) as u128;
+        let system_cpu_percent: u8 = (((system_busy_100ns as u128).saturating_mul(100)
+            / (elapsed_100ns as u128 * cpu_count))
+            .min(100)) as u8;
+
+        // Build the safe-list-name set. The game-mode safe-list's process
+        // denylist already covers the system-critical names ProBalance must
+        // never touch (dwm, audiodg, csrss, anti-cheat, AV, GPU drivers …).
+        let safe_list_exes: HashSet<String> = self
+            .safe_list
+            .denied_process_names()
+            .map(|n| n.to_ascii_lowercase())
+            .collect();
+        let user_ignore_exes: HashSet<String> = cfg
+            .ignore_processes
+            .iter()
+            .map(|n| n.to_ascii_lowercase())
+            .collect();
+
+        let decisions = probalance::decide(
+            &cfg,
+            now,
+            system_cpu_percent,
+            foreground_pid,
+            &decision_samples,
+            &managed_pids,
+            &safe_list_exes,
+            &user_ignore_exes,
+            &mut s.probalance_restrained,
+        );
+
+        for d in decisions {
+            match d {
+                probalance::Decision::Restrain {
+                    pid,
+                    exe_name,
+                    original_raw_class,
+                    demote_to,
+                    demote_to_raw_class,
+                } => {
+                    #[cfg(windows)]
+                    let result = framesage_sys::apply::set_priority_class_for_pid(pid, demote_to);
+                    #[cfg(not(windows))]
+                    let result: Result<()> = {
+                        let _ = demote_to;
+                        Ok(())
+                    };
+                    match result {
+                        Ok(()) => {
+                            info!(
+                                pid,
+                                exe = %exe_name,
+                                from = format!("{:#x}", original_raw_class),
+                                to = format!("{:#x}", demote_to_raw_class),
+                                "probalance: restrained"
+                            );
+                            let _ = self.events.send(Event::ProBalanceRestrained {
+                                pid,
+                                exe_name,
+                                from_class: original_raw_class,
+                                to_class: demote_to_raw_class,
+                            });
+                        }
+                        Err(e) => {
+                            warn!(pid, error = %e, "probalance: restrain syscall failed; rolling back state");
+                            // Don't leak a bookkeeping entry the kernel
+                            // doesn't actually reflect.
+                            s.probalance_restrained.remove(&pid);
+                        }
+                    }
+                }
+                probalance::Decision::Restore {
+                    pid,
+                    exe_name,
+                    restored_raw_class,
+                } => {
+                    #[cfg(windows)]
+                    if let Err(e) = framesage_sys::apply::restore_priority_class_for_pid(
+                        pid,
+                        restored_raw_class,
+                    ) {
+                        debug!(pid, error = %e, "probalance: restore syscall failed (process likely exited)");
+                    }
+                    info!(
+                        pid,
+                        exe = %exe_name,
+                        restored = format!("{:#x}", restored_raw_class),
+                        "probalance: restored"
+                    );
+                    let _ = self.events.send(Event::ProBalanceRestored {
+                        pid,
+                        exe_name,
+                        restored_class: restored_raw_class,
+                    });
+                }
+            }
+        }
+
+        // Roll forward the prev-sample buffer, dropping dead PIDs so the
+        // map size stays proportional to live process count.
+        s.probalance_prev_samples = current_samples
+            .into_iter()
+            .map(|(pid, (total, _exe))| {
+                (
+                    pid,
+                    ProBalancePrevSample {
+                        total_cpu_100ns: total,
+                    },
+                )
+            })
+            .collect();
+    }
+
+    /// Re-push kernel state (affinity, CPU sets, priority, I/O priority) onto
+    /// every PID currently running under a `persistent` profile. Defeats
+    /// runtime overrides — games that call `SetProcessAffinityMask` on
+    /// themselves, plus CPU-Set advisory drift under scheduler contention.
+    ///
+    /// Bounded by `PERSISTENT_REASSERT_INTERVAL` (2 s). Each sweep just calls
+    /// the per-knob setters; no prev-state capture, no revert plan rewrite —
+    /// the original `AppliedRecord` continues to describe what to undo.
+    fn maybe_reassert_persistent_locked(s: &mut EngineState) {
+        let now = Instant::now();
+        if let Some(last) = s.last_persistent_reassert {
+            if now.duration_since(last) < PERSISTENT_REASSERT_INTERVAL {
+                return;
+            }
+        }
+        s.last_persistent_reassert = Some(now);
+
+        // Snapshot first; we can't iterate `s.applied` while also re-borrowing
+        // `s.policy` / `s.topology` immutably (the borrow checker isn't smart
+        // enough to see that `applied` and the other fields are disjoint).
+        // Tuple is (pid, expected_exe_name, profile).
+        let pids_to_reassert: Vec<(u32, String, Profile)> = s
+            .applied
+            .iter()
+            .filter_map(|(pid, record)| {
+                let profile = s.policy.profile(&record.profile_id)?;
+                if profile.persistent {
+                    Some((*pid, record.exe_name.clone(), profile.clone()))
+                } else {
+                    None
+                }
+            })
+            .collect();
+
+        if pids_to_reassert.is_empty() {
+            return;
+        }
+
+        let topology = s.topology.clone();
+        let mut stale_pids: Vec<u32> = Vec::new();
+        for (pid, expected_exe, profile) in pids_to_reassert {
+            // PID reuse defense: Windows can reassign a PID seconds after the
+            // original process exits. Without this check, our 2 s re-assert
+            // sweep would happily push game-x3d onto whatever new process
+            // happens to hold the PID now. Query the live exe and skip on
+            // mismatch — the background-scan path will drop the record on
+            // its next sweep (or we drop it here once we know it's stale).
+            #[cfg(windows)]
+            {
+                let live_exe = match framesage_sys::process::exe_for_pid(pid) {
+                    Ok(Some(path)) => path.rsplit(['\\', '/']).next().unwrap_or(&path).to_owned(),
+                    Ok(None) | Err(_) => {
+                        // Process gone (or unreadable — same outcome: we
+                        // can't re-assert anyway). Mark for cleanup.
+                        stale_pids.push(pid);
+                        continue;
+                    }
+                };
+                if !live_exe.eq_ignore_ascii_case(&expected_exe) {
+                    debug!(
+                        pid,
+                        expected = %expected_exe,
+                        live = %live_exe,
+                        "re-assert: PID was reassigned to a different exe; dropping record"
+                    );
+                    stale_pids.push(pid);
+                    continue;
+                }
+                if let Err(e) = framesage_sys::apply::reassert(pid, &profile, &topology) {
+                    debug!(pid, error = %e, "persistent re-assert failed");
+                }
+            }
+            #[cfg(not(windows))]
+            {
+                let _ = (pid, expected_exe, profile, &topology);
+            }
+        }
+
+        for pid in stale_pids {
+            s.applied.remove(&pid);
+            if s.current_foreground == Some(pid) {
+                s.current_foreground = None;
+            }
+        }
     }
 
     /// Walk every running PID and apply `Policy::background_profile` to any
@@ -377,7 +1162,7 @@ impl Engine {
                 continue;
             }
 
-            match apply_profile(pid, &bg_profile, &topology) {
+            match apply_profile(pid, &exe_name, &bg_profile, &topology) {
                 Ok(record) => {
                     s.applied.insert(pid, record);
                     newly_applied += 1;
@@ -410,10 +1195,26 @@ impl Engine {
             return Ok(());
         }
 
-        // Revert per-process state on the previous foreground.
+        // Revert per-process state on the previous foreground, UNLESS the
+        // profile that was applied is marked `persistent`. Persistent pins
+        // (game-x3d is the canonical example) outlive focus loss: a game
+        // must stay on the X3D CCD while the user briefly alt-tabs to a
+        // browser, a chat client, or Task Manager. Without this guard,
+        // every focus flicker (loading screens, splash transitions, the
+        // user popping Task Manager) ripped the X3D pin off and put the
+        // game back on all cores.
         if let Some(prev_pid) = s.current_foreground.take() {
-            if let Some(record) = s.applied.remove(&prev_pid) {
-                revert_record(prev_pid, record);
+            if let Some(record) = s.applied.get(&prev_pid) {
+                let keep = s
+                    .policy
+                    .profile(&record.profile_id)
+                    .map(|p| p.persistent)
+                    .unwrap_or(false);
+                if !keep {
+                    if let Some(record) = s.applied.remove(&prev_pid) {
+                        revert_record(prev_pid, record);
+                    }
+                }
             }
         }
 
@@ -426,10 +1227,17 @@ impl Engine {
             return Ok(());
         };
 
-        let profile_id = s
-            .policy
-            .match_foreground(&fg.exe_name, &fg.path, &fg.title)
-            .clone();
+        // Manual override wins over the rule matcher. Set by
+        // `set_manual_override` / `Request::SetManualOverride` and cleared
+        // by the complementary calls. When active, every foreground app
+        // gets this profile regardless of what Rules would have matched.
+        let profile_id = match &s.manual_override {
+            Some(ov) => ov.clone(),
+            None => s
+                .policy
+                .match_foreground(&fg.exe_name, &fg.path, &fg.title)
+                .clone(),
+        };
 
         let profile = match s.policy.profile(&profile_id) {
             Some(p) => p.clone(),
@@ -447,17 +1255,52 @@ impl Engine {
             title: fg.title.clone(),
         };
 
-        // If the new foreground was already managed by us (most commonly via
-        // the background scan, e.g. user alt-tabbed back into a long-running
-        // browser), revert that record first. Without this step, the new
-        // apply would capture bg-modified state as `prev`, and an eventual
-        // revert would restore to bg-eco instead of kernel default.
-        if let Some(prev_record) = s.applied.remove(&fg.pid) {
-            revert_record(fg.pid, prev_record);
+        // If the new foreground was already managed by us with the SAME
+        // profile, skip the revert+reapply churn — the state is already
+        // correct. (This is the common path for a persistent profile: the
+        // user alt-tabs away and back; we kept the state in place, and
+        // now we just need to update tracking.)
+        //
+        // If it was managed with a DIFFERENT profile, revert first so the
+        // next apply captures clean prev-state.
+        let already_correct = s
+            .applied
+            .get(&fg.pid)
+            .map(|r| r.profile_id == profile_id)
+            .unwrap_or(false);
+        if !already_correct {
+            if let Some(prev_record) = s.applied.remove(&fg.pid) {
+                revert_record(fg.pid, prev_record);
+            }
         }
 
-        // Per-process apply.
-        match apply_profile(fg.pid, &profile, &topology) {
+        // Per-process apply (idempotent: if already_correct, just update tracking).
+        if already_correct {
+            info!(
+                pid = fg.pid,
+                exe = %fg.exe_name,
+                profile = %profile_id,
+                "re-foregrounded persistent pin — state preserved"
+            );
+            s.current_foreground = Some(fg.pid);
+            s.foreground_snapshot = Some(snapshot.clone());
+            s.active_profile = Some(profile_id.clone());
+            let _ = self.events.send(Event::ForegroundChanged {
+                foreground: snapshot.clone(),
+                profile: profile_id.clone(),
+            });
+            // Fall through to system-mode reconcile below.
+            let new_actions = profile.game_mode.clone();
+            Self::reconcile_system_mode_locked(
+                s,
+                &self.journal,
+                self.safe_list,
+                &profile_id,
+                new_actions,
+            );
+            return Ok(());
+        }
+        match apply_profile(fg.pid, &fg.exe_name, &profile, &topology) {
             Ok(record) => {
                 info!(pid = fg.pid, exe = %fg.exe_name, profile = %profile_id, "applied");
                 s.applied.insert(fg.pid, record);
@@ -674,18 +1517,30 @@ fn applied_from_plan(plan: &ActionPlan) -> AppliedActions {
 }
 
 #[cfg(windows)]
-fn apply_profile(pid: u32, profile: &Profile, topology: &CpuTopology) -> Result<AppliedRecord> {
+fn apply_profile(
+    pid: u32,
+    exe_name: &str,
+    profile: &Profile,
+    topology: &CpuTopology,
+) -> Result<AppliedRecord> {
     let state = framesage_sys::apply::apply(pid, profile, topology)?;
     Ok(AppliedRecord {
         profile_id: profile.id.clone(),
+        exe_name: exe_name.to_owned(),
         state,
     })
 }
 
 #[cfg(not(windows))]
-fn apply_profile(_pid: u32, profile: &Profile, _topology: &CpuTopology) -> Result<AppliedRecord> {
+fn apply_profile(
+    _pid: u32,
+    exe_name: &str,
+    profile: &Profile,
+    _topology: &CpuTopology,
+) -> Result<AppliedRecord> {
     Ok(AppliedRecord {
         profile_id: profile.id.clone(),
+        exe_name: exe_name.to_owned(),
         _phantom: (),
     })
 }

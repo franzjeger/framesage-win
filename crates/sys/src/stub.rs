@@ -3,10 +3,11 @@
 //! binaries don't build on non-Windows hosts.
 
 use anyhow::{anyhow, Result};
-use framesage_core::{CpuTopology, Profile};
+use framesage_core::{CpuTopology, PriorityClass, Profile};
 
 pub mod foreground {
     use super::*;
+    #[derive(Debug, Clone)]
     pub struct ForegroundInfo {
         pub pid: u32,
         pub exe_name: String,
@@ -35,15 +36,77 @@ pub mod apply {
     pub fn revert(_pid: u32, _state: AppliedState) -> Result<()> {
         Err(anyhow!("framesage-sys: not supported on this host"))
     }
+    pub fn reassert(_pid: u32, _profile: &Profile, _topology: &CpuTopology) -> Result<()> {
+        Err(anyhow!("framesage-sys: not supported on this host"))
+    }
+    pub fn get_priority_class_for_pid(_pid: u32) -> Result<Option<u32>> {
+        Ok(None)
+    }
+    pub fn set_priority_class_for_pid(_pid: u32, _class: PriorityClass) -> Result<()> {
+        Err(anyhow!("framesage-sys: not supported on this host"))
+    }
+    pub fn restore_priority_class_for_pid(_pid: u32, _raw_class: u32) -> Result<()> {
+        Ok(())
+    }
 }
 
 pub mod process {
     use super::*;
+
+    #[derive(Debug, Clone, Copy)]
+    pub struct ProcessCpuTimes {
+        pub kernel_100ns: u64,
+        pub user_100ns: u64,
+    }
+    impl ProcessCpuTimes {
+        pub fn total_100ns(&self) -> u64 {
+            self.kernel_100ns.saturating_add(self.user_100ns)
+        }
+    }
+
+    #[derive(Debug, Clone, Copy)]
+    pub struct PidSnapshot {
+        pub pid: u32,
+        pub thread_count: u32,
+    }
+
     pub fn iter_pids() -> Result<Vec<u32>> {
+        Ok(Vec::new())
+    }
+    pub fn iter_pid_snapshots() -> Result<Vec<PidSnapshot>> {
         Ok(Vec::new())
     }
     pub fn exe_for_pid(_pid: u32) -> Result<Option<String>> {
         Ok(None)
+    }
+    pub fn cpu_times(_pid: u32) -> Result<Option<ProcessCpuTimes>> {
+        Ok(None)
+    }
+    pub fn working_set_bytes(_pid: u32) -> Result<Option<u64>> {
+        Ok(None)
+    }
+    pub fn affinity_mask(_pid: u32) -> Result<Option<u64>> {
+        Ok(None)
+    }
+    #[derive(Debug, Clone, Copy, Default)]
+    pub struct SystemCpuTimes {
+        pub idle_100ns: u64,
+        pub kernel_100ns: u64,
+        pub user_100ns: u64,
+    }
+    impl SystemCpuTimes {
+        pub fn busy_100ns(&self) -> u64 {
+            0
+        }
+        pub fn total_100ns(&self) -> u64 {
+            0
+        }
+    }
+    pub fn system_cpu_times() -> Result<SystemCpuTimes> {
+        Ok(SystemCpuTimes::default())
+    }
+    pub fn memory_status() -> Result<(u64, u64)> {
+        Ok((0, 0))
     }
 }
 

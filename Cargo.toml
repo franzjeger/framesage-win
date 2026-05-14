@@ -58,8 +58,15 @@ windows = "0.58"
 windows-service = "0.7"
 
 # Tray UI
-eframe = { version = "0.28", default-features = false, features = ["default_fonts", "glow", "persistence"] }
+# Persistence is intentionally OFF: eframe's window-state persistence has
+# repeatedly restored broken sizes captured during a buggy session
+# (multi-thousand-pixel inner sizes from pre-DPI-manifest drags). Until we
+# have a curated set of fields we actually want persisted, the window
+# launches fresh at the default size every time — far better UX than
+# inheriting yesterday's broken state.
+eframe = { version = "0.28", default-features = false, features = ["default_fonts", "glow"] }
 egui = "0.28"
+egui_extras = { version = "0.28", default-features = false }
 # System tray icon (real persistent tray, not just a window)
 tray-icon = "0.24"
 

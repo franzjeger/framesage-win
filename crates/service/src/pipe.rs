@@ -150,6 +150,16 @@ pub fn create_admin_pipe(name: &str, first_instance: bool) -> Result<NamedPipeSe
     ServerOptions::new()
         .pipe_mode(PipeMode::Byte)
         .first_pipe_instance(first_instance)
+        // tokio caps `max_instances` at 254 (`PIPE_UNLIMITED_INSTANCES - 1`
+        // — the raw Win32 sentinel is 255 but tokio reserves one slot, and
+        // passing 255 panics with "cannot specify more than 254 instances").
+        // The tray's foreground reporter fires every 250 ms on the admin
+        // pipe; without this lift any concurrent client (CLI status query,
+        // a second tray, etc.) would hit ERROR_PIPE_BUSY for the brief
+        // window between accept-and-spawn and the next listener
+        // instantiation. 254 effectively means "unlimited" for our access
+        // pattern.
+        .max_instances(254)
         .create(name)
         .with_context(|| format!("create admin pipe {name}"))
 }

@@ -131,7 +131,30 @@ pub fn card() -> egui::Frame {
         .fill(SURFACE)
         .stroke(Stroke::new(1.0, BORDER))
         .rounding(Rounding::same(6.0))
-        .inner_margin(egui::Margin::symmetric(10.0, 8.0))
+        .inner_margin(egui::Margin::symmetric(14.0, 10.0))
+}
+
+/// Hero strip: full-width, slightly stronger fill, used for the at-a-glance
+/// summary at the top of the Status tab. Bigger inner padding than `card()`
+/// so the headline reads first.
+pub fn hero() -> egui::Frame {
+    egui::Frame::none()
+        .fill(SURFACE_ACTIVE)
+        .stroke(Stroke::new(1.0, BORDER))
+        .rounding(Rounding::same(8.0))
+        .inner_margin(egui::Margin::symmetric(16.0, 12.0))
+}
+
+/// Banner frame for stateful warnings / persistent overrides (manual mode,
+/// admin-required, paused engine). Fill picks up the accent color at low
+/// opacity; stroke is full-opacity for legibility against the dark panel.
+pub fn banner(color: Color32) -> egui::Frame {
+    let bg = Color32::from_rgba_premultiplied(color.r(), color.g(), color.b(), 0x1f);
+    egui::Frame::none()
+        .fill(bg)
+        .stroke(Stroke::new(1.0, color))
+        .rounding(Rounding::same(6.0))
+        .inner_margin(egui::Margin::symmetric(12.0, 8.0))
 }
 
 /// Pill-shaped status badge — small rounded frame with a colored background
@@ -143,4 +166,14 @@ pub fn status_badge(color: Color32) -> egui::Frame {
         .stroke(Stroke::new(1.0, color))
         .rounding(Rounding::same(10.0))
         .inner_margin(egui::Margin::symmetric(8.0, 2.0))
+}
+
+/// Small uppercase section heading — quiet, used to label groups of fields
+/// inside a card without competing visually with the actual values.
+pub fn section_heading(text: &str) -> egui::RichText {
+    egui::RichText::new(text.to_uppercase())
+        .small()
+        .strong()
+        .color(TEXT_MUTED)
+        .extra_letter_spacing(1.0)
 }

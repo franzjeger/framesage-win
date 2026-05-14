@@ -17,6 +17,7 @@ framesage-core = { workspace = true }
 framesage-ipc = { workspace = true }
 eframe = { workspace = true }
 egui = { workspace = true }
+egui_extras = { workspace = true }
 tokio = { workspace = true }
 anyhow = { workspace = true }
 tracing = { workspace = true }
@@ -25,6 +26,7 @@ serde_json = { workspace = true }
 tray-icon = { workspace = true }
 
 [target.'cfg(windows)'.dependencies]
+framesage-sys = { workspace = true }
 windows = { workspace = true, features = [
     "Win32_Foundation",
     "Win32_Security",

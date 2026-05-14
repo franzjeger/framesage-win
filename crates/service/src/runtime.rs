@@ -235,21 +235,35 @@ async fn serve_ipc(engine: Arc<Engine>, kind: PipeKind) -> Result<()> {
     };
     info!(pipe = %pipe_name, kind = ?kind, "ipc server listening");
 
-    // First pipe instance uses FILE_FLAG_FIRST_PIPE_INSTANCE to defeat
-    // squatting; subsequent accept-loop instances do not.
-    let mut first_instance = true;
+    // Pre-create the FIRST instance with FILE_FLAG_FIRST_PIPE_INSTANCE to
+    // defeat name squatting. Each loop iteration then creates the NEXT
+    // instance BEFORE handing the current one off — this closes a
+    // microsecond gap that hits clients connecting in the window between
+    // accept and re-create as ERROR_PIPE_BUSY. The tray's foreground
+    // reporter connects every 250ms; under that load the gap was hit
+    // often enough to make `framesage status` and concurrent IPC calls
+    // intermittently fail.
+    let mut next_server = match kind {
+        PipeKind::Admin => crate::pipe::create_admin_pipe(pipe_name, true)?,
+        PipeKind::Status => crate::pipe::create_status_pipe(pipe_name, true)?,
+    };
     loop {
-        let server = match kind {
-            PipeKind::Admin => crate::pipe::create_admin_pipe(pipe_name, first_instance)?,
-            PipeKind::Status => crate::pipe::create_status_pipe(pipe_name, first_instance)?,
+        // Move the listener we're about to accept on into `current`,
+        // immediately stand up its replacement.
+        let current = next_server;
+        next_server = match kind {
+            PipeKind::Admin => crate::pipe::create_admin_pipe(pipe_name, false)?,
+            PipeKind::Status => crate::pipe::create_status_pipe(pipe_name, false)?,
         };
-        first_instance = false;
 
-        server.connect().await.context("accept named pipe client")?;
+        current
+            .connect()
+            .await
+            .context("accept named pipe client")?;
 
         let engine = engine.clone();
         tokio::spawn(async move {
-            if let Err(e) = handle_client(server, engine, kind).await {
+            if let Err(e) = handle_client(current, engine, kind).await {
                 debug!(error = %e, "client connection ended");
             }
         });
@@ -320,17 +334,60 @@ async fn handle_client(
                 let snap = engine.status();
                 write_response(&mut write_half, &Response::Status(Box::new(snap))).await?;
             }
+            Request::ListProcesses => {
+                let (snapshots, system) = engine.list_process_snapshots();
+                write_response(&mut write_half, &Response::Processes { snapshots, system }).await?;
+            }
+            Request::SetProcessPriority { pid, class } => {
+                match engine.set_process_priority(pid, class) {
+                    Ok(()) => write_response(&mut write_half, &Response::Ok).await?,
+                    Err(e) => {
+                        write_response(
+                            &mut write_half,
+                            &Response::Error {
+                                message: format!("set_process_priority(pid={pid}) failed: {e:#}"),
+                            },
+                        )
+                        .await?;
+                    }
+                }
+            }
             Request::SetPolicy { policy } => {
                 // Apply in-memory first so subsequent ticks see the change
                 // immediately, then persist to disk so the edit survives
                 // service restart. The FS watcher will fire a redundant
                 // reload from the disk write — benign because `set_policy`
                 // is idempotent on identical content.
+                //
+                // Crucially, if the disk save fails (most common cause: the
+                // service is running unelevated and can't write the
+                // SYSTEM-owned `C:\ProgramData\framesage\policy.json`), we
+                // surface that as a Response::Error so the tray's
+                // last_action banner shows the user what went wrong. The
+                // previous behaviour — warn-log and return Ok — meant edits
+                // silently evaporated on service restart, which is the worst
+                // possible failure mode for a config UI.
                 engine.set_policy(policy.clone());
-                if let Err(e) = policy.save(&paths::policy_path()) {
-                    warn!(error = %e, "policy save after SetPolicy failed; in-memory only");
+                match policy.save(&paths::policy_path()) {
+                    Ok(()) => {
+                        write_response(&mut write_half, &Response::Ok).await?;
+                    }
+                    Err(e) => {
+                        warn!(error = %e, "policy save after SetPolicy failed");
+                        write_response(
+                            &mut write_half,
+                            &Response::Error {
+                                message: format!(
+                                    "policy.json save failed: {e}. Edit applied in memory \
+                                     but will be lost on service restart. \
+                                     Install the service elevated so it can write \
+                                     C:\\ProgramData\\framesage\\policy.json."
+                                ),
+                            },
+                        )
+                        .await?;
+                    }
                 }
-                write_response(&mut write_half, &Response::Ok).await?;
             }
             Request::ApplyOnce { profile } => match engine.apply_once(profile) {
                 Ok(()) => {
@@ -346,6 +403,37 @@ async fn handle_client(
                     .await?;
                 }
             },
+            Request::SetManualOverride { profile } => match engine.set_manual_override(profile) {
+                Ok(()) => {
+                    write_response(&mut write_half, &Response::Ok).await?;
+                }
+                Err(e) => {
+                    write_response(
+                        &mut write_half,
+                        &Response::Error {
+                            message: format!("set_manual_override failed: {e:#}"),
+                        },
+                    )
+                    .await?;
+                }
+            },
+            Request::ClearManualOverride => {
+                engine.clear_manual_override();
+                write_response(&mut write_half, &Response::Ok).await?;
+            }
+            Request::ReportForeground {
+                pid,
+                exe_name,
+                path,
+                title,
+            } => {
+                engine.report_foreground(pid, exe_name, path, title);
+                write_response(&mut write_half, &Response::Ok).await?;
+            }
+            Request::ReportNoForeground => {
+                engine.report_no_foreground();
+                write_response(&mut write_half, &Response::Ok).await?;
+            }
             Request::Pause => {
                 engine.pause();
                 write_response(&mut write_half, &Response::Ok).await?;

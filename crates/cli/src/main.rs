@@ -387,6 +387,7 @@ async fn send_simple(req: Request) -> Result<()> {
         match resp {
             Response::Ok => println!("ok"),
             Response::Status(_) => println!("ok"),
+            Response::Processes { .. } => println!("ok"),
             Response::Error { message } => return Err(anyhow!(message)),
         }
     }
@@ -415,6 +416,7 @@ async fn print_status() -> Result<()> {
     match resp {
         Response::Status(s) => print_status_snapshot(&s),
         Response::Ok => println!("ok"),
+        Response::Processes { .. } => println!("ok"),
         Response::Error { message } => return Err(anyhow!(message)),
     }
     Ok(())

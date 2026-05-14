@@ -44,6 +44,33 @@ pub enum Request {
     /// Apply a named profile to the currently foregrounded process, ignoring
     /// the normal rule matcher until focus changes.
     ApplyOnce { profile: ProfileId },
+    /// Enter manual mode: apply this profile to every foreground app and
+    /// keep applying it across focus changes until explicitly cleared.
+    /// Takes precedence over the Rules tab + default_profile until
+    /// `ClearManualOverride` arrives.
+    SetManualOverride { profile: ProfileId },
+    /// Leave manual mode. Foreground apply returns to consulting Rules +
+    /// default_profile. Idempotent — no-op if manual mode was already off.
+    ClearManualOverride,
+    /// Report the user-session foreground app to the service.
+    ///
+    /// The service runs in Windows session 0 (LocalSystem) and can't see
+    /// the interactive desktop — `GetForegroundWindow()` returns null
+    /// from session 0. The tray runs in the user's session, polls
+    /// foreground itself, and sends this report on every frame. Engine
+    /// uses the most recent report instead of polling on its own. Sent
+    /// every few hundred ms; routed on the admin pipe because it
+    /// ultimately drives apply/revert.
+    ReportForeground {
+        pid: u32,
+        exe_name: String,
+        path: String,
+        title: String,
+    },
+    /// Tell the service the user-session currently has no foreground
+    /// (lock screen, UAC dialog, transition). Engine treats this as
+    /// "no foreground" so any active profile reverts.
+    ReportNoForeground,
     /// Pause the engine (still alive, but stops applying anything).
     Pause,
     /// Resume after a pause.
@@ -54,6 +81,18 @@ pub enum Request {
     /// Subscribe to live status events. The server keeps the connection open
     /// and streams `Event` records.
     Subscribe,
+    /// Return a snapshot of every visible process plus the engine's view of
+    /// how each maps onto our state (rule match, profile applied, ProBalance
+    /// restraint). Read-only — backs the tray's Processes tab.
+    ListProcesses,
+    /// Set the priority class of an arbitrary live PID. The engine opens
+    /// the process and writes the class directly — bypasses the profile
+    /// system, so this is a one-off action not a persistent rule. Backs
+    /// the Processes tab's right-click "Set priority" submenu.
+    SetProcessPriority {
+        pid: u32,
+        class: framesage_core::PriorityClass,
+    },
 }
 
 impl Request {
@@ -66,12 +105,17 @@ impl Request {
     /// current variant by name.
     pub fn is_read_only(&self) -> bool {
         match self {
-            Request::Status | Request::Subscribe => true,
+            Request::Status | Request::Subscribe | Request::ListProcesses => true,
             Request::SetPolicy { .. }
             | Request::ApplyOnce { .. }
+            | Request::SetManualOverride { .. }
+            | Request::ClearManualOverride
+            | Request::ReportForeground { .. }
+            | Request::ReportNoForeground
             | Request::Pause
             | Request::Resume
-            | Request::GameModeOff => false,
+            | Request::GameModeOff
+            | Request::SetProcessPriority { .. } => false,
         }
     }
 
@@ -94,9 +138,65 @@ pub enum Response {
     /// other variants — clippy enforces this so we don't blow the response
     /// enum's stack footprint on every reply.
     Status(Box<StatusSnapshot>),
+    Processes {
+        snapshots: Vec<ProcessSnapshot>,
+        /// Live system metrics paired with the snapshot — backs the
+        /// performance band at the top of the tray UI. All three are
+        /// "right now" point-in-time values, so the tray keeps its own
+        /// 60-sample history for the sparkline; the service only emits
+        /// the current reading.
+        #[serde(default)]
+        system: SystemMetrics,
+    },
     Error {
         message: String,
     },
+}
+
+/// System-wide point-in-time metrics, attached to each `Processes`
+/// response. The performance band at the top of the tray UI consumes
+/// these to render the sliding sparkline + current values.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]
+pub struct SystemMetrics {
+    /// Total CPU utilisation across all logical processors, 0-100. Derived
+    /// from `GetSystemTimes` deltas between two engine ticks.
+    pub cpu_percent: u8,
+    /// Physical RAM in use, bytes (total - available).
+    pub memory_used_bytes: u64,
+    /// Physical RAM installed, bytes.
+    pub memory_total_bytes: u64,
+}
+
+/// One row of the Processes tab's live view. Sent over IPC, so all fields
+/// are owned + serialisable.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProcessSnapshot {
+    pub pid: u32,
+    /// Image filename only (no path), original case as the kernel reports.
+    pub exe_name: String,
+    /// Live `GetPriorityClass` value (raw Win32 constant).
+    pub priority_class_raw: u32,
+    /// Live `GetProcessAffinityMask` value. `u64` so we can grow past 32 CPUs.
+    pub affinity_mask: u64,
+    /// "% of one logical CPU" over the engine's last sample window. 0 if
+    /// the engine hasn't sampled the process yet (e.g. just spawned).
+    pub cpu_percent: u16,
+    /// Working set, bytes.
+    pub memory_bytes: u64,
+    /// Thread count.
+    pub threads: u32,
+    /// Note text from the rule that matched this exe, if any. `None` means
+    /// no rule matched and the engine is treating it as background.
+    pub matched_rule_note: Option<String>,
+    /// Profile id the engine has currently applied to this PID, if any.
+    /// `None` means the engine isn't tracking the PID (no rule match AND
+    /// not seen yet by the background scan).
+    pub managed_profile: Option<String>,
+    /// `true` if ProBalance currently has this PID restrained (priority
+    /// class lowered for contention relief). Mutually exclusive with
+    /// `managed_profile` in normal operation — ProBalance skips managed
+    /// PIDs by design.
+    pub restrained_by_probalance: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -105,6 +205,11 @@ pub struct StatusSnapshot {
     pub policy: Policy,
     pub foreground: Option<ForegroundSnapshot>,
     pub active_profile: Option<Profile>,
+    /// When `Some`, the engine is in manual mode and applying the named
+    /// profile to every foreground app regardless of Rules. The tray
+    /// surfaces this with a banner + "Disable manual mode" button.
+    #[serde(default)]
+    pub manual_override: Option<ProfileId>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -126,6 +231,24 @@ pub enum Event {
     },
     Paused,
     Resumed,
+
+    /// ProBalance demoted a background CPU hog. `from_class` and `to_class`
+    /// are raw Win32 priority class constants captured at decision time so
+    /// the action log can render the demotion factually.
+    ProBalanceRestrained {
+        pid: u32,
+        exe_name: String,
+        from_class: u32,
+        to_class: u32,
+    },
+
+    /// ProBalance restored a previously-restrained process to its original
+    /// priority class (the value captured in the matching `Restrained` event).
+    ProBalanceRestored {
+        pid: u32,
+        exe_name: String,
+        restored_class: u32,
+    },
 }
 
 #[cfg(test)]
@@ -140,6 +263,7 @@ mod tests {
             default_profile: ProfileId("perf".into()),
             background_profile: None,
             tick_ms: 300,
+            probalance: framesage_core::ProBalanceConfig::default(),
         }
     }
 
@@ -152,6 +276,12 @@ mod tests {
     fn is_read_only_classifies_every_request_variant() {
         assert!(Request::Status.is_read_only());
         assert!(Request::Subscribe.is_read_only());
+        assert!(Request::ListProcesses.is_read_only());
+        assert!(!Request::SetProcessPriority {
+            pid: 1,
+            class: framesage_core::PriorityClass::Normal,
+        }
+        .is_read_only());
         assert!(!Request::SetPolicy {
             policy: sample_policy()
         }
@@ -160,6 +290,19 @@ mod tests {
             profile: ProfileId("game-x3d".into())
         }
         .is_read_only());
+        assert!(!Request::SetManualOverride {
+            profile: ProfileId("game-x3d".into())
+        }
+        .is_read_only());
+        assert!(!Request::ClearManualOverride.is_read_only());
+        assert!(!Request::ReportForeground {
+            pid: 1,
+            exe_name: String::new(),
+            path: String::new(),
+            title: String::new(),
+        }
+        .is_read_only());
+        assert!(!Request::ReportNoForeground.is_read_only());
         assert!(!Request::Pause.is_read_only());
         assert!(!Request::Resume.is_read_only());
         assert!(!Request::GameModeOff.is_read_only());
