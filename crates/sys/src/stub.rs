@@ -88,6 +88,26 @@ pub mod process {
     pub fn affinity_mask(_pid: u32) -> Result<Option<u64>> {
         Ok(None)
     }
+    #[derive(Debug, Clone, Copy, Default)]
+    pub struct SystemCpuTimes {
+        pub idle_100ns: u64,
+        pub kernel_100ns: u64,
+        pub user_100ns: u64,
+    }
+    impl SystemCpuTimes {
+        pub fn busy_100ns(&self) -> u64 {
+            0
+        }
+        pub fn total_100ns(&self) -> u64 {
+            0
+        }
+    }
+    pub fn system_cpu_times() -> Result<SystemCpuTimes> {
+        Ok(SystemCpuTimes::default())
+    }
+    pub fn memory_status() -> Result<(u64, u64)> {
+        Ok((0, 0))
+    }
 }
 
 pub mod game_mode {

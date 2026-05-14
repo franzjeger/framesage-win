@@ -43,7 +43,19 @@ struct AppState {
     /// Latest snapshot of all processes from the service. Refreshed by
     /// `processes_poll_loop` at ~1 Hz. Empty until the first poll completes.
     processes: Vec<framesage_ipc::ProcessSnapshot>,
+    /// Live system-wide metrics paired with the latest `processes` snapshot
+    /// (CPU% / mem used / mem total). Refreshed each poll.
+    system: framesage_ipc::SystemMetrics,
+    /// Sliding ring buffer of the last `SYSTEM_HISTORY_LEN` (CPU%, mem%)
+    /// samples — backs the sparkline in the permanent performance band at
+    /// the top of every tab. Newest at the back.
+    system_history: std::collections::VecDeque<(u8, u8)>,
 }
+
+/// Number of samples kept in `AppState.system_history`. 60 samples × 1 Hz
+/// poll = 60 seconds of history, which matches Task Manager / PL's default
+/// graph window. Cheap (120 bytes).
+const SYSTEM_HISTORY_LEN: usize = 60;
 
 struct RecentEvent {
     label: String,
@@ -63,8 +75,8 @@ struct TrayCommands {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 enum Tab {
-    #[default]
     Status,
+    #[default]
     Processes,
     Rules,
     Profiles,
@@ -347,6 +359,21 @@ impl eframe::App for FramesageApp {
             }
         }
 
+        // Pull metrics + activity for the always-visible top/bottom strips.
+        let (system_metrics, system_history, recent_for_strip) = {
+            let s = self.state.lock().unwrap();
+            (
+                s.system,
+                s.system_history.iter().copied().collect::<Vec<_>>(),
+                s.recent
+                    .iter()
+                    .rev()
+                    .take(5)
+                    .map(|e| e.label.clone())
+                    .collect::<Vec<_>>(),
+            )
+        };
+
         // Header with brand mark, tabs, connection badge. The OS title bar
         // already says "framesage" so the inline label is styled small and
         // colored — it's a brand mark, not a duplicate heading.
@@ -368,8 +395,8 @@ impl eframe::App for FramesageApp {
                     ui.add_space(8.0);
                     ui.separator();
                     ui.add_space(4.0);
-                    ui.selectable_value(&mut self.tab, Tab::Status, "Status");
                     ui.selectable_value(&mut self.tab, Tab::Processes, "Processes");
+                    ui.selectable_value(&mut self.tab, Tab::Status, "Status");
                     ui.selectable_value(&mut self.tab, Tab::Rules, "Rules");
                     ui.selectable_value(&mut self.tab, Tab::Profiles, "Profiles");
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -383,6 +410,34 @@ impl eframe::App for FramesageApp {
                         });
                     });
                 });
+            });
+
+        // Permanent performance band — second top panel below the header.
+        // CPU% + Mem% + sliding 60s sparkline, visible regardless of which
+        // tab is active. The "what is my machine doing right now?" answer
+        // is always one glance away.
+        egui::TopBottomPanel::top("framesage-perf-band")
+            .frame(
+                egui::Frame::none()
+                    .fill(theme::SURFACE)
+                    .inner_margin(egui::Margin::symmetric(12.0, 6.0)),
+            )
+            .show(ctx, |ui| {
+                render_perf_band(ui, &system_metrics, &system_history);
+            });
+
+        // Permanent activity strip — bottom panel, last 5 engine actions.
+        // Same Recent Activity content the Status tab shows in full; here
+        // it's a single horizontal scroller so you can see what FrameSage
+        // is doing without leaving the Processes tab.
+        egui::TopBottomPanel::bottom("framesage-activity-strip")
+            .frame(
+                egui::Frame::none()
+                    .fill(theme::SURFACE)
+                    .inner_margin(egui::Margin::symmetric(12.0, 5.0)),
+            )
+            .show(ctx, |ui| {
+                render_activity_strip(ui, &recent_for_strip);
             });
 
         egui::CentralPanel::default().show(ctx, |ui| {
@@ -1680,15 +1735,11 @@ impl FramesageApp {
         // ─── Dispatch context-menu actions outside the render closure ─────
         for action in action_queue {
             match action {
-                ProcessAction::SetPriority { pid: _, class } => {
-                    // Best-effort: route through ApplyOnce with a tiny ad-hoc
-                    // profile would require an IPC mutator we don't yet
-                    // expose for arbitrary PIDs. For now, show in last_action
-                    // so the user sees we registered the click; a follow-up
-                    // commit adds `Request::SetProcessPriority { pid, class }`.
-                    *self.last_action.lock().unwrap() = Some(format!(
-                        "Set priority {class:?} — per-PID IPC pending (use Apply profile in the meantime)"
-                    ));
+                ProcessAction::SetPriority { pid, class } => {
+                    self.send_admin_request(
+                        Request::SetProcessPriority { pid, class },
+                        "set priority",
+                    );
                 }
                 ProcessAction::ApplyProfileForeground { profile } => {
                     self.send_admin_request(
@@ -1771,20 +1822,9 @@ impl FramesageApp {
 /// Pending context-menu click captured during the render pass; dispatched
 /// after the render closure releases its borrow on `self`.
 enum ProcessAction {
-    /// Placeholder — IPC for per-PID priority change is in the next commit.
-    /// Captured so the menu click flow is wired end-to-end already.
-    SetPriority {
-        #[allow(dead_code)]
-        pid: u32,
-        class: PriorityClass,
-    },
-    ApplyProfileForeground {
-        profile: String,
-    },
-    CreateRule {
-        exe_name: String,
-        profile: String,
-    },
+    SetPriority { pid: u32, class: PriorityClass },
+    ApplyProfileForeground { profile: String },
+    CreateRule { exe_name: String, profile: String },
 }
 
 /// (display label, enum value) pairs used by the per-row priority submenu.
@@ -1996,6 +2036,161 @@ fn kv_grid_row(ui: &mut egui::Ui, key: &str, value: String) {
     ui.label(egui::RichText::new(key).color(theme::TEXT_MUTED).size(12.0));
     ui.label(value);
     ui.end_row();
+}
+
+/// Permanent performance band rendered above every tab. Two numeric
+/// readouts (CPU%, Memory) plus a 60-sample sparkline. Designed to compress
+/// to ~28 px of vertical space — enough to read at a glance, not enough to
+/// dominate the tab content below it.
+fn render_perf_band(
+    ui: &mut egui::Ui,
+    metrics: &framesage_ipc::SystemMetrics,
+    history: &[(u8, u8)],
+) {
+    ui.horizontal(|ui| {
+        // Left cluster: the live numeric readouts. Color-coded by intensity
+        // so the band visually flags contention without the user having to
+        // read the number.
+        ui.label(
+            egui::RichText::new("CPU")
+                .color(theme::TEXT_MUTED)
+                .size(11.0),
+        );
+        let cpu_color = cpu_percent_color(metrics.cpu_percent as u16);
+        ui.label(
+            egui::RichText::new(format!("{}%", metrics.cpu_percent))
+                .color(cpu_color)
+                .strong()
+                .size(15.0),
+        );
+        ui.add_space(16.0);
+
+        let mem_percent: u8 = if metrics.memory_total_bytes > 0 {
+            ((metrics.memory_used_bytes as u128 * 100 / metrics.memory_total_bytes as u128)
+                .min(100)) as u8
+        } else {
+            0
+        };
+        ui.label(
+            egui::RichText::new("MEM")
+                .color(theme::TEXT_MUTED)
+                .size(11.0),
+        );
+        let mem_color = if mem_percent > 90 {
+            theme::ERROR
+        } else if mem_percent > 75 {
+            theme::WARNING
+        } else {
+            theme::TEXT
+        };
+        ui.label(
+            egui::RichText::new(format!("{}%", mem_percent))
+                .color(mem_color)
+                .strong()
+                .size(15.0),
+        );
+        ui.colored_label(
+            theme::TEXT_MUTED,
+            format!(
+                " {} / {}",
+                format_bytes(metrics.memory_used_bytes),
+                format_bytes(metrics.memory_total_bytes)
+            ),
+        );
+
+        // Right cluster: the sparkline. Fills the remaining horizontal
+        // space and renders inline next to the readouts.
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            // Width: take a chunk of available space, leave room for the
+            // left readouts.
+            let desired = egui::vec2(360.0, 22.0);
+            let (rect, _) = ui.allocate_exact_size(desired, egui::Sense::hover());
+            draw_sparkline(ui.painter(), rect, history);
+        });
+    });
+}
+
+/// Render two overlaid lines (CPU + memory) inside `rect` from the
+/// `history` ring buffer. Newest sample on the right, oldest on the left.
+/// Keeps the visual lightweight — no axes, no grid, just two stroke lines
+/// with subtle fills. Same pattern Task Manager / Process Lasso use.
+fn draw_sparkline(painter: &egui::Painter, rect: egui::Rect, history: &[(u8, u8)]) {
+    use egui::epaint::PathShape;
+    use egui::{Color32, Stroke};
+
+    // Background frame so the line has something to anchor against.
+    painter.rect_filled(rect, 3.0, theme::SURFACE);
+
+    if history.len() < 2 {
+        return;
+    }
+
+    let count = history.len().max(2);
+    let dx = rect.width() / (count - 1) as f32;
+    let mut cpu_points: Vec<egui::Pos2> = Vec::with_capacity(count);
+    let mut mem_points: Vec<egui::Pos2> = Vec::with_capacity(count);
+    for (i, (cpu, mem)) in history.iter().enumerate() {
+        let x = rect.left() + i as f32 * dx;
+        let cpu_y = rect.bottom() - (*cpu as f32 / 100.0) * rect.height();
+        let mem_y = rect.bottom() - (*mem as f32 / 100.0) * rect.height();
+        cpu_points.push(egui::pos2(x, cpu_y));
+        mem_points.push(egui::pos2(x, mem_y));
+    }
+
+    // CPU line in accent, memory in a muted secondary color. Each gets a
+    // subtle fill below the line for visual mass.
+    let cpu_stroke = Stroke::new(1.5, theme::ACCENT);
+    let mem_stroke = Stroke::new(1.0, Color32::from_rgb(140, 90, 200));
+
+    // Filled area under the CPU line (the more eye-catching of the two,
+    // matching its priority for the user).
+    let mut cpu_fill: Vec<egui::Pos2> = cpu_points.clone();
+    cpu_fill.push(egui::pos2(rect.right(), rect.bottom()));
+    cpu_fill.push(egui::pos2(rect.left(), rect.bottom()));
+    painter.add(PathShape::convex_polygon(
+        cpu_fill,
+        Color32::from_rgba_unmultiplied(50, 130, 246, 30),
+        Stroke::NONE,
+    ));
+
+    painter.add(PathShape::line(mem_points, mem_stroke));
+    painter.add(PathShape::line(cpu_points, cpu_stroke));
+}
+
+/// Permanent activity strip — last ~5 engine actions in one horizontal
+/// scroller at the bottom. Mirrors the Status tab's Recent Activity, but
+/// compact and always visible regardless of which tab is open.
+fn render_activity_strip(ui: &mut egui::Ui, recent: &[String]) {
+    ui.horizontal(|ui| {
+        ui.label(
+            egui::RichText::new("ACTIVITY")
+                .color(theme::TEXT_MUTED)
+                .size(10.0)
+                .strong(),
+        );
+        ui.add_space(8.0);
+        if recent.is_empty() {
+            ui.colored_label(theme::TEXT_MUTED, "no events yet");
+            return;
+        }
+        egui::ScrollArea::horizontal()
+            .max_width(f32::INFINITY)
+            .show(ui, |ui| {
+                for (i, line) in recent.iter().enumerate() {
+                    if i > 0 {
+                        ui.colored_label(theme::TEXT_MUTED, "·");
+                    }
+                    let color = if line.contains("probalance") {
+                        theme::WARNING
+                    } else if line.contains("game-x3d") {
+                        theme::ACCENT
+                    } else {
+                        theme::TEXT
+                    };
+                    ui.colored_label(color, line);
+                }
+            });
+    });
 }
 
 /// Recent activity feed. Treats consecutive identical lines as one (with a
@@ -3008,15 +3203,30 @@ fn background_loop(state: Arc<Mutex<AppState>>) {
 /// isn't running yet (we start before it does on logon), we silently
 /// retry on the next tick. No backoff is needed — every 250ms is fine
 /// Poll `Request::ListProcesses` over the status pipe every 1 s and push
-/// the result into `AppState.processes`. Wakes the egui runtime each
-/// refresh so the Processes tab updates even when no other input arrives.
+/// the result (plus paired system metrics) into `AppState`. Wakes the egui
+/// runtime each refresh so the Processes tab and the performance band
+/// update even when no other input arrives.
 #[cfg(windows)]
 fn processes_poll_loop(state: Arc<Mutex<AppState>>, ctx: egui::Context) {
     let interval = std::time::Duration::from_millis(1000);
     loop {
         match send_list_processes_blocking() {
-            Ok(snapshots) => {
-                state.lock().unwrap().processes = snapshots;
+            Ok((snapshots, system)) => {
+                let mem_percent: u8 = if system.memory_total_bytes > 0 {
+                    ((system.memory_used_bytes as u128 * 100 / system.memory_total_bytes as u128)
+                        .min(100)) as u8
+                } else {
+                    0
+                };
+                let mut s = state.lock().unwrap();
+                s.processes = snapshots;
+                s.system = system;
+                s.system_history
+                    .push_back((system.cpu_percent, mem_percent));
+                while s.system_history.len() > SYSTEM_HISTORY_LEN {
+                    s.system_history.pop_front();
+                }
+                drop(s);
                 ctx.request_repaint();
             }
             Err(_) => {
@@ -3031,7 +3241,10 @@ fn processes_poll_loop(state: Arc<Mutex<AppState>>, ctx: egui::Context) {
 }
 
 #[cfg(windows)]
-fn send_list_processes_blocking() -> anyhow::Result<Vec<framesage_ipc::ProcessSnapshot>> {
+fn send_list_processes_blocking() -> anyhow::Result<(
+    Vec<framesage_ipc::ProcessSnapshot>,
+    framesage_ipc::SystemMetrics,
+)> {
     use std::fs::OpenOptions;
     use std::io::{BufRead, BufReader, Write};
 
@@ -3050,7 +3263,7 @@ fn send_list_processes_blocking() -> anyhow::Result<Vec<framesage_ipc::ProcessSn
     let mut line = String::new();
     reader.read_line(&mut line)?;
     match serde_json::from_str::<framesage_ipc::Response>(&line)? {
-        framesage_ipc::Response::Processes { snapshots } => Ok(snapshots),
+        framesage_ipc::Response::Processes { snapshots, system } => Ok((snapshots, system)),
         other => Err(anyhow::anyhow!(
             "expected Processes response, got {other:?}"
         )),

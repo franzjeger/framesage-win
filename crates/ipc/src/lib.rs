@@ -85,6 +85,14 @@ pub enum Request {
     /// how each maps onto our state (rule match, profile applied, ProBalance
     /// restraint). Read-only — backs the tray's Processes tab.
     ListProcesses,
+    /// Set the priority class of an arbitrary live PID. The engine opens
+    /// the process and writes the class directly — bypasses the profile
+    /// system, so this is a one-off action not a persistent rule. Backs
+    /// the Processes tab's right-click "Set priority" submenu.
+    SetProcessPriority {
+        pid: u32,
+        class: framesage_core::PriorityClass,
+    },
 }
 
 impl Request {
@@ -106,7 +114,8 @@ impl Request {
             | Request::ReportNoForeground
             | Request::Pause
             | Request::Resume
-            | Request::GameModeOff => false,
+            | Request::GameModeOff
+            | Request::SetProcessPriority { .. } => false,
         }
     }
 
@@ -131,10 +140,31 @@ pub enum Response {
     Status(Box<StatusSnapshot>),
     Processes {
         snapshots: Vec<ProcessSnapshot>,
+        /// Live system metrics paired with the snapshot — backs the
+        /// performance band at the top of the tray UI. All three are
+        /// "right now" point-in-time values, so the tray keeps its own
+        /// 60-sample history for the sparkline; the service only emits
+        /// the current reading.
+        #[serde(default)]
+        system: SystemMetrics,
     },
     Error {
         message: String,
     },
+}
+
+/// System-wide point-in-time metrics, attached to each `Processes`
+/// response. The performance band at the top of the tray UI consumes
+/// these to render the sliding sparkline + current values.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]
+pub struct SystemMetrics {
+    /// Total CPU utilisation across all logical processors, 0-100. Derived
+    /// from `GetSystemTimes` deltas between two engine ticks.
+    pub cpu_percent: u8,
+    /// Physical RAM in use, bytes (total - available).
+    pub memory_used_bytes: u64,
+    /// Physical RAM installed, bytes.
+    pub memory_total_bytes: u64,
 }
 
 /// One row of the Processes tab's live view. Sent over IPC, so all fields
@@ -247,6 +277,11 @@ mod tests {
         assert!(Request::Status.is_read_only());
         assert!(Request::Subscribe.is_read_only());
         assert!(Request::ListProcesses.is_read_only());
+        assert!(!Request::SetProcessPriority {
+            pid: 1,
+            class: framesage_core::PriorityClass::Normal,
+        }
+        .is_read_only());
         assert!(!Request::SetPolicy {
             policy: sample_policy()
         }

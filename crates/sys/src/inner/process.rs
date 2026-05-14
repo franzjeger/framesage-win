@@ -219,6 +219,66 @@ pub fn working_set_bytes(pid: u32) -> Result<Option<u64>> {
     }
 }
 
+/// Cumulative system CPU times (idle / kernel / user) in 100-ns units.
+/// Used to compute system-wide CPU% by taking two samples and looking at
+/// `1 - delta_idle / delta_total`. `GetSystemTimes` is documented and
+/// cheaper than spinning up a PDH counter — exactly what Task Manager uses.
+#[derive(Debug, Clone, Copy)]
+pub struct SystemCpuTimes {
+    pub idle_100ns: u64,
+    pub kernel_100ns: u64,
+    pub user_100ns: u64,
+}
+
+impl SystemCpuTimes {
+    /// `kernel` from `GetSystemTimes` includes idle. The "busy" portion is
+    /// `kernel + user - idle`. Total wall time across all CPUs is the same
+    /// `kernel + user` value (kernel includes idle by Microsoft's
+    /// convention). Both delta forms are useful: use this to get busy.
+    pub fn busy_100ns(&self) -> u64 {
+        self.kernel_100ns
+            .saturating_add(self.user_100ns)
+            .saturating_sub(self.idle_100ns)
+    }
+    /// Total CPU-time accounted for (across all logical processors).
+    pub fn total_100ns(&self) -> u64 {
+        self.kernel_100ns.saturating_add(self.user_100ns)
+    }
+}
+
+/// Sample `GetSystemTimes`. The caller stores the previous sample and
+/// computes `busy / total` from the delta to get a system CPU% in 0-100.
+pub fn system_cpu_times() -> Result<SystemCpuTimes> {
+    use windows::Win32::System::Threading::GetSystemTimes;
+    let mut idle = FILETIME::default();
+    let mut kernel = FILETIME::default();
+    let mut user = FILETIME::default();
+    // SAFETY: documented call. All three out-params are valid FILETIME ptrs.
+    unsafe { GetSystemTimes(Some(&mut idle), Some(&mut kernel), Some(&mut user)) }
+        .map_err(|e| anyhow!("GetSystemTimes failed: {e}"))?;
+    Ok(SystemCpuTimes {
+        idle_100ns: filetime_to_u64(&idle),
+        kernel_100ns: filetime_to_u64(&kernel),
+        user_100ns: filetime_to_u64(&user),
+    })
+}
+
+/// Total + available physical memory in bytes via `GlobalMemoryStatusEx`.
+/// Returns `(total, available)`. Caller computes used = total - available
+/// (or "load%" via the same struct's `dwMemoryLoad` field — but we want
+/// the byte counts for the performance band, not just a percentage).
+pub fn memory_status() -> Result<(u64, u64)> {
+    use windows::Win32::System::SystemInformation::{GlobalMemoryStatusEx, MEMORYSTATUSEX};
+    let mut mem = MEMORYSTATUSEX {
+        dwLength: std::mem::size_of::<MEMORYSTATUSEX>() as u32,
+        ..Default::default()
+    };
+    // SAFETY: dwLength is correctly initialised; mem out-param valid.
+    unsafe { GlobalMemoryStatusEx(&mut mem) }
+        .map_err(|e| anyhow!("GlobalMemoryStatusEx failed: {e}"))?;
+    Ok((mem.ullTotalPhys, mem.ullAvailPhys))
+}
+
 /// Live process affinity mask via `GetProcessAffinityMask`. `None` if the
 /// PID is gone or we can't open it for query. Returns just the process mask
 /// (we discard the system mask — callers that need it can take their own

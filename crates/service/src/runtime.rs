@@ -335,8 +335,22 @@ async fn handle_client(
                 write_response(&mut write_half, &Response::Status(Box::new(snap))).await?;
             }
             Request::ListProcesses => {
-                let snapshots = engine.list_process_snapshots();
-                write_response(&mut write_half, &Response::Processes { snapshots }).await?;
+                let (snapshots, system) = engine.list_process_snapshots();
+                write_response(&mut write_half, &Response::Processes { snapshots, system }).await?;
+            }
+            Request::SetProcessPriority { pid, class } => {
+                match engine.set_process_priority(pid, class) {
+                    Ok(()) => write_response(&mut write_half, &Response::Ok).await?,
+                    Err(e) => {
+                        write_response(
+                            &mut write_half,
+                            &Response::Error {
+                                message: format!("set_process_priority(pid={pid}) failed: {e:#}"),
+                            },
+                        )
+                        .await?;
+                    }
+                }
             }
             Request::SetPolicy { policy } => {
                 // Apply in-memory first so subsequent ticks see the change

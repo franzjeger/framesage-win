@@ -44,7 +44,7 @@ use framesage_gamemode::{
     safe_list::SafeList,
     state::{AppliedActions, PreviousState, SuspendedProcessSnapshot},
 };
-use framesage_ipc::{Event, ForegroundSnapshot, ProcessSnapshot, StatusSnapshot};
+use framesage_ipc::{Event, ForegroundSnapshot, ProcessSnapshot, StatusSnapshot, SystemMetrics};
 
 /// Dependencies the engine needs at construction. Passing as a struct keeps
 /// the call sites readable (we already have policy + topology, and now journal
@@ -106,6 +106,10 @@ struct EngineState {
     /// Wall-clock instant matching `list_processes_prev_samples`. Used to
     /// turn CPU-time deltas into a % of one logical CPU.
     list_processes_last_sample_at: Option<Instant>,
+    /// Previous system-wide CPU-time sample (`GetSystemTimes`). Subtracted
+    /// from the current sample inside `list_process_snapshots` to derive
+    /// the live system CPU% surfaced in the performance band.
+    list_processes_prev_system_cpu: Option<framesage_sys::process::SystemCpuTimes>,
     /// Manual mode: when set, every foreground reconcile applies this
     /// profile instead of consulting Rules. Stays set across focus
     /// changes until explicitly cleared via `clear_manual_override` /
@@ -208,6 +212,7 @@ impl Engine {
                 probalance_restrained: HashMap::new(),
                 list_processes_prev_samples: HashMap::new(),
                 list_processes_last_sample_at: None,
+                list_processes_prev_system_cpu: None,
                 manual_override: None,
                 reported_foreground: None,
                 foreground_reporter_seen: false,
@@ -245,6 +250,28 @@ impl Engine {
         info!("policy replaced");
     }
 
+    /// One-off priority change against any live PID. Bypasses the profile
+    /// system — used by the Processes tab's right-click "Set priority"
+    /// submenu. If the PID is currently managed by us via a rule, the
+    /// next reconcile (or re-assert tick for persistent profiles) will
+    /// overwrite this with the rule's class; that's the right semantic —
+    /// the rule still wins.
+    pub fn set_process_priority(
+        &self,
+        pid: u32,
+        class: framesage_core::PriorityClass,
+    ) -> Result<()> {
+        #[cfg(windows)]
+        {
+            framesage_sys::apply::set_priority_class_for_pid(pid, class)?;
+        }
+        #[cfg(not(windows))]
+        {
+            let _ = (pid, class);
+        }
+        Ok(())
+    }
+
     pub fn status(&self) -> StatusSnapshot {
         let s = self.state.read();
         let active_profile = s
@@ -260,18 +287,20 @@ impl Engine {
         }
     }
 
-    /// Collect a snapshot row for every visible process. Backs the tray's
-    /// Processes tab. Self-contained: opens its own handles, manages its own
-    /// per-PID CPU-time history so the % is computed even when ProBalance is
-    /// disabled.
+    /// Collect a snapshot row for every visible process plus paired
+    /// system-wide metrics (CPU%, memory). Backs the tray's Processes tab +
+    /// the permanent performance band. Self-contained: opens its own
+    /// handles, manages its own per-PID CPU-time history so the % is
+    /// computed even when ProBalance is disabled.
     ///
     /// Costs ~1 ToolHelp snapshot + 4 `OpenProcess`/`CloseHandle` pairs per
-    /// PID (priority, affinity, mem, cpu_times). On a 200-process machine
+    /// PID (priority, affinity, mem, cpu_times) + 2 cheap system syscalls
+    /// (`GetSystemTimes`, `GlobalMemoryStatusEx`). On a 200-process machine
     /// that's ~800 syscalls per call — fine at 1 Hz from the tray, not fine
     /// at 100 Hz, which is why the tray polls.
-    pub fn list_process_snapshots(&self) -> Vec<ProcessSnapshot> {
+    pub fn list_process_snapshots(&self) -> (Vec<ProcessSnapshot>, SystemMetrics) {
         #[cfg(not(windows))]
-        return Vec::new();
+        return (Vec::new(), SystemMetrics::default());
         #[cfg(windows)]
         {
             let now = Instant::now();
@@ -290,7 +319,7 @@ impl Engine {
                 Ok(v) => v,
                 Err(e) => {
                     warn!(error = %e, "list_process_snapshots: iter_pid_snapshots failed");
-                    return Vec::new();
+                    return (Vec::new(), SystemMetrics::default());
                 }
             };
 
@@ -376,7 +405,40 @@ impl Engine {
             }
 
             s.list_processes_prev_samples = new_prev;
-            out
+
+            // ─── System-wide metrics ─────────────────────────────────────
+            //
+            // System CPU% = 100 - (delta_idle / delta_total) over the same
+            // wall-clock interval as the per-process sample. We compute it
+            // from `GetSystemTimes` rather than summing per-process CPU%
+            // because per-process omits whatever fraction of kernel time
+            // we couldn't open (protected processes) and undercounts.
+            let sys_cpu_now = framesage_sys::process::system_cpu_times().ok();
+            let system_cpu_percent: u8 = match (&sys_cpu_now, &s.list_processes_prev_system_cpu) {
+                (Some(now_t), Some(prev_t)) => {
+                    let total_delta = now_t.total_100ns().saturating_sub(prev_t.total_100ns());
+                    let idle_delta = now_t.idle_100ns.saturating_sub(prev_t.idle_100ns);
+                    if total_delta == 0 {
+                        0
+                    } else {
+                        let busy = total_delta.saturating_sub(idle_delta);
+                        ((busy as u128 * 100 / total_delta as u128).min(100)) as u8
+                    }
+                }
+                _ => 0,
+            };
+            s.list_processes_prev_system_cpu = sys_cpu_now;
+
+            let (mem_total, mem_avail) = framesage_sys::process::memory_status().unwrap_or((0, 0));
+            let mem_used = mem_total.saturating_sub(mem_avail);
+
+            let metrics = SystemMetrics {
+                cpu_percent: system_cpu_percent,
+                memory_used_bytes: mem_used,
+                memory_total_bytes: mem_total,
+            };
+
+            (out, metrics)
         }
     }
 
