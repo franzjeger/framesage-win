@@ -19,8 +19,8 @@ use std::sync::{Arc, Mutex};
 use eframe::egui;
 
 use framesage_core::{
-    AppMatch, AppRule, CoreKind, CpuSelector, FocusAssistMode, GameModeActions, IoPriority,
-    MemoryPriority, Policy, PowerPlanId, PowerThrottlingMode, PriorityClass, Profile, ProfileId,
+    AppMatch, AppRule, CoreKind, CpuSelector, GameModeActions, IoPriority, MemoryPriority, Policy,
+    PowerPlanId, PowerThrottlingMode, PriorityClass, Profile, ProfileId,
 };
 use framesage_ipc::{Event, ForegroundSnapshot, Request, Response, StatusSnapshot};
 #[cfg(windows)]
@@ -1108,17 +1108,27 @@ fn game_mode_editor(ui: &mut egui::Ui, gm: &mut GameModeActions) {
         ui.checkbox(&mut gm.hide_taskbar, "");
     });
 
-    option_combo(
-        ui,
-        "Focus assist",
-        &mut gm.focus_assist,
-        &[
-            FocusAssistMode::Off,
-            FocusAssistMode::PriorityOnly,
-            FocusAssistMode::AlarmsOnly,
-        ],
-        |v| format!("{v} (stub)"),
-    );
+    // Focus Assist has no documented user-mode API on current Windows builds
+    // (Microsoft's own Settings app uses an undocumented COM interface). The
+    // planner rejects this action with `NotImplemented` at apply time, so
+    // we surface that here as a disabled control with a one-line explanation
+    // — exposing a checkbox that silently does nothing was the prior bug.
+    ui.horizontal(|ui| {
+        ui.add_sized(
+            [150.0, 16.0],
+            egui::Label::new(egui::RichText::new("Focus assist").weak()),
+        );
+        ui.add_enabled(
+            false,
+            egui::Label::new(
+                egui::RichText::new("disabled — no documented Windows API")
+                    .color(theme::TEXT_MUTED),
+            ),
+        );
+    });
+    // Clear any value a previous build had stored so it doesn't haunt the
+    // policy file as a value that will never be honoured.
+    gm.focus_assist = None;
 
     string_list_edit(
         ui,

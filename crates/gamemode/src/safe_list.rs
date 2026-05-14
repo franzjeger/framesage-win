@@ -292,6 +292,10 @@ pub enum RejectionKind {
     Denied,
     /// Not present anywhere in the safe-list.
     Unlisted,
+    /// The action is documented but framesage doesn't have a clean user-mode
+    /// implementation on this Windows version, so the planner refuses to claim
+    /// it ran. Surfaces as a visible rejection instead of a silent no-op.
+    NotImplemented,
 }
 
 #[cfg(test)]

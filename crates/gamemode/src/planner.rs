@@ -19,7 +19,7 @@ use tracing::warn;
 
 use framesage_core::{FocusAssistMode, GameModeActions, PowerPlanId};
 
-use crate::safe_list::{Rejection, SafeList};
+use crate::safe_list::{Rejection, RejectionKind, SafeList};
 use crate::state::{PreviousState, ServiceStateSnapshot, ServiceStatus, SuspendedProcessSnapshot};
 
 #[derive(Debug, Error)]
@@ -194,10 +194,23 @@ pub fn plan(
         }
     }
 
-    // ─── Stub features ───────────────────────────────────────────────────
+    // ─── Focus Assist ────────────────────────────────────────────────────
+    //
+    // Microsoft hasn't shipped a documented user-mode API to set Focus Assist
+    // — the Settings app uses an undocumented COM interface that breaks
+    // between Windows builds. Rather than fake success or hand-roll a fragile
+    // binding, we surface the request as a visible rejection so the user
+    // knows their setting isn't doing anything. The field remains in the
+    // serde schema for forward compatibility when a clean API ships.
     if let Some(mode) = actions.focus_assist {
-        planned.push(PlannedAction::SetFocusAssist(mode));
+        rejections.push(Rejection {
+            id: format!("focus_assist:{mode}"),
+            kind: RejectionKind::NotImplemented,
+            reason: "Focus Assist control has no documented user-mode API on this Windows version"
+                .to_owned(),
+        });
     }
+
     if actions.pause_windows_update {
         planned.push(PlannedAction::PauseWindowsUpdate);
     }
@@ -436,17 +449,39 @@ mod tests {
     }
 
     #[test]
-    fn focus_assist_and_wu_are_recorded_as_stubs() {
+    fn focus_assist_is_rejected_as_not_implemented() {
+        // Until a clean user-mode Focus Assist API exists, the planner refuses
+        // to claim Focus Assist will run — it surfaces a visible rejection
+        // instead of silently doing nothing at apply time.
         let actions = GameModeActions {
             focus_assist: Some(FocusAssistMode::PriorityOnly),
+            ..Default::default()
+        };
+        let query = FakeQuery::new();
+        let plan_out = plan(&actions, SafeList::bundled(), &query).unwrap();
+        assert!(
+            !plan_out
+                .actions
+                .iter()
+                .any(|a| matches!(a, PlannedAction::SetFocusAssist(_))),
+            "Focus Assist must not appear in the actions list"
+        );
+        let rejection = plan_out
+            .rejections
+            .iter()
+            .find(|r| r.kind == RejectionKind::NotImplemented)
+            .expect("Focus Assist should be rejected with NotImplemented");
+        assert!(rejection.id.starts_with("focus_assist:"));
+    }
+
+    #[test]
+    fn pause_windows_update_is_planned() {
+        let actions = GameModeActions {
             pause_windows_update: true,
             ..Default::default()
         };
         let query = FakeQuery::new();
         let plan_out = plan(&actions, SafeList::bundled(), &query).unwrap();
-        assert!(plan_out.actions.contains(&PlannedAction::SetFocusAssist(
-            FocusAssistMode::PriorityOnly
-        )));
         assert!(plan_out
             .actions
             .contains(&PlannedAction::PauseWindowsUpdate));

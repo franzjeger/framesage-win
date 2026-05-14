@@ -12,7 +12,7 @@ use framesage_gamemode::state::{
     AppliedActions, PreviousState, ServiceStatus, SuspendedProcessSnapshot,
 };
 
-use super::{power_plan, process, service, taskbar};
+use super::{power_plan, process, service, taskbar, windows_update};
 
 /// Execute one planned action and reflect the result into `applied`.
 ///
@@ -52,14 +52,26 @@ pub fn apply_action(action: &PlannedAction, applied: &mut AppliedActions) -> Res
             Ok(())
         }
         PlannedAction::SetFocusAssist(mode) => {
-            // v0.1 stub. Recorded in `applied` so revert knows to no-op too.
-            warn!(?mode, "Focus Assist control not yet implemented (v0.3)");
+            // Planner now rejects Focus Assist requests with `NotImplemented`,
+            // so this arm should be unreachable for plans produced by the
+            // current planner. We keep the arm (and the variant) for forward
+            // compatibility — when a clean user-mode API ships, the planner
+            // will start emitting the action again and only this branch needs
+            // to learn the new call.
+            warn!(
+                ?mode,
+                "received SetFocusAssist action; planner should have rejected it as NotImplemented"
+            );
             applied.set_focus_assist = true;
             Ok(())
         }
         PlannedAction::PauseWindowsUpdate => {
-            warn!("Windows Update pause not yet implemented (v0.3)");
+            windows_update::pause(windows_update::DEFAULT_PAUSE)?;
             applied.paused_windows_update = true;
+            debug!(
+                pause_secs = windows_update::DEFAULT_PAUSE.as_secs(),
+                "apply: pause Windows Update"
+            );
             Ok(())
         }
     }
@@ -72,7 +84,10 @@ pub fn revert_all(applied: &AppliedActions, previous: &PreviousState) {
     // Reverse the apply order so dependents are restored last.
 
     if applied.paused_windows_update {
-        debug!("revert: pause_windows_update (stub)");
+        match windows_update::resume() {
+            Ok(()) => debug!("revert: Windows Update resumed"),
+            Err(e) => warn!(error = %e, "revert: Windows Update resume failed"),
+        }
     }
     if applied.set_focus_assist {
         debug!("revert: focus_assist (stub)");
