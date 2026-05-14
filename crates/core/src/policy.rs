@@ -182,6 +182,7 @@ impl AppMatch {
 
 impl Default for Policy {
     fn default() -> Self {
+        use crate::game_mode::{GameModeActions, PowerPlanId};
         use crate::profile::{IoPriority, PowerThrottlingMode, PriorityClass};
         use crate::topology::{CoreKind, CpuSelector};
 
@@ -200,7 +201,10 @@ impl Default for Policy {
 
         // "game-x3d" — the marquee profile. Pin CPU Sets to the X3D / Cache CCD.
         // No hard affinity — CPU Sets let the scheduler spill if the CCD is
-        // pinned by something else, which is the desired behavior.
+        // pinned by something else, which is the desired behavior. Also
+        // requests a conservative Game Mode (services + power plan); these
+        // are all opt-in via safe-list so a user who removes the requests
+        // gets back the pure per-process behavior.
         let game = Profile {
             id: "game-x3d".into(),
             description: "Pin to AMD X3D CCD (or P-cores on Intel hybrid).".to_owned(),
@@ -208,6 +212,14 @@ impl Default for Policy {
             power_throttling: Some(PowerThrottlingMode::Performance),
             priority_class: Some(PriorityClass::AboveNormal),
             io_priority: Some(IoPriority::High),
+            game_mode: Some(GameModeActions {
+                hide_taskbar: true,
+                stop_services: vec!["SysMain".into(), "WSearch".into(), "DiagTrack".into()],
+                suspend_processes: vec!["OneDrive.exe".into(), "Dropbox.exe".into()],
+                power_plan: Some(PowerPlanId::HighPerformance),
+                focus_assist: None,
+                pause_windows_update: false,
+            }),
             ..Default::default()
         };
 

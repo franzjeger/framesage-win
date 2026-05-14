@@ -1,0 +1,117 @@
+{
+  "schema_version": 1,
+  "processes": [
+    {
+      "exe": "OneDrive.exe",
+      "display_name": "Microsoft OneDrive",
+      "rationale": "Cloud-storage sync. Spikes disk I/O and CPU on file change bursts. Suspend; resume on profile exit and sync catches up.",
+      "default_suspend": true
+    },
+    {
+      "exe": "Dropbox.exe",
+      "display_name": "Dropbox",
+      "rationale": "Same pattern as OneDrive. Suspend-friendly.",
+      "default_suspend": true
+    },
+    {
+      "exe": "googledrivesync.exe",
+      "display_name": "Google Drive",
+      "rationale": "Same pattern as OneDrive.",
+      "default_suspend": true
+    },
+    {
+      "exe": "iCUE.exe",
+      "display_name": "Corsair iCUE",
+      "rationale": "Peripheral RGB / DPI control. Known for DPC latency spikes from frequent USB polling. Suspending pauses RGB but doesn't crash anything.",
+      "default_suspend": false
+    },
+    {
+      "exe": "LightingService.exe",
+      "display_name": "ASUS Aura / Armoury Crate Lighting Service",
+      "rationale": "ASUS RGB service. Same DPC-spike pattern as iCUE.",
+      "default_suspend": false
+    },
+    {
+      "exe": "ArmouryCrate.Service.exe",
+      "display_name": "ASUS Armoury Crate Service",
+      "rationale": "ASUS umbrella service. Heavier than just lighting; well-known DPC offender.",
+      "default_suspend": false
+    },
+    {
+      "exe": "RazerCentralService.exe",
+      "display_name": "Razer Central",
+      "rationale": "Razer device service. RGB + telemetry; same pattern as iCUE.",
+      "default_suspend": false
+    },
+    {
+      "exe": "Synapse3.exe",
+      "display_name": "Razer Synapse",
+      "rationale": "Razer Synapse UI / driver bridge.",
+      "default_suspend": false
+    },
+    {
+      "exe": "GalaxyClient.exe",
+      "display_name": "GOG Galaxy",
+      "rationale": "Launcher background process. Heavier than Steam's; suspending while playing a different game is fine.",
+      "default_suspend": false
+    },
+    {
+      "exe": "EpicGamesLauncher.exe",
+      "display_name": "Epic Games Launcher",
+      "rationale": "Launcher background. Same reasoning as GOG.",
+      "default_suspend": false
+    },
+    {
+      "exe": "Discord.exe",
+      "display_name": "Discord",
+      "rationale": "Voice/chat. *Don't* suspend if you'll use Discord while gaming. Listed for users who alt-tab less.",
+      "default_suspend": false
+    },
+    {
+      "exe": "msedge.exe",
+      "display_name": "Microsoft Edge (background helpers)",
+      "rationale": "Edge keeps background helpers running for sync/PWA. Suspending pauses them; foreground tabs aren't affected if Edge isn't focused.",
+      "default_suspend": false
+    },
+    {
+      "exe": "chrome.exe",
+      "display_name": "Google Chrome (background helpers)",
+      "rationale": "Same as Edge — Chrome's background tabs / extensions / sync can spike CPU.",
+      "default_suspend": false
+    }
+  ],
+  "denylist": [
+    {
+      "exe": "MsMpEng.exe",
+      "rationale": "Microsoft Defender's main process. Suspending AV is the canonical malware tactic and breaks anti-cheat checks. Permanently denied."
+    },
+    {
+      "exe": "explorer.exe",
+      "rationale": "The shell. Suspending it freezes the taskbar, start menu, and most input dialogs. Permanently denied."
+    },
+    {
+      "exe": "winlogon.exe",
+      "rationale": "User logon manager. Suspending it locks you out. Permanently denied."
+    },
+    {
+      "exe": "csrss.exe",
+      "rationale": "Client/Server Runtime Subsystem. Suspending it blue-screens the machine. Permanently denied."
+    },
+    {
+      "exe": "lsass.exe",
+      "rationale": "Local Security Authority. Same outcome as csrss. Permanently denied."
+    },
+    {
+      "exe": "services.exe",
+      "rationale": "Service Control Manager. Permanently denied."
+    },
+    {
+      "exe": "smss.exe",
+      "rationale": "Session Manager. Permanently denied."
+    },
+    {
+      "exe": "wininit.exe",
+      "rationale": "Windows Initialization. Permanently denied."
+    }
+  ]
+}

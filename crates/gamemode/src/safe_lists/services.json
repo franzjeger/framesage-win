@@ -1,0 +1,114 @@
+{
+  "schema_version": 1,
+  "services": [
+    {
+      "id": "SysMain",
+      "display_name": "SysMain (SuperFetch)",
+      "rationale": "Prefetch heuristics that help mechanical disks; on an NVMe SSD it pollutes disk I/O and CPU during gameplay. Safe to stop temporarily; Windows starts it again on boot.",
+      "default_stop": true
+    },
+    {
+      "id": "WSearch",
+      "display_name": "Windows Search Indexer",
+      "rationale": "Background filesystem indexer. Causes DPC bursts and disk I/O during file scans. Indexer pauses are well-understood; no game depends on it.",
+      "default_stop": true
+    },
+    {
+      "id": "DiagTrack",
+      "display_name": "Connected User Experiences and Telemetry",
+      "rationale": "Microsoft telemetry. Spikes CPU during ETW flush windows. Stopping it during gameplay is the canonical 'tweak'.",
+      "default_stop": true
+    },
+    {
+      "id": "dmwappushservice",
+      "display_name": "Device Management Wireless Application Protocol Push Message Routing",
+      "rationale": "Device-management push. Irrelevant outside enterprise MDM scenarios.",
+      "default_stop": false
+    },
+    {
+      "id": "WerSvc",
+      "display_name": "Windows Error Reporting",
+      "rationale": "Submits crash reports. Idle by default but can flush during heavy CPU; harmless to pause.",
+      "default_stop": false
+    },
+    {
+      "id": "Spooler",
+      "display_name": "Print Spooler",
+      "rationale": "Print queue manager. Stop only if you don't print during the session. Some games oddly depend on this for the PDF/XPS printer drivers — leave it running unless you've verified.",
+      "default_stop": false
+    },
+    {
+      "id": "PcaSvc",
+      "display_name": "Program Compatibility Assistant",
+      "rationale": "Compatibility shim service. Triggers occasional disk scans on first-launches; safe to pause.",
+      "default_stop": false
+    },
+    {
+      "id": "RetailDemo",
+      "display_name": "Retail Demo Service",
+      "rationale": "Retail-display demo; usually disabled already. Pure noise.",
+      "default_stop": true
+    },
+    {
+      "id": "MapsBroker",
+      "display_name": "Downloaded Maps Manager",
+      "rationale": "Backs the offline Windows Maps app. If you don't use that app, the service does no useful work.",
+      "default_stop": true
+    },
+    {
+      "id": "TabletInputService",
+      "display_name": "Touch Keyboard and Handwriting Panel Service",
+      "rationale": "Pen/touch input. Irrelevant on most desktop builds. Note: stopping on a 2-in-1 will break the touchscreen — only stop if you don't use it.",
+      "default_stop": false
+    },
+    {
+      "id": "WbioSrvc",
+      "display_name": "Windows Biometric Service",
+      "rationale": "Fingerprint / face login support. Pause only if you don't use biometric login during the session.",
+      "default_stop": false
+    }
+  ],
+  "denylist": [
+    {
+      "id": "WinDefend",
+      "rationale": "Microsoft Defender Antivirus. Stopping AV mid-session is flagged by anti-cheats (Vanguard especially requires AV to be running) and leaves a security gap if framesage crashes. Permanently denied."
+    },
+    {
+      "id": "MpsSvc",
+      "rationale": "Windows Defender Firewall. Stopping the firewall is a real security risk and breaks loopback for many launchers. Permanently denied."
+    },
+    {
+      "id": "vgc",
+      "rationale": "Riot Vanguard. Kernel-mode anti-cheat. Stopping it is the textbook anti-cheat bypass attempt. Permanently denied."
+    },
+    {
+      "id": "EasyAntiCheat",
+      "rationale": "Epic / Tencent Easy Anti-Cheat user-mode component. Same reasoning as Vanguard. Permanently denied."
+    },
+    {
+      "id": "BEService",
+      "rationale": "BattlEye service. Same reasoning. Permanently denied."
+    },
+    {
+      "id": "Dhcp",
+      "rationale": "DHCP client. Stopping it kills the network. Permanently denied."
+    },
+    {
+      "id": "Dnscache",
+      "rationale": "DNS resolver cache. Stopping it breaks DNS for online games. Permanently denied."
+    },
+    {
+      "id": "NlaSvc",
+      "rationale": "Network Location Awareness. Required for network state detection; stopping it breaks most networked apps.",
+      "default_stop": false
+    },
+    {
+      "id": "AudioSrv",
+      "rationale": "Windows Audio service. Stopping it kills game sound. Permanently denied."
+    },
+    {
+      "id": "Audiosrv",
+      "rationale": "Alias for AudioSrv on some Windows versions. Permanently denied."
+    }
+  ]
+}

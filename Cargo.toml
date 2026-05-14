@@ -9,6 +9,7 @@ members = [
     "crates/cli",
     "crates/tray",
     "crates/sim",
+    "crates/gamemode",
 ]
 
 [workspace.package]
@@ -68,6 +69,10 @@ framesage-core = { path = "crates/core" }
 framesage-sys = { path = "crates/sys" }
 framesage-ipc = { path = "crates/ipc" }
 framesage-engine = { path = "crates/engine" }
+framesage-gamemode = { path = "crates/gamemode" }
+
+# UUIDs for journal session ids
+uuid = { version = "1", features = ["v4", "serde"] }
 
 [profile.release]
 lto = "fat"

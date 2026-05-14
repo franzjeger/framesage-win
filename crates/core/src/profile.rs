@@ -7,6 +7,7 @@
 
 use serde::{Deserialize, Serialize};
 
+use crate::game_mode::GameModeActions;
 use crate::topology::CpuSelector;
 
 /// Stable identifier for a profile inside a `Policy`. UTF-8 string, opaque to
@@ -124,6 +125,14 @@ pub struct Profile {
     /// release RAM before a heavy foreground app launches.
     #[serde(default)]
     pub trim_working_set: bool,
+
+    /// System-level "Game Mode" actions applied while this profile is the
+    /// active foreground profile. Hide-taskbar, stop-services, suspend-
+    /// processes, switch-power-plan, etc. The engine plans these against the
+    /// curated safe-list in `framesage-gamemode`; unknown ids are rejected
+    /// during planning, not at apply time.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub game_mode: Option<GameModeActions>,
 }
 
 impl Profile {
