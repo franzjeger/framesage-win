@@ -73,19 +73,30 @@ enum Tab {
 /// Live state for the Processes tab. Polled from the engine in the
 /// background thread (along with the existing status poll); rendered by the
 /// UI thread without holding the network for any longer than a clone.
-#[derive(Default)]
 struct ProcessesView {
     /// Most recent snapshot from `Request::ListProcesses`. Replaced wholesale
     /// each refresh — no diffing.
     rows: Vec<framesage_ipc::ProcessSnapshot>,
     /// Substring filter on exe name (case-insensitive, stripped on render).
     filter: String,
-    /// Column the user picked to sort by. `None` = original order from
-    /// the engine (which itself is whatever order ToolHelp returned).
+    /// Column the user picked to sort by. Defaults to CPU % descending —
+    /// the convention every other process viewer uses, so users find the
+    /// noisy process at the top without having to click anything.
     sort_by: Option<ProcessSortKey>,
     /// Descending if true, else ascending. Toggled by clicking the same
     /// column header twice.
     sort_desc: bool,
+}
+
+impl Default for ProcessesView {
+    fn default() -> Self {
+        Self {
+            rows: Vec::new(),
+            filter: String::new(),
+            sort_by: Some(ProcessSortKey::Cpu),
+            sort_desc: true,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -324,6 +335,18 @@ impl eframe::App for FramesageApp {
             )
         };
 
+        // Hand the latest processes snapshot into the local view buffer. We
+        // do this under a separate short lock window so the render path can
+        // iterate the rows without holding the mutex (the table walks a
+        // virtualized list and we don't want a long borrow blocking the
+        // poller thread on its 1 Hz refresh).
+        {
+            let s = self.state.lock().unwrap();
+            if !s.processes.is_empty() || self.processes.rows.is_empty() {
+                self.processes.rows = s.processes.clone();
+            }
+        }
+
         // Header with brand mark, tabs, connection badge. The OS title bar
         // already says "framesage" so the inline label is styled small and
         // colored — it's a brand mark, not a duplicate heading.
@@ -469,6 +492,21 @@ impl FramesageApp {
 
         ui.add_space(10.0);
 
+        // ─── ProBalance card ────────────────────────────────────────────
+        // Live state for the dynamic-priority manager. We aggregate the
+        // restraint count from the latest `Processes` snapshot (already
+        // refreshed at 1 Hz by the same poller that backs the Processes
+        // tab) so this card is always in step with the table view.
+        let restrained_now = self
+            .processes
+            .rows
+            .iter()
+            .filter(|p| p.restrained_by_probalance)
+            .count();
+        self.render_probalance_card(ui, s, restrained_now);
+
+        ui.add_space(10.0);
+
         // ─── Quick actions ──────────────────────────────────────────────
         #[cfg(windows)]
         {
@@ -486,6 +524,95 @@ impl FramesageApp {
         ui.label(theme::section_heading("Recent activity"));
         ui.add_space(4.0);
         render_recent_activity(ui, recent);
+    }
+
+    /// ProBalance card — Status-tab summary of the dynamic-priority
+    /// manager. Shows whether it's on, the configured thresholds, and the
+    /// number of processes currently held in restraint. When the engine is
+    /// elevated and we have the admin token, an "Enable" / "Disable" button
+    /// toggles `policy.probalance.enabled` and sends `SetPolicy` so the
+    /// change is persisted to `policy.json` immediately.
+    fn render_probalance_card(
+        &mut self,
+        ui: &mut egui::Ui,
+        s: &StatusSnapshot,
+        restrained_now: usize,
+    ) {
+        theme::card().show(ui, |ui| {
+            ui.horizontal(|ui| {
+                ui.label(theme::section_heading("ProBalance"));
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    let cfg = &s.policy.probalance;
+                    let (color, text) = if cfg.enabled {
+                        (theme::SUCCESS, "Enabled")
+                    } else {
+                        (theme::TEXT_MUTED, "Disabled")
+                    };
+                    theme::status_badge(color).show(ui, |ui| {
+                        ui.colored_label(color, text);
+                    });
+                });
+            });
+            ui.add_space(6.0);
+
+            let cfg = s.policy.probalance.clone();
+            ui.horizontal(|ui| {
+                ui.colored_label(theme::TEXT_MUTED, "Currently restraining:");
+                let color = if restrained_now > 0 {
+                    theme::WARNING
+                } else {
+                    theme::TEXT_MUTED
+                };
+                ui.colored_label(color, format!("{restrained_now} processes"));
+            });
+            ui.horizontal(|ui| {
+                ui.colored_label(theme::TEXT_MUTED, "Trigger:");
+                ui.colored_label(
+                    theme::TEXT,
+                    format!(
+                        "system CPU ≥ {}% AND non-foreground hog ≥ {}% of one core",
+                        cfg.system_cpu_threshold_percent, cfg.hog_cpu_threshold_percent
+                    ),
+                );
+            });
+            ui.horizontal(|ui| {
+                ui.colored_label(theme::TEXT_MUTED, "Dwell:");
+                ui.colored_label(
+                    theme::TEXT,
+                    format!(
+                        "{} ms before any restraint can be released",
+                        cfg.min_restrain_ms
+                    ),
+                );
+            });
+
+            ui.add_space(8.0);
+
+            // Toggle. Unelevated tray can show the state but can't send
+            // SetPolicy through the admin pipe, so the button is greyed
+            // when we're not running with the admin token.
+            #[cfg(windows)]
+            if self.elevated {
+                let label = if cfg.enabled {
+                    "Disable ProBalance"
+                } else {
+                    "Enable ProBalance"
+                };
+                if ui.button(label).clicked() {
+                    let mut new_policy = s.policy.clone();
+                    new_policy.probalance.enabled = !cfg.enabled;
+                    self.send_admin_request(
+                        Request::SetPolicy { policy: new_policy },
+                        "toggle probalance",
+                    );
+                }
+            } else {
+                ui.colored_label(
+                    theme::TEXT_MUTED,
+                    "Relaunch FrameSage as administrator to toggle ProBalance.",
+                );
+            }
+        });
     }
 
     /// Quick-actions strip: elevation prompt when not elevated, or
@@ -1322,20 +1449,62 @@ impl FramesageApp {
     fn render_processes_tab(&mut self, ui: &mut egui::Ui, status: &Option<StatusSnapshot>) {
         use egui_extras::{Column, TableBuilder};
 
-        // ─── Toolbar: filter, sort hint, row count ─────────────────────────
+        // ─── Toolbar: filter, summary stats, row count ─────────────────────
+        // Aggregate totals across the snapshot — gives the "what's the box
+        // doing right now" answer right above the table. CPU is summed in
+        // "% of one CPU" units so the total is naturally bounded by
+        // (CPU count * 100).
+        let total_cpu_one_cpu: u32 = self
+            .processes
+            .rows
+            .iter()
+            .map(|p| p.cpu_percent as u32)
+            .sum();
+        let total_mem: u64 = self.processes.rows.iter().map(|p| p.memory_bytes).sum();
+        let total_threads: u32 = self.processes.rows.iter().map(|p| p.threads).sum();
+        let managed = self
+            .processes
+            .rows
+            .iter()
+            .filter(|p| p.managed_profile.is_some())
+            .count();
+        let restrained = self
+            .processes
+            .rows
+            .iter()
+            .filter(|p| p.restrained_by_probalance)
+            .count();
+
         ui.horizontal(|ui| {
             ui.label("Filter:");
             ui.add(
                 egui::TextEdit::singleline(&mut self.processes.filter)
                     .hint_text("type to filter by exe name")
-                    .desired_width(220.0),
+                    .desired_width(200.0),
             );
             if ui.button("Clear").clicked() {
                 self.processes.filter.clear();
             }
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 let count = self.processes.rows.len();
-                ui.label(format!("{count} processes"));
+                ui.colored_label(theme::TEXT_MUTED, format!("{count} processes"));
+                ui.separator();
+                ui.colored_label(theme::TEXT_MUTED, format!("{total_threads} threads"));
+                ui.separator();
+                ui.colored_label(
+                    theme::TEXT_MUTED,
+                    format!("{} mem", format_bytes(total_mem)),
+                );
+                ui.separator();
+                ui.colored_label(theme::TEXT_MUTED, format!("Σ CPU {total_cpu_one_cpu}%"));
+                if managed > 0 {
+                    ui.separator();
+                    ui.colored_label(theme::ACCENT, format!("{managed} managed"));
+                }
+                if restrained > 0 {
+                    ui.separator();
+                    ui.colored_label(theme::WARNING, format!("{restrained} restrained"));
+                }
             });
         });
         ui.add_space(4.0);
@@ -1399,7 +1568,7 @@ impl FramesageApp {
             .column(Column::initial(110.0).at_least(70.0)) // Affinity
             .column(Column::initial(100.0).at_least(70.0)) // Profile
             .column(Column::remainder().at_least(70.0)) // Status
-            .header(22.0, |mut header| {
+            .header(20.0, |mut header| {
                 header.col(|ui| self.sortable_header(ui, "Process", ProcessSortKey::ExeName));
                 header.col(|ui| self.sortable_header(ui, "PID", ProcessSortKey::Pid));
                 header.col(|ui| self.sortable_header(ui, "CPU %", ProcessSortKey::Cpu));
@@ -1415,7 +1584,7 @@ impl FramesageApp {
                 });
             })
             .body(|body| {
-                body.rows(20.0, rows.len(), |mut row| {
+                body.rows(18.0, rows.len(), |mut row| {
                     let p = &rows[row.index()];
                     let pid = p.pid;
                     let exe = p.exe_name.clone();
@@ -1465,7 +1634,12 @@ impl FramesageApp {
                         ui.monospace(p.pid.to_string());
                     });
                     row.col(|ui| {
-                        ui.monospace(format!("{}", p.cpu_percent));
+                        // Color the CPU% column based on intensity: green for
+                        // idle, yellow for moderate, red for hot. Anchors
+                        // attention on the actually-busy processes at a
+                        // glance — same affordance Task Manager / PL use.
+                        let color = cpu_percent_color(p.cpu_percent);
+                        ui.colored_label(color, format!("{}", p.cpu_percent));
                     });
                     row.col(|ui| {
                         ui.monospace(format_bytes(p.memory_bytes));
@@ -1623,6 +1797,21 @@ const PRIORITY_CHOICES: &[(&str, PriorityClass)] = &[
     ("Below Normal", PriorityClass::BelowNormal),
     ("Idle (lowest)", PriorityClass::Idle),
 ];
+
+/// Pick a CPU%-column foreground based on intensity. Same band thresholds
+/// Process Lasso / Task Manager use:
+///   * 0–10  → muted (idle, default text)
+///   * 10–50 → normal text
+///   * 50–80 → warning (yellow)
+///   * 80+   → error (red)
+fn cpu_percent_color(cpu: u16) -> egui::Color32 {
+    match cpu {
+        0..=10 => theme::TEXT_MUTED,
+        11..=50 => theme::TEXT,
+        51..=80 => theme::WARNING,
+        _ => theme::ERROR,
+    }
+}
 
 fn priority_class_label(raw: u32) -> &'static str {
     match raw {
