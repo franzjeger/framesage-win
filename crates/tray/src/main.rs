@@ -295,26 +295,16 @@ impl eframe::App for FramesageApp {
                 ui.colored_label(theme::ERROR, err);
             }
 
-            // Cap content width so the UI doesn't stretch into "a single
-            // 3440-pixel line of widgets" territory on ultra-wide monitors.
-            // Centers within the available width.
+            // Cap content width so the UI doesn't stretch into a single
+            // 3440-pixel line of widgets on ultrawides. The earlier attempt
+            // wrapped the body in a horizontal layout for centering, but a
+            // horizontal sizes vertically to its content — that clipped any
+            // tab whose list scrolled past the initial height (Rules,
+            // Profiles). `set_max_width` keeps the vertical layout intact;
+            // wide windows just leave empty space on the right.
             const MAX_CONTENT_WIDTH: f32 = 980.0;
-            let available = ui.available_width();
-            let pad = ((available - MAX_CONTENT_WIDTH).max(0.0) / 2.0).floor();
-            if pad > 0.0 {
-                ui.horizontal(|ui| {
-                    ui.add_space(pad);
-                    ui.allocate_ui_with_layout(
-                        egui::vec2(MAX_CONTENT_WIDTH, ui.available_height()),
-                        egui::Layout::top_down(egui::Align::Min),
-                        |ui| {
-                            self.render_active_tab(ctx, ui, &status_snapshot, &recent_events);
-                        },
-                    );
-                });
-            } else {
-                self.render_active_tab(ctx, ui, &status_snapshot, &recent_events);
-            }
+            ui.set_max_width(MAX_CONTENT_WIDTH);
+            self.render_active_tab(ctx, ui, &status_snapshot, &recent_events);
         });
     }
 }
@@ -521,11 +511,11 @@ impl FramesageApp {
         };
 
         if !self.elevated {
-            ui.colored_label(
-                theme::WARNING,
-                "Read-only — switch to Status tab and click Enable controls to edit rules.",
+            render_readonly_banner(
+                ui,
+                "Rule edits need admin — open the Status tab and click Enable controls.",
             );
-            ui.separator();
+            ui.add_space(8.0);
         }
 
         // Resolve the policy to display: the editor's draft if present,
@@ -910,15 +900,16 @@ impl FramesageApp {
         });
 
         if !self.elevated {
-            ui.colored_label(
-                theme::WARNING,
-                "Read-only — open the Status tab and click Enable controls.",
+            ui.add_space(4.0);
+            render_readonly_banner(
+                ui,
+                "Profile edits need admin — open the Status tab and click Enable controls.",
             );
         }
         if let Some(msg) = self.last_action.lock().unwrap().as_ref() {
             ui.small(msg);
         }
-        ui.separator();
+        ui.add_space(8.0);
 
         let mut profile_ids: Vec<ProfileId> = displayed_policy.profiles.keys().cloned().collect();
         profile_ids.sort_by(|a, b| a.0.cmp(&b.0));
@@ -1199,6 +1190,23 @@ fn render_foreground_summary(ui: &mut egui::Ui, fg: &ForegroundSnapshot) {
                 kv_grid_row(ui, "Path", short_path(&fg.path));
             }
         });
+}
+
+/// Reusable read-only banner used by the Rules and Profiles tabs when the
+/// tray isn't elevated. Matches the Status tab's quick-actions banner so the
+/// "you need admin to edit this" signal reads the same everywhere.
+fn render_readonly_banner(ui: &mut egui::Ui, body: &str) {
+    theme::banner(theme::WARNING).show(ui, |ui| {
+        ui.horizontal(|ui| {
+            ui.colored_label(theme::WARNING, egui::RichText::new("⚠").strong().size(14.0));
+            ui.label(
+                egui::RichText::new("Read-only mode")
+                    .strong()
+                    .color(theme::TEXT),
+            );
+            ui.colored_label(theme::TEXT_MUTED, format!("— {body}"));
+        });
+    });
 }
 
 /// Truncate long paths for display — keep the drive letter and the final
