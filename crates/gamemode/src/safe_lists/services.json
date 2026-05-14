@@ -66,6 +66,126 @@
       "display_name": "Windows Biometric Service",
       "rationale": "Fingerprint / face login support. Pause only if you don't use biometric login during the session.",
       "default_stop": false
+    },
+    {
+      "id": "BITS",
+      "display_name": "Background Intelligent Transfer Service",
+      "rationale": "Background downloader used by Windows Update, Defender definitions, and many app updaters. Pausing during gameplay stops opportunistic downloads from sharing your disk and uplink. Resume restores normal update flow.",
+      "default_stop": true
+    },
+    {
+      "id": "DoSvc",
+      "display_name": "Delivery Optimization",
+      "rationale": "Peer-to-peer Windows Update distribution. Uploads update bytes to other PCs on your LAN/WAN — visible network and disk activity during gaming. Safe to pause for a session.",
+      "default_stop": true
+    },
+    {
+      "id": "WpnService",
+      "display_name": "Windows Push Notifications System Service",
+      "rationale": "Backs UWP toast notifications. Stopping during gameplay silences Action Center toasts that can pop over a fullscreen game and cause focus loss. Resume restores notifications.",
+      "default_stop": true
+    },
+    {
+      "id": "CDPSvc",
+      "display_name": "Connected Devices Platform Service",
+      "rationale": "Backs Phone Link, Continue-on-PC, and Nearby Sharing. Periodic Bluetooth/Wi-Fi Direct scans. Pause if you don't use those features during the session.",
+      "default_stop": true
+    },
+    {
+      "id": "WMPNetworkSvc",
+      "display_name": "Windows Media Player Network Sharing Service",
+      "rationale": "DLNA media server for Windows Media Player. Almost no one uses it; idle but listed for completeness.",
+      "default_stop": true
+    },
+    {
+      "id": "AJRouter",
+      "display_name": "AllJoyn Router Service",
+      "rationale": "IoT device discovery (AllJoyn). Effectively dead protocol on Windows 11; safe to stop.",
+      "default_stop": true
+    },
+    {
+      "id": "DPS",
+      "display_name": "Diagnostic Policy Service",
+      "rationale": "Detects and resolves system diagnostics. Spawns diaghost.exe periodically. Pause for cleaner gaming session; resume restores troubleshooter functionality.",
+      "default_stop": true
+    },
+    {
+      "id": "WdiServiceHost",
+      "display_name": "Diagnostic Service Host",
+      "rationale": "Runs diagnostic libraries on behalf of DPS. Pairs with DPS; pause both together for the full quiet effect.",
+      "default_stop": true
+    },
+    {
+      "id": "WdiSystemHost",
+      "display_name": "Diagnostic System Host",
+      "rationale": "System-level diagnostic library host. Pairs with DPS / WdiServiceHost.",
+      "default_stop": true
+    },
+    {
+      "id": "WaaSMedicSvc",
+      "display_name": "Windows Update Medic Service",
+      "rationale": "Repairs damaged Windows Update components and runs reliability checks. Can wake disk I/O at random. Pausing during a session is safe; Windows restarts the service later.",
+      "default_stop": true
+    },
+    {
+      "id": "UsoSvc",
+      "display_name": "Update Orchestrator Service",
+      "rationale": "Orchestrates Windows Update install jobs. Pairs with PauseWindowsUpdate — pausing the service plus pausing scans stops update activity end-to-end for the session.",
+      "default_stop": false
+    },
+    {
+      "id": "defragsvc",
+      "display_name": "Optimize Drives (Defrag)",
+      "rationale": "Scheduled disk defrag / SSD TRIM coordinator. Sometimes wakes mid-session; safe to pause.",
+      "default_stop": true
+    },
+    {
+      "id": "icssvc",
+      "display_name": "Internet Connection Sharing",
+      "rationale": "ICS / mobile-hotspot. If you're not hosting a hotspot, pure background.",
+      "default_stop": true
+    },
+    {
+      "id": "Fax",
+      "display_name": "Fax Service",
+      "rationale": "Fax send/receive. Vestigial on modern desktops. Safe to stop unconditionally.",
+      "default_stop": true
+    },
+    {
+      "id": "RemoteRegistry",
+      "display_name": "Remote Registry",
+      "rationale": "Allows remote registry access. Disabled on most installs by default; listed so power users can ensure it's off during gameplay.",
+      "default_stop": true
+    },
+    {
+      "id": "lfsvc",
+      "display_name": "Geolocation Service",
+      "rationale": "GPS / wifi-positioning. Pause if you don't run apps that need location (most games don't).",
+      "default_stop": false
+    },
+    {
+      "id": "BcastDVRUserService",
+      "display_name": "Game DVR / Broadcast User Service",
+      "rationale": "Xbox Game Bar's recording backbone. Pause only if you don't use Game DVR's instant-clip recording during the session — disabling kills hotkey replay capture.",
+      "default_stop": false
+    },
+    {
+      "id": "SCardSvr",
+      "display_name": "Smart Card Service",
+      "rationale": "Smart card reader support (enterprise CACs, etc.). Safe to stop on home builds.",
+      "default_stop": false
+    },
+    {
+      "id": "PhoneSvc",
+      "display_name": "Phone Service",
+      "rationale": "Telephony state management for legacy phone APIs. Effectively unused on desktop.",
+      "default_stop": true
+    },
+    {
+      "id": "PrintNotify",
+      "display_name": "Printer Extensions and Notifications",
+      "rationale": "Printer-driver notification overlay. Pair with Spooler if you've already paused that; otherwise leave running.",
+      "default_stop": false
     }
   ],
   "denylist": [
@@ -109,6 +229,39 @@
     {
       "id": "Audiosrv",
       "rationale": "Alias for AudioSrv on some Windows versions. Permanently denied."
+    },
+    {
+      "id": "AudioEndpointBuilder",
+      "rationale": "Hosts Windows Audio device endpoint enumeration; AudioSrv depends on it. Stopping breaks audio device switching and ultimately game audio. Permanently denied."
+    },
+    {
+      "id": "RpcSs",
+      "rationale": "Remote Procedure Call (RPC). Nearly every Windows service depends on it; stopping it cascades into shell breakage. Permanently denied."
+    },
+    {
+      "id": "RpcEptMapper",
+      "rationale": "RPC Endpoint Mapper. Required for RPC; same reasoning as RpcSs. Permanently denied."
+    },
+    {
+      "id": "DcomLaunch",
+      "rationale": "DCOM Server Process Launcher. Core COM infrastructure that explorer.exe, Wininit, and the SCM itself depend on. Permanently denied."
+    },
+    {
+      "id": "gpsvc",
+      "rationale": "Group Policy Client. Stopping it can hang login and policy refresh. Permanently denied."
+    },
+    {
+      "id": "SamSs",
+      "rationale": "Security Accounts Manager. Required for local account auth. Permanently denied."
+    },
+    {
+      "id": "ProfSvc",
+      "rationale": "User Profile Service. Required for user-profile load/unload. Permanently denied."
+    },
+    {
+      "id": "Themes",
+      "rationale": "Themes / DWM theming. Stopping it disables compositing and visual styles, which can break fullscreen exclusive transitions on some games.",
+      "default_stop": false
     }
   ]
 }

@@ -60,6 +60,8 @@ windows-service = "0.7"
 # Tray UI
 eframe = { version = "0.28", default-features = false, features = ["default_fonts", "glow", "persistence"] }
 egui = "0.28"
+# System tray icon (real persistent tray, not just a window)
+tray-icon = "0.24"
 
 # File-system watcher for policy hot-reload
 notify = "6"

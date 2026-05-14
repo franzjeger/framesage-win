@@ -26,8 +26,9 @@
 //!   `applied`; system state lives in a crash-safe journal so a process kill
 //!   doesn't strand the user with a hidden taskbar and stopped services.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use parking_lot::RwLock;
@@ -37,9 +38,9 @@ use tracing::{debug, info, warn};
 use framesage_core::{CpuTopology, GameModeActions, Policy, Profile, ProfileId};
 use framesage_gamemode::{
     journal::{Journal, JournalEntry},
-    planner::{plan as plan_game_mode, ActionPlan, SystemStateQuery},
+    planner::{plan as plan_game_mode, ActionPlan, PlannedAction, SystemStateQuery},
     safe_list::SafeList,
-    state::{AppliedActions, PreviousState},
+    state::{AppliedActions, PreviousState, SuspendedProcessSnapshot},
 };
 use framesage_ipc::{Event, ForegroundSnapshot, StatusSnapshot};
 
@@ -74,7 +75,18 @@ struct EngineState {
     /// Whatever system-wide Game Mode we've entered, if any. Mirrored to the
     /// journal on disk so a crash leaves recoverable state.
     system_mode: Option<ActiveSystemMode>,
+    /// Last time we walked the process list to enforce `background_profile`.
+    /// `None` until the first scan; subsequent scans honour
+    /// `BACKGROUND_SCAN_INTERVAL`.
+    last_background_scan: Option<Instant>,
 }
+
+/// How often the engine walks all PIDs to apply `Policy::background_profile`.
+/// Tuned for "low enough that newly-spawned background apps get throttled
+/// promptly, high enough not to thrash the OpenProcess/CloseHandle pair on
+/// every tick." Each scan touches only PIDs not already in `applied`, so the
+/// steady-state cost is one ToolHelp snapshot + a Vec membership check.
+const BACKGROUND_SCAN_INTERVAL: Duration = Duration::from_secs(10);
 
 struct AppliedRecord {
     profile_id: ProfileId,
@@ -110,6 +122,7 @@ impl Engine {
                 foreground_snapshot: None,
                 active_profile: None,
                 system_mode: None,
+                last_background_scan: None,
             })),
             events: tx,
             safe_list: deps.safe_list,
@@ -165,6 +178,76 @@ impl Engine {
         Self::revert_system_mode_locked(&mut s, &self.journal);
     }
 
+    /// Apply a named profile to the currently-foregrounded process,
+    /// overriding the normal rule matcher. The override holds until the
+    /// foreground changes — at the next focus change, `tick`'s reconcile
+    /// path will pick the rule-matched profile for whatever's new.
+    ///
+    /// Used by the CLI's `framesage apply <profile>` and the tray's
+    /// "Apply now" per-profile button. Errors if no foreground exists or
+    /// if the profile id isn't in the active policy.
+    pub fn apply_once(&self, profile_id: ProfileId) -> Result<()> {
+        let foreground = framesage_sys::foreground::current()?
+            .ok_or_else(|| anyhow::anyhow!("no foreground process to apply to"))?;
+        let mut s = self.state.write();
+
+        if s.paused {
+            return Err(anyhow::anyhow!(
+                "engine is paused; resume before apply_once"
+            ));
+        }
+
+        let profile = s
+            .policy
+            .profile(&profile_id)
+            .ok_or_else(|| anyhow::anyhow!("unknown profile id {profile_id}"))?
+            .clone();
+
+        // Revert anything we'd previously applied to this same PID (whether
+        // the prior profile was the same or different) so we have a clean
+        // slate to apply onto.
+        if let Some(record) = s.applied.remove(&foreground.pid) {
+            revert_record(foreground.pid, record);
+        }
+
+        let topology = s.topology.clone();
+        let snapshot = ForegroundSnapshot {
+            pid: foreground.pid,
+            exe_name: foreground.exe_name.clone(),
+            path: foreground.path.clone(),
+            title: foreground.title.clone(),
+        };
+
+        let record = apply_profile(foreground.pid, &profile, &topology)?;
+        info!(
+            pid = foreground.pid,
+            exe = %foreground.exe_name,
+            profile = %profile_id,
+            "apply_once",
+        );
+        s.applied.insert(foreground.pid, record);
+        s.current_foreground = Some(foreground.pid);
+        s.foreground_snapshot = Some(snapshot.clone());
+        s.active_profile = Some(profile_id.clone());
+        let _ = self.events.send(Event::ForegroundChanged {
+            foreground: snapshot,
+            profile: profile_id.clone(),
+        });
+
+        // System mode reconcile — handles entering/exiting/swapping
+        // Game Mode actions according to the new profile.
+        let new_actions = profile.game_mode.clone();
+        Self::reconcile_system_mode_locked(
+            &mut s,
+            &self.journal,
+            self.safe_list,
+            &profile_id,
+            new_actions,
+        );
+
+        Ok(())
+    }
+
     /// Run on startup: if a journal file exists from a previous (possibly
     /// crashed) session, revert it before we apply anything new. Idempotent.
     pub fn recover_orphan_journal(&self) {
@@ -199,7 +282,120 @@ impl Engine {
         let foreground = framesage_sys::foreground::current()?;
 
         let mut s = self.state.write();
-        self.reconcile(&mut s, foreground)
+        self.reconcile(&mut s, foreground)?;
+        Self::maybe_scan_background_locked(&mut s, self.safe_list);
+        Ok(())
+    }
+
+    /// Walk every running PID and apply `Policy::background_profile` to any
+    /// that we aren't already managing. Also drops `applied` entries for PIDs
+    /// that no longer exist (process exited; no revert needed).
+    ///
+    /// Skipped: the system idle / system PIDs, our own PID, the current
+    /// foreground PID, anything we already applied to, and anything whose
+    /// exe appears on the safe-list's process denylist (system shell, audio,
+    /// GPU drivers, anti-cheat). All other failures (OpenProcess denied on
+    /// a protected process, exe path unreadable) silently skip — those are
+    /// expected on every Windows box and aren't worth log spam.
+    ///
+    /// Bounded by `BACKGROUND_SCAN_INTERVAL` so we don't thrash on every
+    /// `tick_ms`; the first call from a fresh service start does the heavy
+    /// lift, subsequent calls only touch newly-spawned PIDs.
+    fn maybe_scan_background_locked(s: &mut EngineState, safe_list: &'static SafeList) {
+        // Bail early if the policy doesn't want background enforcement at all.
+        let Some(bg_profile_id) = s.policy.background_profile.clone() else {
+            return;
+        };
+        let Some(bg_profile) = s.policy.profile(&bg_profile_id).cloned() else {
+            warn!(
+                profile = %bg_profile_id,
+                "background_profile points at an unknown profile id; skipping background scan"
+            );
+            return;
+        };
+
+        let now = Instant::now();
+        if let Some(last) = s.last_background_scan {
+            if now.duration_since(last) < BACKGROUND_SCAN_INTERVAL {
+                return;
+            }
+        }
+        s.last_background_scan = Some(now);
+
+        let live_pids: Vec<u32> = match framesage_sys::process::iter_pids() {
+            Ok(v) => v,
+            Err(e) => {
+                warn!(error = %e, "process enumeration failed; skipping background scan");
+                return;
+            }
+        };
+        let live_set: HashSet<u32> = live_pids.iter().copied().collect();
+        let self_pid = std::process::id();
+        let foreground_pid = s.current_foreground;
+        let topology = s.topology.clone();
+
+        // ─── Drop records for PIDs that exited since last scan ──────────────
+        let stale: Vec<u32> = s
+            .applied
+            .keys()
+            .copied()
+            .filter(|p| !live_set.contains(p))
+            .collect();
+        for pid in stale {
+            // Process is gone; no revert syscall would succeed. Just drop.
+            s.applied.remove(&pid);
+        }
+
+        // ─── Apply background profile to new PIDs ───────────────────────────
+        let mut newly_applied = 0usize;
+        for pid in live_pids {
+            if pid == 0 || pid == 4 {
+                continue; // System Idle / System
+            }
+            if pid == self_pid {
+                continue;
+            }
+            if Some(pid) == foreground_pid {
+                continue;
+            }
+            if s.applied.contains_key(&pid) {
+                continue;
+            }
+
+            // Filter against the safe-list denylist — same denylist that
+            // protects suspend_processes, repurposed here so we don't, e.g.,
+            // throttle dwm or audiodg into stuttering territory.
+            let exe_name = match framesage_sys::process::exe_for_pid(pid) {
+                Ok(Some(path)) => path.rsplit(['\\', '/']).next().unwrap_or(&path).to_owned(),
+                Ok(None) => continue, // exited mid-snapshot, or unreadable
+                Err(_) => continue,
+            };
+            if matches!(
+                safe_list.check_process(&exe_name),
+                framesage_gamemode::safe_list::ProcessVerdict::Denied(_)
+            ) {
+                continue;
+            }
+
+            match apply_profile(pid, &bg_profile, &topology) {
+                Ok(record) => {
+                    s.applied.insert(pid, record);
+                    newly_applied += 1;
+                }
+                // ACCESS_DENIED / INVALID_PARAMETER on protected processes
+                // is expected and not worth surfacing.
+                Err(_) => continue,
+            }
+        }
+
+        if newly_applied > 0 {
+            debug!(
+                profile = %bg_profile_id,
+                applied = newly_applied,
+                managed = s.applied.len(),
+                "background scan applied profile to new PIDs"
+            );
+        }
     }
 
     fn reconcile(
@@ -250,6 +446,15 @@ impl Engine {
             path: fg.path.clone(),
             title: fg.title.clone(),
         };
+
+        // If the new foreground was already managed by us (most commonly via
+        // the background scan, e.g. user alt-tabbed back into a long-running
+        // browser), revert that record first. Without this step, the new
+        // apply would capture bg-modified state as `prev`, and an eventual
+        // revert would restore to bg-eco instead of kernel default.
+        if let Some(prev_record) = s.applied.remove(&fg.pid) {
+            revert_record(fg.pid, prev_record);
+        }
 
         // Per-process apply.
         match apply_profile(fg.pid, &profile, &topology) {
@@ -352,37 +557,44 @@ impl Engine {
         profile_id: &ProfileId,
         plan: ActionPlan,
     ) {
-        let mut entry = JournalEntry::new(profile_id.clone(), plan.previous_state.clone());
+        // Journal the full *intent* before any kernel mutation. This closes a
+        // crash-recovery race that surfaced during first hardware validation:
+        // sys_apply_action mutates kernel state synchronously (e.g. SCM marks
+        // a service stopped), but the journal write that records "we stopped
+        // it" happens after. A SIGKILL between the two left the kernel ahead
+        // of the journal, and recovery missed the unjournaled mutation.
+        //
+        // With intent journaled up-front, recovery reverts everything we
+        // *planned* to do. A failed sys_apply_action means recovery reverts a
+        // change that was never made — an idempotent no-op (start an already-
+        // running service, resume an already-running process).
+        let intended = applied_from_plan(&plan);
 
-        // Write the journal *before* any state change. If this fails, we
-        // refuse to apply — no journal means no safe revert path.
+        let mut entry = JournalEntry::new(profile_id.clone(), plan.previous_state.clone());
+        entry.applied = intended.clone();
+
         if let Err(e) = journal.write(&entry) {
             warn!(error = %e, "initial journal write failed; refusing to enter game mode");
             return;
         }
 
-        let mut applied = AppliedActions::default();
+        // Apply. Partial failures are logged locally; the journal does not
+        // need to be rewritten because it already records the full intent.
         let mut any_failed = false;
-
+        let mut applied_count: usize = 0;
         for action in &plan.actions {
-            match sys_apply_action(action, &mut applied) {
-                Ok(()) => {}
+            // sys_apply_action takes `&mut AppliedActions` for legacy reasons;
+            // we route to a throwaway sink because the authoritative record is
+            // `intended`, persisted before we got here.
+            let mut sink = AppliedActions::default();
+            match sys_apply_action(action, &mut sink) {
+                Ok(()) => {
+                    applied_count += 1;
+                }
                 Err(e) => {
                     warn!(?action, error = %e, "game mode action failed; continuing with rest of plan");
                     any_failed = true;
                 }
-            }
-            // Update the journal incrementally so a crash leaves the most
-            // accurate possible revert plan.
-            entry.applied = applied.clone();
-            if let Err(je) = journal.write(&entry) {
-                // We've already started applying actions; we can't safely
-                // continue without journaling, but rolling back what we did
-                // is essentially "revert now." Do exactly that.
-                warn!(error = %je, "journal update failed mid-apply; reverting");
-                sys_revert_all(&applied, &plan.previous_state);
-                let _ = journal.delete();
-                return;
             }
         }
 
@@ -394,7 +606,7 @@ impl Engine {
 
         info!(
             profile = %profile_id,
-            actions = applied.applied_count(),
+            actions = applied_count,
             partial = any_failed,
             session = %entry.session_id,
             "game mode entered"
@@ -403,7 +615,7 @@ impl Engine {
         s.system_mode = Some(ActiveSystemMode {
             profile_id: profile_id.clone(),
             previous: plan.previous_state,
-            applied,
+            applied: intended,
             journal_session_id: entry.session_id,
         });
     }
@@ -433,29 +645,32 @@ fn revert_record(pid: u32, record: AppliedRecord) {
     let _ = record;
 }
 
-trait AppliedActionsExt {
-    fn applied_count(&self) -> usize;
-}
-
-impl AppliedActionsExt for AppliedActions {
-    fn applied_count(&self) -> usize {
-        let mut n = 0;
-        if self.hid_taskbar {
-            n += 1;
+/// Project a plan's actions onto an `AppliedActions` record describing what
+/// every action would touch if it ran successfully. The engine journals this
+/// up-front so that even a SIGKILL mid-apply leaves a complete revert plan on
+/// disk.
+///
+/// Every `PlannedAction` variant must contribute to at least one field — if a
+/// new variant is added later and this match grows a hole, the unit test
+/// `applied_from_plan_covers_every_planned_action_variant` will catch it.
+fn applied_from_plan(plan: &ActionPlan) -> AppliedActions {
+    let mut a = AppliedActions::default();
+    for action in &plan.actions {
+        match action {
+            PlannedAction::HideTaskbar => a.hid_taskbar = true,
+            PlannedAction::SetPowerPlan { .. } => a.switched_power_plan = true,
+            PlannedAction::StopService { id, .. } => a.stopped_services.push(id.clone()),
+            PlannedAction::SuspendProcess { pid, exe } => {
+                a.suspended_pids.push(SuspendedProcessSnapshot {
+                    pid: *pid,
+                    exe: exe.clone(),
+                });
+            }
+            PlannedAction::SetFocusAssist(_) => a.set_focus_assist = true,
+            PlannedAction::PauseWindowsUpdate => a.paused_windows_update = true,
         }
-        n += self.stopped_services.len();
-        n += self.suspended_pids.len();
-        if self.switched_power_plan {
-            n += 1;
-        }
-        if self.set_focus_assist {
-            n += 1;
-        }
-        if self.paused_windows_update {
-            n += 1;
-        }
-        n
     }
+    a
 }
 
 #[cfg(windows)]
@@ -541,5 +756,79 @@ impl SystemStateQuery for PlatformQuery {
     }
     fn pids_by_exe(&self, exe: &str) -> anyhow::Result<Vec<(u32, String)>> {
         framesage_sys::game_mode::Win32StateQuery.pids_by_exe(exe)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use framesage_core::{FocusAssistMode, PowerPlanId};
+    use framesage_gamemode::state::ServiceStatus;
+
+    fn empty_previous() -> PreviousState {
+        PreviousState {
+            taskbar_visible: true,
+            active_power_plan: None,
+            services: vec![],
+            suspended_pids: vec![],
+        }
+    }
+
+    /// Locks the load-bearing invariant for crash recovery: every concrete
+    /// `PlannedAction` variant must contribute to `AppliedActions`. If a new
+    /// variant is added but the helper isn't extended, recovery will silently
+    /// miss it — exactly the bug this test exists to prevent regressing.
+    #[test]
+    fn applied_from_plan_covers_every_planned_action_variant() {
+        let plan = ActionPlan {
+            previous_state: empty_previous(),
+            actions: vec![
+                PlannedAction::HideTaskbar,
+                PlannedAction::SetPowerPlan {
+                    from: Some(PowerPlanId::Balanced),
+                    to: PowerPlanId::HighPerformance,
+                },
+                PlannedAction::StopService {
+                    id: "SysMain".into(),
+                    was_status: ServiceStatus::Running,
+                },
+                PlannedAction::StopService {
+                    id: "WSearch".into(),
+                    was_status: ServiceStatus::Running,
+                },
+                PlannedAction::SuspendProcess {
+                    pid: 1234,
+                    exe: "OneDrive.exe".into(),
+                },
+                PlannedAction::SetFocusAssist(FocusAssistMode::PriorityOnly),
+                PlannedAction::PauseWindowsUpdate,
+            ],
+            rejections: vec![],
+        };
+
+        let applied = applied_from_plan(&plan);
+
+        assert!(applied.hid_taskbar);
+        assert!(applied.switched_power_plan);
+        assert_eq!(
+            applied.stopped_services,
+            vec!["SysMain".to_string(), "WSearch".to_string()]
+        );
+        assert_eq!(applied.suspended_pids.len(), 1);
+        assert_eq!(applied.suspended_pids[0].pid, 1234);
+        assert_eq!(applied.suspended_pids[0].exe, "OneDrive.exe");
+        assert!(applied.set_focus_assist);
+        assert!(applied.paused_windows_update);
+        assert!(applied.anything_applied());
+    }
+
+    #[test]
+    fn applied_from_plan_yields_empty_for_no_actions() {
+        let plan = ActionPlan {
+            previous_state: empty_previous(),
+            actions: vec![],
+            rejections: vec![],
+        };
+        assert_eq!(applied_from_plan(&plan), AppliedActions::default());
     }
 }

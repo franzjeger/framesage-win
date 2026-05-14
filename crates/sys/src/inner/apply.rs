@@ -29,6 +29,8 @@ use framesage_core::{
     CpuTopology, IoPriority, MemoryPriority, PowerThrottlingMode, PriorityClass, Profile,
 };
 
+use super::io_priority;
+
 /// Captures what we changed on the target process, so revert can restore it.
 /// `None` for a field means "we didn't touch this knob — leave the previous
 /// value alone on revert."
@@ -42,9 +44,9 @@ pub struct AppliedState {
     /// process to the system default. We don't currently snapshot the prior
     /// CPU Sets list (would need to round-trip the Vec<u32>); revert clears.
     cpu_sets_set: bool,
-    /// I/O priority isn't yet wired up (needs NtSetInformationProcess).
-    /// Placeholder for v0.2.
-    #[allow(dead_code)]
+    /// Previous `IO_PRIORITY_HINT` for the process before we touched it,
+    /// captured via `NtQueryInformationProcess(ProcessIoPriority)`. None means
+    /// we left the I/O priority alone.
     prev_io_priority: Option<IoPriority>,
 }
 
@@ -75,6 +77,14 @@ pub fn apply(pid: u32, profile: &Profile, topology: &CpuTopology) -> Result<Appl
     if let Some(prio) = profile.memory_priority {
         state.prev_memory_priority = get_memory_priority(handle).ok();
         set_memory_priority(handle, prio).context("set memory priority")?;
+    }
+
+    if let Some(prio) = profile.io_priority {
+        // Best-effort read of the prior value so revert can restore it. If the
+        // query fails (rare — usually permission), fall back to Normal on
+        // revert; that's the kernel default for almost every user process.
+        state.prev_io_priority = Some(io_priority::get(handle).unwrap_or(IoPriority::Normal));
+        io_priority::set(handle, prio).context("set I/O priority")?;
     }
 
     if let Some(sel) = &profile.cpu_sets {
@@ -114,16 +124,20 @@ pub fn revert(pid: u32, state: AppliedState) -> Result<()> {
     if let Some(class_raw) = state.prev_priority_class {
         let class = PROCESS_CREATION_FLAGS(class_raw);
         // SAFETY: handle valid, class is a documented constant.
-        let _ = unsafe { SetPriorityClass(handle, class) };
+        if let Err(e) = unsafe { SetPriorityClass(handle, class) } {
+            warn_revert(pid, "SetPriorityClass", e);
+        }
     }
 
     if let Some(mask) = state.prev_affinity_mask {
         // SAFETY: handle valid.
-        let _ = unsafe { SetProcessAffinityMask(handle, mask) };
+        if let Err(e) = unsafe { SetProcessAffinityMask(handle, mask) } {
+            warn_revert(pid, "SetProcessAffinityMask", e);
+        }
     }
 
     if let Some(prev) = state.prev_power_throttling {
-        let _ = unsafe {
+        let res = unsafe {
             SetProcessInformation(
                 handle,
                 ProcessPowerThrottling,
@@ -131,10 +145,13 @@ pub fn revert(pid: u32, state: AppliedState) -> Result<()> {
                 size_of::<PROCESS_POWER_THROTTLING_STATE>() as u32,
             )
         };
+        if let Err(e) = res {
+            warn_revert(pid, "SetProcessInformation(PowerThrottling)", e);
+        }
     }
 
     if let Some(prev) = state.prev_memory_priority {
-        let _ = unsafe {
+        let res = unsafe {
             SetProcessInformation(
                 handle,
                 ProcessMemoryPriority,
@@ -142,16 +159,31 @@ pub fn revert(pid: u32, state: AppliedState) -> Result<()> {
                 size_of::<MEMORY_PRIORITY_INFORMATION>() as u32,
             )
         };
+        if let Err(e) = res {
+            warn_revert(pid, "SetProcessInformation(MemoryPriority)", e);
+        }
     }
 
     if state.cpu_sets_set {
         // Empty array resets to system default.
-        let _ = unsafe { SetProcessDefaultCpuSets(handle, None) };
+        if let Err(e) = unsafe { SetProcessDefaultCpuSets(handle, None) }.ok() {
+            warn_revert(pid, "SetProcessDefaultCpuSets(None)", e);
+        }
+    }
+
+    if let Some(prio) = state.prev_io_priority {
+        if let Err(e) = io_priority::set(handle, prio) {
+            warn_revert(pid, "NtSetInformationProcess(ProcessIoPriority)", e);
+        }
     }
 
     // SAFETY: handle valid, last use.
     let _ = unsafe { CloseHandle(handle) };
     Ok(())
+}
+
+fn warn_revert(pid: u32, operation: &str, err: impl std::fmt::Display) {
+    tracing::warn!(pid, %err, "revert: {operation} failed");
 }
 
 // ─── helpers ──────────────────────────────────────────────────────────────

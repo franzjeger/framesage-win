@@ -14,7 +14,7 @@ use tracing::{debug, error, info, warn};
 use framesage_core::{paths, Policy};
 use framesage_engine::{Engine, EngineDeps};
 use framesage_gamemode::{journal::Journal, safe_list::SafeList};
-use framesage_ipc::{Event, Request, Response, PIPE_NAME};
+use framesage_ipc::{Event, Request, Response, PIPE_NAME_ADMIN, PIPE_NAME_STATUS};
 
 /// Synchronous entry point used by the Windows service main fn. Owns its
 /// tokio runtime so the SCM thread can block on it.
@@ -64,10 +64,21 @@ pub async fn run(shutdown: oneshot::Receiver<()>) -> Result<()> {
         }
     });
 
-    let ipc_engine = engine.clone();
-    let ipc_handle = tokio::spawn(async move {
-        if let Err(e) = serve_ipc(ipc_engine).await {
-            error!(error = %e, "ipc server stopped");
+    // Two IPC servers: one admin pipe (default Windows ACL — Administrators
+    // + LocalSystem only) and one status pipe (permissive ACL via SDDL so
+    // the unprivileged tray UI can connect). The handler enforces "status
+    // pipe accepts only read-only requests" regardless of caller identity.
+    let admin_engine = engine.clone();
+    let admin_handle = tokio::spawn(async move {
+        if let Err(e) = serve_ipc(admin_engine, PipeKind::Admin).await {
+            error!(error = %e, "admin ipc server stopped");
+        }
+    });
+
+    let status_engine = engine.clone();
+    let status_handle = tokio::spawn(async move {
+        if let Err(e) = serve_ipc(status_engine, PipeKind::Status).await {
+            error!(error = %e, "status ipc server stopped");
         }
     });
 
@@ -84,9 +95,23 @@ pub async fn run(shutdown: oneshot::Receiver<()>) -> Result<()> {
     let _ = shutdown.await;
     info!("shutdown requested");
     tick_handle.abort();
-    ipc_handle.abort();
+    admin_handle.abort();
+    status_handle.abort();
     reload_handle.abort();
     Ok(())
+}
+
+/// Which named pipe a handler is currently serving on. Drives ACL-layer
+/// rejection of non-read-only requests on the status pipe.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg(windows)]
+enum PipeKind {
+    /// Default Windows ACL — Administrators + LocalSystem. Accepts every
+    /// request type.
+    Admin,
+    /// Permissive ACL (Authenticated Users). Only read-only requests are
+    /// honoured; anything else replies with an error rather than executing.
+    Status,
 }
 
 fn load_policy_or_default(path: &std::path::Path) -> Policy {
@@ -194,6 +219,7 @@ fn detect_topology() -> Result<framesage_core::CpuTopology> {
                 ccd,
                 kind,
                 cppc_rank: Some(100 - core),
+                l3_cache_bytes: None,
                 is_smt_sibling: smt == 1,
             });
         }
@@ -202,29 +228,28 @@ fn detect_topology() -> Result<framesage_core::CpuTopology> {
 }
 
 #[cfg(windows)]
-async fn serve_ipc(engine: Arc<Engine>) -> Result<()> {
-    use tokio::net::windows::named_pipe::{PipeMode, ServerOptions};
+async fn serve_ipc(engine: Arc<Engine>, kind: PipeKind) -> Result<()> {
+    let pipe_name = match kind {
+        PipeKind::Admin => PIPE_NAME_ADMIN,
+        PipeKind::Status => PIPE_NAME_STATUS,
+    };
+    info!(pipe = %pipe_name, kind = ?kind, "ipc server listening");
 
-    // ServerOptions on Windows lets us create a security-attributed pipe.
-    // Default ACL allows Administrators + LocalSystem. We deliberately do NOT
-    // open it to Everyone — only elevated tools should be able to reconfigure
-    // the engine. The tray app needs to be launched with the same user as the
-    // service or via a UAC prompt to administer; status read-only access is
-    // future work (split read vs admin pipes).
-    info!(pipe = %PIPE_NAME, "ipc server listening");
-
+    // First pipe instance uses FILE_FLAG_FIRST_PIPE_INSTANCE to defeat
+    // squatting; subsequent accept-loop instances do not.
+    let mut first_instance = true;
     loop {
-        let server = ServerOptions::new()
-            .pipe_mode(PipeMode::Byte)
-            .first_pipe_instance(false)
-            .create(PIPE_NAME)
-            .with_context(|| format!("create named pipe {PIPE_NAME}"))?;
+        let server = match kind {
+            PipeKind::Admin => crate::pipe::create_admin_pipe(pipe_name, first_instance)?,
+            PipeKind::Status => crate::pipe::create_status_pipe(pipe_name, first_instance)?,
+        };
+        first_instance = false;
 
         server.connect().await.context("accept named pipe client")?;
 
         let engine = engine.clone();
         tokio::spawn(async move {
-            if let Err(e) = handle_client(server, engine).await {
+            if let Err(e) = handle_client(server, engine, kind).await {
                 debug!(error = %e, "client connection ended");
             }
         });
@@ -232,7 +257,14 @@ async fn serve_ipc(engine: Arc<Engine>) -> Result<()> {
 }
 
 #[cfg(not(windows))]
-async fn serve_ipc(_engine: Arc<Engine>) -> Result<()> {
+#[derive(Debug, Clone, Copy)]
+enum PipeKind {
+    Admin,
+    Status,
+}
+
+#[cfg(not(windows))]
+async fn serve_ipc(_engine: Arc<Engine>, _kind: PipeKind) -> Result<()> {
     // No named pipes off Windows. Console mode loses the IPC plane; the engine
     // still ticks against the synthetic topology so we can validate state
     // machines without the actual OS.
@@ -250,6 +282,7 @@ async fn futures_pending() -> ! {
 async fn handle_client(
     stream: tokio::net::windows::named_pipe::NamedPipeServer,
     engine: Arc<Engine>,
+    kind: PipeKind,
 ) -> Result<()> {
     let (read_half, mut write_half) = tokio::io::split(stream);
     let mut reader = BufReader::new(read_half).lines();
@@ -266,19 +299,53 @@ async fn handle_client(
             }
         };
 
+        // Defense in depth: even though the status pipe's OS-layer ACL is
+        // permissive, the IPC handler still rejects any mutating request on
+        // it. A misrouted client (or a future bug that opens the status
+        // pipe for a mutator) gets a clean error rather than executing.
+        if kind == PipeKind::Status && !req.is_read_only() {
+            let resp = Response::Error {
+                message: format!(
+                    "{:?} requires the admin pipe ({})",
+                    std::mem::discriminant(&req),
+                    framesage_ipc::PIPE_NAME_ADMIN
+                ),
+            };
+            write_response(&mut write_half, &resp).await?;
+            continue;
+        }
+
         match req {
             Request::Status => {
                 let snap = engine.status();
                 write_response(&mut write_half, &Response::Status(Box::new(snap))).await?;
             }
             Request::SetPolicy { policy } => {
-                engine.set_policy(policy);
+                // Apply in-memory first so subsequent ticks see the change
+                // immediately, then persist to disk so the edit survives
+                // service restart. The FS watcher will fire a redundant
+                // reload from the disk write — benign because `set_policy`
+                // is idempotent on identical content.
+                engine.set_policy(policy.clone());
+                if let Err(e) = policy.save(&paths::policy_path()) {
+                    warn!(error = %e, "policy save after SetPolicy failed; in-memory only");
+                }
                 write_response(&mut write_half, &Response::Ok).await?;
             }
-            Request::ApplyOnce { profile: _ } => {
-                // TODO(v0.2): one-shot profile apply on the current foreground.
-                write_response(&mut write_half, &Response::Ok).await?;
-            }
+            Request::ApplyOnce { profile } => match engine.apply_once(profile) {
+                Ok(()) => {
+                    write_response(&mut write_half, &Response::Ok).await?;
+                }
+                Err(e) => {
+                    write_response(
+                        &mut write_half,
+                        &Response::Error {
+                            message: format!("apply_once failed: {e:#}"),
+                        },
+                    )
+                    .await?;
+                }
+            },
             Request::Pause => {
                 engine.pause();
                 write_response(&mut write_half, &Response::Ok).await?;

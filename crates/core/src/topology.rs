@@ -23,6 +23,17 @@ pub enum CoreKind {
     Cache,
 }
 
+impl std::fmt::Display for CoreKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let s = match self {
+            Self::Performance => "Performance (P-cores)",
+            Self::Efficiency => "Efficiency (E-cores)",
+            Self::Cache => "Cache (X3D)",
+        };
+        f.write_str(s)
+    }
+}
+
 /// One logical processor as seen by Windows.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LogicalCpu {
@@ -39,6 +50,12 @@ pub struct LogicalCpu {
     /// CPPC perf rank (higher = faster silicon). `None` if not exposed by the
     /// platform. Values are platform-defined, only the relative order matters.
     pub cppc_rank: Option<u32>,
+    /// Size in bytes of the L3 cache shared with this logical processor's CCD.
+    /// `None` on hosts where cache enumeration failed or wasn't run yet. The
+    /// X3D CCD's L3 is ~3x the size of the non-X3D CCD's (96 MB vs 32 MB), so
+    /// this is what `retag_ccds_from_signals` uses to identify the cache CCD.
+    #[serde(default)]
+    pub l3_cache_bytes: Option<u32>,
     /// Is the second SMT thread on this physical core?
     pub is_smt_sibling: bool,
 }
@@ -73,6 +90,98 @@ impl CpuTopology {
 
     pub fn cpus_of_kind(&self, kind: CoreKind) -> impl Iterator<Item = &LogicalCpu> {
         self.cpus.iter().filter(move |c| c.kind == kind)
+    }
+
+    /// Infer which CCD carries 3D V-Cache and retag its cores as
+    /// `CoreKind::Cache`.
+    ///
+    /// Two signals, in priority order:
+    ///
+    /// 1. **L3 cache size per CCD.** The X3D CCD's L3 is ~3x the non-X3D CCD's
+    ///    (96 MB vs 32 MB on 7950X3D / 9950X3D — verified on hardware). We
+    ///    require a ≥ 1.5x ratio between the two CCDs' L3 sizes; the larger-L3
+    ///    CCD is the X3D one. This is the only signal that actually distinguishes
+    ///    AMD X3D parts at the Windows API layer.
+    /// 2. **CPPC rank distribution (fallback).** On hosts where L3 sizes are
+    ///    equal or unavailable but ranks aren't (e.g. Intel hybrid binned with
+    ///    asymmetric base clocks), fall back to the rank gap: ≥ 5% between the
+    ///    two CCDs' top ranks marks the slower one as `Cache`.
+    ///
+    /// Originally this used `PROCESSOR_POWER_INFORMATION::MaxMhz` as the X3D
+    /// signal — that turned out to be uniform across CCDs on AMD Ryzen (the
+    /// API reports ACPI base spec, not per-CCD boost ceiling), so the rank
+    /// path was demoted to a fallback after hardware validation on 9950X3D.
+    ///
+    /// We deliberately leave alone:
+    /// * Single-CCD topologies — can't distinguish 7800X3D from 7700X here;
+    ///   user can configure manually.
+    /// * 3+ CCD topologies (Threadripper) — not a desktop X3D scenario, and a
+    ///   pairwise heuristic would be fragile.
+    /// * Cores already tagged as `Efficiency` — those came from a different
+    ///   signal (Intel hybrid) and outrank this heuristic.
+    pub fn retag_ccds_from_signals(&mut self) {
+        const CACHE_CCD_L3_RATIO_NUM: u64 = 3;
+        const CACHE_CCD_L3_RATIO_DEN: u64 = 2;
+        const CACHE_CCD_RANK_MARGIN_PCT: u64 = 5;
+
+        let ccds: Vec<u8> = self.ccds().collect();
+        if ccds.len() != 2 {
+            return;
+        }
+
+        // Signal 1: L3 cache size differential. Reliable on AMD X3D parts.
+        let l3_a = self
+            .cpus_on_ccd(ccds[0])
+            .filter_map(|c| c.l3_cache_bytes)
+            .max();
+        let l3_b = self
+            .cpus_on_ccd(ccds[1])
+            .filter_map(|c| c.l3_cache_bytes)
+            .max();
+        if let (Some(l3_a), Some(l3_b)) = (l3_a, l3_b) {
+            if l3_a != l3_b {
+                let (cache_ccd, larger, smaller) = if l3_a > l3_b {
+                    (ccds[0], l3_a, l3_b)
+                } else {
+                    (ccds[1], l3_b, l3_a)
+                };
+                // Require larger ≥ (num/den) × smaller. 3/2 = 1.5x.
+                if (larger as u64) * CACHE_CCD_L3_RATIO_DEN
+                    >= (smaller as u64) * CACHE_CCD_L3_RATIO_NUM
+                {
+                    self.retag_ccd_as_cache(cache_ccd);
+                    return;
+                }
+            }
+        }
+
+        // Signal 2 (fallback): CPPC rank gap.
+        let r_a = self.cpus_on_ccd(ccds[0]).filter_map(|c| c.cppc_rank).max();
+        let r_b = self.cpus_on_ccd(ccds[1]).filter_map(|c| c.cppc_rank).max();
+        let (Some(r_a), Some(r_b)) = (r_a, r_b) else {
+            return;
+        };
+        if r_a == r_b {
+            return;
+        }
+        let (cache_ccd, perf_rank, cache_rank) = if r_a > r_b {
+            (ccds[1], r_a, r_b)
+        } else {
+            (ccds[0], r_b, r_a)
+        };
+
+        if (perf_rank as u64) * 100 < (cache_rank as u64) * (100 + CACHE_CCD_RANK_MARGIN_PCT) {
+            return;
+        }
+        self.retag_ccd_as_cache(cache_ccd);
+    }
+
+    fn retag_ccd_as_cache(&mut self, ccd: u8) {
+        for cpu in &mut self.cpus {
+            if cpu.ccd == ccd && cpu.kind == CoreKind::Performance {
+                cpu.kind = CoreKind::Cache;
+            }
+        }
     }
 
     /// Resolve a `CpuSelector` against this topology into the concrete set of
@@ -167,6 +276,7 @@ mod tests {
                     ccd,
                     kind,
                     cppc_rank: Some(base_rank - (core % 4)),
+                    l3_cache_bytes: None,
                     is_smt_sibling: smt == 1,
                 });
             }
@@ -236,6 +346,137 @@ mod tests {
         let topo = x3d_dual_ccd();
         let ccds: Vec<u8> = topo.ccds().collect();
         assert_eq!(ccds, vec![0, 1]);
+    }
+
+    /// Two CCDs of 4 cores * 2 SMT each, both initially tagged as
+    /// `Performance`. CCD 0 gets `slow_max_mhz`; CCD 1 gets `fast_max_mhz`.
+    /// L3 sizes are left unset — tests that exercise the L3 path set them
+    /// explicitly via `with_l3`. Mirrors what `framesage-sys::topology::detect()`
+    /// produces before `retag_ccds_from_signals` runs.
+    fn two_ccds(fast_max_mhz: u32, slow_max_mhz: u32) -> CpuTopology {
+        let mut cpus = Vec::new();
+        let mut idx = 0u32;
+        for ccd in 0u8..2 {
+            let top = if ccd == 0 { slow_max_mhz } else { fast_max_mhz };
+            for core in 0..4u32 {
+                for smt in 0..2u32 {
+                    cpus.push(LogicalCpu {
+                        index: idx,
+                        physical_core: (ccd as u32) * 4 + core,
+                        ccd,
+                        kind: CoreKind::Performance,
+                        cppc_rank: Some(top.saturating_sub(core * 25)),
+                        l3_cache_bytes: None,
+                        is_smt_sibling: smt == 1,
+                    });
+                    idx += 1;
+                }
+            }
+        }
+        CpuTopology { cpus }
+    }
+
+    /// Stamp every CPU on `ccd` with `bytes` of L3.
+    fn with_l3(topo: &mut CpuTopology, ccd: u8, bytes: u32) {
+        for cpu in &mut topo.cpus {
+            if cpu.ccd == ccd {
+                cpu.l3_cache_bytes = Some(bytes);
+            }
+        }
+    }
+
+    const L3_X3D_BYTES: u32 = 96 * 1024 * 1024;
+    const L3_STD_BYTES: u32 = 32 * 1024 * 1024;
+
+    #[test]
+    fn retag_uses_l3_size_to_pick_x3d_ccd_even_when_ranks_are_uniform() {
+        // The exact distribution observed on the 9950X3D validation hardware:
+        // both CCDs report MaxMhz=4300 (ACPI base spec), so ranks are tied.
+        // L3 differential is what makes detection work in reality.
+        let mut topo = two_ccds(4300, 4300);
+        with_l3(&mut topo, 0, L3_X3D_BYTES);
+        with_l3(&mut topo, 1, L3_STD_BYTES);
+        topo.retag_ccds_from_signals();
+
+        assert!(
+            topo.cpus_on_ccd(0).all(|c| c.kind == CoreKind::Cache),
+            "CCD 0 has the larger L3 (96 MB) — should be Cache"
+        );
+        assert!(
+            topo.cpus_on_ccd(1).all(|c| c.kind == CoreKind::Performance),
+            "CCD 1 has the smaller L3 (32 MB) — should remain Performance"
+        );
+    }
+
+    #[test]
+    fn retag_uses_l3_when_the_smaller_l3_ccd_is_ccd1() {
+        // Mirror image: X3D is on CCD 1 (some boards/BIOSes enumerate that way).
+        let mut topo = two_ccds(4300, 4300);
+        with_l3(&mut topo, 0, L3_STD_BYTES);
+        with_l3(&mut topo, 1, L3_X3D_BYTES);
+        topo.retag_ccds_from_signals();
+        assert!(topo.cpus_on_ccd(1).all(|c| c.kind == CoreKind::Cache));
+        assert!(topo.cpus_on_ccd(0).all(|c| c.kind == CoreKind::Performance));
+    }
+
+    #[test]
+    fn retag_falls_back_to_rank_when_l3_sizes_are_equal() {
+        // Non-X3D Intel hybrid-ish part: same L3 across both clusters, but
+        // base clocks differ. Rank-based path still picks the slower one.
+        let mut topo = two_ccds(5700, 5000);
+        with_l3(&mut topo, 0, L3_STD_BYTES);
+        with_l3(&mut topo, 1, L3_STD_BYTES);
+        topo.retag_ccds_from_signals();
+        assert!(topo.cpus_on_ccd(0).all(|c| c.kind == CoreKind::Cache));
+        assert!(topo.cpus_on_ccd(1).all(|c| c.kind == CoreKind::Performance));
+    }
+
+    #[test]
+    fn retag_marks_slower_ccd_as_cache_when_rank_gap_is_large_enough() {
+        // Original rank-based path, no L3 info — same behavior as before.
+        let mut topo = two_ccds(5700, 5000);
+        topo.retag_ccds_from_signals();
+        assert!(topo.cpus_on_ccd(0).all(|c| c.kind == CoreKind::Cache));
+        assert!(topo.cpus_on_ccd(1).all(|c| c.kind == CoreKind::Performance));
+    }
+
+    #[test]
+    fn retag_leaves_topology_alone_when_both_signals_agree_on_no_split() {
+        // L3 sizes equal AND rank gap < 5%. Real two-CCD non-X3D part.
+        let mut topo = two_ccds(5700, 5600);
+        with_l3(&mut topo, 0, L3_STD_BYTES);
+        with_l3(&mut topo, 1, L3_STD_BYTES);
+        topo.retag_ccds_from_signals();
+        assert!(topo.cpus.iter().all(|c| c.kind == CoreKind::Performance));
+    }
+
+    #[test]
+    fn retag_is_a_noop_on_single_ccd_topology() {
+        let mut topo = CpuTopology {
+            cpus: (0..8)
+                .map(|i| LogicalCpu {
+                    index: i,
+                    physical_core: i / 2,
+                    ccd: 0,
+                    kind: CoreKind::Cache,
+                    cppc_rank: Some(5000),
+                    l3_cache_bytes: Some(L3_X3D_BYTES),
+                    is_smt_sibling: i % 2 == 1,
+                })
+                .collect(),
+        };
+        topo.retag_ccds_from_signals();
+        assert!(topo.cpus.iter().all(|c| c.kind == CoreKind::Cache));
+    }
+
+    #[test]
+    fn retag_is_a_noop_when_both_signals_are_missing() {
+        let mut topo = two_ccds(5700, 5000);
+        for cpu in &mut topo.cpus {
+            cpu.cppc_rank = None;
+        }
+        topo.retag_ccds_from_signals();
+        assert!(topo.cpus.iter().all(|c| c.kind == CoreKind::Performance));
     }
 
     #[test]

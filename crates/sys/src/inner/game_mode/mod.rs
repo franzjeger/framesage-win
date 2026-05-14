@@ -6,6 +6,7 @@ pub mod process;
 pub mod query;
 pub mod service;
 pub mod taskbar;
+pub mod windows_update;
 
 pub use apply::{apply_action, revert_all};
 pub use query::Win32StateQuery;

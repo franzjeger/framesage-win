@@ -8,6 +8,12 @@
       "default_suspend": true
     },
     {
+      "exe": "FileCoAuth.exe",
+      "display_name": "Microsoft OneDrive (co-authoring helper)",
+      "rationale": "OneDrive's per-file co-authoring helper. Spawns alongside OneDrive.exe and shares its sync burden. Suspend with OneDrive itself.",
+      "default_suspend": true
+    },
+    {
       "exe": "Dropbox.exe",
       "display_name": "Dropbox",
       "rationale": "Same pattern as OneDrive. Suspend-friendly.",
@@ -18,6 +24,30 @@
       "display_name": "Google Drive",
       "rationale": "Same pattern as OneDrive.",
       "default_suspend": true
+    },
+    {
+      "exe": "GoogleDriveFS.exe",
+      "display_name": "Google Drive for desktop (FS driver helper)",
+      "rationale": "User-mode helper for Drive's stream-files mount. Suspends cleanly alongside the main sync process.",
+      "default_suspend": true
+    },
+    {
+      "exe": "pCloud.exe",
+      "display_name": "pCloud Drive",
+      "rationale": "Cloud-storage sync. Same I/O pattern as OneDrive/Dropbox.",
+      "default_suspend": true
+    },
+    {
+      "exe": "MEGAsync.exe",
+      "display_name": "MEGAsync",
+      "rationale": "MEGA cloud sync. Heavy crypto + I/O during background transfers.",
+      "default_suspend": true
+    },
+    {
+      "exe": "Box.exe",
+      "display_name": "Box Drive",
+      "rationale": "Box cloud sync. Same I/O profile as other sync clients.",
+      "default_suspend": false
     },
     {
       "exe": "iCUE.exe",
@@ -38,6 +68,18 @@
       "default_suspend": false
     },
     {
+      "exe": "ArmouryCrate.UserSessionHelper.exe",
+      "display_name": "ASUS Armoury Crate User Session Helper",
+      "rationale": "Per-user helper for Armoury Crate. Suspending alongside the main service stops the full Armoury stack for the session.",
+      "default_suspend": false
+    },
+    {
+      "exe": "AsusOptimization.exe",
+      "display_name": "ASUS Optimization",
+      "rationale": "ASUS background optimisations / hotkey handler. Periodic polling; suspend with the rest of the ASUS stack.",
+      "default_suspend": false
+    },
+    {
       "exe": "RazerCentralService.exe",
       "display_name": "Razer Central",
       "rationale": "Razer device service. RGB + telemetry; same pattern as iCUE.",
@@ -47,6 +89,36 @@
       "exe": "Synapse3.exe",
       "display_name": "Razer Synapse",
       "rationale": "Razer Synapse UI / driver bridge.",
+      "default_suspend": false
+    },
+    {
+      "exe": "lghub.exe",
+      "display_name": "Logitech G HUB",
+      "rationale": "Logitech G HUB UI process. Persistent overlay process with periodic device polling. Pause if you're not actively using G HUB macros / on-the-fly config.",
+      "default_suspend": false
+    },
+    {
+      "exe": "lghub_agent.exe",
+      "display_name": "Logitech G HUB Agent",
+      "rationale": "G HUB background agent that talks to peripherals. Heavier than the UI process; safe to pause when no macros are in use.",
+      "default_suspend": false
+    },
+    {
+      "exe": "lghub_updater.exe",
+      "display_name": "Logitech G HUB Updater",
+      "rationale": "Auto-update check process for G HUB. Pure background; no game depends on it being live.",
+      "default_suspend": true
+    },
+    {
+      "exe": "MSIAfterburner.exe",
+      "display_name": "MSI Afterburner",
+      "rationale": "GPU overclock + OSD. Default-disabled because users running an OC profile or watching the OSD will want it; flip on if your OC is set in BIOS/MSI Center and Afterburner is just sitting in tray.",
+      "default_suspend": false
+    },
+    {
+      "exe": "RTSS.exe",
+      "display_name": "RivaTuner Statistics Server",
+      "rationale": "Frame-limit + overlay backbone for Afterburner. Don't suspend if you rely on RTSS frame caps — that will release the cap mid-game.",
       "default_suspend": false
     },
     {
@@ -62,9 +134,63 @@
       "default_suspend": false
     },
     {
+      "exe": "EpicWebHelper.exe",
+      "display_name": "Epic Web Helper",
+      "rationale": "Embedded Chromium helper inside Epic Games Launcher. Pause with the main launcher.",
+      "default_suspend": false
+    },
+    {
+      "exe": "Spotify.exe",
+      "display_name": "Spotify",
+      "rationale": "Music streaming client. Default-disabled — most gamers want music during sessions. Enable only if you listen on another device.",
+      "default_suspend": false
+    },
+    {
       "exe": "Discord.exe",
       "display_name": "Discord",
       "rationale": "Voice/chat. *Don't* suspend if you'll use Discord while gaming. Listed for users who alt-tab less.",
+      "default_suspend": false
+    },
+    {
+      "exe": "Slack.exe",
+      "display_name": "Slack",
+      "rationale": "Workplace chat. Heavy Electron app with background sync. Pause unless you need work notifications during the session.",
+      "default_suspend": false
+    },
+    {
+      "exe": "Teams.exe",
+      "display_name": "Microsoft Teams (classic)",
+      "rationale": "Heavyweight Electron + Skype-stack. Suspending stops idle CPU draw; resume restores chat/meeting state. Pause for personal sessions; skip for on-call shifts.",
+      "default_suspend": false
+    },
+    {
+      "exe": "ms-teams.exe",
+      "display_name": "Microsoft Teams (new)",
+      "rationale": "WebView2-based Teams successor. Lighter than classic but still a real CPU draw at idle.",
+      "default_suspend": false
+    },
+    {
+      "exe": "WhatsApp.exe",
+      "display_name": "WhatsApp Desktop",
+      "rationale": "Electron messaging client. Background sync; resume lands queued messages.",
+      "default_suspend": false
+    },
+    {
+      "exe": "Skype.exe",
+      "display_name": "Skype",
+      "rationale": "Legacy Skype client. Mostly idle, but suspends cleanly.",
+      "default_suspend": true
+    },
+    {
+      "exe": "Code.exe",
+      "display_name": "Visual Studio Code",
+      "rationale": "Code's idle CPU is low, but extensions (LSP servers, linters) keep workers busy. Pause if your editor is just sitting open.",
+      "default_suspend": false
+    },
+    {
+      "exe": "firefox.exe",
+      "display_name": "Mozilla Firefox (background helpers)",
+      "rationale": "Background tabs / sync. Same reasoning as Edge / Chrome.",
       "default_suspend": false
     },
     {
@@ -78,6 +204,54 @@
       "display_name": "Google Chrome (background helpers)",
       "rationale": "Same as Edge — Chrome's background tabs / extensions / sync can spike CPU.",
       "default_suspend": false
+    },
+    {
+      "exe": "qBittorrent.exe",
+      "display_name": "qBittorrent",
+      "rationale": "Torrent client. Disk + network heavy. Pause for clean upload/download stop during gameplay.",
+      "default_suspend": true
+    },
+    {
+      "exe": "Transmission.exe",
+      "display_name": "Transmission",
+      "rationale": "Torrent client. Same reasoning as qBittorrent.",
+      "default_suspend": true
+    },
+    {
+      "exe": "TeamSpeak3.exe",
+      "display_name": "TeamSpeak 3",
+      "rationale": "Voice chat. Don't suspend if you're in a TS channel for the game.",
+      "default_suspend": false
+    },
+    {
+      "exe": "Mumble.exe",
+      "display_name": "Mumble",
+      "rationale": "Open-source voice chat. Same reasoning as TS3.",
+      "default_suspend": false
+    },
+    {
+      "exe": "YourPhone.exe",
+      "display_name": "Phone Link (legacy)",
+      "rationale": "Win10 Phone Link / Your Phone bridge. Periodic Bluetooth chatter; safe to pause.",
+      "default_suspend": true
+    },
+    {
+      "exe": "PhoneExperienceHost.exe",
+      "display_name": "Phone Link",
+      "rationale": "Modern Phone Link host. Pair with CDPSvc pause for full Phone-Link quietude.",
+      "default_suspend": true
+    },
+    {
+      "exe": "OneDriveStandaloneUpdater.exe",
+      "display_name": "OneDrive Standalone Updater",
+      "rationale": "Auto-update process for OneDrive. Pure background; safe to pause.",
+      "default_suspend": true
+    },
+    {
+      "exe": "GoogleUpdate.exe",
+      "display_name": "Google Updater",
+      "rationale": "Auto-updates Chrome / other Google apps. Periodic background check.",
+      "default_suspend": true
     }
   ],
   "denylist": [
@@ -86,8 +260,28 @@
       "rationale": "Microsoft Defender's main process. Suspending AV is the canonical malware tactic and breaks anti-cheat checks. Permanently denied."
     },
     {
+      "exe": "NisSrv.exe",
+      "rationale": "Microsoft Defender Network Inspection Service. Suspending it is equivalent to suspending Defender — same anti-cheat / security reasoning. Permanently denied."
+    },
+    {
+      "exe": "SecurityHealthService.exe",
+      "rationale": "Windows Security UI host. Suspending breaks the Security Center notifications and can trip anti-cheat heuristics. Permanently denied."
+    },
+    {
       "exe": "explorer.exe",
       "rationale": "The shell. Suspending it freezes the taskbar, start menu, and most input dialogs. Permanently denied."
+    },
+    {
+      "exe": "dwm.exe",
+      "rationale": "Desktop Window Manager — the compositor. Suspending it freezes screen redraw and breaks fullscreen-exclusive transitions. Permanently denied."
+    },
+    {
+      "exe": "audiodg.exe",
+      "rationale": "Windows Audio Device Graph Isolation. Suspending it stops audio output mid-game. Permanently denied."
+    },
+    {
+      "exe": "fontdrvhost.exe",
+      "rationale": "User-mode font driver host. Suspending it breaks text rendering across the system. Permanently denied."
     },
     {
       "exe": "winlogon.exe",
@@ -112,6 +306,58 @@
     {
       "exe": "wininit.exe",
       "rationale": "Windows Initialization. Permanently denied."
+    },
+    {
+      "exe": "sihost.exe",
+      "rationale": "Shell Infrastructure Host. Backs Action Center, Start menu animations, and the shell's per-user UI. Suspending degrades shell responsiveness. Permanently denied."
+    },
+    {
+      "exe": "ApplicationFrameHost.exe",
+      "rationale": "UWP / Modern apps window frame host. Suspending freezes any open Store-app windows. Permanently denied."
+    },
+    {
+      "exe": "RuntimeBroker.exe",
+      "rationale": "UWP runtime broker. Suspending breaks UWP app permission negotiation and frequently crashes the affected apps. Permanently denied."
+    },
+    {
+      "exe": "LockApp.exe",
+      "rationale": "Windows lock-screen UWP app. Suspending breaks lock-screen show/hide transitions. Permanently denied."
+    },
+    {
+      "exe": "StartMenuExperienceHost.exe",
+      "rationale": "Win11 Start menu host. Suspending freezes the Start menu and pinned-app search. Permanently denied."
+    },
+    {
+      "exe": "ShellExperienceHost.exe",
+      "rationale": "Windows shell experience (Action Center, calendar flyout). Suspending breaks notifications. Permanently denied."
+    },
+    {
+      "exe": "TextInputHost.exe",
+      "rationale": "Touch / IME input host. Suspending breaks IME for languages that use it and can lose keyboard input entirely. Permanently denied."
+    },
+    {
+      "exe": "SearchHost.exe",
+      "rationale": "Win11 search UI host. Suspending breaks the Start menu search box and Windows Search overlay. Permanently denied."
+    },
+    {
+      "exe": "ctfmon.exe",
+      "rationale": "Cicero text-input host. Suspending breaks keyboard input switching and on-screen-keyboard interaction. Permanently denied."
+    },
+    {
+      "exe": "nvcontainer.exe",
+      "rationale": "NVIDIA Container — the umbrella process that hosts driver telemetry, GeForce Experience, and the Game Bar overlay path. Suspending breaks the in-game overlay, NVENC capture, and DLSS Frame Generation. Permanently denied."
+    },
+    {
+      "exe": "NVDisplay.Container.exe",
+      "rationale": "NVIDIA display container host. Suspending breaks display switching and panel power management. Permanently denied."
+    },
+    {
+      "exe": "atiesrxx.exe",
+      "rationale": "AMD external events utility. Suspending can wedge HDR / dynamic-resolution toggles on Radeon drivers. Permanently denied."
+    },
+    {
+      "exe": "RadeonSoftware.exe",
+      "rationale": "AMD Adrenalin Software UI. Suspending breaks the in-game overlay and recording. Permanently denied."
     }
   ]
 }
