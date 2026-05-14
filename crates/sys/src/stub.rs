@@ -67,6 +67,7 @@ pub mod process {
     #[derive(Debug, Clone, Copy)]
     pub struct PidSnapshot {
         pub pid: u32,
+        pub parent_pid: u32,
         pub thread_count: u32,
     }
 

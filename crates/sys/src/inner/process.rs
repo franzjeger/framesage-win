@@ -44,19 +44,28 @@ impl ProcessCpuTimes {
     }
 }
 
-/// Tuple of `(pid, thread_count)` snapshot from a single ToolHelp pass.
-/// Cheaper than calling `iter_pids` then opening each PID for thread count
-/// separately — ToolHelp already populated `cntThreads` for free.
+/// Tuple of `(pid, parent_pid, thread_count)` snapshot from a single
+/// ToolHelp pass. Cheaper than calling `iter_pids` then opening each PID
+/// for thread count + parent separately — ToolHelp populates both
+/// (`th32ParentProcessID`, `cntThreads`) for free.
 #[derive(Debug, Clone, Copy)]
 pub struct PidSnapshot {
     pub pid: u32,
+    /// PID of the process that created this one. `0` for orphan / root
+    /// processes (System Idle, or processes whose parent has exited). Note
+    /// the kernel does not update this when a parent exits — a fresh
+    /// `notepad.exe` spawned by `explorer.exe`, after explorer is killed,
+    /// still reports the explorer PID until the kernel reaps it. Treated
+    /// as an orphan by the tree-builder if no live process matches.
+    pub parent_pid: u32,
     pub thread_count: u32,
 }
 
-/// Snapshot every running process plus its thread count via ToolHelp. The
-/// thread count comes from the same struct ToolHelp populates for `iter_pids`
-/// — no extra OpenProcess required, which matters when the Processes tab
-/// re-snapshots ~200 processes every second.
+/// Snapshot every running process plus its thread count + parent PID via
+/// ToolHelp. The thread count and parent come from the same struct
+/// ToolHelp populates for `iter_pids` — no extra OpenProcess required,
+/// which matters when the Processes tab re-snapshots ~200 processes
+/// every second.
 pub fn iter_pid_snapshots() -> Result<Vec<PidSnapshot>> {
     let snap = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) }
         .map_err(|e| anyhow!("CreateToolhelp32Snapshot failed: {e}"))?;
@@ -74,11 +83,13 @@ pub fn iter_pid_snapshots() -> Result<Vec<PidSnapshot>> {
     if first_ok {
         out.push(PidSnapshot {
             pid: entry.th32ProcessID,
+            parent_pid: entry.th32ParentProcessID,
             thread_count: entry.cntThreads,
         });
         while unsafe { Process32NextW(snap, &mut entry) }.is_ok() {
             out.push(PidSnapshot {
                 pid: entry.th32ProcessID,
+                parent_pid: entry.th32ParentProcessID,
                 thread_count: entry.cntThreads,
             });
         }

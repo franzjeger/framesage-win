@@ -179,6 +179,13 @@ pub struct SystemMetrics {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProcessSnapshot {
     pub pid: u32,
+    /// PID of the parent process at snapshot time (`PROCESSENTRY32W::
+    /// th32ParentProcessID`). `0` for true roots; a non-zero value
+    /// pointing at a PID that's not in the snapshot is an orphan and is
+    /// rendered at the top of the tree. `serde(default)` so older clients
+    /// still parse responses written by newer servers.
+    #[serde(default)]
+    pub parent_pid: u32,
     /// Image filename only (no path), original case as the kernel reports.
     pub exe_name: String,
     /// Full image path. Carried alongside `exe_name` so the tray can extract

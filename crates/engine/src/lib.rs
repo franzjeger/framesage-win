@@ -446,6 +446,7 @@ impl Engine {
 
                 out.push(ProcessSnapshot {
                     pid,
+                    parent_pid: ps.parent_pid,
                     exe_name,
                     exe_path,
                     description: info.description,

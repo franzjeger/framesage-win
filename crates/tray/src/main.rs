@@ -104,6 +104,19 @@ struct ProcessesView {
     /// table reserves a strip at the bottom for the detail panel; click the
     /// same row again (or the panel's × button) to clear.
     selected_pid: Option<u32>,
+    /// Render mode: when true, rows nest under their parent PID with
+    /// indentation + a ▶/▼ toggle, like Process Explorer's "All Processes"
+    /// tab. Otherwise the table is a flat sortable list. Filter forces flat
+    /// mode regardless — searching across the whole tree is more useful
+    /// than searching within visible subtrees.
+    tree_mode: bool,
+    /// PIDs whose children are currently hidden in tree mode. Default is
+    /// "all expanded" so a fresh session shows the full process forest;
+    /// the user opts *out* of detail by collapsing branches they don't
+    /// care about. Storing collapsed (not expanded) makes new processes
+    /// inherit the "expanded" default automatically — no enumeration of
+    /// every fresh PID required.
+    collapsed: std::collections::HashSet<u32>,
 }
 
 impl Default for ProcessesView {
@@ -114,6 +127,8 @@ impl Default for ProcessesView {
             sort_by: Some(ProcessSortKey::Cpu),
             sort_desc: true,
             selected_pid: None,
+            tree_mode: true,
+            collapsed: std::collections::HashSet::new(),
         }
     }
 }
@@ -1868,6 +1883,24 @@ impl FramesageApp {
             if ui.button("Clear").clicked() {
                 self.processes.filter.clear();
             }
+            ui.separator();
+            // Tree-mode toggle. Disabled when a filter is set — the filter
+            // forces flat mode so search can find hits buried inside
+            // collapsed subtrees. The disabled checkbox communicates that
+            // without being a no-op (hover shows the explanation).
+            let tree_enabled = self.processes.filter.is_empty();
+            let resp = ui
+                .add_enabled(
+                    tree_enabled,
+                    egui::Checkbox::new(&mut self.processes.tree_mode, "Tree"),
+                )
+                .on_disabled_hover_text("Tree mode is disabled while a filter is active");
+            if tree_enabled && resp.clicked() && self.processes.tree_mode {
+                // Re-enable tree → start fully expanded so the user sees
+                // the whole forest rather than wondering why nothing
+                // appeared.
+                self.processes.collapsed.clear();
+            }
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 let count = self.processes.rows.len();
                 ui.colored_label(theme::TEXT_MUTED, format!("{count} processes"));
@@ -1893,7 +1926,17 @@ impl FramesageApp {
         ui.add_space(4.0);
 
         // ─── Apply filter + sort to a local view ───────────────────────────
+        //
+        // Tree mode and a non-empty filter are mutually exclusive: searching
+        // across the whole tree is more useful than searching within visible
+        // subtrees, so the filter forces a flat list. Sort applies either
+        // way — in tree mode it sorts within siblings, in flat mode it
+        // sorts globally.
         let filter_lc = self.processes.filter.to_ascii_lowercase();
+        let tree_active = self.processes.tree_mode && self.processes.filter.is_empty();
+        let sort_by = self.processes.sort_by;
+        let sort_desc = self.processes.sort_desc;
+
         let mut rows: Vec<framesage_ipc::ProcessSnapshot> = self
             .processes
             .rows
@@ -1903,40 +1946,30 @@ impl FramesageApp {
             })
             .cloned()
             .collect();
-        if let Some(sort_by) = self.processes.sort_by {
-            rows.sort_by(|a, b| {
-                let ord = match sort_by {
-                    ProcessSortKey::ExeName => a
-                        .exe_name
-                        .to_ascii_lowercase()
-                        .cmp(&b.exe_name.to_ascii_lowercase()),
-                    ProcessSortKey::Pid => a.pid.cmp(&b.pid),
-                    ProcessSortKey::Cpu => a.cpu_percent.cmp(&b.cpu_percent),
-                    ProcessSortKey::Memory => a.memory_bytes.cmp(&b.memory_bytes),
-                    ProcessSortKey::Threads => a.threads.cmp(&b.threads),
-                    ProcessSortKey::Priority => a.priority_class_raw.cmp(&b.priority_class_raw),
-                    ProcessSortKey::Profile => a.managed_profile.cmp(&b.managed_profile),
-                    ProcessSortKey::Description => {
-                        // Case-insensitive description sort. None entries
-                        // collate after Some entries so the actually-labelled
-                        // rows cluster together regardless of sort direction.
-                        let av = a.description.as_deref().unwrap_or("\u{ffff}");
-                        let bv = b.description.as_deref().unwrap_or("\u{ffff}");
-                        av.to_ascii_lowercase().cmp(&bv.to_ascii_lowercase())
-                    }
-                    ProcessSortKey::Company => {
-                        let av = a.company.as_deref().unwrap_or("\u{ffff}");
-                        let bv = b.company.as_deref().unwrap_or("\u{ffff}");
-                        av.to_ascii_lowercase().cmp(&bv.to_ascii_lowercase())
-                    }
-                };
-                if self.processes.sort_desc {
-                    ord.reverse()
-                } else {
-                    ord
-                }
-            });
+        if !tree_active {
+            // Flat sort. Tree mode does its own per-sibling sort inside
+            // build_tree_view.
+            rows.sort_by(|a, b| compare_snapshots(a, b, sort_by, sort_desc));
         }
+
+        // `visible` is what the body iterates: in tree mode the depth-first
+        // flattened tree, in flat mode a trivial all-depth-0 list. Keeping
+        // the body loop uniform avoids branching on `tree_active` per row.
+        let visible: Vec<TreeRow> = if tree_active {
+            build_tree_view(&rows, &self.processes.collapsed, |a, b| {
+                compare_snapshots(a, b, sort_by, sort_desc)
+            })
+        } else {
+            rows.iter()
+                .enumerate()
+                .map(|(i, r)| TreeRow {
+                    pid: r.pid,
+                    row_index: i,
+                    depth: 0,
+                    has_children: false,
+                })
+                .collect()
+        };
 
         // ─── Pull the profile id list so the context menu can offer them ──
         let profile_ids: Vec<String> = status
@@ -1977,6 +2010,7 @@ impl FramesageApp {
         let mut action_queue: Vec<ProcessAction> = Vec::new();
         let mut clicked_pid: Option<u32> = None;
         let mut close_detail = false;
+        let mut toggled_pid: Option<u32> = None;
         // Per-frame icon extraction budget. Caps the worst-case cost when a
         // wave of new processes hits the table for the first time — without
         // this a fresh poll could trigger 200 SHGetFileInfoW calls in one
@@ -2034,8 +2068,9 @@ impl FramesageApp {
                         });
                     })
                     .body(|body| {
-                        body.rows(18.0, rows.len(), |mut row| {
-                            let p = &rows[row.index()];
+                        body.rows(18.0, visible.len(), |mut row| {
+                            let tr = visible[row.index()];
+                            let p = &rows[tr.row_index];
                             let pid = p.pid;
                             let exe = p.exe_name.clone();
                             let state = classify_row(p, foreground_pid);
@@ -2083,80 +2118,112 @@ impl FramesageApp {
                             });
 
                             row.col(|ui| {
-                                // Foreground rows get a small right-pointing triangle
-                                // prefix so the eye picks them out instantly even
-                                // when the user has scrolled away from the colored
-                                // marker. ▸ is U+25B8, a geometric-shapes-block
-                                // glyph supported by virtually every font.
-                                let label_text = if state == RowState::Foreground {
-                                    format!("▸ {}", p.exe_name)
-                                } else {
-                                    p.exe_name.clone()
-                                };
-                                // Wrap the label in an explicit `Label::sense(click)`
-                                // so a single click toggles row selection. The
-                                // subsequent .context_menu() call attaches the
-                                // right-click menu to the same response — same widget
-                                // serves both interactions.
-                                let label = egui::Label::new(
-                                    egui::RichText::new(label_text).color(row_exe_color(state)),
-                                )
-                                .sense(egui::Sense::click());
-                                let mut resp = ui.add(label);
-                                // Highlight the currently-selected row by stroking
-                                // a thin accent border around the cell.
-                                if selected_pid == Some(pid) {
-                                    let rect = ui.max_rect();
-                                    ui.painter().rect_stroke(
-                                        rect,
-                                        egui::Rounding::ZERO,
-                                        egui::Stroke::new(1.0, theme::ACCENT),
-                                    );
-                                }
-                                if resp.clicked() {
-                                    clicked_pid = Some(pid);
-                                    resp.mark_changed();
-                                }
-                                // Right-click anywhere on the name opens the per-PID
-                                // context menu — same affordance Process Explorer uses.
-                                resp.context_menu(|ui| {
-                                    ui.label(format!("{} (pid {})", &exe, pid));
-                                    ui.separator();
-                                    ui.menu_button("Set priority", |ui| {
-                                        for (label, class) in PRIORITY_CHOICES.iter() {
-                                            if ui.button(*label).clicked() {
-                                                action_queue.push(ProcessAction::SetPriority {
-                                                    pid,
-                                                    class: *class,
-                                                });
-                                                ui.close_menu();
-                                            }
+                                ui.horizontal(|ui| {
+                                    ui.spacing_mut().item_spacing.x = 2.0;
+                                    // Tree indent + ▶/▼ toggle. Tree mode
+                                    // only — in flat mode tr.depth is 0
+                                    // and tr.has_children is false, so no
+                                    // indent and no glyph.
+                                    if tr.depth > 0 {
+                                        ui.add_space(tr.depth as f32 * 14.0);
+                                    }
+                                    if tr.has_children {
+                                        let collapsed_now = self.processes.collapsed.contains(&pid);
+                                        let glyph = if collapsed_now { "▶" } else { "▼" };
+                                        let tri = ui.add(
+                                            egui::Label::new(
+                                                egui::RichText::new(glyph)
+                                                    .color(theme::TEXT_MUTED)
+                                                    .small(),
+                                            )
+                                            .sense(egui::Sense::click()),
+                                        );
+                                        if tri.clicked() {
+                                            toggled_pid = Some(pid);
                                         }
-                                    });
-                                    ui.menu_button("Apply profile now", |ui| {
-                                        for pid_name in &profile_ids {
-                                            if ui.button(pid_name).clicked() {
-                                                action_queue.push(
-                                                    ProcessAction::ApplyProfileForeground {
+                                    } else if tr.depth > 0 {
+                                        // Leaf child: reserve the toggle's
+                                        // width so labels of siblings still
+                                        // align under the parent's name.
+                                        ui.add_space(10.0);
+                                    }
+
+                                    // Foreground rows get a small right-pointing triangle
+                                    // prefix so the eye picks them out instantly even
+                                    // when the user has scrolled away from the colored
+                                    // marker. ▸ is U+25B8, a geometric-shapes-block
+                                    // glyph supported by virtually every font.
+                                    let label_text = if state == RowState::Foreground {
+                                        format!("▸ {}", p.exe_name)
+                                    } else {
+                                        p.exe_name.clone()
+                                    };
+                                    // Wrap the label in an explicit
+                                    // `Label::sense(click)` so a single click
+                                    // toggles row selection. The subsequent
+                                    // .context_menu() call attaches the
+                                    // right-click menu to the same response —
+                                    // same widget serves both interactions.
+                                    let label = egui::Label::new(
+                                        egui::RichText::new(label_text).color(row_exe_color(state)),
+                                    )
+                                    .sense(egui::Sense::click());
+                                    let mut resp = ui.add(label);
+                                    // Highlight the currently-selected row by stroking
+                                    // a thin accent border around the cell.
+                                    if selected_pid == Some(pid) {
+                                        let rect = ui.max_rect();
+                                        ui.painter().rect_stroke(
+                                            rect,
+                                            egui::Rounding::ZERO,
+                                            egui::Stroke::new(1.0, theme::ACCENT),
+                                        );
+                                    }
+                                    if resp.clicked() {
+                                        clicked_pid = Some(pid);
+                                        resp.mark_changed();
+                                    }
+                                    // Right-click anywhere on the name opens the per-PID
+                                    // context menu — same affordance Process Explorer uses.
+                                    resp.context_menu(|ui| {
+                                        ui.label(format!("{} (pid {})", &exe, pid));
+                                        ui.separator();
+                                        ui.menu_button("Set priority", |ui| {
+                                            for (label, class) in PRIORITY_CHOICES.iter() {
+                                                if ui.button(*label).clicked() {
+                                                    action_queue.push(ProcessAction::SetPriority {
+                                                        pid,
+                                                        class: *class,
+                                                    });
+                                                    ui.close_menu();
+                                                }
+                                            }
+                                        });
+                                        ui.menu_button("Apply profile now", |ui| {
+                                            for pid_name in &profile_ids {
+                                                if ui.button(pid_name).clicked() {
+                                                    action_queue.push(
+                                                        ProcessAction::ApplyProfileForeground {
+                                                            profile: pid_name.clone(),
+                                                        },
+                                                    );
+                                                    ui.close_menu();
+                                                }
+                                            }
+                                        });
+                                        ui.menu_button("Create rule for this exe", |ui| {
+                                            for pid_name in &profile_ids {
+                                                if ui.button(pid_name).clicked() {
+                                                    action_queue.push(ProcessAction::CreateRule {
+                                                        exe_name: exe.clone(),
                                                         profile: pid_name.clone(),
-                                                    },
-                                                );
-                                                ui.close_menu();
+                                                    });
+                                                    ui.close_menu();
+                                                }
                                             }
-                                        }
+                                        });
                                     });
-                                    ui.menu_button("Create rule for this exe", |ui| {
-                                        for pid_name in &profile_ids {
-                                            if ui.button(pid_name).clicked() {
-                                                action_queue.push(ProcessAction::CreateRule {
-                                                    exe_name: exe.clone(),
-                                                    profile: pid_name.clone(),
-                                                });
-                                                ui.close_menu();
-                                            }
-                                        }
-                                    });
-                                });
+                                }); // ui.horizontal (tree indent + name)
                             });
                             // Description: human-readable label from the
                             // exe's version resource ("Microsoft OneDrive",
@@ -2294,6 +2361,14 @@ impl FramesageApp {
         if close_detail {
             self.processes.selected_pid = None;
         }
+        // Toggle tree expand/collapse: a row's ▶/▼ click flips its PID's
+        // membership in the `collapsed` set. Default empty = all expanded;
+        // explicit membership = children hidden for this branch.
+        if let Some(pid) = toggled_pid {
+            if !self.processes.collapsed.remove(&pid) {
+                self.processes.collapsed.insert(pid);
+            }
+        }
 
         // ─── Dispatch context-menu actions outside the render closure ─────
         for action in action_queue {
@@ -2414,6 +2489,148 @@ fn cpu_percent_color(cpu: u16) -> egui::Color32 {
         51..=80 => theme::WARNING,
         _ => theme::ERROR,
     }
+}
+
+/// Compare two `ProcessSnapshot`s by the chosen sort key + direction.
+///
+/// Single source of truth for both the flat-mode sort and the per-sibling
+/// sort inside `build_tree_view`. `None` for `sort_by` means "preserve
+/// input order" (= `Equal` for every pair) so callers can opt out without
+/// branching at the call site.
+fn compare_snapshots(
+    a: &framesage_ipc::ProcessSnapshot,
+    b: &framesage_ipc::ProcessSnapshot,
+    sort_by: Option<ProcessSortKey>,
+    desc: bool,
+) -> std::cmp::Ordering {
+    let Some(key) = sort_by else {
+        return std::cmp::Ordering::Equal;
+    };
+    let ord = match key {
+        ProcessSortKey::ExeName => a
+            .exe_name
+            .to_ascii_lowercase()
+            .cmp(&b.exe_name.to_ascii_lowercase()),
+        ProcessSortKey::Pid => a.pid.cmp(&b.pid),
+        ProcessSortKey::Cpu => a.cpu_percent.cmp(&b.cpu_percent),
+        ProcessSortKey::Memory => a.memory_bytes.cmp(&b.memory_bytes),
+        ProcessSortKey::Threads => a.threads.cmp(&b.threads),
+        ProcessSortKey::Priority => a.priority_class_raw.cmp(&b.priority_class_raw),
+        ProcessSortKey::Profile => a.managed_profile.cmp(&b.managed_profile),
+        ProcessSortKey::Description => {
+            // Case-insensitive; None collates after Some so labelled rows
+            // cluster together regardless of direction.
+            let av = a.description.as_deref().unwrap_or("\u{ffff}");
+            let bv = b.description.as_deref().unwrap_or("\u{ffff}");
+            av.to_ascii_lowercase().cmp(&bv.to_ascii_lowercase())
+        }
+        ProcessSortKey::Company => {
+            let av = a.company.as_deref().unwrap_or("\u{ffff}");
+            let bv = b.company.as_deref().unwrap_or("\u{ffff}");
+            av.to_ascii_lowercase().cmp(&bv.to_ascii_lowercase())
+        }
+    };
+    if desc {
+        ord.reverse()
+    } else {
+        ord
+    }
+}
+
+/// One visible row in tree mode. The flat table iterates these instead of
+/// the raw `Vec<ProcessSnapshot>`; the depth controls indentation and the
+/// `has_children` flag controls whether the ▶/▼ toggle renders.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct TreeRow {
+    pid: u32,
+    /// Index into the unsorted `rows: &[ProcessSnapshot]` slice the builder
+    /// was given. Lets the renderer fetch the underlying snapshot without
+    /// a second hash lookup.
+    row_index: usize,
+    depth: u8,
+    has_children: bool,
+}
+
+/// Build a depth-first flattened view of the process tree, respecting the
+/// user's collapsed set.
+///
+/// Edges come from `ProcessSnapshot::parent_pid`. A process is a root when
+/// its parent is `0` OR points at a PID not present in `rows` (the parent
+/// has exited but the kernel hasn't reaped the orphan). Cycles — which
+/// shouldn't be possible but a stale PID-reuse race could theoretically
+/// produce — are broken via a DFS stack: if we'd revisit a PID already
+/// on the path, we skip rather than loop.
+///
+/// Children of each parent (and the root list) are sorted by `cmp`, so
+/// the chosen ProcessSortKey applies within siblings — matches the
+/// Process Explorer / Process Lasso convention.
+fn build_tree_view(
+    rows: &[framesage_ipc::ProcessSnapshot],
+    collapsed: &std::collections::HashSet<u32>,
+    cmp: impl Fn(&framesage_ipc::ProcessSnapshot, &framesage_ipc::ProcessSnapshot) -> std::cmp::Ordering,
+) -> Vec<TreeRow> {
+    use std::collections::HashMap;
+    let mut by_pid: HashMap<u32, usize> = HashMap::with_capacity(rows.len());
+    for (i, r) in rows.iter().enumerate() {
+        by_pid.insert(r.pid, i);
+    }
+    let mut children: HashMap<u32, Vec<usize>> = HashMap::new();
+    let mut roots: Vec<usize> = Vec::new();
+    for (i, r) in rows.iter().enumerate() {
+        let parent_alive = r.parent_pid != 0 && by_pid.contains_key(&r.parent_pid);
+        if parent_alive {
+            children.entry(r.parent_pid).or_default().push(i);
+        } else {
+            roots.push(i);
+        }
+    }
+    // Sort within siblings and at the root.
+    for v in children.values_mut() {
+        v.sort_by(|&a, &b| cmp(&rows[a], &rows[b]));
+    }
+    roots.sort_by(|&a, &b| cmp(&rows[a], &rows[b]));
+
+    let mut out = Vec::with_capacity(rows.len());
+    let mut stack: Vec<u32> = Vec::new();
+    for r in roots {
+        visit_tree(r, 0, rows, &children, collapsed, &mut out, &mut stack);
+    }
+    out
+}
+
+fn visit_tree(
+    i: usize,
+    depth: u8,
+    rows: &[framesage_ipc::ProcessSnapshot],
+    children: &std::collections::HashMap<u32, Vec<usize>>,
+    collapsed: &std::collections::HashSet<u32>,
+    out: &mut Vec<TreeRow>,
+    stack: &mut Vec<u32>,
+) {
+    let pid = rows[i].pid;
+    if stack.contains(&pid) {
+        // Cycle: shouldn't happen in practice (the kernel's parent linkage
+        // doesn't make loops), but a malformed snapshot could trip us up.
+        // Drop silently rather than loop forever.
+        return;
+    }
+    let has_children = children.get(&pid).map(|v| !v.is_empty()).unwrap_or(false);
+    out.push(TreeRow {
+        pid,
+        row_index: i,
+        depth,
+        has_children,
+    });
+    if !has_children || collapsed.contains(&pid) {
+        return;
+    }
+    stack.push(pid);
+    if let Some(kids) = children.get(&pid) {
+        for &c in kids {
+            visit_tree(c, depth + 1, rows, children, collapsed, out, stack);
+        }
+    }
+    stack.pop();
 }
 
 /// Decode a process affinity bitmask into a human-readable CPU-range list:
@@ -3308,9 +3525,10 @@ fn display_profile_id(raw: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        classify_row, decode_affinity_mask, display_profile_id, format_top_cores, row_marker_color,
-        RowState,
+        build_tree_view, classify_row, decode_affinity_mask, display_profile_id, format_top_cores,
+        row_marker_color, RowState,
     };
+    use std::collections::HashSet;
 
     #[test]
     fn profile_id_display_handles_common_cases() {
@@ -3325,6 +3543,7 @@ mod tests {
     fn make_proc(pid: u32) -> framesage_ipc::ProcessSnapshot {
         framesage_ipc::ProcessSnapshot {
             pid,
+            parent_pid: 0,
             exe_name: "test.exe".into(),
             exe_path: String::new(),
             description: None,
@@ -3420,6 +3639,100 @@ mod tests {
             format_top_cores(&[], 5),
             "(per-core data not available yet)"
         );
+    }
+
+    fn proc_with_parent(pid: u32, parent_pid: u32) -> framesage_ipc::ProcessSnapshot {
+        let mut p = make_proc(pid);
+        p.parent_pid = parent_pid;
+        p
+    }
+
+    #[test]
+    fn build_tree_view_groups_children_under_parents() {
+        // Tree:
+        //   1 (root)
+        //     └ 2
+        //         └ 4
+        //     └ 3
+        //   5 (root, parent=99 missing → orphan = root)
+        let rows = vec![
+            proc_with_parent(1, 0),
+            proc_with_parent(2, 1),
+            proc_with_parent(3, 1),
+            proc_with_parent(4, 2),
+            proc_with_parent(5, 99),
+        ];
+        let collapsed = HashSet::new();
+        let tree = build_tree_view(&rows, &collapsed, |a, b| a.pid.cmp(&b.pid));
+        // With ascending-PID sort within siblings, expected DFS order is:
+        // 1, 2, 4, 3, 5
+        let pids: Vec<u32> = tree.iter().map(|t| t.pid).collect();
+        assert_eq!(pids, vec![1, 2, 4, 3, 5]);
+        let depths: Vec<u8> = tree.iter().map(|t| t.depth).collect();
+        assert_eq!(depths, vec![0, 1, 2, 1, 0]);
+    }
+
+    #[test]
+    fn build_tree_view_respects_collapsed() {
+        // Collapsing pid 1 should hide 2, 3, 4 — they all sit under 1.
+        let rows = vec![
+            proc_with_parent(1, 0),
+            proc_with_parent(2, 1),
+            proc_with_parent(3, 1),
+            proc_with_parent(4, 2),
+            proc_with_parent(5, 0),
+        ];
+        let mut collapsed = HashSet::new();
+        collapsed.insert(1);
+        let tree = build_tree_view(&rows, &collapsed, |a, b| a.pid.cmp(&b.pid));
+        let pids: Vec<u32> = tree.iter().map(|t| t.pid).collect();
+        assert_eq!(pids, vec![1, 5]);
+        // Pid 1 still has children even though they're hidden; the toggle
+        // glyph needs to render.
+        assert!(tree[0].has_children);
+        assert!(!tree[1].has_children);
+    }
+
+    #[test]
+    fn build_tree_view_treats_missing_parents_as_orphans() {
+        // PID 7's parent (42) isn't in the snapshot → 7 should be a root.
+        let rows = vec![proc_with_parent(1, 0), proc_with_parent(7, 42)];
+        let tree = build_tree_view(&rows, &HashSet::new(), |a, b| a.pid.cmp(&b.pid));
+        assert_eq!(
+            tree.iter()
+                .filter(|t| t.depth == 0)
+                .map(|t| t.pid)
+                .collect::<Vec<_>>(),
+            vec![1, 7]
+        );
+    }
+
+    #[test]
+    fn build_tree_view_breaks_cycles() {
+        // Pathological cycle (shouldn't happen in real kernel state but
+        // defending against it): 1 → 2 → 1.
+        let rows = vec![proc_with_parent(1, 2), proc_with_parent(2, 1)];
+        let tree = build_tree_view(&rows, &HashSet::new(), |a, b| a.pid.cmp(&b.pid));
+        // Both have a "parent" present so neither is a top-level root by
+        // our normal rule — `roots` ends up empty. The output should be
+        // empty rather than infinite-looping.
+        assert!(tree.is_empty());
+    }
+
+    #[test]
+    fn build_tree_view_sort_applies_to_siblings_only() {
+        // Sort by reverse pid; expect siblings to flip but tree structure
+        // intact.
+        let rows = vec![
+            proc_with_parent(1, 0),
+            proc_with_parent(2, 1),
+            proc_with_parent(3, 1),
+        ];
+        let tree = build_tree_view(&rows, &HashSet::new(), |a, b| b.pid.cmp(&a.pid));
+        let pids: Vec<u32> = tree.iter().map(|t| t.pid).collect();
+        // Root is unchanged (only one root); siblings of 1 emit in
+        // reverse-PID order → 3, then 2.
+        assert_eq!(pids, vec![1, 3, 2]);
     }
 }
 
