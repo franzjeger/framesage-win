@@ -346,6 +346,24 @@ async fn handle_client(
                     .await?;
                 }
             },
+            Request::SetManualOverride { profile } => match engine.set_manual_override(profile) {
+                Ok(()) => {
+                    write_response(&mut write_half, &Response::Ok).await?;
+                }
+                Err(e) => {
+                    write_response(
+                        &mut write_half,
+                        &Response::Error {
+                            message: format!("set_manual_override failed: {e:#}"),
+                        },
+                    )
+                    .await?;
+                }
+            },
+            Request::ClearManualOverride => {
+                engine.clear_manual_override();
+                write_response(&mut write_half, &Response::Ok).await?;
+            }
             Request::Pause => {
                 engine.pause();
                 write_response(&mut write_half, &Response::Ok).await?;

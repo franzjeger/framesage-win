@@ -279,14 +279,15 @@ pub enum ProcessVerdict<'a> {
     Unlisted,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct Rejection {
     pub id: String,
     pub kind: RejectionKind,
     pub reason: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum RejectionKind {
     /// Explicitly denied — denylist wins over allowlist.
     Denied,

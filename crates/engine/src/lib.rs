@@ -79,6 +79,11 @@ struct EngineState {
     /// `None` until the first scan; subsequent scans honour
     /// `BACKGROUND_SCAN_INTERVAL`.
     last_background_scan: Option<Instant>,
+    /// Manual mode: when set, every foreground reconcile applies this
+    /// profile instead of consulting Rules. Stays set across focus
+    /// changes until explicitly cleared via `clear_manual_override` /
+    /// `Request::ClearManualOverride`.
+    manual_override: Option<ProfileId>,
 }
 
 /// How often the engine walks all PIDs to apply `Policy::background_profile`.
@@ -123,6 +128,7 @@ impl Engine {
                 active_profile: None,
                 system_mode: None,
                 last_background_scan: None,
+                manual_override: None,
             })),
             events: tx,
             safe_list: deps.safe_list,
@@ -168,6 +174,35 @@ impl Engine {
             policy: s.policy.clone(),
             foreground: s.foreground_snapshot.clone(),
             active_profile,
+            manual_override: s.manual_override.clone(),
+        }
+    }
+
+    /// Enter manual mode: every foreground reconcile from now on applies
+    /// `profile_id` regardless of Rules / default_profile, until
+    /// `clear_manual_override` is called. Errors if the profile id isn't
+    /// present in the active policy. Idempotent on a no-change SetManual
+    /// for the same profile.
+    pub fn set_manual_override(&self, profile_id: ProfileId) -> Result<()> {
+        let mut s = self.state.write();
+        if s.policy.profile(&profile_id).is_none() {
+            return Err(anyhow::anyhow!("unknown profile id {profile_id}"));
+        }
+        let changed = s.manual_override.as_ref() != Some(&profile_id);
+        s.manual_override = Some(profile_id.clone());
+        if changed {
+            info!(profile = %profile_id, "manual override set");
+        }
+        Ok(())
+    }
+
+    /// Leave manual mode. Idempotent — no-op if manual mode was already off.
+    /// Does not revert any currently-applied per-PID state; the next focus
+    /// change picks up the rule-matched profile via the normal path.
+    pub fn clear_manual_override(&self) {
+        let mut s = self.state.write();
+        if s.manual_override.take().is_some() {
+            info!("manual override cleared");
         }
     }
 
@@ -426,10 +461,17 @@ impl Engine {
             return Ok(());
         };
 
-        let profile_id = s
-            .policy
-            .match_foreground(&fg.exe_name, &fg.path, &fg.title)
-            .clone();
+        // Manual override wins over the rule matcher. Set by
+        // `set_manual_override` / `Request::SetManualOverride` and cleared
+        // by the complementary calls. When active, every foreground app
+        // gets this profile regardless of what Rules would have matched.
+        let profile_id = match &s.manual_override {
+            Some(ov) => ov.clone(),
+            None => s
+                .policy
+                .match_foreground(&fg.exe_name, &fg.path, &fg.title)
+                .clone(),
+        };
 
         let profile = match s.policy.profile(&profile_id) {
             Some(p) => p.clone(),

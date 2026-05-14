@@ -44,6 +44,14 @@ pub enum Request {
     /// Apply a named profile to the currently foregrounded process, ignoring
     /// the normal rule matcher until focus changes.
     ApplyOnce { profile: ProfileId },
+    /// Enter manual mode: apply this profile to every foreground app and
+    /// keep applying it across focus changes until explicitly cleared.
+    /// Takes precedence over the Rules tab + default_profile until
+    /// `ClearManualOverride` arrives.
+    SetManualOverride { profile: ProfileId },
+    /// Leave manual mode. Foreground apply returns to consulting Rules +
+    /// default_profile. Idempotent — no-op if manual mode was already off.
+    ClearManualOverride,
     /// Pause the engine (still alive, but stops applying anything).
     Pause,
     /// Resume after a pause.
@@ -69,6 +77,8 @@ impl Request {
             Request::Status | Request::Subscribe => true,
             Request::SetPolicy { .. }
             | Request::ApplyOnce { .. }
+            | Request::SetManualOverride { .. }
+            | Request::ClearManualOverride
             | Request::Pause
             | Request::Resume
             | Request::GameModeOff => false,
@@ -105,6 +115,11 @@ pub struct StatusSnapshot {
     pub policy: Policy,
     pub foreground: Option<ForegroundSnapshot>,
     pub active_profile: Option<Profile>,
+    /// When `Some`, the engine is in manual mode and applying the named
+    /// profile to every foreground app regardless of Rules. The tray
+    /// surfaces this with a banner + "Disable manual mode" button.
+    #[serde(default)]
+    pub manual_override: Option<ProfileId>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -160,6 +175,11 @@ mod tests {
             profile: ProfileId("game-x3d".into())
         }
         .is_read_only());
+        assert!(!Request::SetManualOverride {
+            profile: ProfileId("game-x3d".into())
+        }
+        .is_read_only());
+        assert!(!Request::ClearManualOverride.is_read_only());
         assert!(!Request::Pause.is_read_only());
         assert!(!Request::Resume.is_read_only());
         assert!(!Request::GameModeOff.is_read_only());

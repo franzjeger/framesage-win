@@ -329,6 +329,9 @@ impl FramesageApp {
                     "Default profile",
                     display_profile_id(&s.policy.default_profile.0),
                 );
+                if let Some(manual) = &s.manual_override {
+                    kv_row(ui, "Manual mode", display_profile_id(&manual.0));
+                }
                 match &s.active_profile {
                     Some(p) => {
                         kv_row(ui, "Active profile", display_profile_id(&p.id.0));
@@ -477,6 +480,42 @@ impl FramesageApp {
                 }
             }
 
+            // Shortcut: open the Add-rule form pre-filled from whatever's
+            // foregrounded right now. Saves the typing-the-exe-name step
+            // that turned the bare "Add rule" flow into the most-asked-about
+            // pain point during hardware validation.
+            let fg_exe = s.foreground.as_ref().map(|fg| fg.exe_name.clone());
+            let from_fg_enabled = self.elevated && self.rules.form.is_none() && fg_exe.is_some();
+            let from_fg_btn = egui::Button::new("Add rule for foreground");
+            let resp = ui.add_enabled(from_fg_enabled, from_fg_btn).on_hover_text(
+                "Pre-fill an Add-rule form with the current foreground app's exe name. \
+                     You can change the matched profile or the match kind before saving.",
+            );
+            if resp.clicked() {
+                if let Some(exe) = fg_exe.clone() {
+                    let default_profile = profile_ids
+                        .first()
+                        .map(|id| id.0.clone())
+                        .unwrap_or_else(|| s.policy.default_profile.0.clone());
+                    let note = s
+                        .foreground
+                        .as_ref()
+                        .map(|fg| fg.title.clone())
+                        .filter(|t| !t.is_empty())
+                        .unwrap_or_default();
+                    self.rules.form = Some(RuleForm {
+                        editing_index: None,
+                        match_kind: MatchKind::ExeName,
+                        match_value: exe,
+                        profile_id: default_profile,
+                        note,
+                    });
+                    if self.policy_draft.is_none() {
+                        self.policy_draft = Some(s.policy.clone());
+                    }
+                }
+            }
+
             let save_enabled = self.elevated && dirty && self.rules.form.is_none();
             if ui
                 .add_enabled(save_enabled, egui::Button::new("Save changes"))
@@ -543,8 +582,29 @@ impl FramesageApp {
                     ui.add(
                         egui::TextEdit::singleline(&mut form.match_value)
                             .hint_text(hint)
-                            .desired_width(280.0),
+                            .desired_width(220.0),
                     );
+                    // Per-match-kind shortcut: pull the right field off the
+                    // current foreground. Disabled when there's no foreground.
+                    let fg = s.foreground.as_ref();
+                    let (label, value): (&str, Option<String>) = match form.match_kind {
+                        MatchKind::ExeName => {
+                            ("Use foreground exe", fg.map(|f| f.exe_name.clone()))
+                        }
+                        MatchKind::PathContains => {
+                            ("Use foreground path", fg.map(|f| f.path.clone()))
+                        }
+                        MatchKind::WindowTitleContains => (
+                            "Use foreground title",
+                            fg.map(|f| f.title.clone()).filter(|t| !t.is_empty()),
+                        ),
+                    };
+                    let enabled = value.is_some();
+                    if ui.add_enabled(enabled, egui::Button::new(label)).clicked() {
+                        if let Some(v) = value {
+                            form.match_value = v;
+                        }
+                    }
                 });
                 ui.horizontal(|ui| {
                     ui.label("Profile:");
@@ -714,9 +774,42 @@ impl FramesageApp {
         ui.colored_label(
             theme::TEXT_MUTED,
             "Profiles auto-apply by foreground app via the Rules tab. \
-             Use \u{201c}Apply to foreground\u{201d} on a profile below to override the rule \
-             match for the currently-focused app.",
+             \u{201c}Apply to foreground\u{201d} overrides the rule match for the current app \
+             until you focus a different one. \u{201c}Set as manual mode\u{201d} forces every \
+             foreground app to use the chosen profile until you exit manual mode.",
         );
+
+        // Manual-mode banner. Renders prominently above the profile list so
+        // the user sees at a glance that rules + default_profile are being
+        // bypassed, and can exit with one click. Click handler dispatches
+        // directly (not via the `ops` collector below) because the banner
+        // is outside the per-profile iteration's borrow scope.
+        let mut clear_manual_clicked = false;
+        if let Some(manual_id) = &s.manual_override {
+            ui.add_space(6.0);
+            theme::status_badge(theme::WARNING).show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    ui.colored_label(theme::WARNING, "Manual mode:");
+                    ui.colored_label(
+                        theme::WARNING,
+                        egui::RichText::new(display_profile_id(&manual_id.0)).strong(),
+                    );
+                    ui.add_space(8.0);
+                    if ui
+                        .add_enabled(self.elevated, egui::Button::new("Exit manual mode"))
+                        .on_hover_text(
+                            "Return to rule-driven auto-apply (Rules tab + default profile).",
+                        )
+                        .clicked()
+                    {
+                        clear_manual_clicked = true;
+                    }
+                });
+            });
+        }
+        if clear_manual_clicked {
+            self.send_admin_request(Request::ClearManualOverride, "clear manual override");
+        }
         ui.horizontal(|ui| {
             let save_enabled = self.elevated
                 && dirty
@@ -769,6 +862,8 @@ impl FramesageApp {
             // we don't pay the cost on every Op enum value.
             UpdateProfile(String, Box<Profile>),
             ApplyNow(String),
+            SetManual(String),
+            ClearManual,
         }
         let mut ops: Vec<Op> = Vec::new();
 
@@ -835,6 +930,33 @@ impl FramesageApp {
                             {
                                 ops.push(Op::ApplyNow(id.0.clone()));
                             }
+
+                            // Manual-mode toggle for this profile. If this profile
+                            // is already the manual override, the button becomes an
+                            // exit affordance; otherwise it sets the override.
+                            let is_manual = s.manual_override.as_ref().is_some_and(|m| m == id);
+                            let manual_label = if is_manual {
+                                "Exit manual mode"
+                            } else {
+                                "Set as manual mode"
+                            };
+                            let manual_enabled =
+                                self.elevated && !is_editing && self.rules.form.is_none();
+                            if ui
+                                .add_enabled(manual_enabled, egui::Button::new(manual_label))
+                                .on_hover_text(
+                                    "Manual mode pins this profile across every focus change. \
+                                     The Rules tab and default profile are bypassed until you \
+                                     exit manual mode.",
+                                )
+                                .clicked()
+                            {
+                                if is_manual {
+                                    ops.push(Op::ClearManual);
+                                } else {
+                                    ops.push(Op::SetManual(id.0.clone()));
+                                }
+                            }
                         });
                         if is_editing {
                             let mut edited = p.clone();
@@ -871,6 +993,17 @@ impl FramesageApp {
                         },
                         "apply now",
                     );
+                }
+                Op::SetManual(id) => {
+                    self.send_admin_request(
+                        Request::SetManualOverride {
+                            profile: ProfileId(id.clone()),
+                        },
+                        "set manual override",
+                    );
+                }
+                Op::ClearManual => {
+                    self.send_admin_request(Request::ClearManualOverride, "clear manual override");
                 }
             }
         }
