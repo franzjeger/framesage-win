@@ -137,11 +137,16 @@ fn try_connect_and_serve(state: Arc<Mutex<AppState>>) -> anyhow::Result<()> {
     use std::fs::OpenOptions;
     use std::io::{BufRead, BufReader, Write};
 
+    // The tray only ever sends Status + Subscribe — both read-only — so
+    // we open the status pipe. That pipe's ACL grants Authenticated Users
+    // access, so the tray works without elevation. (The admin pipe would
+    // refuse an unprivileged caller at the OS layer.)
+    //
     // FILE_FLAG_OVERLAPPED is not set; we get blocking semantics.
     let pipe = OpenOptions::new()
         .read(true)
         .write(true)
-        .open(framesage_ipc::PIPE_NAME)?;
+        .open(framesage_ipc::PIPE_NAME_STATUS)?;
     {
         let mut s = state.lock().unwrap();
         s.connected = true;

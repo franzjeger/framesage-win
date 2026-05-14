@@ -3,13 +3,35 @@
 //!
 //! Wire format: newline-delimited JSON. Cheap to write, easy to debug with a
 //! pipe-cat tool, no codegen, plenty fast for 10–50 messages per second.
+//!
+//! # Two pipes, one ACL split
+//!
+//! The service binds two named pipes:
+//!
+//! * **Status pipe** ([`PIPE_NAME_STATUS`]) — open to Authenticated Users.
+//!   Accepts only read-only requests ([`Request::is_read_only`]). The tray
+//!   UI and any unprivileged status caller connects here.
+//! * **Admin pipe** ([`PIPE_NAME_ADMIN`]) — default Windows ACL
+//!   (Administrators + LocalSystem). Accepts every request, including
+//!   mutators like [`Request::SetPolicy`].
+//!
+//! A client picks the pipe by asking `Request::is_read_only`: read-only ⇒
+//! status pipe, otherwise admin pipe. The server enforces the same rule on
+//! the receive side as defense-in-depth, so a misrouted mutator on the status
+//! pipe is rejected with [`Response::Error`] rather than executed.
 
 use serde::{Deserialize, Serialize};
 
 use framesage_core::{Policy, Profile, ProfileId};
 
-/// Canonical pipe name. The service creates it as `\\.\pipe\framesage`.
-pub const PIPE_NAME: &str = r"\\.\pipe\framesage";
+/// Status pipe — readable + writable by Authenticated Users for round-tripping
+/// status queries. The service rejects any non-read-only request received on
+/// this pipe regardless of caller identity.
+pub const PIPE_NAME_STATUS: &str = r"\\.\pipe\framesage-status";
+
+/// Admin pipe — Administrators + LocalSystem only. Accepts every request,
+/// including policy mutations and the Game Mode panic button.
+pub const PIPE_NAME_ADMIN: &str = r"\\.\pipe\framesage-admin";
 
 /// Requests sent from a client to the service.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -32,6 +54,36 @@ pub enum Request {
     /// Subscribe to live status events. The server keeps the connection open
     /// and streams `Event` records.
     Subscribe,
+}
+
+impl Request {
+    /// True if this request only reads engine state and never mutates kernel
+    /// or service state. Read-only requests are valid on the status pipe;
+    /// mutators must go through the admin pipe.
+    ///
+    /// Keep this match exhaustive — the compiler will catch any new variant
+    /// that forgets to classify itself, and the unit tests below cover every
+    /// current variant by name.
+    pub fn is_read_only(&self) -> bool {
+        match self {
+            Request::Status | Request::Subscribe => true,
+            Request::SetPolicy { .. }
+            | Request::ApplyOnce { .. }
+            | Request::Pause
+            | Request::Resume
+            | Request::GameModeOff => false,
+        }
+    }
+
+    /// Which pipe should a client open to send this request? Convenience
+    /// wrapper around [`Request::is_read_only`].
+    pub fn target_pipe(&self) -> &'static str {
+        if self.is_read_only() {
+            PIPE_NAME_STATUS
+        } else {
+            PIPE_NAME_ADMIN
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -74,4 +126,75 @@ pub enum Event {
     },
     Paused,
     Resumed,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashMap;
+
+    fn sample_policy() -> Policy {
+        Policy {
+            profiles: HashMap::new(),
+            rules: vec![],
+            default_profile: ProfileId("perf".into()),
+            background_profile: None,
+            tick_ms: 300,
+        }
+    }
+
+    /// Pipe-routing contract: read-only requests target the status pipe,
+    /// mutators target the admin pipe. If a new variant lands without a
+    /// classification in `is_read_only`, this match-based test won't catch
+    /// it — but `is_read_only`'s own match IS exhaustive, so the compiler
+    /// catches it there. This test locks the public routing table.
+    #[test]
+    fn is_read_only_classifies_every_request_variant() {
+        assert!(Request::Status.is_read_only());
+        assert!(Request::Subscribe.is_read_only());
+        assert!(!Request::SetPolicy {
+            policy: sample_policy()
+        }
+        .is_read_only());
+        assert!(!Request::ApplyOnce {
+            profile: ProfileId("game-x3d".into())
+        }
+        .is_read_only());
+        assert!(!Request::Pause.is_read_only());
+        assert!(!Request::Resume.is_read_only());
+        assert!(!Request::GameModeOff.is_read_only());
+    }
+
+    #[test]
+    fn target_pipe_matches_is_read_only() {
+        assert_eq!(Request::Status.target_pipe(), PIPE_NAME_STATUS);
+        assert_eq!(Request::Subscribe.target_pipe(), PIPE_NAME_STATUS);
+        assert_eq!(Request::Pause.target_pipe(), PIPE_NAME_ADMIN);
+        assert_eq!(Request::Resume.target_pipe(), PIPE_NAME_ADMIN);
+        assert_eq!(Request::GameModeOff.target_pipe(), PIPE_NAME_ADMIN);
+        assert_eq!(
+            Request::ApplyOnce {
+                profile: ProfileId("game-x3d".into())
+            }
+            .target_pipe(),
+            PIPE_NAME_ADMIN
+        );
+        assert_eq!(
+            Request::SetPolicy {
+                policy: sample_policy()
+            }
+            .target_pipe(),
+            PIPE_NAME_ADMIN
+        );
+    }
+
+    #[test]
+    fn pipe_names_use_correct_prefix() {
+        // Catch typos. The kernel will reject anything not starting with
+        // `\\.\pipe\` so a regression here would manifest at runtime as
+        // ERROR_INVALID_NAME, which is hard to debug. Lock it here.
+        assert!(PIPE_NAME_STATUS.starts_with(r"\\.\pipe\"));
+        assert!(PIPE_NAME_ADMIN.starts_with(r"\\.\pipe\"));
+        assert_ne!(PIPE_NAME_STATUS, PIPE_NAME_ADMIN);
+    }
 }

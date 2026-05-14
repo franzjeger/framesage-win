@@ -280,11 +280,11 @@ fn default_service_binary() -> Result<std::path::PathBuf> {
 // ─── IPC ──────────────────────────────────────────────────────────────────
 
 #[cfg(windows)]
-async fn open_pipe() -> Result<tokio::net::windows::named_pipe::NamedPipeClient> {
+async fn open_pipe(name: &str) -> Result<tokio::net::windows::named_pipe::NamedPipeClient> {
     use tokio::net::windows::named_pipe::ClientOptions;
     ClientOptions::new()
-        .open(framesage_ipc::PIPE_NAME)
-        .with_context(|| format!("open pipe {}", framesage_ipc::PIPE_NAME))
+        .open(name)
+        .with_context(|| format!("open pipe {name}"))
 }
 
 #[cfg(not(windows))]
@@ -301,7 +301,13 @@ async fn send_simple(_req: Request) -> Result<()> {
 async fn send_simple(req: Request) -> Result<()> {
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
-    let stream = open_pipe().await?;
+    // Pick the right pipe based on whether this request mutates state.
+    // The admin pipe rejects non-admin callers at the OS layer; the status
+    // pipe rejects mutators in the IPC handler. Routing here keeps both
+    // outcomes friendly: a `pause` on the status pipe would error with
+    // "requires admin pipe" — by going straight to the admin pipe instead,
+    // an elevated CLI just works.
+    let stream = open_pipe(req.target_pipe()).await?;
     let (read_half, mut write_half) = tokio::io::split(stream);
     let mut reader = BufReader::new(read_half).lines();
 
@@ -325,7 +331,9 @@ async fn send_simple(req: Request) -> Result<()> {
 async fn print_status() -> Result<()> {
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
-    let stream = open_pipe().await?;
+    // Status is read-only — always use the status pipe so an unprivileged
+    // CLI invocation works without UAC.
+    let stream = open_pipe(Request::Status.target_pipe()).await?;
     let (read_half, mut write_half) = tokio::io::split(stream);
     let mut reader = BufReader::new(read_half).lines();
 
