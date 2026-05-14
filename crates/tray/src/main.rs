@@ -18,12 +18,15 @@ use std::sync::{Arc, Mutex};
 
 use eframe::egui;
 
-use framesage_ipc::{Event, ForegroundSnapshot, StatusSnapshot};
+use framesage_ipc::{Event, ForegroundSnapshot, Request, Response, StatusSnapshot};
 #[cfg(windows)]
 use tray_icon::{
     menu::{Menu, MenuEvent, MenuId, MenuItem, PredefinedMenuItem},
     Icon, TrayIcon, TrayIconBuilder, TrayIconEvent,
 };
+
+#[cfg(windows)]
+mod win32;
 
 #[derive(Default)]
 struct AppState {
@@ -52,6 +55,12 @@ struct TrayCommands {
 struct FramesageApp {
     state: Arc<Mutex<AppState>>,
     commands: TrayCommands,
+    /// `true` if this process has the elevated token (UAC-elevated launch or
+    /// LocalSystem). Determines whether admin controls are enabled in the UI.
+    elevated: bool,
+    /// One-line status echo from the last admin button click (e.g. "paused"
+    /// or "error: …"). Cleared after a few seconds by the egui repaint loop.
+    last_action: Arc<Mutex<Option<String>>>,
     /// Holding the tray icon for its lifetime — drop = icon disappears.
     /// `#[allow(dead_code)]` because we never read it after construction;
     /// the field exists purely to extend the icon's lifetime to match the
@@ -62,7 +71,7 @@ struct FramesageApp {
 }
 
 impl FramesageApp {
-    fn new(_cc: &eframe::CreationContext<'_>, commands: TrayCommands) -> Self {
+    fn new(_cc: &eframe::CreationContext<'_>, commands: TrayCommands, elevated: bool) -> Self {
         let state = Arc::new(Mutex::new(AppState::default()));
         let bg_state = state.clone();
         std::thread::spawn(move || {
@@ -75,9 +84,35 @@ impl FramesageApp {
         Self {
             state,
             commands,
+            elevated,
+            last_action: Arc::new(Mutex::new(None)),
             #[cfg(windows)]
             tray,
         }
+    }
+
+    /// Dispatch a one-shot admin request on a background thread; on
+    /// completion (success or failure) update `last_action` so the UI
+    /// shows feedback. Returns immediately so the click handler doesn't
+    /// block the egui frame.
+    #[cfg(windows)]
+    fn send_admin_request(&self, req: Request, label: &'static str) {
+        let last_action = self.last_action.clone();
+        std::thread::spawn(move || {
+            let result = send_request_blocking(framesage_ipc::PIPE_NAME_ADMIN, &req);
+            let msg = match result {
+                Ok(Response::Ok) | Ok(Response::Status(_)) => format!("{label}: ok"),
+                Ok(Response::Error { message }) => format!("{label}: error — {message}"),
+                Err(e) => format!("{label}: error — {e}"),
+            };
+            *last_action.lock().unwrap() = Some(msg);
+        });
+    }
+
+    #[cfg(not(windows))]
+    fn send_admin_request(&self, _req: Request, _label: &'static str) {
+        // No-op on non-Windows so this stub still compiles in cross-checks.
+        *self.last_action.lock().unwrap() = Some("admin requests are Windows-only".to_string());
     }
 }
 
@@ -163,6 +198,76 @@ impl eframe::App for FramesageApp {
                 }
             } else {
                 ui.label("waiting for status…");
+            }
+
+            ui.separator();
+
+            // ─── Controls (admin-only) ──────────────────────────────────────
+            //
+            // Non-elevated tray: show a "🔒 Read-only" banner with a button
+            // to relaunch elevated. Elevated tray: enable Pause/Resume/
+            // Game-Mode-Off buttons that hit the admin pipe directly.
+            #[cfg(windows)]
+            {
+                let paused = state.status.as_ref().map(|s| s.paused).unwrap_or(false);
+                let active_profile = state
+                    .status
+                    .as_ref()
+                    .and_then(|s| s.active_profile.as_ref());
+                let in_game_mode = active_profile
+                    .map(|p| p.game_mode.is_some())
+                    .unwrap_or(false);
+
+                if self.elevated {
+                    ui.colored_label(
+                        egui::Color32::from_rgb(80, 200, 120),
+                        "🔓 admin controls enabled",
+                    );
+                    ui.horizontal(|ui| {
+                        if paused {
+                            if ui.button("Resume engine").clicked() {
+                                self.send_admin_request(Request::Resume, "resume");
+                            }
+                        } else if ui.button("Pause engine").clicked() {
+                            self.send_admin_request(Request::Pause, "pause");
+                        }
+                        let gm_button = egui::Button::new("Game Mode off");
+                        if ui.add_enabled(in_game_mode, gm_button).clicked() {
+                            self.send_admin_request(Request::GameModeOff, "game-mode off");
+                        }
+                    });
+                    if let Some(msg) = self.last_action.lock().unwrap().as_ref() {
+                        ui.small(msg);
+                    }
+                } else {
+                    ui.colored_label(
+                        egui::Color32::from_rgb(200, 150, 80),
+                        "🔒 read-only — admin pipe needs UAC",
+                    );
+                    if ui
+                        .button("Enable controls (UAC)…")
+                        .on_hover_text(
+                            "Relaunch framesage-tray elevated so Pause/Resume/Game-Mode-Off work.",
+                        )
+                        .clicked()
+                    {
+                        match win32::relaunch_as_admin() {
+                            Ok(()) => {
+                                // Elevated child is starting; release tray
+                                // resources and exit so it can take over.
+                                ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                                self.commands.exit_requested.store(true, Ordering::Relaxed);
+                            }
+                            Err(e) => {
+                                *self.last_action.lock().unwrap() =
+                                    Some(format!("relaunch failed: {e}"));
+                            }
+                        }
+                    }
+                    if let Some(msg) = self.last_action.lock().unwrap().as_ref() {
+                        ui.small(msg);
+                    }
+                }
             }
 
             ui.separator();
@@ -400,15 +505,61 @@ fn background_loop(state: Arc<Mutex<AppState>>) {
     s.last_error = Some("tray UI only operates against a Windows service".into());
 }
 
+/// One-shot blocking IPC: open the named pipe, send a single request,
+/// read a single response, close. Used by admin button handlers; we
+/// deliberately don't reuse a persistent connection because admin
+/// operations are rare and the simpler per-call lifecycle is easier
+/// to reason about than a long-lived sender.
+#[cfg(windows)]
+fn send_request_blocking(pipe_name: &str, req: &Request) -> anyhow::Result<Response> {
+    use std::fs::OpenOptions;
+    use std::io::{BufRead, BufReader, Write};
+
+    let pipe = OpenOptions::new().read(true).write(true).open(pipe_name)?;
+    let mut writer = pipe.try_clone()?;
+    let mut reader = BufReader::new(pipe);
+
+    let mut buf = serde_json::to_vec(req)?;
+    buf.push(b'\n');
+    writer.write_all(&buf)?;
+    writer.flush()?;
+
+    let mut line = String::new();
+    reader.read_line(&mut line)?;
+    let resp: Response = serde_json::from_str(line.trim_end())?;
+    Ok(resp)
+}
+
 // ─── main ────────────────────────────────────────────────────────────────────
 
 fn main() -> eframe::Result<()> {
+    // Singleton + elevation handoff: if another tray is running, wait briefly
+    // for it to exit (in case this is the elevated child taking over from a
+    // non-elevated parent), then fail cleanly if it doesn't.
+    #[cfg(windows)]
+    let _singleton = match win32::acquire_singleton() {
+        Ok(guard) => guard,
+        Err(e) => {
+            eprintln!("framesage-tray: {e}");
+            return Ok(());
+        }
+    };
+
+    #[cfg(windows)]
+    let elevated = win32::is_elevated().unwrap_or(false);
+    #[cfg(not(windows))]
+    let elevated = false;
+
     let commands = TrayCommands::default();
 
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([520.0, 480.0])
-            .with_title("framesage")
+            .with_title(if elevated {
+                "framesage (admin)"
+            } else {
+                "framesage"
+            })
             .with_close_button(true),
         ..Default::default()
     };
@@ -417,6 +568,6 @@ fn main() -> eframe::Result<()> {
     eframe::run_native(
         "framesage",
         options,
-        Box::new(move |cc| Ok(Box::new(FramesageApp::new(cc, cmds_for_app)))),
+        Box::new(move |cc| Ok(Box::new(FramesageApp::new(cc, cmds_for_app, elevated)))),
     )
 }
