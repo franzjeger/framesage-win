@@ -266,6 +266,14 @@ impl Engine {
         let mut s = self.state.write();
         if s.paused {
             s.paused = false;
+            // Force the next tick's reconcile to re-apply the rule for the
+            // current foreground. Without this, if the foreground PID
+            // hasn't changed since the pause, `reconcile()` early-returns
+            // on `new_pid == s.current_foreground` and the user has to
+            // alt-tab away and back to get a profile applied. Clearing
+            // `current_foreground` makes the next tick treat whatever's
+            // foregrounded as freshly-arrived.
+            s.current_foreground = None;
             let _ = self.events.send(Event::Resumed);
             info!("engine resumed");
         }
@@ -1354,7 +1362,27 @@ impl Engine {
                 continue;
             }
 
-            match apply_profile(pid, &exe_name, &bg_profile, &topology) {
+            // Rule-first: if the user authored a rule for this exe, the
+            // rule's profile wins over the generic background profile.
+            // Without this, a game launched into the background — or one
+            // the user never alt-tabs to before the engine resumes —
+            // sits on the generic `eco` profile despite an explicit
+            // `game-x3d` rule matching its name. (Path / window-title
+            // matchers don't fire here because we don't have a window
+            // title for background processes; only exe-name matchers
+            // make sense in this scan path.)
+            let profile_for_pid = s
+                .policy
+                .rules
+                .iter()
+                .find(|r| match &r.r#match {
+                    framesage_core::AppMatch::ExeName(n) => n.eq_ignore_ascii_case(&exe_name),
+                    _ => false,
+                })
+                .and_then(|r| s.policy.profile(&r.profile).cloned())
+                .unwrap_or_else(|| bg_profile.clone());
+
+            match apply_profile(pid, &exe_name, &profile_for_pid, &topology) {
                 Ok(record) => {
                     s.applied.insert(pid, record);
                     newly_applied += 1;
