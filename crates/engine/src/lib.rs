@@ -270,11 +270,6 @@ impl Engine {
             return;
         };
 
-        // Revert old per-PID state so the new apply captures a clean prev.
-        if let Some(record) = s.applied.remove(&prev_pid) {
-            revert_record(prev_pid, record);
-        }
-
         // Resolve the new profile via the same precedence the tick path
         // uses: manual override wins, else first-match rule, else default.
         let profile_id = match &s.manual_override {
@@ -292,15 +287,39 @@ impl Engine {
             }
         };
 
-        let topology = s.topology.clone();
-        match apply_profile(prev_pid, &snapshot.exe_name, &profile, &topology) {
-            Ok(record) => {
-                info!(pid = prev_pid, profile = %profile_id, "force_recompute applied");
-                s.applied.insert(prev_pid, record);
+        // Same-profile-already-applied: don't churn the kernel state. Mirrors
+        // reconcile + apply_once. Especially important here because
+        // force_recompute fires on manual-override toggles — if the user is
+        // already running game-x3d and toggles "set as manual mode" off
+        // (which leaves them on game-x3d via the rule matcher), we'd
+        // momentarily tear down the X3D pin for no reason.
+        let already_correct = s
+            .applied
+            .get(&prev_pid)
+            .map(|r| r.profile_id == profile_id)
+            .unwrap_or(false);
+        if !already_correct {
+            // Revert old per-PID state so the new apply captures a clean prev.
+            if let Some(record) = s.applied.remove(&prev_pid) {
+                revert_record(prev_pid, record);
             }
-            Err(e) => {
-                warn!(pid = prev_pid, error = %e, "force_recompute apply failed");
+
+            let topology = s.topology.clone();
+            match apply_profile(prev_pid, &snapshot.exe_name, &profile, &topology) {
+                Ok(record) => {
+                    info!(pid = prev_pid, profile = %profile_id, "force_recompute applied");
+                    s.applied.insert(prev_pid, record);
+                }
+                Err(e) => {
+                    warn!(pid = prev_pid, error = %e, "force_recompute apply failed");
+                }
             }
+        } else {
+            info!(
+                pid = prev_pid,
+                profile = %profile_id,
+                "force_recompute: already correct, preserving state"
+            );
         }
         s.active_profile = Some(profile_id.clone());
         let _ = self.events.send(Event::ForegroundChanged {
@@ -371,11 +390,23 @@ impl Engine {
             .ok_or_else(|| anyhow::anyhow!("unknown profile id {profile_id}"))?
             .clone();
 
-        // Revert anything we'd previously applied to this same PID (whether
-        // the prior profile was the same or different) so we have a clean
-        // slate to apply onto.
-        if let Some(record) = s.applied.remove(&foreground.pid) {
-            revert_record(foreground.pid, record);
+        // If we already applied the SAME profile to this PID and the new
+        // profile is persistent, the state is in place — don't churn it by
+        // revert+reapply. Mirrors the reconcile fast path. Without this,
+        // hitting "Apply now" on a persistent game-x3d profile briefly tears
+        // down the affinity before re-establishing it — visible UX glitch.
+        let already_correct = s
+            .applied
+            .get(&foreground.pid)
+            .map(|r| r.profile_id == profile_id)
+            .unwrap_or(false);
+        if !already_correct {
+            // Revert anything we'd previously applied to this same PID
+            // (whether the prior profile was the same or different) so we
+            // have a clean slate to apply onto.
+            if let Some(record) = s.applied.remove(&foreground.pid) {
+                revert_record(foreground.pid, record);
+            }
         }
 
         let topology = s.topology.clone();
@@ -386,14 +417,23 @@ impl Engine {
             title: foreground.title.clone(),
         };
 
-        let record = apply_profile(foreground.pid, &foreground.exe_name, &profile, &topology)?;
-        info!(
-            pid = foreground.pid,
-            exe = %foreground.exe_name,
-            profile = %profile_id,
-            "apply_once",
-        );
-        s.applied.insert(foreground.pid, record);
+        if !already_correct {
+            let record = apply_profile(foreground.pid, &foreground.exe_name, &profile, &topology)?;
+            info!(
+                pid = foreground.pid,
+                exe = %foreground.exe_name,
+                profile = %profile_id,
+                "apply_once",
+            );
+            s.applied.insert(foreground.pid, record);
+        } else {
+            info!(
+                pid = foreground.pid,
+                exe = %foreground.exe_name,
+                profile = %profile_id,
+                "apply_once: already correct, preserving state",
+            );
+        }
         s.current_foreground = Some(foreground.pid);
         s.foreground_snapshot = Some(snapshot.clone());
         s.active_profile = Some(profile_id.clone());
