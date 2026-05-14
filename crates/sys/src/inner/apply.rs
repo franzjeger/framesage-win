@@ -298,6 +298,55 @@ fn open_for_write(pid: u32) -> Result<HANDLE> {
         .map_err(|e| anyhow!("OpenProcess({pid}) for write failed: {e}"))
 }
 
+/// Read a process's current priority class by PID. Returns the raw Win32
+/// constant (`NORMAL_PRIORITY_CLASS` = 0x20, etc.). `Ok(None)` if the PID is
+/// gone or inaccessible — ProBalance treats both as "no signal, skip."
+///
+/// Public so the engine's ProBalance pass can query and stash the original
+/// class without going through the full profile-apply path.
+pub fn get_priority_class_for_pid(pid: u32) -> Result<Option<u32>> {
+    let handle = match open_for_write(pid) {
+        Ok(h) => h,
+        Err(_) => return Ok(None),
+    };
+    let v = unsafe { GetPriorityClass(handle) };
+    let _ = unsafe { CloseHandle(handle) };
+    if v == 0 {
+        Ok(None)
+    } else {
+        Ok(Some(v))
+    }
+}
+
+/// Force a process to a given priority class by PID. Used by ProBalance to
+/// temporarily demote background hogs and later restore them.
+///
+/// `class` accepts the canonical `PriorityClass` enum from
+/// `framesage_core::profile`; the public surface matches the rest of the
+/// crate's API style. Returns `Ok(())` on success, `Err` if the PID can't
+/// be opened (caller logs and moves on).
+pub fn set_priority_class_for_pid(pid: u32, class: PriorityClass) -> Result<()> {
+    let handle = open_for_write(pid)?;
+    let r = set_priority_class(handle, class);
+    let _ = unsafe { CloseHandle(handle) };
+    r
+}
+
+/// Restore a priority class from a previously-captured raw Win32 constant
+/// (the value returned by `get_priority_class_for_pid`). Used by ProBalance
+/// when the dwell window expires and the original class must come back.
+/// Best-effort — silently skips if the PID is gone.
+pub fn restore_priority_class_for_pid(pid: u32, raw_class: u32) -> Result<()> {
+    let handle = match open_for_write(pid) {
+        Ok(h) => h,
+        Err(_) => return Ok(()),
+    };
+    let r = unsafe { SetPriorityClass(handle, PROCESS_CREATION_FLAGS(raw_class)) }
+        .map_err(|e| anyhow!("SetPriorityClass(raw={raw_class:#x}) failed: {e}"));
+    let _ = unsafe { CloseHandle(handle) };
+    r
+}
+
 fn get_priority_class(handle: HANDLE) -> Result<u32> {
     // SAFETY: handle is valid.
     let v = unsafe { GetPriorityClass(handle) };

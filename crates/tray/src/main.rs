@@ -2377,6 +2377,23 @@ fn try_connect_and_serve(state: Arc<Mutex<AppState>>) -> anyhow::Result<()> {
                 ),
                 Event::Paused => "paused".into(),
                 Event::Resumed => "resumed".into(),
+                Event::ProBalanceRestrained {
+                    pid,
+                    exe_name,
+                    from_class,
+                    to_class,
+                } => format!(
+                    "probalance restrained {} (pid {}) {:#x} -> {:#x}",
+                    exe_name, pid, from_class, to_class
+                ),
+                Event::ProBalanceRestored {
+                    pid,
+                    exe_name,
+                    restored_class,
+                } => format!(
+                    "probalance restored {} (pid {}) -> {:#x}",
+                    exe_name, pid, restored_class
+                ),
             };
             let mut s = state.lock().unwrap();
             s.recent.push(RecentEvent { label });

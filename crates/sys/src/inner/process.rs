@@ -15,13 +15,34 @@
 use anyhow::{anyhow, Result};
 
 use windows::core::PWSTR;
-use windows::Win32::Foundation::{CloseHandle, HANDLE, INVALID_HANDLE_VALUE, MAX_PATH};
+use windows::Win32::Foundation::{CloseHandle, FILETIME, HANDLE, INVALID_HANDLE_VALUE, MAX_PATH};
 use windows::Win32::System::Diagnostics::ToolHelp::{
     CreateToolhelp32Snapshot, Process32FirstW, Process32NextW, PROCESSENTRY32W, TH32CS_SNAPPROCESS,
 };
 use windows::Win32::System::Threading::{
-    OpenProcess, QueryFullProcessImageNameW, PROCESS_NAME_FORMAT, PROCESS_QUERY_LIMITED_INFORMATION,
+    GetProcessTimes, OpenProcess, QueryFullProcessImageNameW, PROCESS_NAME_FORMAT,
+    PROCESS_QUERY_LIMITED_INFORMATION,
 };
+
+/// CPU times (kernel + user) for a single process, both in 100-nanosecond
+/// units (the unit `GetProcessTimes` reports). Subtracting two samples taken
+/// at known wall-clock instants yields per-process CPU consumption over that
+/// interval; dividing by the elapsed wall time gives utilisation as a
+/// fraction of one logical CPU.
+#[derive(Debug, Clone, Copy)]
+pub struct ProcessCpuTimes {
+    /// `lpKernelTime` from `GetProcessTimes`, in 100-ns units.
+    pub kernel_100ns: u64,
+    /// `lpUserTime` from `GetProcessTimes`, in 100-ns units.
+    pub user_100ns: u64,
+}
+
+impl ProcessCpuTimes {
+    /// Sum of kernel + user CPU time consumed.
+    pub fn total_100ns(&self) -> u64 {
+        self.kernel_100ns.saturating_add(self.user_100ns)
+    }
+}
 
 /// Snapshot every running process and return their PIDs.
 ///
@@ -92,6 +113,45 @@ pub fn exe_for_pid(pid: u32) -> Result<Option<String>> {
         Ok(()) => Ok(Some(String::from_utf16_lossy(&buf[..size as usize]))),
         Err(_) => Ok(None),
     }
+}
+
+/// Sample CPU times (kernel + user) for a single PID. Used by ProBalance to
+/// compute per-process CPU utilisation between two ticks: subtract this
+/// tick's `total_100ns` from the next tick's, divide by elapsed wall time
+/// in 100 ns units, get a fraction of one logical CPU.
+///
+/// Returns `Ok(None)` if the PID is gone or inaccessible (protected
+/// processes, PID 0 / 4, ACCESS_DENIED). The caller can treat this as
+/// "no signal" and skip the PID.
+pub fn cpu_times(pid: u32) -> Result<Option<ProcessCpuTimes>> {
+    if pid == 0 {
+        return Ok(None);
+    }
+    let handle = match unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid) } {
+        Ok(h) => h,
+        Err(_) => return Ok(None),
+    };
+
+    let mut creation = FILETIME::default();
+    let mut exit = FILETIME::default();
+    let mut kernel = FILETIME::default();
+    let mut user = FILETIME::default();
+    // SAFETY: handle valid; the four FILETIME out-params are valid pointers.
+    let result =
+        unsafe { GetProcessTimes(handle, &mut creation, &mut exit, &mut kernel, &mut user) };
+    close_handle(handle);
+
+    match result {
+        Ok(()) => Ok(Some(ProcessCpuTimes {
+            kernel_100ns: filetime_to_u64(&kernel),
+            user_100ns: filetime_to_u64(&user),
+        })),
+        Err(_) => Ok(None),
+    }
+}
+
+fn filetime_to_u64(ft: &FILETIME) -> u64 {
+    ((ft.dwHighDateTime as u64) << 32) | (ft.dwLowDateTime as u64)
 }
 
 fn close_handle(h: HANDLE) {

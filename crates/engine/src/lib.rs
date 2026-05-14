@@ -35,6 +35,8 @@ use parking_lot::RwLock;
 use tokio::sync::broadcast;
 use tracing::{debug, info, warn};
 
+pub mod probalance;
+
 use framesage_core::{CpuTopology, GameModeActions, Policy, Profile, ProfileId};
 use framesage_gamemode::{
     journal::{Journal, JournalEntry},
@@ -83,6 +85,19 @@ struct EngineState {
     /// `None` until the first sweep; subsequent sweeps honour
     /// `PERSISTENT_REASSERT_INTERVAL`.
     last_persistent_reassert: Option<Instant>,
+    /// Per-PID CPU-time + exe-name snapshot from the previous ProBalance
+    /// sample. Used to compute deltas (CPU% over the inter-sample window).
+    /// Keyed by PID; entries for PIDs that have exited are reaped each
+    /// sample. Empty when ProBalance is disabled.
+    probalance_prev_samples: HashMap<u32, ProBalancePrevSample>,
+    /// Timestamp of the last ProBalance sample, paired with
+    /// `probalance_prev_samples`. The wall-clock delta between this and
+    /// `Instant::now()` divides the CPU-time delta into a utilisation %.
+    probalance_last_sample_at: Option<Instant>,
+    /// Active ProBalance restraints — PID → original priority class + exe.
+    /// Populated when `probalance::decide` returns `Decision::Restrain`,
+    /// drained on `Decision::Restore`.
+    probalance_restrained: HashMap<u32, probalance::RestrainedRecord>,
     /// Manual mode: when set, every foreground reconcile applies this
     /// profile instead of consulting Rules. Stays set across focus
     /// changes until explicitly cleared via `clear_manual_override` /
@@ -124,6 +139,19 @@ const BACKGROUND_SCAN_INTERVAL: Duration = Duration::from_secs(10);
 /// per managed PID, and persistent-profile PIDs are typically 1–3 (games,
 /// not background apps).
 const PERSISTENT_REASSERT_INTERVAL: Duration = Duration::from_secs(2);
+
+/// How often the engine samples per-PID CPU usage for ProBalance. 1 s gives
+/// reasonable accuracy (a process that's busy for 200 ms of every second
+/// shows up at ~20%) without thrashing OpenProcess. Skipped entirely when
+/// `policy.probalance.enabled == false`.
+const PROBALANCE_SAMPLE_INTERVAL: Duration = Duration::from_millis(1000);
+
+/// Cached fields from the previous ProBalance sample.
+#[derive(Debug, Clone, Copy)]
+struct ProBalancePrevSample {
+    /// `kernel + user` 100-ns ticks from `GetProcessTimes` at last sample.
+    total_cpu_100ns: u64,
+}
 
 struct AppliedRecord {
     profile_id: ProfileId,
@@ -167,6 +195,9 @@ impl Engine {
                 system_mode: None,
                 last_background_scan: None,
                 last_persistent_reassert: None,
+                probalance_prev_samples: HashMap::new(),
+                probalance_last_sample_at: None,
+                probalance_restrained: HashMap::new(),
                 manual_override: None,
                 reported_foreground: None,
                 foreground_reporter_seen: false,
@@ -507,7 +538,260 @@ impl Engine {
         self.reconcile(&mut s, foreground)?;
         Self::maybe_scan_background_locked(&mut s, self.safe_list);
         Self::maybe_reassert_persistent_locked(&mut s);
+        self.maybe_run_probalance_locked(&mut s);
         Ok(())
+    }
+
+    /// One ProBalance pass: sample per-PID CPU, compute deltas vs. last
+    /// sample, hand to `probalance::decide`, execute returned `Restrain` /
+    /// `Restore` decisions as kernel calls, emit IPC events.
+    ///
+    /// Bounded by `PROBALANCE_SAMPLE_INTERVAL` (1 s) — the engine ticks much
+    /// faster than that (300 ms by default), so most ticks fall through.
+    /// Zero-cost when `cfg.enabled == false`.
+    fn maybe_run_probalance_locked(&self, s: &mut EngineState) {
+        // Fast-path bail when ProBalance is disabled.
+        let cfg = s.policy.probalance.clone();
+        if !cfg.enabled {
+            // If the user just toggled it OFF while restraints were active,
+            // we still need to release them. One-time drain.
+            if !s.probalance_restrained.is_empty() {
+                let drained: Vec<(u32, probalance::RestrainedRecord)> =
+                    s.probalance_restrained.drain().collect();
+                for (pid, rec) in drained {
+                    #[cfg(windows)]
+                    if let Err(e) = framesage_sys::apply::restore_priority_class_for_pid(
+                        pid,
+                        rec.original_raw_class,
+                    ) {
+                        warn!(pid, error = %e, "probalance: failed to release restraint on disable");
+                    }
+                    let _ = self.events.send(Event::ProBalanceRestored {
+                        pid,
+                        exe_name: rec.exe_name,
+                        restored_class: rec.original_raw_class,
+                    });
+                }
+                s.probalance_prev_samples.clear();
+                s.probalance_last_sample_at = None;
+            }
+            return;
+        }
+
+        let now = Instant::now();
+        let elapsed = match s.probalance_last_sample_at {
+            Some(t) if now.duration_since(t) < PROBALANCE_SAMPLE_INTERVAL => return,
+            Some(t) => now.duration_since(t),
+            None => Duration::from_millis(0), // first sample — seed only
+        };
+
+        // Snapshot per-PID CPU times. Capture the foreground PID first so
+        // we never even consider restraining it.
+        let foreground_pid = s.current_foreground;
+        let managed_pids: HashSet<u32> = s.applied.keys().copied().collect();
+
+        let live_pids: Vec<u32> = match framesage_sys::process::iter_pids() {
+            Ok(v) => v,
+            Err(e) => {
+                debug!(error = %e, "probalance: iter_pids failed; skipping sample");
+                return;
+            }
+        };
+
+        // Sample CPU times for every live PID we can open. PIDs that fail
+        // (protected, exited) are silently skipped — they aren't candidates.
+        let mut current_samples: HashMap<u32, (u64, String)> = HashMap::new();
+        for pid in &live_pids {
+            #[cfg(windows)]
+            {
+                let times = match framesage_sys::process::cpu_times(*pid) {
+                    Ok(Some(t)) => t,
+                    Ok(None) | Err(_) => continue,
+                };
+                let exe_name = match framesage_sys::process::exe_for_pid(*pid) {
+                    Ok(Some(p)) => p
+                        .rsplit(['\\', '/'])
+                        .next()
+                        .unwrap_or(&p)
+                        .to_ascii_lowercase(),
+                    Ok(None) | Err(_) => continue,
+                };
+                current_samples.insert(*pid, (times.total_100ns(), exe_name));
+            }
+            #[cfg(not(windows))]
+            {
+                let _ = pid;
+            }
+        }
+
+        s.probalance_last_sample_at = Some(now);
+
+        // First-sample seed: store, no decision can be made yet (no delta).
+        if elapsed.is_zero() {
+            s.probalance_prev_samples = current_samples
+                .iter()
+                .map(|(pid, (total, _))| {
+                    (
+                        *pid,
+                        ProBalancePrevSample {
+                            total_cpu_100ns: *total,
+                        },
+                    )
+                })
+                .collect();
+            return;
+        }
+
+        // Compute CPU% per PID over `elapsed`. Format is "% of one logical
+        // CPU" — 100 means one fully busy thread, 200 means two, etc.
+        // Both kernel and user CPU time use 100-ns units, so we divide by
+        // `elapsed_100ns / 100` (i.e. elapsed_micros * 10 → percent).
+        let elapsed_100ns =
+            (elapsed.as_secs() * 10_000_000) + (elapsed.subsec_nanos() as u64 / 100);
+        if elapsed_100ns == 0 {
+            return;
+        }
+        let mut decision_samples: Vec<probalance::ProcessSample> =
+            Vec::with_capacity(current_samples.len());
+        let mut system_busy_100ns: u64 = 0;
+        for (pid, (total, exe)) in &current_samples {
+            let prev_total = match s.probalance_prev_samples.get(pid) {
+                Some(p) => p.total_cpu_100ns,
+                None => continue, // first time we saw this PID — wait for next sample
+            };
+            let delta = total.saturating_sub(prev_total);
+            system_busy_100ns = system_busy_100ns.saturating_add(delta);
+            let cpu_percent_of_one = ((delta as u128).saturating_mul(100) / elapsed_100ns as u128)
+                .min(u16::MAX as u128) as u16;
+            // Query the current priority class for the demotion-target gate.
+            #[cfg(windows)]
+            let current_raw_class = match framesage_sys::apply::get_priority_class_for_pid(*pid) {
+                Ok(Some(c)) => c,
+                _ => continue,
+            };
+            #[cfg(not(windows))]
+            let current_raw_class = 0x20u32;
+            decision_samples.push(probalance::ProcessSample {
+                pid: *pid,
+                exe_name: exe.clone(),
+                cpu_percent_of_one_cpu: cpu_percent_of_one,
+                current_raw_class,
+            });
+        }
+
+        // System CPU% = total CPU-time consumed across all sampled PIDs,
+        // normalised to one fully-busy logical CPU, divided by CPU count.
+        let cpu_count = s.topology.cpus.len().max(1) as u128;
+        let system_cpu_percent: u8 = (((system_busy_100ns as u128).saturating_mul(100)
+            / (elapsed_100ns as u128 * cpu_count))
+            .min(100)) as u8;
+
+        // Build the safe-list-name set. The game-mode safe-list's process
+        // denylist already covers the system-critical names ProBalance must
+        // never touch (dwm, audiodg, csrss, anti-cheat, AV, GPU drivers …).
+        let safe_list_exes: HashSet<String> = self
+            .safe_list
+            .denied_process_names()
+            .map(|n| n.to_ascii_lowercase())
+            .collect();
+        let user_ignore_exes: HashSet<String> = cfg
+            .ignore_processes
+            .iter()
+            .map(|n| n.to_ascii_lowercase())
+            .collect();
+
+        let decisions = probalance::decide(
+            &cfg,
+            now,
+            system_cpu_percent,
+            foreground_pid,
+            &decision_samples,
+            &managed_pids,
+            &safe_list_exes,
+            &user_ignore_exes,
+            &mut s.probalance_restrained,
+        );
+
+        for d in decisions {
+            match d {
+                probalance::Decision::Restrain {
+                    pid,
+                    exe_name,
+                    original_raw_class,
+                    demote_to,
+                    demote_to_raw_class,
+                } => {
+                    #[cfg(windows)]
+                    let result = framesage_sys::apply::set_priority_class_for_pid(pid, demote_to);
+                    #[cfg(not(windows))]
+                    let result: Result<()> = {
+                        let _ = demote_to;
+                        Ok(())
+                    };
+                    match result {
+                        Ok(()) => {
+                            info!(
+                                pid,
+                                exe = %exe_name,
+                                from = format!("{:#x}", original_raw_class),
+                                to = format!("{:#x}", demote_to_raw_class),
+                                "probalance: restrained"
+                            );
+                            let _ = self.events.send(Event::ProBalanceRestrained {
+                                pid,
+                                exe_name,
+                                from_class: original_raw_class,
+                                to_class: demote_to_raw_class,
+                            });
+                        }
+                        Err(e) => {
+                            warn!(pid, error = %e, "probalance: restrain syscall failed; rolling back state");
+                            // Don't leak a bookkeeping entry the kernel
+                            // doesn't actually reflect.
+                            s.probalance_restrained.remove(&pid);
+                        }
+                    }
+                }
+                probalance::Decision::Restore {
+                    pid,
+                    exe_name,
+                    restored_raw_class,
+                } => {
+                    #[cfg(windows)]
+                    if let Err(e) = framesage_sys::apply::restore_priority_class_for_pid(
+                        pid,
+                        restored_raw_class,
+                    ) {
+                        debug!(pid, error = %e, "probalance: restore syscall failed (process likely exited)");
+                    }
+                    info!(
+                        pid,
+                        exe = %exe_name,
+                        restored = format!("{:#x}", restored_raw_class),
+                        "probalance: restored"
+                    );
+                    let _ = self.events.send(Event::ProBalanceRestored {
+                        pid,
+                        exe_name,
+                        restored_class: restored_raw_class,
+                    });
+                }
+            }
+        }
+
+        // Roll forward the prev-sample buffer, dropping dead PIDs so the
+        // map size stays proportional to live process count.
+        s.probalance_prev_samples = current_samples
+            .into_iter()
+            .map(|(pid, (total, _exe))| {
+                (
+                    pid,
+                    ProBalancePrevSample {
+                        total_cpu_100ns: total,
+                    },
+                )
+            })
+            .collect();
     }
 
     /// Re-push kernel state (affinity, CPU sets, priority, I/O priority) onto

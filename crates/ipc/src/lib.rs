@@ -162,6 +162,24 @@ pub enum Event {
     },
     Paused,
     Resumed,
+
+    /// ProBalance demoted a background CPU hog. `from_class` and `to_class`
+    /// are raw Win32 priority class constants captured at decision time so
+    /// the action log can render the demotion factually.
+    ProBalanceRestrained {
+        pid: u32,
+        exe_name: String,
+        from_class: u32,
+        to_class: u32,
+    },
+
+    /// ProBalance restored a previously-restrained process to its original
+    /// priority class (the value captured in the matching `Restrained` event).
+    ProBalanceRestored {
+        pid: u32,
+        exe_name: String,
+        restored_class: u32,
+    },
 }
 
 #[cfg(test)]
@@ -176,6 +194,7 @@ mod tests {
             default_profile: ProfileId("perf".into()),
             background_profile: None,
             tick_ms: 300,
+            probalance: framesage_core::ProBalanceConfig::default(),
         }
     }
 

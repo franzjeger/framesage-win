@@ -78,6 +78,60 @@ pub struct Policy {
     /// means snappier response to focus changes, higher means less overhead.
     #[serde(default = "Policy::default_tick_ms")]
     pub tick_ms: u64,
+
+    /// Dynamic-priority contention management. When the system is under heavy
+    /// CPU load AND a non-foreground process is the top consumer, temporarily
+    /// lower its priority class one step so the foreground app gets the CPU.
+    /// Restore after a quiet dwell window. Disabled by default — opt in via
+    /// policy.
+    #[serde(default)]
+    pub probalance: ProBalanceConfig,
+}
+
+/// Tunables for dynamic priority management. Modeled after Process Lasso's
+/// ProBalance feature — clean-room reimplementation from public docs and
+/// observed behavior. Defaults to disabled until the user opts in.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ProBalanceConfig {
+    /// Master switch. `false` (default) means the engine does nothing in this
+    /// area — no sampling, no decisions, zero overhead.
+    pub enabled: bool,
+
+    /// System-wide CPU utilisation, expressed as a percentage of total
+    /// across all logical processors, above which we consider the machine
+    /// "under contention" and become eligible to restrain background hogs.
+    /// 75 is a sensible default — below this the system has slack and there's
+    /// nothing to fix.
+    pub system_cpu_threshold_percent: u8,
+
+    /// A single non-foreground process must be consuming at least this much
+    /// of one logical CPU (i.e. "100" means one fully-busy thread) to be
+    /// considered a hog worth restraining. Prevents twitchy restraint of
+    /// processes that briefly spike.
+    pub hog_cpu_threshold_percent: u16,
+
+    /// Minimum dwell, milliseconds, that a process stays restrained before
+    /// we'll even consider restoring it. Avoids ping-ponging the priority
+    /// class on borderline-busy processes.
+    pub min_restrain_ms: u64,
+
+    /// Process names (case-insensitive, no path) that ProBalance never
+    /// touches. Beyond the system-critical denylist enforced internally,
+    /// this is the user's escape hatch.
+    #[serde(default)]
+    pub ignore_processes: Vec<String>,
+}
+
+impl Default for ProBalanceConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            system_cpu_threshold_percent: 75,
+            hog_cpu_threshold_percent: 50,
+            min_restrain_ms: 1500,
+            ignore_processes: Vec::new(),
+        }
+    }
 }
 
 impl Policy {
@@ -315,6 +369,7 @@ impl Default for Policy {
             default_profile: "perf".into(),
             background_profile: Some("eco".into()),
             tick_ms: Self::default_tick_ms(),
+            probalance: ProBalanceConfig::default(),
         }
     }
 }
@@ -353,6 +408,7 @@ mod tests {
             default_profile: ProfileId("perf".into()),
             background_profile: None,
             tick_ms: 250,
+            probalance: ProBalanceConfig::default(),
         }
     }
 
