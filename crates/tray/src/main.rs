@@ -84,6 +84,11 @@ struct ProfilesEditor {
     /// Profile id currently in edit mode (only one at a time). `None`
     /// means all profiles are in view-only mode.
     editing_id: Option<String>,
+    /// Add-profile inline form. `Some(string)` = form is open with the id
+    /// the user is typing. `None` = no form. Mutually exclusive with
+    /// `editing_id` so the user never thinks they're editing two things
+    /// at once.
+    new_form: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -872,9 +877,28 @@ impl FramesageApp {
             self.send_admin_request(Request::ClearManualOverride, "clear manual override");
         }
         ui.horizontal(|ui| {
+            let add_enabled = self.elevated
+                && self.profiles.editing_id.is_none()
+                && self.profiles.new_form.is_none()
+                && self.rules.form.is_none();
+            if ui
+                .add_enabled(add_enabled, egui::Button::new("Add profile"))
+                .on_hover_text(
+                    "Create a new profile. After saving, expand the new profile \
+                     and click Edit to fill in the per-process knobs and Game Mode.",
+                )
+                .clicked()
+            {
+                self.profiles.new_form = Some(String::new());
+                if self.policy_draft.is_none() {
+                    self.policy_draft = Some(s.policy.clone());
+                }
+            }
+
             let save_enabled = self.elevated
                 && dirty
                 && self.profiles.editing_id.is_none()
+                && self.profiles.new_form.is_none()
                 && self.rules.form.is_none();
             if ui
                 .add_enabled(save_enabled, egui::Button::new("Save changes"))
@@ -891,6 +915,7 @@ impl FramesageApp {
             {
                 self.policy_draft = None;
                 self.profiles.editing_id = None;
+                self.profiles.new_form = None;
             }
             if dirty {
                 theme::status_badge(theme::WARNING).show(ui, |ui| {
@@ -898,6 +923,65 @@ impl FramesageApp {
                 });
             }
         });
+
+        // Inline new-profile form. Renders below the toolbar when active.
+        if let Some(new_id) = &mut self.profiles.new_form {
+            let mut commit = false;
+            let mut cancel = false;
+            ui.add_space(4.0);
+            ui.group(|ui| {
+                ui.label(theme::section_heading("New profile"));
+                ui.add_space(4.0);
+                ui.horizontal(|ui| {
+                    ui.label("Id:");
+                    ui.add(
+                        egui::TextEdit::singleline(new_id)
+                            .hint_text("e.g. game-poe2")
+                            .desired_width(220.0),
+                    );
+                });
+                ui.colored_label(
+                    theme::TEXT_MUTED,
+                    "Lowercase, dashes only — matches what you'd reference from Rules \
+                     (e.g. \u{201c}game-poe2\u{201d} becomes \u{201c}Game POE2\u{201d} in the UI).",
+                );
+                ui.horizontal(|ui| {
+                    let trimmed = new_id.trim();
+                    let id_taken = displayed_policy
+                        .profiles
+                        .keys()
+                        .any(|p| p.0.eq_ignore_ascii_case(trimmed));
+                    let can_save = !trimmed.is_empty() && !id_taken;
+                    if ui.add_enabled(can_save, egui::Button::new("Add")).clicked() {
+                        commit = true;
+                    }
+                    if ui.button("Cancel").clicked() {
+                        cancel = true;
+                    }
+                    if id_taken {
+                        ui.colored_label(theme::WARNING, "An profile with this id already exists.");
+                    }
+                });
+            });
+            if commit {
+                let id = new_id.trim().to_owned();
+                let draft = self.policy_draft.get_or_insert_with(|| s.policy.clone());
+                draft.profiles.insert(
+                    ProfileId(id.clone()),
+                    Profile {
+                        id: ProfileId(id.clone()),
+                        description: String::new(),
+                        ..Default::default()
+                    },
+                );
+                self.profiles.new_form = None;
+                // Drop straight into edit mode on the new profile so the
+                // user can fill in the knobs immediately.
+                self.profiles.editing_id = Some(id);
+            } else if cancel {
+                self.profiles.new_form = None;
+            }
+        }
 
         if !self.elevated {
             ui.add_space(4.0);
@@ -926,6 +1010,7 @@ impl FramesageApp {
             ApplyNow(String),
             SetManual(String),
             ClearManual,
+            DeleteProfile(String),
         }
         let mut ops: Vec<Op> = Vec::new();
 
@@ -1019,6 +1104,51 @@ impl FramesageApp {
                                     ops.push(Op::SetManual(id.0.clone()));
                                 }
                             }
+
+                            // Delete: right-aligned, separated visually since
+                            // it's destructive. Disabled on the active /
+                            // manual / default / background profile to stop
+                            // the user from deleting something the engine is
+                            // currently referencing.
+                            let is_default = displayed_policy.default_profile == *id;
+                            let is_background = displayed_policy
+                                .background_profile
+                                .as_ref()
+                                .is_some_and(|p| p == id);
+                            let referenced_by_rule =
+                                displayed_policy.rules.iter().any(|r| r.profile == *id);
+                            let delete_enabled = self.elevated
+                                && !is_editing
+                                && !is_active
+                                && !is_manual
+                                && !is_default
+                                && !is_background
+                                && !referenced_by_rule
+                                && self.rules.form.is_none();
+                            ui.with_layout(
+                                egui::Layout::right_to_left(egui::Align::Center),
+                                |ui| {
+                                    let hover = if is_default {
+                                        "Cannot delete the default profile."
+                                    } else if is_background {
+                                        "Cannot delete the background profile."
+                                    } else if referenced_by_rule {
+                                        "Cannot delete: still referenced by one or more rules. \
+                                         Remove or edit those rules first."
+                                    } else if is_active || is_manual {
+                                        "Cannot delete the currently-applied profile."
+                                    } else {
+                                        "Delete this profile from the policy."
+                                    };
+                                    if ui
+                                        .add_enabled(delete_enabled, egui::Button::new("Delete"))
+                                        .on_hover_text(hover)
+                                        .clicked()
+                                    {
+                                        ops.push(Op::DeleteProfile(id.0.clone()));
+                                    }
+                                },
+                            );
                         });
                         if is_editing {
                             let mut edited = p.clone();
@@ -1066,6 +1196,12 @@ impl FramesageApp {
                 }
                 Op::ClearManual => {
                     self.send_admin_request(Request::ClearManualOverride, "clear manual override");
+                }
+                Op::DeleteProfile(id) => {
+                    let draft = self.policy_draft.get_or_insert_with(|| s.policy.clone());
+                    draft.profiles.remove(&ProfileId(id));
+                    // Stay below the dirty-state checkbox: don't auto-Save;
+                    // user confirms by clicking Save changes.
                 }
             }
         }

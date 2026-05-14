@@ -326,11 +326,36 @@ async fn handle_client(
                 // service restart. The FS watcher will fire a redundant
                 // reload from the disk write — benign because `set_policy`
                 // is idempotent on identical content.
+                //
+                // Crucially, if the disk save fails (most common cause: the
+                // service is running unelevated and can't write the
+                // SYSTEM-owned `C:\ProgramData\framesage\policy.json`), we
+                // surface that as a Response::Error so the tray's
+                // last_action banner shows the user what went wrong. The
+                // previous behaviour — warn-log and return Ok — meant edits
+                // silently evaporated on service restart, which is the worst
+                // possible failure mode for a config UI.
                 engine.set_policy(policy.clone());
-                if let Err(e) = policy.save(&paths::policy_path()) {
-                    warn!(error = %e, "policy save after SetPolicy failed; in-memory only");
+                match policy.save(&paths::policy_path()) {
+                    Ok(()) => {
+                        write_response(&mut write_half, &Response::Ok).await?;
+                    }
+                    Err(e) => {
+                        warn!(error = %e, "policy save after SetPolicy failed");
+                        write_response(
+                            &mut write_half,
+                            &Response::Error {
+                                message: format!(
+                                    "policy.json save failed: {e}. Edit applied in memory \
+                                     but will be lost on service restart. \
+                                     Install the service elevated so it can write \
+                                     C:\\ProgramData\\framesage\\policy.json."
+                                ),
+                            },
+                        )
+                        .await?;
+                    }
                 }
-                write_response(&mut write_half, &Response::Ok).await?;
             }
             Request::ApplyOnce { profile } => match engine.apply_once(profile) {
                 Ok(()) => {
