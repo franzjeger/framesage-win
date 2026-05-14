@@ -98,6 +98,10 @@ struct ProcessesView {
     /// Descending if true, else ascending. Toggled by clicking the same
     /// column header twice.
     sort_desc: bool,
+    /// PID of the row the user has clicked to inspect. When `Some(pid)` the
+    /// table reserves a strip at the bottom for the detail panel; click the
+    /// same row again (or the panel's × button) to clear.
+    selected_pid: Option<u32>,
 }
 
 impl Default for ProcessesView {
@@ -107,6 +111,7 @@ impl Default for ProcessesView {
             filter: String::new(),
             sort_by: Some(ProcessSortKey::Cpu),
             sort_desc: true,
+            selected_pid: None,
         }
     }
 }
@@ -1922,6 +1927,18 @@ impl FramesageApp {
             .as_ref()
             .and_then(|s| s.foreground.as_ref())
             .map(|f| f.pid);
+        let selected_pid = self.processes.selected_pid;
+
+        // ─── Layout split: reserve space for the detail panel ──────────────
+        // When a row is selected we carve ~200px from the bottom of the
+        // central area for the detail card; the table fills the rest.
+        // Process Lasso / Process Explorer both use this pattern.
+        let detail_open = self.processes.selected_pid.is_some();
+        let avail_h = ui.available_height();
+        let detail_h = if detail_open { 210.0_f32 } else { 0.0 };
+        // Always leave the table at least 120px tall so even a tiny window
+        // stays usable. The detail panel will scroll internally if cramped.
+        let table_h = (avail_h - detail_h - 8.0).max(120.0);
 
         // ─── Table ─────────────────────────────────────────────────────────
         //
@@ -1931,170 +1948,245 @@ impl FramesageApp {
         // row state — like the "modified" gutter in code editors. Empty in
         // default rows so colored rows pop without the table looking busy.
         let mut action_queue: Vec<ProcessAction> = Vec::new();
-        TableBuilder::new(ui)
-            .striped(true)
-            .resizable(true)
-            .cell_layout(egui::Layout::left_to_right(egui::Align::Center))
-            .column(Column::exact(6.0)) // State marker (no header)
-            .column(Column::initial(220.0).at_least(120.0)) // Exe
-            .column(Column::initial(60.0).at_least(50.0)) // PID
-            .column(Column::initial(60.0).at_least(45.0)) // CPU%
-            .column(Column::initial(85.0).at_least(60.0)) // Memory
-            .column(Column::initial(55.0).at_least(45.0)) // Threads
-            .column(Column::initial(85.0).at_least(60.0)) // Priority
-            .column(Column::initial(110.0).at_least(70.0)) // Affinity
-            .column(Column::initial(100.0).at_least(70.0)) // Profile
-            .column(Column::remainder().at_least(70.0)) // Status
-            .header(20.0, |mut header| {
-                header.col(|_ui| {}); // marker column — no header glyph
-                header.col(|ui| self.sortable_header(ui, "Process", ProcessSortKey::ExeName));
-                header.col(|ui| self.sortable_header(ui, "PID", ProcessSortKey::Pid));
-                header.col(|ui| self.sortable_header(ui, "CPU %", ProcessSortKey::Cpu));
-                header.col(|ui| self.sortable_header(ui, "Memory", ProcessSortKey::Memory));
-                header.col(|ui| self.sortable_header(ui, "Threads", ProcessSortKey::Threads));
-                header.col(|ui| self.sortable_header(ui, "Priority", ProcessSortKey::Priority));
-                header.col(|ui| {
-                    ui.label("Affinity");
-                });
-                header.col(|ui| self.sortable_header(ui, "Profile", ProcessSortKey::Profile));
-                header.col(|ui| {
-                    ui.label("Status");
-                });
-            })
-            .body(|body| {
-                body.rows(18.0, rows.len(), |mut row| {
-                    let p = &rows[row.index()];
-                    let pid = p.pid;
-                    let exe = p.exe_name.clone();
-                    let state = classify_row(p, foreground_pid);
+        let mut clicked_pid: Option<u32> = None;
+        let mut close_detail = false;
+        ui.allocate_ui_with_layout(
+            egui::vec2(ui.available_width(), table_h),
+            egui::Layout::top_down(egui::Align::LEFT),
+            |ui| {
+                TableBuilder::new(ui)
+                    .striped(true)
+                    .resizable(true)
+                    .cell_layout(egui::Layout::left_to_right(egui::Align::Center))
+                    .column(Column::exact(6.0)) // State marker (no header)
+                    .column(Column::initial(220.0).at_least(120.0)) // Exe
+                    .column(Column::initial(60.0).at_least(50.0)) // PID
+                    .column(Column::initial(60.0).at_least(45.0)) // CPU%
+                    .column(Column::initial(85.0).at_least(60.0)) // Memory
+                    .column(Column::initial(55.0).at_least(45.0)) // Threads
+                    .column(Column::initial(85.0).at_least(60.0)) // Priority
+                    .column(Column::initial(110.0).at_least(70.0)) // Affinity
+                    .column(Column::initial(100.0).at_least(70.0)) // Profile
+                    .column(Column::remainder().at_least(70.0)) // Status
+                    .header(20.0, |mut header| {
+                        header.col(|_ui| {}); // marker column — no header glyph
+                        header
+                            .col(|ui| self.sortable_header(ui, "Process", ProcessSortKey::ExeName));
+                        header.col(|ui| self.sortable_header(ui, "PID", ProcessSortKey::Pid));
+                        header.col(|ui| self.sortable_header(ui, "CPU %", ProcessSortKey::Cpu));
+                        header.col(|ui| self.sortable_header(ui, "Memory", ProcessSortKey::Memory));
+                        header
+                            .col(|ui| self.sortable_header(ui, "Threads", ProcessSortKey::Threads));
+                        header.col(|ui| {
+                            self.sortable_header(ui, "Priority", ProcessSortKey::Priority)
+                        });
+                        header.col(|ui| {
+                            ui.label("Affinity");
+                        });
+                        header
+                            .col(|ui| self.sortable_header(ui, "Profile", ProcessSortKey::Profile));
+                        header.col(|ui| {
+                            ui.label("Status");
+                        });
+                    })
+                    .body(|body| {
+                        body.rows(18.0, rows.len(), |mut row| {
+                            let p = &rows[row.index()];
+                            let pid = p.pid;
+                            let exe = p.exe_name.clone();
+                            let state = classify_row(p, foreground_pid);
 
-                    // Marker column: paint a 3px vertical band on the left of
-                    // the cell when the row has a non-default state. The
-                    // painter is clipped to the cell, so this never leaks
-                    // outside the column even with the table's striping.
-                    row.col(|ui| {
-                        if let Some(color) = row_marker_color(state) {
-                            let rect = ui.max_rect();
-                            let bar =
-                                egui::Rect::from_min_size(rect.min, egui::vec2(3.0, rect.height()));
-                            ui.painter().rect_filled(bar, egui::Rounding::ZERO, color);
-                        }
-                    });
-
-                    row.col(|ui| {
-                        // Foreground rows get a small right-pointing triangle
-                        // prefix so the eye picks them out instantly even
-                        // when the user has scrolled away from the colored
-                        // marker. ▸ is U+25B8, a geometric-shapes-block
-                        // glyph supported by virtually every font.
-                        let label_text = if state == RowState::Foreground {
-                            format!("▸ {}", p.exe_name)
-                        } else {
-                            p.exe_name.clone()
-                        };
-                        let resp = ui.colored_label(row_exe_color(state), label_text);
-                        // Right-click anywhere on the name opens the per-PID
-                        // context menu — same affordance Process Explorer uses.
-                        resp.context_menu(|ui| {
-                            ui.label(format!("{} (pid {})", &exe, pid));
-                            ui.separator();
-                            ui.menu_button("Set priority", |ui| {
-                                for (label, class) in PRIORITY_CHOICES.iter() {
-                                    if ui.button(*label).clicked() {
-                                        action_queue.push(ProcessAction::SetPriority {
-                                            pid,
-                                            class: *class,
-                                        });
-                                        ui.close_menu();
-                                    }
+                            // Marker column: paint a 3px vertical band on the left of
+                            // the cell when the row has a non-default state. The
+                            // painter is clipped to the cell, so this never leaks
+                            // outside the column even with the table's striping.
+                            row.col(|ui| {
+                                if let Some(color) = row_marker_color(state) {
+                                    let rect = ui.max_rect();
+                                    let bar = egui::Rect::from_min_size(
+                                        rect.min,
+                                        egui::vec2(3.0, rect.height()),
+                                    );
+                                    ui.painter().rect_filled(bar, egui::Rounding::ZERO, color);
                                 }
                             });
-                            ui.menu_button("Apply profile now", |ui| {
-                                for pid_name in &profile_ids {
-                                    if ui.button(pid_name).clicked() {
-                                        action_queue.push(ProcessAction::ApplyProfileForeground {
-                                            profile: pid_name.clone(),
-                                        });
-                                        ui.close_menu();
-                                    }
+
+                            row.col(|ui| {
+                                // Foreground rows get a small right-pointing triangle
+                                // prefix so the eye picks them out instantly even
+                                // when the user has scrolled away from the colored
+                                // marker. ▸ is U+25B8, a geometric-shapes-block
+                                // glyph supported by virtually every font.
+                                let label_text = if state == RowState::Foreground {
+                                    format!("▸ {}", p.exe_name)
+                                } else {
+                                    p.exe_name.clone()
+                                };
+                                // Wrap the label in an explicit `Label::sense(click)`
+                                // so a single click toggles row selection. The
+                                // subsequent .context_menu() call attaches the
+                                // right-click menu to the same response — same widget
+                                // serves both interactions.
+                                let label = egui::Label::new(
+                                    egui::RichText::new(label_text).color(row_exe_color(state)),
+                                )
+                                .sense(egui::Sense::click());
+                                let mut resp = ui.add(label);
+                                // Highlight the currently-selected row by stroking
+                                // a thin accent border around the cell.
+                                if selected_pid == Some(pid) {
+                                    let rect = ui.max_rect();
+                                    ui.painter().rect_stroke(
+                                        rect,
+                                        egui::Rounding::ZERO,
+                                        egui::Stroke::new(1.0, theme::ACCENT),
+                                    );
+                                }
+                                if resp.clicked() {
+                                    clicked_pid = Some(pid);
+                                    resp.mark_changed();
+                                }
+                                // Right-click anywhere on the name opens the per-PID
+                                // context menu — same affordance Process Explorer uses.
+                                resp.context_menu(|ui| {
+                                    ui.label(format!("{} (pid {})", &exe, pid));
+                                    ui.separator();
+                                    ui.menu_button("Set priority", |ui| {
+                                        for (label, class) in PRIORITY_CHOICES.iter() {
+                                            if ui.button(*label).clicked() {
+                                                action_queue.push(ProcessAction::SetPriority {
+                                                    pid,
+                                                    class: *class,
+                                                });
+                                                ui.close_menu();
+                                            }
+                                        }
+                                    });
+                                    ui.menu_button("Apply profile now", |ui| {
+                                        for pid_name in &profile_ids {
+                                            if ui.button(pid_name).clicked() {
+                                                action_queue.push(
+                                                    ProcessAction::ApplyProfileForeground {
+                                                        profile: pid_name.clone(),
+                                                    },
+                                                );
+                                                ui.close_menu();
+                                            }
+                                        }
+                                    });
+                                    ui.menu_button("Create rule for this exe", |ui| {
+                                        for pid_name in &profile_ids {
+                                            if ui.button(pid_name).clicked() {
+                                                action_queue.push(ProcessAction::CreateRule {
+                                                    exe_name: exe.clone(),
+                                                    profile: pid_name.clone(),
+                                                });
+                                                ui.close_menu();
+                                            }
+                                        }
+                                    });
+                                });
+                            });
+                            row.col(|ui| {
+                                ui.monospace(p.pid.to_string());
+                            });
+                            row.col(|ui| {
+                                // Color the CPU% column based on intensity: green for
+                                // idle, yellow for moderate, red for hot. Anchors
+                                // attention on the actually-busy processes at a
+                                // glance — same affordance Task Manager / PL use.
+                                let color = cpu_percent_color(p.cpu_percent);
+                                ui.colored_label(color, format!("{}", p.cpu_percent));
+                            });
+                            row.col(|ui| {
+                                ui.monospace(format_bytes(p.memory_bytes));
+                            });
+                            row.col(|ui| {
+                                ui.monospace(p.threads.to_string());
+                            });
+                            row.col(|ui| {
+                                ui.label(priority_class_label(p.priority_class_raw));
+                            });
+                            row.col(|ui| {
+                                ui.monospace(format!("{:#x}", p.affinity_mask));
+                            });
+                            row.col(|ui| match &p.managed_profile {
+                                Some(id) => {
+                                    // ★ prefix marks rows whose profile came from a
+                                    // user-authored Rule (a match in policy.rules).
+                                    // Without the prefix it'd be impossible at a
+                                    // glance to tell a Rule-pinned profile from a
+                                    // one-shot ApplyOnce or manual-override profile.
+                                    // matched_rule_note is set for every rule match
+                                    // (empty string if the user didn't write a note),
+                                    // so its presence is the signal.
+                                    let pinned = p.matched_rule_note.is_some();
+                                    let label = if pinned {
+                                        format!("★ {id}")
+                                    } else {
+                                        id.clone()
+                                    };
+                                    ui.colored_label(theme::ACCENT, label);
+                                }
+                                None => {
+                                    ui.weak("—");
                                 }
                             });
-                            ui.menu_button("Create rule for this exe", |ui| {
-                                for pid_name in &profile_ids {
-                                    if ui.button(pid_name).clicked() {
-                                        action_queue.push(ProcessAction::CreateRule {
-                                            exe_name: exe.clone(),
-                                            profile: pid_name.clone(),
-                                        });
-                                        ui.close_menu();
+                            row.col(|ui| {
+                                if p.restrained_by_probalance {
+                                    // ● prefix calls out ProBalance involvement;
+                                    // visually pairs with the WARNING-tinted marker
+                                    // bar on the same row.
+                                    ui.colored_label(theme::WARNING, "● ProBalance");
+                                } else if let Some(note) = &p.matched_rule_note {
+                                    if note.is_empty() {
+                                        ui.weak("rule");
+                                    } else {
+                                        ui.weak(note);
                                     }
+                                } else {
+                                    ui.weak("—");
                                 }
                             });
                         });
                     });
-                    row.col(|ui| {
-                        ui.monospace(p.pid.to_string());
-                    });
-                    row.col(|ui| {
-                        // Color the CPU% column based on intensity: green for
-                        // idle, yellow for moderate, red for hot. Anchors
-                        // attention on the actually-busy processes at a
-                        // glance — same affordance Task Manager / PL use.
-                        let color = cpu_percent_color(p.cpu_percent);
-                        ui.colored_label(color, format!("{}", p.cpu_percent));
-                    });
-                    row.col(|ui| {
-                        ui.monospace(format_bytes(p.memory_bytes));
-                    });
-                    row.col(|ui| {
-                        ui.monospace(p.threads.to_string());
-                    });
-                    row.col(|ui| {
-                        ui.label(priority_class_label(p.priority_class_raw));
-                    });
-                    row.col(|ui| {
-                        ui.monospace(format!("{:#x}", p.affinity_mask));
-                    });
-                    row.col(|ui| match &p.managed_profile {
-                        Some(id) => {
-                            // ★ prefix marks rows whose profile came from a
-                            // user-authored Rule (a match in policy.rules).
-                            // Without the prefix it'd be impossible at a
-                            // glance to tell a Rule-pinned profile from a
-                            // one-shot ApplyOnce or manual-override profile.
-                            // matched_rule_note is set for every rule match
-                            // (empty string if the user didn't write a note),
-                            // so its presence is the signal.
-                            let pinned = p.matched_rule_note.is_some();
-                            let label = if pinned {
-                                format!("★ {id}")
-                            } else {
-                                id.clone()
-                            };
-                            ui.colored_label(theme::ACCENT, label);
-                        }
-                        None => {
-                            ui.weak("—");
-                        }
-                    });
-                    row.col(|ui| {
-                        if p.restrained_by_probalance {
-                            // ● prefix calls out ProBalance involvement;
-                            // visually pairs with the WARNING-tinted marker
-                            // bar on the same row.
-                            ui.colored_label(theme::WARNING, "● ProBalance");
-                        } else if let Some(note) = &p.matched_rule_note {
-                            if note.is_empty() {
-                                ui.weak("rule");
-                            } else {
-                                ui.weak(note);
-                            }
-                        } else {
-                            ui.weak("—");
-                        }
-                    });
-                });
-            });
+            }, // close allocate_ui_with_layout for the table region
+        );
+
+        // ─── Detail panel ──────────────────────────────────────────────────
+        // Renders below the table when a row is selected. Looks up the PID
+        // in the rendered (filtered+sorted) list so the panel matches what
+        // the user clicked; if the PID disappeared between polls the panel
+        // auto-closes via `close_detail`.
+        if let Some(pid) = selected_pid {
+            ui.separator();
+            ui.allocate_ui_with_layout(
+                egui::vec2(ui.available_width(), detail_h),
+                egui::Layout::top_down(egui::Align::LEFT),
+                |ui| {
+                    render_process_detail(
+                        ui,
+                        pid,
+                        &rows,
+                        &profile_ids,
+                        &mut action_queue,
+                        &mut close_detail,
+                    );
+                },
+            );
+        }
+
+        // ─── Apply selection toggle / close flag ───────────────────────────
+        if let Some(pid) = clicked_pid {
+            if self.processes.selected_pid == Some(pid) {
+                self.processes.selected_pid = None;
+            } else {
+                self.processes.selected_pid = Some(pid);
+            }
+        }
+        if close_detail {
+            self.processes.selected_pid = None;
+        }
 
         // ─── Dispatch context-menu actions outside the render closure ─────
         for action in action_queue {
@@ -2227,6 +2319,152 @@ fn priority_class_label(raw: u32) -> &'static str {
         0x0000_0100 => "Realtime",
         _ => "—",
     }
+}
+
+/// Selected-process detail panel rendered below the Processes table.
+///
+/// Layout: title bar with exe + pid + close button, then a two-column field
+/// grid (key on the left in mono-muted, value on the right in plain text),
+/// then a row of action buttons that mirror the right-click context menu.
+/// The detail card is the discoverability surface for users who never
+/// right-click — Process Lasso ships the same set of actions both ways for
+/// exactly this reason.
+fn render_process_detail(
+    ui: &mut egui::Ui,
+    pid: u32,
+    rows: &[framesage_ipc::ProcessSnapshot],
+    profile_ids: &[String],
+    action_queue: &mut Vec<ProcessAction>,
+    close_flag: &mut bool,
+) {
+    let Some(p) = rows.iter().find(|p| p.pid == pid) else {
+        // PID disappeared between snapshots — auto-close the panel rather
+        // than render a misleading "unknown process" card.
+        *close_flag = true;
+        return;
+    };
+
+    theme::card().show(ui, |ui| {
+        // Title row: exe name + PID badge + close.
+        ui.horizontal(|ui| {
+            ui.heading(&p.exe_name);
+            theme::status_badge(theme::TEXT_MUTED).show(ui, |ui| {
+                ui.colored_label(theme::TEXT_MUTED, format!("pid {}", p.pid));
+            });
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if ui
+                    .small_button("✕")
+                    .on_hover_text("Close detail panel")
+                    .clicked()
+                {
+                    *close_flag = true;
+                }
+            });
+        });
+        ui.add_space(4.0);
+
+        egui::ScrollArea::vertical()
+            .auto_shrink([false, true])
+            .show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    // Left column: metrics.
+                    ui.vertical(|ui| {
+                        detail_kv(ui, "CPU", format!("{} %", p.cpu_percent));
+                        detail_kv(ui, "Memory", format_bytes(p.memory_bytes));
+                        detail_kv(ui, "Threads", p.threads.to_string());
+                        detail_kv(
+                            ui,
+                            "Priority",
+                            priority_class_label(p.priority_class_raw).to_string(),
+                        );
+                        detail_kv(ui, "Affinity", format!("{:#018x}", p.affinity_mask));
+                    });
+                    ui.separator();
+                    // Right column: framesage state.
+                    ui.vertical(|ui| {
+                        let profile_text = match &p.managed_profile {
+                            Some(id) => {
+                                if p.matched_rule_note.is_some() {
+                                    format!("★ {id}  (Rule)")
+                                } else {
+                                    id.clone()
+                                }
+                            }
+                            None => "—".to_string(),
+                        };
+                        detail_kv(ui, "Profile", profile_text);
+                        let rule_note = p
+                            .matched_rule_note
+                            .as_deref()
+                            .filter(|n| !n.is_empty())
+                            .unwrap_or("—");
+                        detail_kv(ui, "Rule note", rule_note.to_string());
+                        let probal = if p.restrained_by_probalance {
+                            "● restrained"
+                        } else {
+                            "—"
+                        };
+                        detail_kv(ui, "ProBalance", probal.to_string());
+                    });
+                });
+            });
+
+        ui.add_space(6.0);
+        ui.separator();
+        ui.add_space(6.0);
+
+        // Action row — same submenus as the table's right-click context menu.
+        let exe = p.exe_name.clone();
+        let pid = p.pid;
+        ui.horizontal(|ui| {
+            ui.menu_button("Set priority", |ui| {
+                for (label, class) in PRIORITY_CHOICES.iter() {
+                    if ui.button(*label).clicked() {
+                        action_queue.push(ProcessAction::SetPriority { pid, class: *class });
+                        ui.close_menu();
+                    }
+                }
+            });
+            ui.menu_button("Apply profile now", |ui| {
+                for pid_name in profile_ids {
+                    if ui.button(pid_name).clicked() {
+                        action_queue.push(ProcessAction::ApplyProfileForeground {
+                            profile: pid_name.clone(),
+                        });
+                        ui.close_menu();
+                    }
+                }
+            });
+            ui.menu_button("Create rule for this exe", |ui| {
+                for pid_name in profile_ids {
+                    if ui.button(pid_name).clicked() {
+                        action_queue.push(ProcessAction::CreateRule {
+                            exe_name: exe.clone(),
+                            profile: pid_name.clone(),
+                        });
+                        ui.close_menu();
+                    }
+                }
+            });
+        });
+    });
+}
+
+/// Two-line key/value cell for the detail panel. Key in a fixed-width muted
+/// font on top, value in the regular body font underneath. Used in
+/// `render_process_detail` so the grid wraps gracefully on narrow windows.
+fn detail_kv(ui: &mut egui::Ui, key: &str, value: String) {
+    ui.vertical(|ui| {
+        ui.label(
+            egui::RichText::new(key.to_uppercase())
+                .small()
+                .strong()
+                .color(theme::TEXT_MUTED)
+                .extra_letter_spacing(1.0),
+        );
+        ui.label(value);
+        ui.add_space(2.0);
+    });
 }
 
 fn format_bytes(b: u64) -> String {
