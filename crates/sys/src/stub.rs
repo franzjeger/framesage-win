@@ -140,6 +140,19 @@ pub mod process {
     }
 }
 
+pub mod process_actions {
+    use super::*;
+    pub fn suspend(_pid: u32) -> Result<()> {
+        Err(anyhow!("framesage-sys: not supported on this host"))
+    }
+    pub fn resume(_pid: u32) -> Result<()> {
+        Err(anyhow!("framesage-sys: not supported on this host"))
+    }
+    pub fn terminate(_pid: u32) -> Result<()> {
+        Err(anyhow!("framesage-sys: not supported on this host"))
+    }
+}
+
 pub mod version_info {
     use super::Result;
 

@@ -93,6 +93,18 @@ pub enum Request {
         pid: u32,
         class: framesage_core::PriorityClass,
     },
+    /// Freeze every thread of `pid` via `NtSuspendProcess`. Same primitive
+    /// Game Mode's `suspend_processes` action uses, exposed for one-off
+    /// right-click use against any live PID. Idempotent — repeated calls
+    /// stack into the suspend counter, but `ResumeProcess` resets to zero.
+    SuspendProcess { pid: u32 },
+    /// Release a previous suspend via `NtResumeProcess`. Safe on a process
+    /// that isn't currently suspended — returns success.
+    ResumeProcess { pid: u32 },
+    /// Force-terminate `pid` via `TerminateProcess(handle, 1)`. The tray
+    /// gates this behind a confirm dialog; the service performs no further
+    /// confirmation — by the time the request arrives the user is committed.
+    TerminateProcess { pid: u32 },
 }
 
 impl Request {
@@ -115,7 +127,10 @@ impl Request {
             | Request::Pause
             | Request::Resume
             | Request::GameModeOff
-            | Request::SetProcessPriority { .. } => false,
+            | Request::SetProcessPriority { .. }
+            | Request::SuspendProcess { .. }
+            | Request::ResumeProcess { .. }
+            | Request::TerminateProcess { .. } => false,
         }
     }
 
@@ -336,6 +351,9 @@ mod tests {
             class: framesage_core::PriorityClass::Normal,
         }
         .is_read_only());
+        assert!(!Request::SuspendProcess { pid: 1 }.is_read_only());
+        assert!(!Request::ResumeProcess { pid: 1 }.is_read_only());
+        assert!(!Request::TerminateProcess { pid: 1 }.is_read_only());
         assert!(!Request::SetPolicy {
             policy: sample_policy()
         }
