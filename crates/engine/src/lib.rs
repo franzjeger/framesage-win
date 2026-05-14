@@ -165,6 +165,76 @@ impl Engine {
         Self::revert_system_mode_locked(&mut s, &self.journal);
     }
 
+    /// Apply a named profile to the currently-foregrounded process,
+    /// overriding the normal rule matcher. The override holds until the
+    /// foreground changes — at the next focus change, `tick`'s reconcile
+    /// path will pick the rule-matched profile for whatever's new.
+    ///
+    /// Used by the CLI's `framesage apply <profile>` and the tray's
+    /// "Apply now" per-profile button. Errors if no foreground exists or
+    /// if the profile id isn't in the active policy.
+    pub fn apply_once(&self, profile_id: ProfileId) -> Result<()> {
+        let foreground = framesage_sys::foreground::current()?
+            .ok_or_else(|| anyhow::anyhow!("no foreground process to apply to"))?;
+        let mut s = self.state.write();
+
+        if s.paused {
+            return Err(anyhow::anyhow!(
+                "engine is paused; resume before apply_once"
+            ));
+        }
+
+        let profile = s
+            .policy
+            .profile(&profile_id)
+            .ok_or_else(|| anyhow::anyhow!("unknown profile id {profile_id}"))?
+            .clone();
+
+        // Revert anything we'd previously applied to this same PID (whether
+        // the prior profile was the same or different) so we have a clean
+        // slate to apply onto.
+        if let Some(record) = s.applied.remove(&foreground.pid) {
+            revert_record(foreground.pid, record);
+        }
+
+        let topology = s.topology.clone();
+        let snapshot = ForegroundSnapshot {
+            pid: foreground.pid,
+            exe_name: foreground.exe_name.clone(),
+            path: foreground.path.clone(),
+            title: foreground.title.clone(),
+        };
+
+        let record = apply_profile(foreground.pid, &profile, &topology)?;
+        info!(
+            pid = foreground.pid,
+            exe = %foreground.exe_name,
+            profile = %profile_id,
+            "apply_once",
+        );
+        s.applied.insert(foreground.pid, record);
+        s.current_foreground = Some(foreground.pid);
+        s.foreground_snapshot = Some(snapshot.clone());
+        s.active_profile = Some(profile_id.clone());
+        let _ = self.events.send(Event::ForegroundChanged {
+            foreground: snapshot,
+            profile: profile_id.clone(),
+        });
+
+        // System mode reconcile — handles entering/exiting/swapping
+        // Game Mode actions according to the new profile.
+        let new_actions = profile.game_mode.clone();
+        Self::reconcile_system_mode_locked(
+            &mut s,
+            &self.journal,
+            self.safe_list,
+            &profile_id,
+            new_actions,
+        );
+
+        Ok(())
+    }
+
     /// Run on startup: if a journal file exists from a previous (possibly
     /// crashed) session, revert it before we apply anything new. Idempotent.
     pub fn recover_orphan_journal(&self) {

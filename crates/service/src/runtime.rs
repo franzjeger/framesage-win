@@ -331,10 +331,20 @@ async fn handle_client(
                 }
                 write_response(&mut write_half, &Response::Ok).await?;
             }
-            Request::ApplyOnce { profile: _ } => {
-                // TODO(v0.2): one-shot profile apply on the current foreground.
-                write_response(&mut write_half, &Response::Ok).await?;
-            }
+            Request::ApplyOnce { profile } => match engine.apply_once(profile) {
+                Ok(()) => {
+                    write_response(&mut write_half, &Response::Ok).await?;
+                }
+                Err(e) => {
+                    write_response(
+                        &mut write_half,
+                        &Response::Error {
+                            message: format!("apply_once failed: {e:#}"),
+                        },
+                    )
+                    .await?;
+                }
+            },
             Request::Pause => {
                 engine.pause();
                 write_response(&mut write_half, &Response::Ok).await?;

@@ -753,6 +753,7 @@ impl FramesageApp {
             // much larger than the other variants. Clippy enforces this so
             // we don't pay the cost on every Op enum value.
             UpdateProfile(String, Box<Profile>),
+            ApplyNow(String),
         }
         let mut ops: Vec<Op> = Vec::new();
 
@@ -794,6 +795,22 @@ impl FramesageApp {
                             if is_editing && ui.button("Done").clicked() {
                                 ops.push(Op::ExitEdit);
                             }
+                            // Apply-now: send ApplyOnce(id) over the admin
+                            // pipe. Disabled in edit mode (the user should
+                            // Save first) and on the already-active profile
+                            // (no-op vs. the normal rule-match path).
+                            let apply_enabled =
+                                self.elevated && !is_editing && self.rules.form.is_none();
+                            if ui
+                                .add_enabled(apply_enabled, egui::Button::new("Apply now"))
+                                .on_hover_text(
+                                    "Apply this profile to the current foreground process. \
+                                     Overrides the rule matcher until focus changes.",
+                                )
+                                .clicked()
+                            {
+                                ops.push(Op::ApplyNow(id.0.clone()));
+                            }
                         });
                         if is_editing {
                             let mut edited = p.clone();
@@ -822,6 +839,14 @@ impl FramesageApp {
                 Op::UpdateProfile(id, new_profile) => {
                     let draft = self.policy_draft.get_or_insert_with(|| s.policy.clone());
                     draft.profiles.insert(ProfileId(id), *new_profile);
+                }
+                Op::ApplyNow(id) => {
+                    self.send_admin_request(
+                        Request::ApplyOnce {
+                            profile: ProfileId(id.clone()),
+                        },
+                        "apply now",
+                    );
                 }
             }
         }
