@@ -192,18 +192,90 @@ impl Engine {
         s.manual_override = Some(profile_id.clone());
         if changed {
             info!(profile = %profile_id, "manual override set");
+            self.force_recompute_active_profile_locked(&mut s);
         }
         Ok(())
     }
 
     /// Leave manual mode. Idempotent — no-op if manual mode was already off.
-    /// Does not revert any currently-applied per-PID state; the next focus
-    /// change picks up the rule-matched profile via the normal path.
+    /// On change, immediately re-evaluates the current foreground's profile
+    /// (rule-match or default) and runs the full reconcile so the system
+    /// reverts Game Mode + restores the previous-profile knobs without
+    /// waiting for a focus change. This closes a bug where exiting manual
+    /// mode while focused on the same window left the taskbar hidden.
     pub fn clear_manual_override(&self) {
         let mut s = self.state.write();
         if s.manual_override.take().is_some() {
             info!("manual override cleared");
+            self.force_recompute_active_profile_locked(&mut s);
         }
+    }
+
+    /// Re-evaluate the current foreground's profile and re-apply it
+    /// end-to-end (per-process + Game Mode), bypassing the
+    /// "new_pid == current_foreground" early-return in `reconcile`.
+    ///
+    /// Called from anywhere that changes the *answer* to "what profile
+    /// should the current foreground get" without changing the foreground
+    /// PID itself — most prominently the manual-override set/clear paths.
+    /// Without this, those paths only took effect at the next focus
+    /// change, which stranded Game Mode state (taskbar hidden, services
+    /// stopped, …) until the user happened to alt-tab.
+    fn force_recompute_active_profile_locked(&self, s: &mut EngineState) {
+        let Some(prev_pid) = s.current_foreground else {
+            return;
+        };
+        let Some(snapshot) = s.foreground_snapshot.clone() else {
+            return;
+        };
+
+        // Revert old per-PID state so the new apply captures a clean prev.
+        if let Some(record) = s.applied.remove(&prev_pid) {
+            revert_record(prev_pid, record);
+        }
+
+        // Resolve the new profile via the same precedence the tick path
+        // uses: manual override wins, else first-match rule, else default.
+        let profile_id = match &s.manual_override {
+            Some(ov) => ov.clone(),
+            None => s
+                .policy
+                .match_foreground(&snapshot.exe_name, &snapshot.path, &snapshot.title)
+                .clone(),
+        };
+        let profile = match s.policy.profile(&profile_id) {
+            Some(p) => p.clone(),
+            None => {
+                warn!(profile = %profile_id, "force_recompute: profile id not in policy");
+                return;
+            }
+        };
+
+        let topology = s.topology.clone();
+        match apply_profile(prev_pid, &profile, &topology) {
+            Ok(record) => {
+                info!(pid = prev_pid, profile = %profile_id, "force_recompute applied");
+                s.applied.insert(prev_pid, record);
+            }
+            Err(e) => {
+                warn!(pid = prev_pid, error = %e, "force_recompute apply failed");
+            }
+        }
+        s.active_profile = Some(profile_id.clone());
+        let _ = self.events.send(Event::ForegroundChanged {
+            foreground: snapshot,
+            profile: profile_id.clone(),
+        });
+
+        // Reconcile system-wide Game Mode against the new profile.
+        let new_actions = profile.game_mode.clone();
+        Self::reconcile_system_mode_locked(
+            s,
+            &self.journal,
+            self.safe_list,
+            &profile_id,
+            new_actions,
+        );
     }
 
     /// Panic button: revert any active system mode regardless of foreground.
