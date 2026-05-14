@@ -926,6 +926,7 @@ dependencies = [
  "framesage-core",
  "framesage-gamemode",
  "framesage-ipc",
+ "framesage-sys",
  "serde_json",
  "tokio",
  "tracing",

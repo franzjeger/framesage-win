@@ -219,6 +219,7 @@ fn detect_topology() -> Result<framesage_core::CpuTopology> {
                 ccd,
                 kind,
                 cppc_rank: Some(100 - core),
+                l3_cache_bytes: None,
                 is_smt_sibling: smt == 1,
             });
         }

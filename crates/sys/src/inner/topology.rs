@@ -1,5 +1,6 @@
 //! Detect CPU topology via `GetLogicalProcessorInformationEx`, then enrich
-//! each logical CPU with a coarse perf rank from `CallNtPowerInformation`.
+//! each logical CPU with a coarse perf rank from `CallNtPowerInformation` and
+//! the L3 cache size servicing its CCD.
 //!
 //! Notes on what this code does and doesn't do today:
 //!
@@ -8,23 +9,24 @@
 //!   group 0 only — anything beyond is a v0.2 concern.
 //! * **CPPC ranks.** We read `PROCESSOR_POWER_INFORMATION` via
 //!   `CallNtPowerInformation(ProcessorInformation, …)` and use `MaxMhz` as the
-//!   per-CPU rank. That's not a true CPPC perf-class read (which lives in
-//!   MSRs not cleanly exposed to user-mode), but it's a high-quality proxy:
-//!   P-cores beat E-cores, non-X3D CCDs beat X3D CCDs, and within a CCD the
-//!   ranks order cleanly by silicon quality.
-//! * **X3D / Cache CCD detection.** Once ranks are populated, we use the
-//!   per-CCD max rank: when there are exactly two CCDs and one is a clear
-//!   margin slower, retag the slower CCD's cores as `CoreKind::Cache`. This
-//!   is what makes `CpuSelector::Kind(CoreKind::Cache)` work on a real X3D
-//!   machine without manual configuration.
+//!   per-CPU rank. On AMD Ryzen `MaxMhz` is the *ACPI base spec* — uniform
+//!   across both CCDs on a 9950X3D, so it's useless for X3D detection (we
+//!   verified this on real hardware). On Intel hybrid the same field does
+//!   discriminate P vs E cores. We populate it anyway so `TopRanked(N)` has
+//!   data to work with where it can.
+//! * **L3 cache size per CCD.** The reliable X3D signal. The X3D CCD's L3 is
+//!   ~3x the non-X3D CCD's (96 MB vs 32 MB). We enumerate L3 caches via
+//!   `GetLogicalProcessorInformationEx(RelationCache, …)`, stamp each logical
+//!   CPU with the size of its CCD's L3, and `retag_ccds_from_signals` uses
+//!   the size differential to mark the larger-L3 CCD as `CoreKind::Cache`.
 //! * **Intel hybrid (P/E split)** is *not* detected here yet — the proper
 //!   signal is `PROCESSOR_RELATIONSHIP::EfficiencyClass`, a v0.2 task.
 
 use anyhow::{anyhow, Result};
 use tracing::{debug, warn};
 use windows::Win32::System::SystemInformation::{
-    GetLogicalProcessorInformationEx, RelationProcessorCore, LOGICAL_PROCESSOR_RELATIONSHIP,
-    SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX,
+    GetLogicalProcessorInformationEx, RelationCache, RelationProcessorCore, CACHE_RELATIONSHIP,
+    LOGICAL_PROCESSOR_RELATIONSHIP, SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX,
 };
 
 use framesage_core::{CoreKind, CpuTopology, LogicalCpu};
@@ -32,8 +34,9 @@ use framesage_core::{CoreKind, CpuTopology, LogicalCpu};
 use super::cppc;
 
 /// Enumerate logical processors and their physical-core groupings, then enrich
-/// with CPPC ranks and retag the X3D CCD if we can spot it from the rank
-/// distribution.
+/// each `LogicalCpu` with its CPPC rank (from `PROCESSOR_POWER_INFORMATION`)
+/// and its CCD's L3 cache size (from `RelationCache` enumeration). Finally
+/// `retag_ccds_from_signals` uses those signals to identify the X3D CCD.
 ///
 /// The OS reports each physical core as one record with a bitmask of its
 /// logical processors. We expand those into `LogicalCpu` entries and assign
@@ -58,6 +61,7 @@ pub fn detect() -> Result<CpuTopology> {
                 ccd,
                 kind: CoreKind::Performance,
                 cppc_rank: None,
+                l3_cache_bytes: None,
                 is_smt_sibling: sibling_idx > 0,
             });
             next_index += 1;
@@ -84,18 +88,100 @@ pub fn detect() -> Result<CpuTopology> {
             );
         }
         Err(e) => {
-            warn!(error = %e, "CPPC readout failed; TopRanked / X3D detection will degrade");
+            warn!(error = %e, "CPPC readout failed; TopRanked will degrade");
+        }
+    }
+
+    // Enrich with per-CPU L3 cache size. This is the load-bearing signal for
+    // X3D detection on AMD; rank alone is insufficient (see module docs).
+    match enumerate_l3_caches() {
+        Ok(l3_caches) => {
+            for (mask, size) in &l3_caches {
+                for cpu in &mut cpus {
+                    if mask & (1u64 << cpu.index) != 0 {
+                        cpu.l3_cache_bytes = Some(*size);
+                    }
+                }
+            }
+            debug!(
+                caches = l3_caches.len(),
+                "L3 cache sizes populated from RelationCache enumeration"
+            );
+        }
+        Err(e) => {
+            warn!(error = %e, "L3 cache enumeration failed; X3D detection will fall back to CPPC ranks");
         }
     }
 
     let mut topo = CpuTopology { cpus };
-    topo.retag_ccds_from_ranks();
+    topo.retag_ccds_from_signals();
     Ok(topo)
 }
 
 struct PhysicalCore {
     /// Logical processor indices (within group 0) that share this core.
     logical_processors: Vec<u32>,
+}
+
+/// Walk `GetLogicalProcessorInformationEx(RelationCache, …)` and return one
+/// `(group0_mask, size_bytes)` for each L3 cache the OS reports.
+///
+/// We only consider group 0 for parity with the rest of this module; multi-
+/// group machines lose their other groups' caches here (same caveat as core
+/// enumeration).
+fn enumerate_l3_caches() -> Result<Vec<(u64, u32)>> {
+    let mut buf_size: u32 = 0;
+    // SAFETY: null buffer + 0 size; documented to return ERROR_INSUFFICIENT_BUFFER
+    // with the required size in `buf_size`.
+    let _ = unsafe { GetLogicalProcessorInformationEx(RelationCache, None, &mut buf_size) };
+    if buf_size == 0 {
+        return Err(anyhow!(
+            "GetLogicalProcessorInformationEx(RelationCache) returned zero size"
+        ));
+    }
+
+    let mut buf: Vec<u8> = vec![0; buf_size as usize];
+    // SAFETY: buf has buf_size bytes; the API writes a sequence of variable-
+    // length records.
+    unsafe {
+        GetLogicalProcessorInformationEx(
+            RelationCache,
+            Some(buf.as_mut_ptr() as *mut SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX),
+            &mut buf_size,
+        )
+    }
+    .map_err(|e| anyhow!("GetLogicalProcessorInformationEx(RelationCache) failed: {e}"))?;
+
+    let mut caches = Vec::new();
+    let mut offset = 0usize;
+    while offset < buf_size as usize {
+        // SAFETY: `offset` is in bounds; each record's `Size` field tells us
+        // how many bytes it occupies.
+        let info = unsafe {
+            &*(buf.as_ptr().add(offset) as *const SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX)
+        };
+        let size = info.Size as usize;
+        if size == 0 || offset + size > buf_size as usize {
+            break;
+        }
+        if info.Relationship == LOGICAL_PROCESSOR_RELATIONSHIP(RelationCache.0) {
+            // SAFETY: we just checked `Relationship == RelationCache`.
+            let cache: CACHE_RELATIONSHIP = unsafe { info.Anonymous.Cache };
+            if cache.Level == 3 {
+                // SAFETY: GroupMask is valid for at least one entry (the
+                // single-group variant). Multi-group L3 doesn't exist on
+                // current consumer silicon — if it ever does we lose the
+                // other groups here, same scope cut as enumerate_cores.
+                let mask = unsafe { cache.Anonymous.GroupMask };
+                if mask.Group == 0 {
+                    caches.push((mask.Mask as u64, cache.CacheSize));
+                }
+            }
+        }
+        offset += size;
+    }
+
+    Ok(caches)
 }
 
 fn enumerate_cores() -> Result<Vec<PhysicalCore>> {

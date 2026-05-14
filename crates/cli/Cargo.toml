@@ -25,3 +25,4 @@ serde_json = { workspace = true }
 
 [target.'cfg(windows)'.dependencies]
 windows-service = { workspace = true }
+framesage-sys = { workspace = true }

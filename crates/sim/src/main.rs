@@ -346,6 +346,7 @@ fn mk_single_ccd(cores: u32, kind: CoreKind) -> CpuTopology {
                 ccd: 0,
                 kind,
                 cppc_rank: Some(120 - c),
+                l3_cache_bytes: None,
                 is_smt_sibling: smt == 1,
             });
         }
@@ -365,6 +366,7 @@ fn mk_dual_ccd(cache_cores: u32, perf_cores: u32, smt: bool) -> CpuTopology {
                 ccd: 0,
                 kind: CoreKind::Cache,
                 cppc_rank: Some(95 - c),
+                l3_cache_bytes: None,
                 is_smt_sibling: s == 1,
             });
             idx += 1;
@@ -378,6 +380,7 @@ fn mk_dual_ccd(cache_cores: u32, perf_cores: u32, smt: bool) -> CpuTopology {
                 ccd: 1,
                 kind: CoreKind::Performance,
                 cppc_rank: Some(130 - c),
+                l3_cache_bytes: None,
                 is_smt_sibling: s == 1,
             });
             idx += 1;
@@ -398,6 +401,7 @@ fn mk_intel_hybrid(p_cores: u32, e_cores: u32) -> CpuTopology {
                 ccd: 0,
                 kind: CoreKind::Performance,
                 cppc_rank: Some(140 - c),
+                l3_cache_bytes: None,
                 is_smt_sibling: s == 1,
             });
             idx += 1;
@@ -411,6 +415,7 @@ fn mk_intel_hybrid(p_cores: u32, e_cores: u32) -> CpuTopology {
             ccd: 0,
             kind: CoreKind::Efficiency,
             cppc_rank: Some(70 - c),
+            l3_cache_bytes: None,
             is_smt_sibling: false,
         });
         idx += 1;

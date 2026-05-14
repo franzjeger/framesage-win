@@ -9,7 +9,7 @@ use anyhow::{anyhow, Context, Result};
 use clap::{Parser, Subcommand};
 use tracing::info;
 
-use framesage_core::ProfileId;
+use framesage_core::{CoreKind, ProfileId};
 use framesage_ipc::{Request, Response, StatusSnapshot};
 
 const SERVICE_NAME: &str = "framesage";
@@ -55,6 +55,11 @@ enum Cmd {
         /// Profile id, e.g. `game-x3d`.
         profile: String,
     },
+    /// Print the CPU topology as detected by `framesage-sys` on this machine
+    /// — number of logical CPUs, per-CCD layout, kind (Performance / Cache /
+    /// Efficiency), CPPC ranks, SMT siblings. Useful for verifying that X3D
+    /// detection picked the right CCD on a new chip.
+    Topology,
     /// Game Mode controls — status, panic-off, safe-list inspection.
     #[command(subcommand)]
     GameMode(GameModeCmd),
@@ -91,6 +96,7 @@ fn main() -> Result<()> {
             })
             .await
         }),
+        Cmd::Topology => print_topology(),
         Cmd::GameMode(sub) => match sub {
             GameModeCmd::Status => tokio_block(async { print_game_mode_status().await }),
             GameModeCmd::Off => tokio_block(async { send_simple(Request::GameModeOff).await }),
@@ -100,6 +106,66 @@ fn main() -> Result<()> {
             }
         },
     }
+}
+
+#[cfg(windows)]
+fn print_topology() -> Result<()> {
+    let topo = framesage_sys::topology::detect().context("topology::detect failed")?;
+    println!("logical cpus: {}", topo.cpus.len());
+
+    let mut ccds: Vec<u8> = topo.ccds().collect();
+    ccds.sort_unstable();
+    for ccd in &ccds {
+        let cpus: Vec<_> = topo.cpus_on_ccd(*ccd).collect();
+        let cache = cpus.iter().filter(|c| c.kind == CoreKind::Cache).count();
+        let perf = cpus
+            .iter()
+            .filter(|c| c.kind == CoreKind::Performance)
+            .count();
+        let eff = cpus
+            .iter()
+            .filter(|c| c.kind == CoreKind::Efficiency)
+            .count();
+        let top_rank = cpus.iter().filter_map(|c| c.cppc_rank).max();
+        let l3 = cpus.iter().filter_map(|c| c.l3_cache_bytes).max();
+        println!(
+            "ccd {}: {} cpus  (perf={} cache={} eff={})  top_rank={}  l3={}",
+            ccd,
+            cpus.len(),
+            perf,
+            cache,
+            eff,
+            top_rank
+                .map(|r| r.to_string())
+                .unwrap_or_else(|| "—".into()),
+            l3.map(|b| format!("{} MB", b / (1024 * 1024)))
+                .unwrap_or_else(|| "—".into()),
+        );
+    }
+
+    println!();
+    for cpu in &topo.cpus {
+        println!(
+            "  cpu{:2}  core={:2}  ccd={}  kind={:?}  rank={:?}  l3={}  smt={}",
+            cpu.index,
+            cpu.physical_core,
+            cpu.ccd,
+            cpu.kind,
+            cpu.cppc_rank,
+            cpu.l3_cache_bytes
+                .map(|b| format!("{}MB", b / (1024 * 1024)))
+                .unwrap_or_else(|| "—".into()),
+            cpu.is_smt_sibling
+        );
+    }
+    Ok(())
+}
+
+#[cfg(not(windows))]
+fn print_topology() -> Result<()> {
+    Err(anyhow!(
+        "topology detection is Windows-only; use `framesage-sim topology` for the cross-platform dev view"
+    ))
 }
 
 fn print_safe_list() {
