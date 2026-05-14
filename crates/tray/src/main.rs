@@ -411,7 +411,7 @@ impl FramesageApp {
         }
 
         ui.separator();
-        ui.heading("recent events");
+        ui.heading("Recent events");
         egui::ScrollArea::vertical().show(ui, |ui| {
             for label in recent {
                 ui.label(label);
@@ -693,13 +693,17 @@ impl FramesageApp {
         // ─── Toolbar ────────────────────────────────────────────────────────
         ui.horizontal(|ui| {
             let active_id = s.active_profile.as_ref().map(|p| p.id.0.as_str());
-            ui.label("Profiles:");
-            ui.label(format!("default = {}", displayed_policy.default_profile));
+            ui.label(egui::RichText::new("Default:").weak());
+            ui.label(displayed_policy.default_profile.to_string());
             if let Some(bg) = &displayed_policy.background_profile {
-                ui.label(format!("background = {bg}"));
+                ui.label(egui::RichText::new("·").weak());
+                ui.label(egui::RichText::new("Background:").weak());
+                ui.label(bg.to_string());
             }
             if let Some(active) = active_id {
-                ui.label(format!("active = {active}"));
+                ui.label(egui::RichText::new("·").weak());
+                ui.label(egui::RichText::new("Active:").weak());
+                ui.label(active);
             }
         });
         ui.horizontal(|ui| {
@@ -880,38 +884,38 @@ fn render_profile_body(ui: &mut egui::Ui, p: &Profile) {
             ui,
             "Power throttling",
             p.power_throttling
-                .map(|v| format!("{v:?}"))
+                .map(|v| v.to_string())
                 .unwrap_or_else(|| "—".to_owned()),
         );
         kv_row(
             ui,
             "Priority class",
             p.priority_class
-                .map(|v| format!("{v:?}"))
+                .map(|v| v.to_string())
                 .unwrap_or_else(|| "—".to_owned()),
         );
         kv_row(
             ui,
             "I/O priority",
             p.io_priority
-                .map(|v| format!("{v:?}"))
+                .map(|v| v.to_string())
                 .unwrap_or_else(|| "—".to_owned()),
         );
         kv_row(
             ui,
             "Memory priority",
             p.memory_priority
-                .map(|v| format!("{v:?}"))
+                .map(|v| v.to_string())
                 .unwrap_or_else(|| "—".to_owned()),
         );
-        kv_row(ui, "Trim working set", p.trim_working_set.to_string());
+        kv_row(ui, "Trim working set", yes_no(p.trim_working_set).into());
     });
 
     if let Some(gm) = &p.game_mode {
         ui.add_space(4.0);
         ui.group(|ui| {
             ui.heading("Game Mode (system-wide)");
-            kv_row(ui, "Hide taskbar", gm.hide_taskbar.to_string());
+            kv_row(ui, "Hide taskbar", yes_no(gm.hide_taskbar).into());
             kv_row(
                 ui,
                 "Stop services",
@@ -935,28 +939,24 @@ fn render_profile_body(ui: &mut egui::Ui, p: &Profile) {
                 "Power plan",
                 gm.power_plan
                     .as_ref()
-                    .map(|p| format!("{p:?}"))
+                    .map(|p| p.to_string())
                     .unwrap_or_else(|| "—".to_owned()),
             );
             kv_row(
                 ui,
                 "Focus assist",
                 gm.focus_assist
-                    .map(|m| format!("{m:?} (stub)"))
+                    .map(|m| format!("{m} (stub)"))
                     .unwrap_or_else(|| "—".to_owned()),
             );
             kv_row(
                 ui,
                 "Pause Windows Update",
-                format!(
-                    "{}{}",
-                    gm.pause_windows_update,
-                    if gm.pause_windows_update {
-                        " (stub)"
-                    } else {
-                        ""
-                    }
-                ),
+                if gm.pause_windows_update {
+                    "Yes (stub)".to_owned()
+                } else {
+                    "No".to_owned()
+                },
             );
         });
     } else {
@@ -965,6 +965,16 @@ fn render_profile_body(ui: &mut egui::Ui, p: &Profile) {
             theme::TEXT_MUTED,
             "Game Mode: not requested by this profile.",
         );
+    }
+}
+
+/// Human label for booleans shown to users. Used in the read-only profile
+/// viewer where `true`/`false` reads as developer output, not as a setting.
+fn yes_no(b: bool) -> &'static str {
+    if b {
+        "Yes"
+    } else {
+        "No"
     }
 }
 
@@ -1004,7 +1014,7 @@ fn render_profile_editor(ui: &mut egui::Ui, p: &mut Profile) {
                 PowerThrottlingMode::Performance,
                 PowerThrottlingMode::SystemDefault,
             ],
-            |v| format!("{v:?}"),
+            |v| v.to_string(),
         );
         option_combo(
             ui,
@@ -1017,7 +1027,7 @@ fn render_profile_editor(ui: &mut egui::Ui, p: &mut Profile) {
                 PriorityClass::AboveNormal,
                 PriorityClass::High,
             ],
-            |v| format!("{v:?}"),
+            |v| v.to_string(),
         );
         option_combo(
             ui,
@@ -1030,7 +1040,7 @@ fn render_profile_editor(ui: &mut egui::Ui, p: &mut Profile) {
                 IoPriority::High,
                 IoPriority::Critical,
             ],
-            |v| format!("{v:?}"),
+            |v| v.to_string(),
         );
         option_combo(
             ui,
@@ -1043,7 +1053,7 @@ fn render_profile_editor(ui: &mut egui::Ui, p: &mut Profile) {
                 MemoryPriority::BelowNormal,
                 MemoryPriority::Normal,
             ],
-            |v| format!("{v:?}"),
+            |v| v.to_string(),
         );
         ui.horizontal(|ui| {
             ui.add_sized(
@@ -1107,7 +1117,7 @@ fn game_mode_editor(ui: &mut egui::Ui, gm: &mut GameModeActions) {
             FocusAssistMode::PriorityOnly,
             FocusAssistMode::AlarmsOnly,
         ],
-        |v| format!("{v:?} (stub)"),
+        |v| format!("{v} (stub)"),
     );
 
     string_list_edit(
@@ -1244,13 +1254,13 @@ fn option_combo<T>(
             egui::Label::new(egui::RichText::new(label).monospace().weak()),
         );
         let selected_text = match current {
-            None => "<unset>".to_owned(),
+            None => "—".to_owned(),
             Some(v) => fmt(v),
         };
         egui::ComboBox::from_id_source(("option-combo", label))
             .selected_text(selected_text)
             .show_ui(ui, |ui| {
-                ui.selectable_value(current, None, "<unset>");
+                ui.selectable_value(current, None, "— (unset)");
                 for v in variants {
                     ui.selectable_value(current, Some(*v), fmt(v));
                 }
@@ -1260,9 +1270,9 @@ fn option_combo<T>(
 
 fn format_cpu_selector(sel: Option<&CpuSelector>) -> String {
     match sel {
-        None => "<unset>".to_owned(),
+        None => "—".to_owned(),
         Some(CpuSelector::All) => "All cores".to_owned(),
-        Some(CpuSelector::Kind(k)) => format!("Kind: {k:?}"),
+        Some(CpuSelector::Kind(k)) => k.to_string(),
         Some(CpuSelector::Ccd(c)) => format!("CCD {c}"),
         Some(CpuSelector::CcdNot(c)) => format!("Everything except CCD {c}"),
         Some(CpuSelector::TopRanked(n)) => format!("Top {n} by CPPC rank"),
@@ -1300,9 +1310,9 @@ impl CpuSelectorKind {
 
     fn label(self) -> &'static str {
         match self {
-            Self::Unset => "<unset>",
+            Self::Unset => "— (unset)",
             Self::All => "All cores",
-            Self::Kind => "Kind (Performance/Efficiency/Cache)",
+            Self::Kind => "By core kind",
             Self::Ccd => "CCD by index",
             Self::CcdNot => "Everything except CCD",
             Self::TopRanked => "Top N by CPPC rank",
@@ -1365,11 +1375,19 @@ fn cpu_selector_edit(ui: &mut egui::Ui, label: &str, sel: &mut Option<CpuSelecto
             None | Some(CpuSelector::All) => {}
             Some(CpuSelector::Kind(k)) => {
                 egui::ComboBox::from_id_source(("cpu-selector-corekind", label))
-                    .selected_text(format!("{k:?}"))
+                    .selected_text(k.to_string())
                     .show_ui(ui, |ui| {
-                        ui.selectable_value(k, CoreKind::Performance, "Performance");
-                        ui.selectable_value(k, CoreKind::Efficiency, "Efficiency");
-                        ui.selectable_value(k, CoreKind::Cache, "Cache");
+                        ui.selectable_value(
+                            k,
+                            CoreKind::Performance,
+                            CoreKind::Performance.to_string(),
+                        );
+                        ui.selectable_value(
+                            k,
+                            CoreKind::Efficiency,
+                            CoreKind::Efficiency.to_string(),
+                        );
+                        ui.selectable_value(k, CoreKind::Cache, CoreKind::Cache.to_string());
                     });
             }
             Some(CpuSelector::Ccd(c)) | Some(CpuSelector::CcdNot(c)) => {
@@ -1654,7 +1672,8 @@ fn main() -> eframe::Result<()> {
 
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_inner_size([520.0, 480.0])
+            .with_inner_size([640.0, 560.0])
+            .with_min_inner_size([520.0, 420.0])
             .with_title(if elevated {
                 "framesage (admin)"
             } else {

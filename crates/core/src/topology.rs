@@ -23,6 +23,17 @@ pub enum CoreKind {
     Cache,
 }
 
+impl std::fmt::Display for CoreKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let s = match self {
+            Self::Performance => "Performance (P-cores)",
+            Self::Efficiency => "Efficiency (E-cores)",
+            Self::Cache => "Cache (X3D)",
+        };
+        f.write_str(s)
+    }
+}
+
 /// One logical processor as seen by Windows.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LogicalCpu {

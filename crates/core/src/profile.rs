@@ -40,6 +40,19 @@ pub enum IoPriority {
     Critical,
 }
 
+impl std::fmt::Display for IoPriority {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let s = match self {
+            Self::VeryLow => "Very low",
+            Self::Low => "Low",
+            Self::Normal => "Normal",
+            Self::High => "High",
+            Self::Critical => "Critical",
+        };
+        f.write_str(s)
+    }
+}
+
 /// Maps to `PROCESS_INFORMATION_CLASS::ProcessMemoryPriority`. 1..=5. Lower
 /// values get trimmed from the working set first under memory pressure.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -64,6 +77,19 @@ impl MemoryPriority {
     }
 }
 
+impl std::fmt::Display for MemoryPriority {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let s = match self {
+            Self::VeryLow => "Very low",
+            Self::Low => "Low",
+            Self::Medium => "Medium",
+            Self::BelowNormal => "Below normal",
+            Self::Normal => "Normal",
+        };
+        f.write_str(s)
+    }
+}
+
 /// `SetPriorityClass` levels. We don't expose Realtime by default — it can
 /// freeze the desktop and there's almost never a real reason for it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -74,6 +100,19 @@ pub enum PriorityClass {
     Normal,
     AboveNormal,
     High,
+}
+
+impl std::fmt::Display for PriorityClass {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let s = match self {
+            Self::Idle => "Idle",
+            Self::BelowNormal => "Below normal",
+            Self::Normal => "Normal",
+            Self::AboveNormal => "Above normal",
+            Self::High => "High",
+        };
+        f.write_str(s)
+    }
 }
 
 /// Maps to `PROCESS_POWER_THROTTLING_STATE`.
@@ -88,6 +127,17 @@ pub enum PowerThrottlingMode {
     Eco,
     Performance,
     SystemDefault,
+}
+
+impl std::fmt::Display for PowerThrottlingMode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let s = match self {
+            Self::Eco => "Eco (background)",
+            Self::Performance => "Performance (no throttle)",
+            Self::SystemDefault => "System default",
+        };
+        f.write_str(s)
+    }
 }
 
 /// A profile is a set of (optional) policy overrides for a process.
@@ -141,5 +191,33 @@ impl Profile {
             id: id.into(),
             ..Default::default()
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn display_impls_use_human_friendly_labels() {
+        assert_eq!(IoPriority::VeryLow.to_string(), "Very low");
+        assert_eq!(IoPriority::Critical.to_string(), "Critical");
+
+        assert_eq!(MemoryPriority::VeryLow.to_string(), "Very low");
+        assert_eq!(MemoryPriority::BelowNormal.to_string(), "Below normal");
+
+        assert_eq!(PriorityClass::AboveNormal.to_string(), "Above normal");
+        assert_eq!(PriorityClass::BelowNormal.to_string(), "Below normal");
+        assert_eq!(PriorityClass::High.to_string(), "High");
+
+        assert_eq!(PowerThrottlingMode::Eco.to_string(), "Eco (background)");
+        assert_eq!(
+            PowerThrottlingMode::Performance.to_string(),
+            "Performance (no throttle)"
+        );
+        assert_eq!(
+            PowerThrottlingMode::SystemDefault.to_string(),
+            "System default"
+        );
     }
 }

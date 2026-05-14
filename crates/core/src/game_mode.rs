@@ -61,6 +61,17 @@ pub enum FocusAssistMode {
     AlarmsOnly,
 }
 
+impl std::fmt::Display for FocusAssistMode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let s = match self {
+            Self::Off => "Off",
+            Self::PriorityOnly => "Priority only",
+            Self::AlarmsOnly => "Alarms only",
+        };
+        f.write_str(s)
+    }
+}
+
 /// Windows power plan identifier.
 ///
 /// Well-known plans are referenced by name so a profile authored on one
@@ -94,6 +105,18 @@ impl PowerPlanId {
             PowerPlanId::PowerSaver => "a1841308-3541-4fab-bc81-f71556f20b4a",
             PowerPlanId::UltimatePerformance => "e9a42b02-d5df-448d-aa00-03f14749eb61",
             PowerPlanId::Custom(g) => g.as_str(),
+        }
+    }
+}
+
+impl std::fmt::Display for PowerPlanId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            PowerPlanId::Balanced => f.write_str("Balanced"),
+            PowerPlanId::HighPerformance => f.write_str("High performance"),
+            PowerPlanId::PowerSaver => f.write_str("Power saver"),
+            PowerPlanId::UltimatePerformance => f.write_str("Ultimate performance"),
+            PowerPlanId::Custom(g) => write!(f, "Custom ({g})"),
         }
     }
 }
@@ -144,6 +167,25 @@ mod tests {
         let json = serde_json::to_string(&custom).expect("serialize");
         let parsed: PowerPlanId = serde_json::from_str(&json).expect("deserialize");
         assert_eq!(parsed, custom);
+    }
+
+    #[test]
+    fn display_impls_use_human_friendly_labels() {
+        assert_eq!(FocusAssistMode::PriorityOnly.to_string(), "Priority only");
+        assert_eq!(FocusAssistMode::AlarmsOnly.to_string(), "Alarms only");
+        assert_eq!(FocusAssistMode::Off.to_string(), "Off");
+
+        assert_eq!(PowerPlanId::Balanced.to_string(), "Balanced");
+        assert_eq!(PowerPlanId::HighPerformance.to_string(), "High performance");
+        assert_eq!(PowerPlanId::PowerSaver.to_string(), "Power saver");
+        assert_eq!(
+            PowerPlanId::UltimatePerformance.to_string(),
+            "Ultimate performance"
+        );
+        assert_eq!(
+            PowerPlanId::Custom("abc-123".into()).to_string(),
+            "Custom (abc-123)"
+        );
     }
 
     #[test]
