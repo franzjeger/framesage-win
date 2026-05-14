@@ -337,6 +337,52 @@ impl Engine {
         Ok(())
     }
 
+    /// One-shot affinity pin against a live PID. Resolves `selector`
+    /// against the current topology so the caller can say "Kind(Cache)"
+    /// and let us figure out which CPUs are the X3D ones on this box.
+    ///
+    /// Bypasses the profile system intentionally — this is the user's
+    /// override hammer for cases the rule engine can't reach (anti-cheat
+    /// processes that refuse `OpenProcess(PROCESS_SET_INFORMATION)`,
+    /// parent processes the user wants to constrain so children
+    /// inherit at spawn, etc.).
+    pub fn set_process_affinity(
+        &self,
+        pid: u32,
+        selector: framesage_core::CpuSelector,
+    ) -> Result<()> {
+        #[cfg(windows)]
+        {
+            let topology = self.state.read().topology.clone();
+            let indices = topology.resolve(&selector);
+            if indices.is_empty() {
+                return Err(anyhow::anyhow!(
+                    "selector {:?} resolved to no CPUs on this topology",
+                    selector
+                ));
+            }
+            let mut mask: u64 = 0;
+            for idx in indices {
+                if idx < 64 {
+                    mask |= 1u64 << idx;
+                }
+            }
+            if mask == 0 {
+                return Err(anyhow::anyhow!(
+                    "selector {:?} produced an empty mask (all indices >= 64?)",
+                    selector
+                ));
+            }
+            framesage_sys::apply::set_affinity_mask_for_pid(pid, mask)?;
+            info!(pid, mask = format!("{:#x}", mask), "set_process_affinity");
+        }
+        #[cfg(not(windows))]
+        {
+            let _ = (pid, selector);
+        }
+        Ok(())
+    }
+
     /// Hard kill via `TerminateProcess(handle, 1)`. The tray confirms the
     /// user's intent before the request reaches us; the engine performs
     /// no further confirmation. Also strips our internal bookkeeping for

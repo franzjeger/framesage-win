@@ -332,6 +332,29 @@ pub fn set_priority_class_for_pid(pid: u32, class: PriorityClass) -> Result<()> 
     r
 }
 
+/// One-shot affinity-mask write against any live PID, bypassing the
+/// profile system entirely. Backs the Processes tab's right-click
+/// "Set CPU affinity" submenu and the persistent steam-pin workflow
+/// (pin Steam to X3D → BF6 inherits at launch, before its anti-cheat
+/// hooks have anywhere to refuse our calls).
+///
+/// `mask` is the raw Win32 process-affinity bitmap; bit `i` set means
+/// "thread of this process is eligible to run on logical CPU `i`". Zero
+/// is rejected at the kernel level (would leave the process with no
+/// CPU at all), so callers MUST resolve `CpuSelector` to a non-zero
+/// mask before calling.
+pub fn set_affinity_mask_for_pid(pid: u32, mask: u64) -> Result<()> {
+    if mask == 0 {
+        return Err(anyhow!(
+            "refusing to set affinity to 0 (would leave pid {pid} with no CPU)"
+        ));
+    }
+    let handle = open_for_write(pid)?;
+    let r = set_affinity_mask(handle, mask as usize);
+    let _ = unsafe { CloseHandle(handle) };
+    r
+}
+
 /// Restore a priority class from a previously-captured raw Win32 constant
 /// (the value returned by `get_priority_class_for_pid`). Used by ProBalance
 /// when the dwell window expires and the original class must come back.

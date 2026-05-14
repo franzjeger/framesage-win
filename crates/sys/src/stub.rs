@@ -48,6 +48,9 @@ pub mod apply {
     pub fn restore_priority_class_for_pid(_pid: u32, _raw_class: u32) -> Result<()> {
         Ok(())
     }
+    pub fn set_affinity_mask_for_pid(_pid: u32, _mask: u64) -> Result<()> {
+        Err(anyhow!("framesage-sys: not supported on this host"))
+    }
 }
 
 pub mod process {

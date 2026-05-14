@@ -388,6 +388,20 @@ async fn handle_client(
                     .await?;
                 }
             },
+            Request::SetProcessAffinity { pid, selector } => {
+                match engine.set_process_affinity(pid, selector) {
+                    Ok(()) => write_response(&mut write_half, &Response::Ok).await?,
+                    Err(e) => {
+                        write_response(
+                            &mut write_half,
+                            &Response::Error {
+                                message: format!("set_process_affinity(pid={pid}) failed: {e:#}"),
+                            },
+                        )
+                        .await?;
+                    }
+                }
+            }
             Request::SetPolicy { policy } => {
                 // Apply in-memory first so subsequent ticks see the change
                 // immediately, then persist to disk so the edit survives

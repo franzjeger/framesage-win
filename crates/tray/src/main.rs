@@ -147,6 +147,20 @@ struct TerminateConfirm {
     exe_name: String,
 }
 
+/// State for the custom-mask affinity picker modal. Holds the working
+/// mask as the user toggles individual CPUs; Apply turns it into a
+/// `CpuSelector::Mask` IPC. The X3D / non-X3D quick presets in the
+/// context menu don't go through the picker — they dispatch directly
+/// with a `Kind(...)` selector so the engine resolves against the
+/// live topology.
+struct AffinityPicker {
+    pid: u32,
+    exe_name: String,
+    /// Bit `i` set = CPU `i` allowed. Initialised to the process's
+    /// current mask so the user can tweak rather than start fresh.
+    mask: u64,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ProcessSortKey {
     ExeName,
@@ -292,6 +306,10 @@ struct FramesageApp {
     /// from a context-menu click opens the modal; the modal's Confirm /
     /// Cancel buttons clear it and (for Confirm) fire the IPC.
     terminate_confirm: Option<TerminateConfirm>,
+    /// `Some` while the custom-mask affinity picker is open. Opened from
+    /// context-menu → "Set CPU affinity → Custom…". Apply / Cancel
+    /// clear it.
+    affinity_picker: Option<AffinityPicker>,
     /// Per-exe icon cache, populated lazily as rows render. Lives outside
     /// `ProcessesView` because the egui textures it holds want to be reused
     /// across tab switches (cheaper than re-extracting on tab return).
@@ -360,6 +378,7 @@ impl FramesageApp {
             profiles: ProfilesEditor::default(),
             processes: ProcessesView::default(),
             terminate_confirm: None,
+            affinity_picker: None,
             #[cfg(windows)]
             icons: icons::IconCache::new(),
             #[cfg(windows)]
@@ -615,6 +634,8 @@ impl eframe::App for FramesageApp {
         // they're about to kill. `Window` is the standard egui pattern for
         // a transient modal-ish overlay.
         self.render_terminate_confirm_modal(ctx);
+        // Modal: custom-mask affinity picker. Same overlay treatment.
+        self.render_affinity_picker_modal(ctx);
     }
 }
 
@@ -676,6 +697,178 @@ impl FramesageApp {
             self.terminate_confirm = None;
         } else if do_cancel {
             self.terminate_confirm = None;
+        }
+    }
+
+    /// Custom-mask affinity picker. Grid of toggles (one per logical CPU)
+    /// with the X3D / Cache cores highlighted so the user can see which
+    /// half is the gaming side at a glance. Apply fires
+    /// `Request::SetProcessAffinity { selector: Mask(...) }` with the
+    /// composed bitmap; Cancel closes without firing.
+    fn render_affinity_picker_modal(&mut self, ctx: &egui::Context) {
+        let Some(picker) = self.affinity_picker.as_mut() else {
+            return;
+        };
+        let pid = picker.pid;
+        let exe_name = picker.exe_name.clone();
+
+        let mut do_apply = false;
+        let mut do_cancel = false;
+        let mut new_mask = picker.mask;
+
+        // CPU count: prefer per_core_cpu_percent length (live), fall back
+        // to 32 as a sane default.
+        let cpu_count = {
+            let s = self.state.lock().unwrap();
+            let n = s.system.per_core_cpu_percent.len();
+            if n == 0 {
+                32
+            } else {
+                n
+            }
+        };
+        // Heuristic: assume the lower half of CPUs is the X3D / Cache CCD
+        // on AMD dual-CCD parts. Correct for 9950X3D on this hardware
+        // (we verified via L3 cache enumeration in `framesage topology`).
+        // The Kind(Cache) preset uses the actual topology — this
+        // highlight in the picker is just a visual hint.
+        let x3d_lo = 0usize;
+        let x3d_hi = cpu_count / 2;
+
+        egui::Window::new("Set CPU affinity")
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+            .default_width(540.0)
+            .show(ctx, |ui| {
+                ui.label(format!("{exe_name} (pid {pid})"));
+                ui.add_space(4.0);
+                ui.colored_label(
+                    theme::TEXT_MUTED,
+                    "Toggle individual CPUs. Highlighted column = likely X3D CCD.",
+                );
+                ui.add_space(8.0);
+
+                // Quick presets row.
+                ui.horizontal(|ui| {
+                    if ui.button("X3D CCD only").clicked() {
+                        let mut m = 0u64;
+                        for i in x3d_lo..x3d_hi {
+                            if i < 64 {
+                                m |= 1u64 << i;
+                            }
+                        }
+                        new_mask = m;
+                    }
+                    if ui.button("Non-X3D CCD only").clicked() {
+                        let mut m = 0u64;
+                        for i in x3d_hi..cpu_count {
+                            if i < 64 {
+                                m |= 1u64 << i;
+                            }
+                        }
+                        new_mask = m;
+                    }
+                    if ui.button("All cores").clicked() {
+                        let mut m = 0u64;
+                        for i in 0..cpu_count {
+                            if i < 64 {
+                                m |= 1u64 << i;
+                            }
+                        }
+                        new_mask = m;
+                    }
+                    if ui.button("Invert").clicked() {
+                        let mut all = 0u64;
+                        for i in 0..cpu_count {
+                            if i < 64 {
+                                all |= 1u64 << i;
+                            }
+                        }
+                        new_mask ^= all;
+                    }
+                });
+
+                ui.add_space(8.0);
+                ui.separator();
+                ui.add_space(8.0);
+
+                // 16 toggles per row — fits 32 CPUs in two rows, 64 in
+                // four, etc. Each toggle is a tiny labeled checkbox.
+                const PER_ROW: usize = 16;
+                let mut idx = 0usize;
+                while idx < cpu_count {
+                    ui.horizontal(|ui| {
+                        for col in 0..PER_ROW {
+                            let i = idx + col;
+                            if i >= cpu_count {
+                                break;
+                            }
+                            let bit = 1u64 << i.min(63);
+                            let mut on = new_mask & bit != 0;
+                            let in_x3d = i >= x3d_lo && i < x3d_hi;
+                            let label = if in_x3d {
+                                egui::RichText::new(format!("{i}")).color(theme::ACCENT)
+                            } else {
+                                egui::RichText::new(format!("{i}"))
+                            };
+                            if ui.checkbox(&mut on, label).changed() {
+                                if on {
+                                    new_mask |= bit;
+                                } else {
+                                    new_mask &= !bit;
+                                }
+                            }
+                        }
+                    });
+                    idx += PER_ROW;
+                }
+
+                ui.add_space(10.0);
+                ui.horizontal(|ui| {
+                    let count = new_mask.count_ones();
+                    ui.label(format!("Mask: 0x{new_mask:016X}  ({count} cores)"));
+                });
+
+                ui.add_space(10.0);
+                ui.horizontal(|ui| {
+                    if ui.button("Cancel").clicked() {
+                        do_cancel = true;
+                    }
+                    ui.add_space(4.0);
+                    let apply_enabled = new_mask != 0;
+                    let apply_btn = ui.add_enabled(
+                        apply_enabled,
+                        egui::Button::new(
+                            egui::RichText::new("Apply").color(theme::ACCENT).strong(),
+                        ),
+                    );
+                    if apply_btn.clicked() {
+                        do_apply = true;
+                    }
+                    if !apply_enabled {
+                        ui.colored_label(theme::ERROR, "Pick at least one CPU.");
+                    }
+                });
+            });
+
+        // Commit the working mask back to picker state so it persists across
+        // re-renders while the modal is open.
+        if let Some(p) = self.affinity_picker.as_mut() {
+            p.mask = new_mask;
+        }
+
+        if do_apply {
+            self.send_admin_request(
+                Request::SetProcessAffinity {
+                    pid,
+                    selector: framesage_core::CpuSelector::Mask(new_mask as u128),
+                },
+                "set affinity",
+            );
+            self.affinity_picker = None;
+        } else if do_cancel {
+            self.affinity_picker = None;
         }
     }
 
@@ -2326,6 +2519,45 @@ impl FramesageApp {
                                                 }
                                             }
                                         });
+                                        ui.menu_button("Set CPU affinity", |ui| {
+                                            if ui.button("X3D CCD (Cache cores)").clicked() {
+                                                action_queue.push(ProcessAction::SetAffinity {
+                                                    pid,
+                                                    selector: framesage_core::CpuSelector::Kind(
+                                                        framesage_core::CoreKind::Cache,
+                                                    ),
+                                                });
+                                                ui.close_menu();
+                                            }
+                                            if ui
+                                                .button("Non-X3D CCD (Performance cores)")
+                                                .clicked()
+                                            {
+                                                action_queue.push(ProcessAction::SetAffinity {
+                                                    pid,
+                                                    selector: framesage_core::CpuSelector::Kind(
+                                                        framesage_core::CoreKind::Performance,
+                                                    ),
+                                                });
+                                                ui.close_menu();
+                                            }
+                                            if ui.button("All cores (reset)").clicked() {
+                                                action_queue.push(ProcessAction::SetAffinity {
+                                                    pid,
+                                                    selector: framesage_core::CpuSelector::All,
+                                                });
+                                                ui.close_menu();
+                                            }
+                                            if ui.button("Custom…").clicked() {
+                                                action_queue.push(
+                                                    ProcessAction::RequestAffinityPicker {
+                                                        pid,
+                                                        exe_name: exe.clone(),
+                                                    },
+                                                );
+                                                ui.close_menu();
+                                            }
+                                        });
                                         ui.separator();
                                         if ui.button("Suspend process").clicked() {
                                             action_queue.push(ProcessAction::Suspend { pid });
@@ -2642,6 +2874,29 @@ impl FramesageApp {
                     // The modal's "Confirm" click is what actually terminates.
                     self.terminate_confirm = Some(TerminateConfirm { pid, exe_name });
                 }
+                ProcessAction::SetAffinity { pid, selector } => {
+                    self.send_admin_request(
+                        Request::SetProcessAffinity { pid, selector },
+                        "set affinity",
+                    );
+                }
+                ProcessAction::RequestAffinityPicker { pid, exe_name } => {
+                    // Pre-populate the picker with the process's CURRENT mask
+                    // so the user can tweak rather than start from scratch.
+                    // Default to all cores if we can't read the live mask.
+                    let initial_mask = self
+                        .processes
+                        .rows
+                        .iter()
+                        .find(|p| p.pid == pid)
+                        .map(|p| p.affinity_mask)
+                        .unwrap_or(!0u64);
+                    self.affinity_picker = Some(AffinityPicker {
+                        pid,
+                        exe_name,
+                        mask: initial_mask,
+                    });
+                }
             }
         }
     }
@@ -2699,6 +2954,20 @@ enum ProcessAction {
     /// Captured separately from `Suspend` / `Resume` because we never want
     /// a misclick to nuke a process.
     RequestTerminate {
+        pid: u32,
+        exe_name: String,
+    },
+    /// One-shot affinity pin using a topology-aware selector (Kind(Cache)
+    /// for X3D, Kind(Performance) for non-X3D, All for reset, etc.).
+    /// Engine resolves against live `CpuTopology`.
+    SetAffinity {
+        pid: u32,
+        selector: framesage_core::CpuSelector,
+    },
+    /// Opens the custom-mask affinity picker modal for `pid`. The modal's
+    /// Apply button is what fires the actual `SetAffinity` IPC with the
+    /// user-built mask.
+    RequestAffinityPicker {
         pid: u32,
         exe_name: String,
     },
@@ -3093,6 +3362,36 @@ fn render_process_detail(
                         });
                         ui.close_menu();
                     }
+                }
+            });
+            ui.menu_button("Set affinity", |ui| {
+                if ui.button("X3D CCD").clicked() {
+                    action_queue.push(ProcessAction::SetAffinity {
+                        pid,
+                        selector: framesage_core::CpuSelector::Kind(
+                            framesage_core::CoreKind::Cache,
+                        ),
+                    });
+                }
+                if ui.button("Non-X3D CCD").clicked() {
+                    action_queue.push(ProcessAction::SetAffinity {
+                        pid,
+                        selector: framesage_core::CpuSelector::Kind(
+                            framesage_core::CoreKind::Performance,
+                        ),
+                    });
+                }
+                if ui.button("All cores").clicked() {
+                    action_queue.push(ProcessAction::SetAffinity {
+                        pid,
+                        selector: framesage_core::CpuSelector::All,
+                    });
+                }
+                if ui.button("Custom…").clicked() {
+                    action_queue.push(ProcessAction::RequestAffinityPicker {
+                        pid,
+                        exe_name: exe.clone(),
+                    });
                 }
             });
             ui.separator();
