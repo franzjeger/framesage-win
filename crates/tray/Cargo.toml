@@ -17,6 +17,7 @@ framesage-core = { workspace = true }
 framesage-ipc = { workspace = true }
 eframe = { workspace = true }
 egui = { workspace = true }
+egui_extras = { workspace = true }
 tokio = { workspace = true }
 anyhow = { workspace = true }
 tracing = { workspace = true }

@@ -64,13 +64,28 @@ pub mod process {
         }
     }
 
+    #[derive(Debug, Clone, Copy)]
+    pub struct PidSnapshot {
+        pub pid: u32,
+        pub thread_count: u32,
+    }
+
     pub fn iter_pids() -> Result<Vec<u32>> {
+        Ok(Vec::new())
+    }
+    pub fn iter_pid_snapshots() -> Result<Vec<PidSnapshot>> {
         Ok(Vec::new())
     }
     pub fn exe_for_pid(_pid: u32) -> Result<Option<String>> {
         Ok(None)
     }
     pub fn cpu_times(_pid: u32) -> Result<Option<ProcessCpuTimes>> {
+        Ok(None)
+    }
+    pub fn working_set_bytes(_pid: u32) -> Result<Option<u64>> {
+        Ok(None)
+    }
+    pub fn affinity_mask(_pid: u32) -> Result<Option<u64>> {
         Ok(None)
     }
 }

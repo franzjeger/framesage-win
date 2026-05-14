@@ -40,6 +40,9 @@ struct AppState {
     last_error: Option<String>,
     status: Option<StatusSnapshot>,
     recent: Vec<RecentEvent>,
+    /// Latest snapshot of all processes from the service. Refreshed by
+    /// `processes_poll_loop` at ~1 Hz. Empty until the first poll completes.
+    processes: Vec<framesage_ipc::ProcessSnapshot>,
 }
 
 struct RecentEvent {
@@ -62,8 +65,38 @@ struct TrayCommands {
 enum Tab {
     #[default]
     Status,
+    Processes,
     Rules,
     Profiles,
+}
+
+/// Live state for the Processes tab. Polled from the engine in the
+/// background thread (along with the existing status poll); rendered by the
+/// UI thread without holding the network for any longer than a clone.
+#[derive(Default)]
+struct ProcessesView {
+    /// Most recent snapshot from `Request::ListProcesses`. Replaced wholesale
+    /// each refresh — no diffing.
+    rows: Vec<framesage_ipc::ProcessSnapshot>,
+    /// Substring filter on exe name (case-insensitive, stripped on render).
+    filter: String,
+    /// Column the user picked to sort by. `None` = original order from
+    /// the engine (which itself is whatever order ToolHelp returned).
+    sort_by: Option<ProcessSortKey>,
+    /// Descending if true, else ascending. Toggled by clicking the same
+    /// column header twice.
+    sort_desc: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ProcessSortKey {
+    ExeName,
+    Pid,
+    Cpu,
+    Memory,
+    Threads,
+    Priority,
+    Profile,
 }
 
 /// State for the Rules-tab inline editor. Holds only the open form; the
@@ -139,6 +172,8 @@ struct FramesageApp {
     rules: RulesEditor,
     /// Profiles-tab editor state.
     profiles: ProfilesEditor,
+    /// Processes-tab live view + UI state (filter, sort).
+    processes: ProcessesView,
     /// Holding the tray icon for its lifetime — drop = icon disappears.
     /// `#[allow(dead_code)]` because we never read it after construction;
     /// the field exists purely to extend the icon's lifetime to match the
@@ -173,6 +208,17 @@ impl FramesageApp {
             .spawn(foreground_reporter_loop)
             .expect("spawn foreground reporter thread");
 
+        // Processes-tab data source: one-shot `Request::ListProcesses` once
+        // per second. Separate from the long-lived Subscribe connection in
+        // `background_loop` so the event stream stays open and the snapshot
+        // poll can use the status pipe's short-lived semantics.
+        let proc_state = state.clone();
+        let proc_ctx = cc.egui_ctx.clone();
+        std::thread::Builder::new()
+            .name("framesage-tray-processes-poller".into())
+            .spawn(move || processes_poll_loop(proc_state, proc_ctx))
+            .expect("spawn processes poller thread");
+
         // The tray runs in a separate thread; pass an egui::Context clone so
         // the menu/click handlers can wake the runtime. Without this, hiding
         // the window parks the message loop and tray clicks fall on the floor
@@ -189,6 +235,7 @@ impl FramesageApp {
             policy_draft: None,
             rules: RulesEditor::default(),
             profiles: ProfilesEditor::default(),
+            processes: ProcessesView::default(),
             #[cfg(windows)]
             tray,
         }
@@ -204,7 +251,9 @@ impl FramesageApp {
         std::thread::spawn(move || {
             let result = send_request_blocking(framesage_ipc::PIPE_NAME_ADMIN, &req);
             let msg = match result {
-                Ok(Response::Ok) | Ok(Response::Status(_)) => format!("{label}: ok"),
+                Ok(Response::Ok) | Ok(Response::Status(_)) | Ok(Response::Processes { .. }) => {
+                    format!("{label}: ok")
+                }
                 Ok(Response::Error { message }) => format!("{label}: error — {message}"),
                 Err(e) => format!("{label}: error — {e}"),
             };
@@ -297,6 +346,7 @@ impl eframe::App for FramesageApp {
                     ui.separator();
                     ui.add_space(4.0);
                     ui.selectable_value(&mut self.tab, Tab::Status, "Status");
+                    ui.selectable_value(&mut self.tab, Tab::Processes, "Processes");
                     ui.selectable_value(&mut self.tab, Tab::Rules, "Rules");
                     ui.selectable_value(&mut self.tab, Tab::Profiles, "Profiles");
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -341,6 +391,7 @@ impl FramesageApp {
     ) {
         match self.tab {
             Tab::Status => self.render_status_tab(ctx, ui, status, recent),
+            Tab::Processes => self.render_processes_tab(ui, status),
             Tab::Rules => self.render_rules_tab(ui, status),
             Tab::Profiles => self.render_profiles_tab(ui, status),
         }
@@ -1257,6 +1308,343 @@ impl FramesageApp {
                 }
             }
         }
+    }
+
+    /// Processes tab — live table of every process, with filter + sort +
+    /// per-row context menu. The main day-to-day view; mirrors the mental
+    /// model of every other process supervisor (Task Manager, Process Lasso,
+    /// Process Explorer).
+    ///
+    /// Data source is `AppState.processes`, refreshed at ~1 Hz by
+    /// `processes_poll_loop`. The render path holds the lock only long
+    /// enough to take a `Vec` snapshot — long-running sort + table walk
+    /// happens against the local copy.
+    fn render_processes_tab(&mut self, ui: &mut egui::Ui, status: &Option<StatusSnapshot>) {
+        use egui_extras::{Column, TableBuilder};
+
+        // ─── Toolbar: filter, sort hint, row count ─────────────────────────
+        ui.horizontal(|ui| {
+            ui.label("Filter:");
+            ui.add(
+                egui::TextEdit::singleline(&mut self.processes.filter)
+                    .hint_text("type to filter by exe name")
+                    .desired_width(220.0),
+            );
+            if ui.button("Clear").clicked() {
+                self.processes.filter.clear();
+            }
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                let count = self.processes.rows.len();
+                ui.label(format!("{count} processes"));
+            });
+        });
+        ui.add_space(4.0);
+
+        // ─── Apply filter + sort to a local view ───────────────────────────
+        let filter_lc = self.processes.filter.to_ascii_lowercase();
+        let mut rows: Vec<framesage_ipc::ProcessSnapshot> = self
+            .processes
+            .rows
+            .iter()
+            .filter(|p| {
+                filter_lc.is_empty() || p.exe_name.to_ascii_lowercase().contains(&filter_lc)
+            })
+            .cloned()
+            .collect();
+        if let Some(sort_by) = self.processes.sort_by {
+            rows.sort_by(|a, b| {
+                let ord = match sort_by {
+                    ProcessSortKey::ExeName => a
+                        .exe_name
+                        .to_ascii_lowercase()
+                        .cmp(&b.exe_name.to_ascii_lowercase()),
+                    ProcessSortKey::Pid => a.pid.cmp(&b.pid),
+                    ProcessSortKey::Cpu => a.cpu_percent.cmp(&b.cpu_percent),
+                    ProcessSortKey::Memory => a.memory_bytes.cmp(&b.memory_bytes),
+                    ProcessSortKey::Threads => a.threads.cmp(&b.threads),
+                    ProcessSortKey::Priority => a.priority_class_raw.cmp(&b.priority_class_raw),
+                    ProcessSortKey::Profile => a.managed_profile.cmp(&b.managed_profile),
+                };
+                if self.processes.sort_desc {
+                    ord.reverse()
+                } else {
+                    ord
+                }
+            });
+        }
+
+        // ─── Pull the profile id list so the context menu can offer them ──
+        let profile_ids: Vec<String> = status
+            .as_ref()
+            .map(|s| s.policy.profiles.keys().map(|p| p.0.clone()).collect())
+            .unwrap_or_default();
+        let mut profile_ids = profile_ids;
+        profile_ids.sort();
+
+        // ─── Table ─────────────────────────────────────────────────────────
+        //
+        // egui_extras::TableBuilder handles virtualised rows so a 500-row
+        // process list stays cheap even with the per-row context menu.
+        let mut action_queue: Vec<ProcessAction> = Vec::new();
+        TableBuilder::new(ui)
+            .striped(true)
+            .resizable(true)
+            .cell_layout(egui::Layout::left_to_right(egui::Align::Center))
+            .column(Column::initial(220.0).at_least(120.0)) // Exe
+            .column(Column::initial(60.0).at_least(50.0)) // PID
+            .column(Column::initial(60.0).at_least(45.0)) // CPU%
+            .column(Column::initial(85.0).at_least(60.0)) // Memory
+            .column(Column::initial(55.0).at_least(45.0)) // Threads
+            .column(Column::initial(85.0).at_least(60.0)) // Priority
+            .column(Column::initial(110.0).at_least(70.0)) // Affinity
+            .column(Column::initial(100.0).at_least(70.0)) // Profile
+            .column(Column::remainder().at_least(70.0)) // Status
+            .header(22.0, |mut header| {
+                header.col(|ui| self.sortable_header(ui, "Process", ProcessSortKey::ExeName));
+                header.col(|ui| self.sortable_header(ui, "PID", ProcessSortKey::Pid));
+                header.col(|ui| self.sortable_header(ui, "CPU %", ProcessSortKey::Cpu));
+                header.col(|ui| self.sortable_header(ui, "Memory", ProcessSortKey::Memory));
+                header.col(|ui| self.sortable_header(ui, "Threads", ProcessSortKey::Threads));
+                header.col(|ui| self.sortable_header(ui, "Priority", ProcessSortKey::Priority));
+                header.col(|ui| {
+                    ui.label("Affinity");
+                });
+                header.col(|ui| self.sortable_header(ui, "Profile", ProcessSortKey::Profile));
+                header.col(|ui| {
+                    ui.label("Status");
+                });
+            })
+            .body(|body| {
+                body.rows(20.0, rows.len(), |mut row| {
+                    let p = &rows[row.index()];
+                    let pid = p.pid;
+                    let exe = p.exe_name.clone();
+
+                    row.col(|ui| {
+                        let resp = ui.label(&p.exe_name);
+                        // Right-click anywhere on the name opens the per-PID
+                        // context menu — same affordance Process Explorer uses.
+                        resp.context_menu(|ui| {
+                            ui.label(format!("{} (pid {})", &exe, pid));
+                            ui.separator();
+                            ui.menu_button("Set priority", |ui| {
+                                for (label, class) in PRIORITY_CHOICES.iter() {
+                                    if ui.button(*label).clicked() {
+                                        action_queue.push(ProcessAction::SetPriority {
+                                            pid,
+                                            class: *class,
+                                        });
+                                        ui.close_menu();
+                                    }
+                                }
+                            });
+                            ui.menu_button("Apply profile now", |ui| {
+                                for pid_name in &profile_ids {
+                                    if ui.button(pid_name).clicked() {
+                                        action_queue.push(ProcessAction::ApplyProfileForeground {
+                                            profile: pid_name.clone(),
+                                        });
+                                        ui.close_menu();
+                                    }
+                                }
+                            });
+                            ui.menu_button("Create rule for this exe", |ui| {
+                                for pid_name in &profile_ids {
+                                    if ui.button(pid_name).clicked() {
+                                        action_queue.push(ProcessAction::CreateRule {
+                                            exe_name: exe.clone(),
+                                            profile: pid_name.clone(),
+                                        });
+                                        ui.close_menu();
+                                    }
+                                }
+                            });
+                        });
+                    });
+                    row.col(|ui| {
+                        ui.monospace(p.pid.to_string());
+                    });
+                    row.col(|ui| {
+                        ui.monospace(format!("{}", p.cpu_percent));
+                    });
+                    row.col(|ui| {
+                        ui.monospace(format_bytes(p.memory_bytes));
+                    });
+                    row.col(|ui| {
+                        ui.monospace(p.threads.to_string());
+                    });
+                    row.col(|ui| {
+                        ui.label(priority_class_label(p.priority_class_raw));
+                    });
+                    row.col(|ui| {
+                        ui.monospace(format!("{:#x}", p.affinity_mask));
+                    });
+                    row.col(|ui| match &p.managed_profile {
+                        Some(id) => {
+                            ui.colored_label(theme::ACCENT, id);
+                        }
+                        None => {
+                            ui.weak("—");
+                        }
+                    });
+                    row.col(|ui| {
+                        if p.restrained_by_probalance {
+                            ui.colored_label(theme::WARNING, "ProBalance");
+                        } else if let Some(note) = &p.matched_rule_note {
+                            if note.is_empty() {
+                                ui.weak("rule");
+                            } else {
+                                ui.weak(note);
+                            }
+                        } else {
+                            ui.weak("—");
+                        }
+                    });
+                });
+            });
+
+        // ─── Dispatch context-menu actions outside the render closure ─────
+        for action in action_queue {
+            match action {
+                ProcessAction::SetPriority { pid: _, class } => {
+                    // Best-effort: route through ApplyOnce with a tiny ad-hoc
+                    // profile would require an IPC mutator we don't yet
+                    // expose for arbitrary PIDs. For now, show in last_action
+                    // so the user sees we registered the click; a follow-up
+                    // commit adds `Request::SetProcessPriority { pid, class }`.
+                    *self.last_action.lock().unwrap() = Some(format!(
+                        "Set priority {class:?} — per-PID IPC pending (use Apply profile in the meantime)"
+                    ));
+                }
+                ProcessAction::ApplyProfileForeground { profile } => {
+                    self.send_admin_request(
+                        Request::ApplyOnce {
+                            profile: ProfileId(profile),
+                        },
+                        "apply profile",
+                    );
+                }
+                ProcessAction::CreateRule { exe_name, profile } => {
+                    if let Some(s) = status {
+                        // Take a snapshot of the policy we'd send before any
+                        // mutable borrows on self happen, then issue the IPC
+                        // call. This avoids the borrow-checker complaining
+                        // about overlapping borrows of self.policy_draft and
+                        // self.send_admin_request.
+                        let new_policy = {
+                            let draft = self.policy_draft.get_or_insert_with(|| s.policy.clone());
+                            let already = draft.rules.iter().any(|r| match &r.r#match {
+                                AppMatch::ExeName(n) => n.eq_ignore_ascii_case(&exe_name),
+                                _ => false,
+                            });
+                            if already {
+                                None
+                            } else {
+                                draft.rules.push(AppRule {
+                                    r#match: AppMatch::ExeName(exe_name.clone()),
+                                    profile: ProfileId(profile),
+                                    note: String::new(),
+                                });
+                                Some(draft.clone())
+                            }
+                        };
+                        match new_policy {
+                            Some(p) => {
+                                self.send_admin_request(
+                                    Request::SetPolicy { policy: p },
+                                    "create rule",
+                                );
+                            }
+                            None => {
+                                *self.last_action.lock().unwrap() =
+                                    Some(format!("Rule for {exe_name} already exists"));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// Header cell that toggles the sort key on click. Shows ▲ / ▼ on the
+    /// active column.
+    fn sortable_header(&mut self, ui: &mut egui::Ui, label: &str, key: ProcessSortKey) {
+        let active = self.processes.sort_by == Some(key);
+        let suffix = if !active {
+            ""
+        } else if self.processes.sort_desc {
+            " ▼"
+        } else {
+            " ▲"
+        };
+        if ui
+            .add(egui::Label::new(format!("{label}{suffix}")).sense(egui::Sense::click()))
+            .clicked()
+        {
+            if active {
+                self.processes.sort_desc = !self.processes.sort_desc;
+            } else {
+                self.processes.sort_by = Some(key);
+                self.processes.sort_desc = !matches!(
+                    key,
+                    ProcessSortKey::ExeName | ProcessSortKey::Pid | ProcessSortKey::Profile
+                );
+            }
+        }
+    }
+}
+
+/// Pending context-menu click captured during the render pass; dispatched
+/// after the render closure releases its borrow on `self`.
+enum ProcessAction {
+    /// Placeholder — IPC for per-PID priority change is in the next commit.
+    /// Captured so the menu click flow is wired end-to-end already.
+    SetPriority {
+        #[allow(dead_code)]
+        pid: u32,
+        class: PriorityClass,
+    },
+    ApplyProfileForeground {
+        profile: String,
+    },
+    CreateRule {
+        exe_name: String,
+        profile: String,
+    },
+}
+
+/// (display label, enum value) pairs used by the per-row priority submenu.
+/// Order matches Task Manager's "Set priority" — high to low — which is
+/// what users expect.
+const PRIORITY_CHOICES: &[(&str, PriorityClass)] = &[
+    ("High", PriorityClass::High),
+    ("Above Normal", PriorityClass::AboveNormal),
+    ("Normal", PriorityClass::Normal),
+    ("Below Normal", PriorityClass::BelowNormal),
+    ("Idle (lowest)", PriorityClass::Idle),
+];
+
+fn priority_class_label(raw: u32) -> &'static str {
+    match raw {
+        0x0000_0040 => "Idle",
+        0x0000_4000 => "BelowNormal",
+        0x0000_0020 => "Normal",
+        0x0000_8000 => "AboveNormal",
+        0x0000_0080 => "High",
+        0x0000_0100 => "Realtime",
+        _ => "—",
+    }
+}
+
+fn format_bytes(b: u64) -> String {
+    if b >= 1024 * 1024 * 1024 {
+        format!("{:.1} GB", b as f64 / (1024.0 * 1024.0 * 1024.0))
+    } else if b >= 1024 * 1024 {
+        format!("{} MB", b / (1024 * 1024))
+    } else if b >= 1024 {
+        format!("{} KB", b / 1024)
+    } else {
+        format!("{b} B")
     }
 }
 
@@ -2430,6 +2818,56 @@ fn background_loop(state: Arc<Mutex<AppState>>) {
 /// Deliberately tolerant of transient pipe failures: if the service
 /// isn't running yet (we start before it does on logon), we silently
 /// retry on the next tick. No backoff is needed — every 250ms is fine
+/// Poll `Request::ListProcesses` over the status pipe every 1 s and push
+/// the result into `AppState.processes`. Wakes the egui runtime each
+/// refresh so the Processes tab updates even when no other input arrives.
+#[cfg(windows)]
+fn processes_poll_loop(state: Arc<Mutex<AppState>>, ctx: egui::Context) {
+    let interval = std::time::Duration::from_millis(1000);
+    loop {
+        match send_list_processes_blocking() {
+            Ok(snapshots) => {
+                state.lock().unwrap().processes = snapshots;
+                ctx.request_repaint();
+            }
+            Err(_) => {
+                // Service down or pipe busy — skip this tick. The connect
+                // status drives the UI's "Disconnected" pill via the
+                // existing background_loop; no need to surface the failure
+                // here too.
+            }
+        }
+        std::thread::sleep(interval);
+    }
+}
+
+#[cfg(windows)]
+fn send_list_processes_blocking() -> anyhow::Result<Vec<framesage_ipc::ProcessSnapshot>> {
+    use std::fs::OpenOptions;
+    use std::io::{BufRead, BufReader, Write};
+
+    let pipe = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(framesage_ipc::PIPE_NAME_STATUS)?;
+    let mut writer = pipe.try_clone()?;
+    let mut reader = BufReader::new(pipe);
+
+    let mut buf = serde_json::to_vec(&framesage_ipc::Request::ListProcesses)?;
+    buf.push(b'\n');
+    writer.write_all(&buf)?;
+    writer.flush()?;
+
+    let mut line = String::new();
+    reader.read_line(&mut line)?;
+    match serde_json::from_str::<framesage_ipc::Response>(&line)? {
+        framesage_ipc::Response::Processes { snapshots } => Ok(snapshots),
+        other => Err(anyhow::anyhow!(
+            "expected Processes response, got {other:?}"
+        )),
+    }
+}
+
 /// even if the service is down for minutes.
 #[cfg(windows)]
 fn foreground_reporter_loop() {

@@ -44,6 +44,49 @@ impl ProcessCpuTimes {
     }
 }
 
+/// Tuple of `(pid, thread_count)` snapshot from a single ToolHelp pass.
+/// Cheaper than calling `iter_pids` then opening each PID for thread count
+/// separately — ToolHelp already populated `cntThreads` for free.
+#[derive(Debug, Clone, Copy)]
+pub struct PidSnapshot {
+    pub pid: u32,
+    pub thread_count: u32,
+}
+
+/// Snapshot every running process plus its thread count via ToolHelp. The
+/// thread count comes from the same struct ToolHelp populates for `iter_pids`
+/// — no extra OpenProcess required, which matters when the Processes tab
+/// re-snapshots ~200 processes every second.
+pub fn iter_pid_snapshots() -> Result<Vec<PidSnapshot>> {
+    let snap = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) }
+        .map_err(|e| anyhow!("CreateToolhelp32Snapshot failed: {e}"))?;
+    if snap == INVALID_HANDLE_VALUE {
+        return Err(anyhow!(
+            "CreateToolhelp32Snapshot returned INVALID_HANDLE_VALUE"
+        ));
+    }
+    let mut entry = PROCESSENTRY32W {
+        dwSize: std::mem::size_of::<PROCESSENTRY32W>() as u32,
+        ..Default::default()
+    };
+    let mut out = Vec::with_capacity(256);
+    let first_ok = unsafe { Process32FirstW(snap, &mut entry) }.is_ok();
+    if first_ok {
+        out.push(PidSnapshot {
+            pid: entry.th32ProcessID,
+            thread_count: entry.cntThreads,
+        });
+        while unsafe { Process32NextW(snap, &mut entry) }.is_ok() {
+            out.push(PidSnapshot {
+                pid: entry.th32ProcessID,
+                thread_count: entry.cntThreads,
+            });
+        }
+    }
+    close_handle(snap);
+    Ok(out)
+}
+
 /// Snapshot every running process and return their PIDs.
 ///
 /// Includes PID 0 (System Idle) and PID 4 (System) — callers that want only
@@ -152,6 +195,52 @@ pub fn cpu_times(pid: u32) -> Result<Option<ProcessCpuTimes>> {
 
 fn filetime_to_u64(ft: &FILETIME) -> u64 {
     ((ft.dwHighDateTime as u64) << 32) | (ft.dwLowDateTime as u64)
+}
+
+/// Live working-set size in bytes via `GetProcessMemoryInfo`. `None` if the
+/// PID is gone or we can't open it for query.
+pub fn working_set_bytes(pid: u32) -> Result<Option<u64>> {
+    use windows::Win32::System::ProcessStatus::{GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS};
+    if pid == 0 {
+        return Ok(None);
+    }
+    let handle = match unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid) } {
+        Ok(h) => h,
+        Err(_) => return Ok(None),
+    };
+    let mut counters = PROCESS_MEMORY_COUNTERS::default();
+    let size = std::mem::size_of::<PROCESS_MEMORY_COUNTERS>() as u32;
+    // SAFETY: handle valid; counters out-param valid; size matches struct.
+    let r = unsafe { GetProcessMemoryInfo(handle, &mut counters, size) };
+    close_handle(handle);
+    match r {
+        Ok(()) => Ok(Some(counters.WorkingSetSize as u64)),
+        Err(_) => Ok(None),
+    }
+}
+
+/// Live process affinity mask via `GetProcessAffinityMask`. `None` if the
+/// PID is gone or we can't open it for query. Returns just the process mask
+/// (we discard the system mask — callers that need it can take their own
+/// snapshot).
+pub fn affinity_mask(pid: u32) -> Result<Option<u64>> {
+    use windows::Win32::System::Threading::GetProcessAffinityMask;
+    if pid == 0 {
+        return Ok(None);
+    }
+    let handle = match unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid) } {
+        Ok(h) => h,
+        Err(_) => return Ok(None),
+    };
+    let mut process_mask: usize = 0;
+    let mut system_mask: usize = 0;
+    // SAFETY: handle valid; both out-params valid.
+    let r = unsafe { GetProcessAffinityMask(handle, &mut process_mask, &mut system_mask) };
+    close_handle(handle);
+    match r {
+        Ok(()) => Ok(Some(process_mask as u64)),
+        Err(_) => Ok(None),
+    }
 }
 
 fn close_handle(h: HANDLE) {

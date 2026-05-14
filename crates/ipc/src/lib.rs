@@ -81,6 +81,10 @@ pub enum Request {
     /// Subscribe to live status events. The server keeps the connection open
     /// and streams `Event` records.
     Subscribe,
+    /// Return a snapshot of every visible process plus the engine's view of
+    /// how each maps onto our state (rule match, profile applied, ProBalance
+    /// restraint). Read-only — backs the tray's Processes tab.
+    ListProcesses,
 }
 
 impl Request {
@@ -93,7 +97,7 @@ impl Request {
     /// current variant by name.
     pub fn is_read_only(&self) -> bool {
         match self {
-            Request::Status | Request::Subscribe => true,
+            Request::Status | Request::Subscribe | Request::ListProcesses => true,
             Request::SetPolicy { .. }
             | Request::ApplyOnce { .. }
             | Request::SetManualOverride { .. }
@@ -125,9 +129,44 @@ pub enum Response {
     /// other variants — clippy enforces this so we don't blow the response
     /// enum's stack footprint on every reply.
     Status(Box<StatusSnapshot>),
+    Processes {
+        snapshots: Vec<ProcessSnapshot>,
+    },
     Error {
         message: String,
     },
+}
+
+/// One row of the Processes tab's live view. Sent over IPC, so all fields
+/// are owned + serialisable.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProcessSnapshot {
+    pub pid: u32,
+    /// Image filename only (no path), original case as the kernel reports.
+    pub exe_name: String,
+    /// Live `GetPriorityClass` value (raw Win32 constant).
+    pub priority_class_raw: u32,
+    /// Live `GetProcessAffinityMask` value. `u64` so we can grow past 32 CPUs.
+    pub affinity_mask: u64,
+    /// "% of one logical CPU" over the engine's last sample window. 0 if
+    /// the engine hasn't sampled the process yet (e.g. just spawned).
+    pub cpu_percent: u16,
+    /// Working set, bytes.
+    pub memory_bytes: u64,
+    /// Thread count.
+    pub threads: u32,
+    /// Note text from the rule that matched this exe, if any. `None` means
+    /// no rule matched and the engine is treating it as background.
+    pub matched_rule_note: Option<String>,
+    /// Profile id the engine has currently applied to this PID, if any.
+    /// `None` means the engine isn't tracking the PID (no rule match AND
+    /// not seen yet by the background scan).
+    pub managed_profile: Option<String>,
+    /// `true` if ProBalance currently has this PID restrained (priority
+    /// class lowered for contention relief). Mutually exclusive with
+    /// `managed_profile` in normal operation — ProBalance skips managed
+    /// PIDs by design.
+    pub restrained_by_probalance: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -207,6 +246,7 @@ mod tests {
     fn is_read_only_classifies_every_request_variant() {
         assert!(Request::Status.is_read_only());
         assert!(Request::Subscribe.is_read_only());
+        assert!(Request::ListProcesses.is_read_only());
         assert!(!Request::SetPolicy {
             policy: sample_policy()
         }

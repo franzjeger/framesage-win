@@ -44,7 +44,7 @@ use framesage_gamemode::{
     safe_list::SafeList,
     state::{AppliedActions, PreviousState, SuspendedProcessSnapshot},
 };
-use framesage_ipc::{Event, ForegroundSnapshot, StatusSnapshot};
+use framesage_ipc::{Event, ForegroundSnapshot, ProcessSnapshot, StatusSnapshot};
 
 /// Dependencies the engine needs at construction. Passing as a struct keeps
 /// the call sites readable (we already have policy + topology, and now journal
@@ -98,6 +98,14 @@ struct EngineState {
     /// Populated when `probalance::decide` returns `Decision::Restrain`,
     /// drained on `Decision::Restore`.
     probalance_restrained: HashMap<u32, probalance::RestrainedRecord>,
+    /// Per-PID CPU-time snapshot from the previous call to
+    /// `list_process_snapshots`. Independent of `probalance_prev_samples`
+    /// because the Processes tab needs CPU% whether or not the user has
+    /// ProBalance enabled. Updated on every IPC `ListProcesses` request.
+    list_processes_prev_samples: HashMap<u32, u64>,
+    /// Wall-clock instant matching `list_processes_prev_samples`. Used to
+    /// turn CPU-time deltas into a % of one logical CPU.
+    list_processes_last_sample_at: Option<Instant>,
     /// Manual mode: when set, every foreground reconcile applies this
     /// profile instead of consulting Rules. Stays set across focus
     /// changes until explicitly cleared via `clear_manual_override` /
@@ -198,6 +206,8 @@ impl Engine {
                 probalance_prev_samples: HashMap::new(),
                 probalance_last_sample_at: None,
                 probalance_restrained: HashMap::new(),
+                list_processes_prev_samples: HashMap::new(),
+                list_processes_last_sample_at: None,
                 manual_override: None,
                 reported_foreground: None,
                 foreground_reporter_seen: false,
@@ -247,6 +257,126 @@ impl Engine {
             foreground: s.foreground_snapshot.clone(),
             active_profile,
             manual_override: s.manual_override.clone(),
+        }
+    }
+
+    /// Collect a snapshot row for every visible process. Backs the tray's
+    /// Processes tab. Self-contained: opens its own handles, manages its own
+    /// per-PID CPU-time history so the % is computed even when ProBalance is
+    /// disabled.
+    ///
+    /// Costs ~1 ToolHelp snapshot + 4 `OpenProcess`/`CloseHandle` pairs per
+    /// PID (priority, affinity, mem, cpu_times). On a 200-process machine
+    /// that's ~800 syscalls per call — fine at 1 Hz from the tray, not fine
+    /// at 100 Hz, which is why the tray polls.
+    pub fn list_process_snapshots(&self) -> Vec<ProcessSnapshot> {
+        #[cfg(not(windows))]
+        return Vec::new();
+        #[cfg(windows)]
+        {
+            let now = Instant::now();
+            let mut s = self.state.write();
+            let elapsed = match s.list_processes_last_sample_at {
+                Some(prev) => now.duration_since(prev),
+                None => Duration::ZERO,
+            };
+            let elapsed_100ns = elapsed
+                .as_secs()
+                .saturating_mul(10_000_000)
+                .saturating_add(elapsed.subsec_nanos() as u64 / 100);
+            s.list_processes_last_sample_at = Some(now);
+
+            let pid_snapshots = match framesage_sys::process::iter_pid_snapshots() {
+                Ok(v) => v,
+                Err(e) => {
+                    warn!(error = %e, "list_process_snapshots: iter_pid_snapshots failed");
+                    return Vec::new();
+                }
+            };
+
+            let mut new_prev: HashMap<u32, u64> = HashMap::with_capacity(pid_snapshots.len());
+            let mut out: Vec<ProcessSnapshot> = Vec::with_capacity(pid_snapshots.len());
+
+            for ps in &pid_snapshots {
+                let pid = ps.pid;
+                if pid == 0 {
+                    continue;
+                }
+
+                // exe path → bare filename
+                let exe_name = match framesage_sys::process::exe_for_pid(pid) {
+                    Ok(Some(path)) => path.rsplit(['\\', '/']).next().unwrap_or(&path).to_owned(),
+                    Ok(None) | Err(_) => continue,
+                };
+
+                let priority_class_raw = framesage_sys::apply::get_priority_class_for_pid(pid)
+                    .ok()
+                    .flatten()
+                    .unwrap_or(0);
+
+                let affinity_mask = framesage_sys::process::affinity_mask(pid)
+                    .ok()
+                    .flatten()
+                    .unwrap_or(0);
+
+                let memory_bytes = framesage_sys::process::working_set_bytes(pid)
+                    .ok()
+                    .flatten()
+                    .unwrap_or(0);
+
+                let total_cpu = framesage_sys::process::cpu_times(pid)
+                    .ok()
+                    .flatten()
+                    .map(|t| t.total_100ns())
+                    .unwrap_or(0);
+                let cpu_percent: u16 = if elapsed_100ns > 0 {
+                    let prev = s
+                        .list_processes_prev_samples
+                        .get(&pid)
+                        .copied()
+                        .unwrap_or(0);
+                    if prev == 0 {
+                        0 // first time we see this PID — no delta yet
+                    } else {
+                        let delta = total_cpu.saturating_sub(prev);
+                        ((delta as u128).saturating_mul(100) / elapsed_100ns as u128)
+                            .min(u16::MAX as u128) as u16
+                    }
+                } else {
+                    0
+                };
+                new_prev.insert(pid, total_cpu);
+
+                // Rule match: ask the policy matcher. We don't have window
+                // title here (no foreground info for arbitrary PIDs), so
+                // title-based rules won't fire on the Processes view — that's
+                // fine, they're inherently foreground-scoped.
+                let rule_note = s
+                    .policy
+                    .rules
+                    .iter()
+                    .find(|r| r.r#match.matches(&exe_name, &exe_name, ""))
+                    .map(|r| r.note.clone());
+
+                let managed_profile = s.applied.get(&pid).map(|r| r.profile_id.0.clone());
+                let restrained_by_probalance = s.probalance_restrained.contains_key(&pid);
+
+                out.push(ProcessSnapshot {
+                    pid,
+                    exe_name,
+                    priority_class_raw,
+                    affinity_mask,
+                    cpu_percent,
+                    memory_bytes,
+                    threads: ps.thread_count,
+                    matched_rule_note: rule_note,
+                    managed_profile,
+                    restrained_by_probalance,
+                });
+            }
+
+            s.list_processes_prev_samples = new_prev;
+            out
         }
     }
 

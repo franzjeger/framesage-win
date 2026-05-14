@@ -334,6 +334,10 @@ async fn handle_client(
                 let snap = engine.status();
                 write_response(&mut write_half, &Response::Status(Box::new(snap))).await?;
             }
+            Request::ListProcesses => {
+                let snapshots = engine.list_process_snapshots();
+                write_response(&mut write_half, &Response::Processes { snapshots }).await?;
+            }
             Request::SetPolicy { policy } => {
                 // Apply in-memory first so subsequent ticks see the change
                 // immediately, then persist to disk so the edit survives
