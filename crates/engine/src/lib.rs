@@ -26,8 +26,9 @@
 //!   `applied`; system state lives in a crash-safe journal so a process kill
 //!   doesn't strand the user with a hidden taskbar and stopped services.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use parking_lot::RwLock;
@@ -74,7 +75,18 @@ struct EngineState {
     /// Whatever system-wide Game Mode we've entered, if any. Mirrored to the
     /// journal on disk so a crash leaves recoverable state.
     system_mode: Option<ActiveSystemMode>,
+    /// Last time we walked the process list to enforce `background_profile`.
+    /// `None` until the first scan; subsequent scans honour
+    /// `BACKGROUND_SCAN_INTERVAL`.
+    last_background_scan: Option<Instant>,
 }
+
+/// How often the engine walks all PIDs to apply `Policy::background_profile`.
+/// Tuned for "low enough that newly-spawned background apps get throttled
+/// promptly, high enough not to thrash the OpenProcess/CloseHandle pair on
+/// every tick." Each scan touches only PIDs not already in `applied`, so the
+/// steady-state cost is one ToolHelp snapshot + a Vec membership check.
+const BACKGROUND_SCAN_INTERVAL: Duration = Duration::from_secs(10);
 
 struct AppliedRecord {
     profile_id: ProfileId,
@@ -110,6 +122,7 @@ impl Engine {
                 foreground_snapshot: None,
                 active_profile: None,
                 system_mode: None,
+                last_background_scan: None,
             })),
             events: tx,
             safe_list: deps.safe_list,
@@ -269,7 +282,120 @@ impl Engine {
         let foreground = framesage_sys::foreground::current()?;
 
         let mut s = self.state.write();
-        self.reconcile(&mut s, foreground)
+        self.reconcile(&mut s, foreground)?;
+        Self::maybe_scan_background_locked(&mut s, self.safe_list);
+        Ok(())
+    }
+
+    /// Walk every running PID and apply `Policy::background_profile` to any
+    /// that we aren't already managing. Also drops `applied` entries for PIDs
+    /// that no longer exist (process exited; no revert needed).
+    ///
+    /// Skipped: the system idle / system PIDs, our own PID, the current
+    /// foreground PID, anything we already applied to, and anything whose
+    /// exe appears on the safe-list's process denylist (system shell, audio,
+    /// GPU drivers, anti-cheat). All other failures (OpenProcess denied on
+    /// a protected process, exe path unreadable) silently skip — those are
+    /// expected on every Windows box and aren't worth log spam.
+    ///
+    /// Bounded by `BACKGROUND_SCAN_INTERVAL` so we don't thrash on every
+    /// `tick_ms`; the first call from a fresh service start does the heavy
+    /// lift, subsequent calls only touch newly-spawned PIDs.
+    fn maybe_scan_background_locked(s: &mut EngineState, safe_list: &'static SafeList) {
+        // Bail early if the policy doesn't want background enforcement at all.
+        let Some(bg_profile_id) = s.policy.background_profile.clone() else {
+            return;
+        };
+        let Some(bg_profile) = s.policy.profile(&bg_profile_id).cloned() else {
+            warn!(
+                profile = %bg_profile_id,
+                "background_profile points at an unknown profile id; skipping background scan"
+            );
+            return;
+        };
+
+        let now = Instant::now();
+        if let Some(last) = s.last_background_scan {
+            if now.duration_since(last) < BACKGROUND_SCAN_INTERVAL {
+                return;
+            }
+        }
+        s.last_background_scan = Some(now);
+
+        let live_pids: Vec<u32> = match framesage_sys::process::iter_pids() {
+            Ok(v) => v,
+            Err(e) => {
+                warn!(error = %e, "process enumeration failed; skipping background scan");
+                return;
+            }
+        };
+        let live_set: HashSet<u32> = live_pids.iter().copied().collect();
+        let self_pid = std::process::id();
+        let foreground_pid = s.current_foreground;
+        let topology = s.topology.clone();
+
+        // ─── Drop records for PIDs that exited since last scan ──────────────
+        let stale: Vec<u32> = s
+            .applied
+            .keys()
+            .copied()
+            .filter(|p| !live_set.contains(p))
+            .collect();
+        for pid in stale {
+            // Process is gone; no revert syscall would succeed. Just drop.
+            s.applied.remove(&pid);
+        }
+
+        // ─── Apply background profile to new PIDs ───────────────────────────
+        let mut newly_applied = 0usize;
+        for pid in live_pids {
+            if pid == 0 || pid == 4 {
+                continue; // System Idle / System
+            }
+            if pid == self_pid {
+                continue;
+            }
+            if Some(pid) == foreground_pid {
+                continue;
+            }
+            if s.applied.contains_key(&pid) {
+                continue;
+            }
+
+            // Filter against the safe-list denylist — same denylist that
+            // protects suspend_processes, repurposed here so we don't, e.g.,
+            // throttle dwm or audiodg into stuttering territory.
+            let exe_name = match framesage_sys::process::exe_for_pid(pid) {
+                Ok(Some(path)) => path.rsplit(['\\', '/']).next().unwrap_or(&path).to_owned(),
+                Ok(None) => continue, // exited mid-snapshot, or unreadable
+                Err(_) => continue,
+            };
+            if matches!(
+                safe_list.check_process(&exe_name),
+                framesage_gamemode::safe_list::ProcessVerdict::Denied(_)
+            ) {
+                continue;
+            }
+
+            match apply_profile(pid, &bg_profile, &topology) {
+                Ok(record) => {
+                    s.applied.insert(pid, record);
+                    newly_applied += 1;
+                }
+                // ACCESS_DENIED / INVALID_PARAMETER on protected processes
+                // is expected and not worth surfacing.
+                Err(_) => continue,
+            }
+        }
+
+        if newly_applied > 0 {
+            debug!(
+                profile = %bg_profile_id,
+                applied = newly_applied,
+                managed = s.applied.len(),
+                "background scan applied profile to new PIDs"
+            );
+        }
     }
 
     fn reconcile(
