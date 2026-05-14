@@ -105,6 +105,17 @@ pub enum Request {
     /// gates this behind a confirm dialog; the service performs no further
     /// confirmation — by the time the request arrives the user is committed.
     TerminateProcess { pid: u32 },
+    /// One-shot affinity pin against a live PID. Engine resolves `selector`
+    /// against the live `CpuTopology` (so "Kind(Cache)" picks whatever CPUs
+    /// are X3D on THIS box, not a stale cached mask), turns it into a raw
+    /// `SetProcessAffinityMask` bitmap, and writes it. Used by the Processes
+    /// tab's right-click "Set CPU affinity" submenu — the user-level lever
+    /// that pins Steam so games inherit the correct CCD at spawn, before
+    /// anti-cheat hooks can refuse our other calls.
+    SetProcessAffinity {
+        pid: u32,
+        selector: framesage_core::CpuSelector,
+    },
 }
 
 impl Request {
@@ -130,7 +141,8 @@ impl Request {
             | Request::SetProcessPriority { .. }
             | Request::SuspendProcess { .. }
             | Request::ResumeProcess { .. }
-            | Request::TerminateProcess { .. } => false,
+            | Request::TerminateProcess { .. }
+            | Request::SetProcessAffinity { .. } => false,
         }
     }
 
@@ -354,6 +366,11 @@ mod tests {
         assert!(!Request::SuspendProcess { pid: 1 }.is_read_only());
         assert!(!Request::ResumeProcess { pid: 1 }.is_read_only());
         assert!(!Request::TerminateProcess { pid: 1 }.is_read_only());
+        assert!(!Request::SetProcessAffinity {
+            pid: 1,
+            selector: framesage_core::CpuSelector::All,
+        }
+        .is_read_only());
         assert!(!Request::SetPolicy {
             policy: sample_policy()
         }
