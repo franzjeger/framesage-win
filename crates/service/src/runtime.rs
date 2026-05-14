@@ -320,7 +320,15 @@ async fn handle_client(
                 write_response(&mut write_half, &Response::Status(Box::new(snap))).await?;
             }
             Request::SetPolicy { policy } => {
-                engine.set_policy(policy);
+                // Apply in-memory first so subsequent ticks see the change
+                // immediately, then persist to disk so the edit survives
+                // service restart. The FS watcher will fire a redundant
+                // reload from the disk write — benign because `set_policy`
+                // is idempotent on identical content.
+                engine.set_policy(policy.clone());
+                if let Err(e) = policy.save(&paths::policy_path()) {
+                    warn!(error = %e, "policy save after SetPolicy failed; in-memory only");
+                }
                 write_response(&mut write_half, &Response::Ok).await?;
             }
             Request::ApplyOnce { profile: _ } => {
