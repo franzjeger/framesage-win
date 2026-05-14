@@ -127,6 +127,12 @@ const PERSISTENT_REASSERT_INTERVAL: Duration = Duration::from_secs(2);
 
 struct AppliedRecord {
     profile_id: ProfileId,
+    /// Image filename (without path) captured at apply time. Used by the
+    /// periodic re-assert sweep to defend against PID reuse: if the PID's
+    /// current exe doesn't match `exe_name`, the original process is gone
+    /// and Windows reassigned the PID — we drop the record and never push
+    /// our settings onto an unrelated process. Compared case-insensitively.
+    exe_name: String,
     /// Opaque per-platform state used to revert per-process changes.
     #[cfg(windows)]
     state: framesage_sys::apply::AppliedState,
@@ -287,7 +293,7 @@ impl Engine {
         };
 
         let topology = s.topology.clone();
-        match apply_profile(prev_pid, &profile, &topology) {
+        match apply_profile(prev_pid, &snapshot.exe_name, &profile, &topology) {
             Ok(record) => {
                 info!(pid = prev_pid, profile = %profile_id, "force_recompute applied");
                 s.applied.insert(prev_pid, record);
@@ -380,7 +386,7 @@ impl Engine {
             title: foreground.title.clone(),
         };
 
-        let record = apply_profile(foreground.pid, &profile, &topology)?;
+        let record = apply_profile(foreground.pid, &foreground.exe_name, &profile, &topology)?;
         info!(
             pid = foreground.pid,
             exe = %foreground.exe_name,
@@ -484,13 +490,14 @@ impl Engine {
         // Snapshot first; we can't iterate `s.applied` while also re-borrowing
         // `s.policy` / `s.topology` immutably (the borrow checker isn't smart
         // enough to see that `applied` and the other fields are disjoint).
-        let pids_to_reassert: Vec<(u32, Profile)> = s
+        // Tuple is (pid, expected_exe_name, profile).
+        let pids_to_reassert: Vec<(u32, String, Profile)> = s
             .applied
             .iter()
             .filter_map(|(pid, record)| {
                 let profile = s.policy.profile(&record.profile_id)?;
                 if profile.persistent {
-                    Some((*pid, profile.clone()))
+                    Some((*pid, record.exe_name.clone(), profile.clone()))
                 } else {
                     None
                 }
@@ -502,14 +509,49 @@ impl Engine {
         }
 
         let topology = s.topology.clone();
-        for (pid, profile) in pids_to_reassert {
+        let mut stale_pids: Vec<u32> = Vec::new();
+        for (pid, expected_exe, profile) in pids_to_reassert {
+            // PID reuse defense: Windows can reassign a PID seconds after the
+            // original process exits. Without this check, our 2 s re-assert
+            // sweep would happily push game-x3d onto whatever new process
+            // happens to hold the PID now. Query the live exe and skip on
+            // mismatch — the background-scan path will drop the record on
+            // its next sweep (or we drop it here once we know it's stale).
             #[cfg(windows)]
-            if let Err(e) = framesage_sys::apply::reassert(pid, &profile, &topology) {
-                debug!(pid, error = %e, "persistent re-assert failed (process probably exited)");
+            {
+                let live_exe = match framesage_sys::process::exe_for_pid(pid) {
+                    Ok(Some(path)) => path.rsplit(['\\', '/']).next().unwrap_or(&path).to_owned(),
+                    Ok(None) | Err(_) => {
+                        // Process gone (or unreadable — same outcome: we
+                        // can't re-assert anyway). Mark for cleanup.
+                        stale_pids.push(pid);
+                        continue;
+                    }
+                };
+                if !live_exe.eq_ignore_ascii_case(&expected_exe) {
+                    debug!(
+                        pid,
+                        expected = %expected_exe,
+                        live = %live_exe,
+                        "re-assert: PID was reassigned to a different exe; dropping record"
+                    );
+                    stale_pids.push(pid);
+                    continue;
+                }
+                if let Err(e) = framesage_sys::apply::reassert(pid, &profile, &topology) {
+                    debug!(pid, error = %e, "persistent re-assert failed");
+                }
             }
             #[cfg(not(windows))]
             {
-                let _ = (pid, profile, &topology);
+                let _ = (pid, expected_exe, profile, &topology);
+            }
+        }
+
+        for pid in stale_pids {
+            s.applied.remove(&pid);
+            if s.current_foreground == Some(pid) {
+                s.current_foreground = None;
             }
         }
     }
@@ -604,7 +646,7 @@ impl Engine {
                 continue;
             }
 
-            match apply_profile(pid, &bg_profile, &topology) {
+            match apply_profile(pid, &exe_name, &bg_profile, &topology) {
                 Ok(record) => {
                     s.applied.insert(pid, record);
                     newly_applied += 1;
@@ -742,7 +784,7 @@ impl Engine {
             );
             return Ok(());
         }
-        match apply_profile(fg.pid, &profile, &topology) {
+        match apply_profile(fg.pid, &fg.exe_name, &profile, &topology) {
             Ok(record) => {
                 info!(pid = fg.pid, exe = %fg.exe_name, profile = %profile_id, "applied");
                 s.applied.insert(fg.pid, record);
@@ -959,18 +1001,30 @@ fn applied_from_plan(plan: &ActionPlan) -> AppliedActions {
 }
 
 #[cfg(windows)]
-fn apply_profile(pid: u32, profile: &Profile, topology: &CpuTopology) -> Result<AppliedRecord> {
+fn apply_profile(
+    pid: u32,
+    exe_name: &str,
+    profile: &Profile,
+    topology: &CpuTopology,
+) -> Result<AppliedRecord> {
     let state = framesage_sys::apply::apply(pid, profile, topology)?;
     Ok(AppliedRecord {
         profile_id: profile.id.clone(),
+        exe_name: exe_name.to_owned(),
         state,
     })
 }
 
 #[cfg(not(windows))]
-fn apply_profile(_pid: u32, profile: &Profile, _topology: &CpuTopology) -> Result<AppliedRecord> {
+fn apply_profile(
+    _pid: u32,
+    exe_name: &str,
+    profile: &Profile,
+    _topology: &CpuTopology,
+) -> Result<AppliedRecord> {
     Ok(AppliedRecord {
         profile_id: profile.id.clone(),
+        exe_name: exe_name.to_owned(),
         _phantom: (),
     })
 }
