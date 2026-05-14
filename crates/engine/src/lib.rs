@@ -126,6 +126,13 @@ struct EngineState {
     /// stable for the lifetime of an installed binary, and the cache stays
     /// small (~200 entries × ~150 bytes).
     version_info_cache: HashMap<String, framesage_sys::version_info::VersionInfo>,
+    /// Per-PID owner cache. `Some(name)` = SID resolved to a user name;
+    /// `None` = the kernel told us about the token but `LookupAccountSidW`
+    /// returned nothing (rare; some capability SIDs); absent key = never
+    /// tried. Pruned each tick to PIDs still present in the snapshot so
+    /// PID reuse can't surface a stale account name from a previous
+    /// process under the same number.
+    user_cache: HashMap<u32, Option<String>>,
     /// Manual mode: when set, every foreground reconcile applies this
     /// profile instead of consulting Rules. Stays set across focus
     /// changes until explicitly cleared via `clear_manual_override` /
@@ -231,6 +238,7 @@ impl Engine {
                 list_processes_prev_system_cpu: None,
                 list_processes_prev_per_cpu: None,
                 version_info_cache: HashMap::new(),
+                user_cache: HashMap::new(),
                 manual_override: None,
                 reported_foreground: None,
                 foreground_reporter_seen: false,
@@ -349,6 +357,11 @@ impl Engine {
             // fresh process list paints for the first time. The cache is
             // populated lazily over a few seconds rather than all-at-once.
             let mut version_info_budget: u32 = 8;
+            // Same idea for user-SID lookups. OpenProcessToken +
+            // GetTokenInformation + LookupAccountSidW is fast on local
+            // accounts but can touch a domain controller on AD-joined
+            // boxes — keeping the budget small protects the worst case.
+            let mut user_budget: u32 = 8;
 
             for ps in &pid_snapshots {
                 let pid = ps.pid;
@@ -444,6 +457,24 @@ impl Engine {
                     }
                 };
 
+                // Owner-user, PID-keyed cache. Same lazy-budget pattern as
+                // the version-info read. The cache is pruned to live PIDs
+                // at the end of the loop so PID reuse can't surface a stale
+                // name.
+                let user = match s.user_cache.get(&pid) {
+                    Some(u) => u.clone(),
+                    None => {
+                        if user_budget > 0 {
+                            user_budget -= 1;
+                            let u = framesage_sys::process::user_for_pid(pid).ok().flatten();
+                            s.user_cache.insert(pid, u.clone());
+                            u
+                        } else {
+                            None
+                        }
+                    }
+                };
+
                 out.push(ProcessSnapshot {
                     pid,
                     parent_pid: ps.parent_pid,
@@ -451,6 +482,7 @@ impl Engine {
                     exe_path,
                     description: info.description,
                     company: info.company,
+                    user,
                     priority_class_raw,
                     affinity_mask,
                     cpu_percent,
@@ -463,6 +495,15 @@ impl Engine {
             }
 
             s.list_processes_prev_samples = new_prev;
+
+            // Prune the user-cache to PIDs that still exist. PIDs reuse —
+            // if pid 1234 was bf6.exe yesterday and is notepad.exe today,
+            // we don't want to surface the old user name. The cache holds
+            // resolved SID→name strings keyed by PID; cheapest correctness
+            // strategy is "drop anyone not in the live snapshot."
+            let live_pids: std::collections::HashSet<u32> =
+                pid_snapshots.iter().map(|p| p.pid).collect();
+            s.user_cache.retain(|p, _| live_pids.contains(p));
 
             // ─── System-wide metrics ─────────────────────────────────────
             //

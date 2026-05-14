@@ -80,6 +80,9 @@ pub mod process {
     pub fn exe_for_pid(_pid: u32) -> Result<Option<String>> {
         Ok(None)
     }
+    pub fn user_for_pid(_pid: u32) -> Result<Option<String>> {
+        Ok(None)
+    }
     pub fn cpu_times(_pid: u32) -> Result<Option<ProcessCpuTimes>> {
         Ok(None)
     }

@@ -209,6 +209,13 @@ pub struct ProcessSnapshot {
     /// alongside `description` from the same resource read.
     #[serde(default)]
     pub company: Option<String>,
+    /// User that owns the process, formatted as `"DOMAIN\\username"`
+    /// (or just `"username"` when there's no domain). `None` for
+    /// processes the engine couldn't open or whose SID failed to
+    /// resolve. Cached engine-side keyed by PID with eviction on PID
+    /// disappearance so the cache stays bounded.
+    #[serde(default)]
+    pub user: Option<String>,
     /// Live `GetPriorityClass` value (raw Win32 constant).
     pub priority_class_raw: u32,
     /// Live `GetProcessAffinityMask` value. `u64` so we can grow past 32 CPUs.

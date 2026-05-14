@@ -11,6 +11,7 @@ description = "Win32 wrappers for framesage-win: foreground window, CPU Sets, Po
 [target.'cfg(windows)'.dependencies]
 windows = { workspace = true, features = [
     "Win32_Foundation",
+    "Win32_Security_Authorization",
     "Win32_Storage_FileSystem",
     "Win32_System_Threading",
     "Win32_System_ProcessStatus",

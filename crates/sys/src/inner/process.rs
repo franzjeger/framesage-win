@@ -169,6 +169,178 @@ pub fn exe_for_pid(pid: u32) -> Result<Option<String>> {
     }
 }
 
+/// Resolve the user that owns a running process, formatted as
+/// `"DOMAIN\\username"` (or just `"username"` for a missing domain).
+///
+/// Chain: `OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION)` →
+/// `OpenProcessToken(TOKEN_QUERY)` → `GetTokenInformation(TokenUser)` to
+/// extract the SID → `LookupAccountSidW` to map SID → name+domain. Same
+/// chain Task Manager / Process Explorer use for their User column;
+/// anti-cheat-clean (read-only token query).
+///
+/// Returns `Ok(None)` for:
+///   * PID 0 (System Idle — can't be opened)
+///   * Protected / anti-cheat-protected processes (`OpenProcess` denies)
+///   * Processes that exited between snapshot and query
+///   * Cases where `LookupAccountSidW` can't resolve the SID (well-known
+///     SIDs like the special "Console Logon" appliance SIDs sometimes
+///     fail; we treat that as "no resolvable user" rather than an error).
+pub fn user_for_pid(pid: u32) -> Result<Option<String>> {
+    use std::ffi::c_void;
+    use windows::Win32::Security::{
+        GetTokenInformation, LookupAccountSidW, TokenUser, SID_NAME_USE, TOKEN_QUERY, TOKEN_USER,
+    };
+    use windows::Win32::System::Threading::OpenProcessToken;
+
+    if pid == 0 {
+        return Ok(None);
+    }
+    // SAFETY: documented call. Returns Err for denied / nonexistent PIDs.
+    let proc_handle = match unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid) } {
+        Ok(h) => h,
+        Err(_) => return Ok(None),
+    };
+
+    let mut token: HANDLE = HANDLE::default();
+    // SAFETY: proc_handle is valid; documented call.
+    let token_result = unsafe { OpenProcessToken(proc_handle, TOKEN_QUERY, &mut token) };
+    close_handle(proc_handle);
+    if token_result.is_err() {
+        return Ok(None);
+    }
+
+    // GetTokenInformation: classic two-call dance for buffer sizing.
+    let mut needed: u32 = 0;
+    // SAFETY: NULL buffer + 0 size deliberately triggers
+    // ERROR_INSUFFICIENT_BUFFER and writes the required size into `needed`.
+    let _ = unsafe { GetTokenInformation(token, TokenUser, None, 0, &mut needed) };
+    if needed == 0 {
+        close_handle(token);
+        return Ok(None);
+    }
+    let mut buf = vec![0u8; needed as usize];
+    // SAFETY: buf has exactly `needed` bytes.
+    let result = unsafe {
+        GetTokenInformation(
+            token,
+            TokenUser,
+            Some(buf.as_mut_ptr() as *mut c_void),
+            needed,
+            &mut needed,
+        )
+    };
+    close_handle(token);
+    if result.is_err() {
+        return Ok(None);
+    }
+
+    // The first sizeof(TOKEN_USER) bytes of `buf` are a TOKEN_USER struct;
+    // its `User.Sid` field points into the same buffer.
+    // SAFETY: GetTokenInformation wrote a TOKEN_USER at offset 0.
+    let token_user = unsafe { &*(buf.as_ptr() as *const TOKEN_USER) };
+    let sid = token_user.User.Sid;
+    if sid.is_invalid() {
+        return Ok(None);
+    }
+
+    // LookupAccountSidW: another two-call dance — first query needed
+    // buffer sizes for name + domain. The W variant takes raw `PWSTR`
+    // (not `Option<PWSTR>`), so we pass `PWSTR::null()` to elicit the
+    // ERROR_INSUFFICIENT_BUFFER probe.
+    let mut name_len: u32 = 0;
+    let mut domain_len: u32 = 0;
+    let mut sid_use = SID_NAME_USE::default();
+    // SAFETY: null name/domain buffers force size return via
+    // Err(InsufficientBuffer); name_len + domain_len are valid out-params.
+    let _ = unsafe {
+        LookupAccountSidW(
+            windows::core::PCWSTR::null(),
+            sid,
+            PWSTR::null(),
+            &mut name_len,
+            PWSTR::null(),
+            &mut domain_len,
+            &mut sid_use,
+        )
+    };
+    if name_len == 0 {
+        // SID didn't resolve to a known account. Fall back to the SID
+        // string form ("S-1-5-18", "S-1-5-21-…") so we at least surface
+        // *something* — better than rendering "—" when the row is e.g.
+        // a SYSTEM service.
+        return Ok(sid_to_string(sid));
+    }
+
+    let mut name_buf = vec![0u16; name_len as usize];
+    let mut domain_buf = vec![0u16; domain_len as usize];
+    // SAFETY: both buffers sized per the previous probe call.
+    let result = unsafe {
+        LookupAccountSidW(
+            windows::core::PCWSTR::null(),
+            sid,
+            PWSTR(name_buf.as_mut_ptr()),
+            &mut name_len,
+            PWSTR(domain_buf.as_mut_ptr()),
+            &mut domain_len,
+            &mut sid_use,
+        )
+    };
+    if result.is_err() {
+        return Ok(sid_to_string(sid));
+    }
+
+    // LookupAccountSidW writes name_len / domain_len as the actual char
+    // counts (NOT including the null terminator) on success.
+    let name = String::from_utf16_lossy(&name_buf[..name_len as usize]);
+    let domain = if domain_len > 0 {
+        String::from_utf16_lossy(&domain_buf[..domain_len as usize])
+    } else {
+        String::new()
+    };
+
+    let combined = if domain.is_empty() {
+        name
+    } else {
+        format!("{domain}\\{name}")
+    };
+    if combined.is_empty() {
+        Ok(None)
+    } else {
+        Ok(Some(combined))
+    }
+}
+
+/// Format a SID as its canonical string ("S-1-5-18" for LocalSystem etc.)
+/// via `ConvertSidToStringSidW`. Used as a fallback display when
+/// `LookupAccountSidW` can't resolve the SID to a name (rare; happens
+/// for unusual capability SIDs on AppContainer / UWP processes).
+fn sid_to_string(sid: windows::Win32::Security::PSID) -> Option<String> {
+    use windows::core::PWSTR;
+    use windows::Win32::Foundation::LocalFree;
+    use windows::Win32::Security::Authorization::ConvertSidToStringSidW;
+
+    let mut out: PWSTR = PWSTR::null();
+    // SAFETY: sid is valid (checked by caller); out is a valid out-param.
+    let result = unsafe { ConvertSidToStringSidW(sid, &mut out) };
+    if result.is_err() || out.is_null() {
+        return None;
+    }
+    // SAFETY: out is a null-terminated wide string allocated by LocalAlloc.
+    let len = unsafe {
+        let mut n = 0usize;
+        while *out.0.add(n) != 0 {
+            n += 1;
+        }
+        n
+    };
+    // SAFETY: out points to `len` u16 + null.
+    let slice = unsafe { std::slice::from_raw_parts(out.0, len) };
+    let s = String::from_utf16_lossy(slice);
+    // SAFETY: out was returned by the API and must be freed with LocalFree.
+    let _ = unsafe { LocalFree(windows::Win32::Foundation::HLOCAL(out.0 as _)) };
+    Some(s)
+}
+
 /// Sample CPU times (kernel + user) for a single PID. Used by ProBalance to
 /// compute per-process CPU utilisation between two ticks: subtract this
 /// tick's `total_100ns` from the next tick's, divide by elapsed wall time

@@ -144,6 +144,7 @@ enum ProcessSortKey {
     Profile,
     Description,
     Company,
+    User,
 }
 
 /// Visual classification for a Processes-tab row. Drives the colored leading
@@ -2032,6 +2033,7 @@ impl FramesageApp {
                     .column(Column::initial(220.0).at_least(120.0)) // Exe
                     .column(Column::initial(200.0).at_least(120.0)) // Description
                     .column(Column::initial(140.0).at_least(80.0)) // Company
+                    .column(Column::initial(140.0).at_least(80.0)) // User
                     .column(Column::initial(60.0).at_least(50.0)) // PID
                     .column(Column::initial(60.0).at_least(45.0)) // CPU%
                     .column(Column::initial(85.0).at_least(60.0)) // Memory
@@ -2050,6 +2052,7 @@ impl FramesageApp {
                         });
                         header
                             .col(|ui| self.sortable_header(ui, "Company", ProcessSortKey::Company));
+                        header.col(|ui| self.sortable_header(ui, "User", ProcessSortKey::User));
                         header.col(|ui| self.sortable_header(ui, "PID", ProcessSortKey::Pid));
                         header.col(|ui| self.sortable_header(ui, "CPU %", ProcessSortKey::Cpu));
                         header.col(|ui| self.sortable_header(ui, "Memory", ProcessSortKey::Memory));
@@ -2248,6 +2251,34 @@ impl FramesageApp {
                                     let resp = ui.add(egui::Label::new(co).truncate());
                                     if co.len() > 18 {
                                         let _ = resp.on_hover_text(co);
+                                    }
+                                }
+                                None => {
+                                    ui.weak("—");
+                                }
+                            });
+                            // User: owning account, "DOMAIN\\username" or
+                            // just "username" for local accounts. Color
+                            // SYSTEM / NT-SERVICE rows muted so the eye
+                            // skips OS background and lands on user code.
+                            row.col(|ui| match &p.user {
+                                Some(u) => {
+                                    let is_system = u.starts_with("NT AUTHORITY\\")
+                                        || u == "SYSTEM"
+                                        || u.starts_with("NT SERVICE\\")
+                                        || u.starts_with("Window Manager\\")
+                                        || u.starts_with("Font Driver Host\\");
+                                    let label = egui::Label::new(egui::RichText::new(u).color(
+                                        if is_system {
+                                            theme::TEXT_MUTED
+                                        } else {
+                                            theme::TEXT
+                                        },
+                                    ))
+                                    .truncate();
+                                    let resp = ui.add(label);
+                                    if u.len() > 18 {
+                                        let _ = resp.on_hover_text(u);
                                     }
                                 }
                                 None => {
@@ -2529,6 +2560,11 @@ fn compare_snapshots(
             let bv = b.company.as_deref().unwrap_or("\u{ffff}");
             av.to_ascii_lowercase().cmp(&bv.to_ascii_lowercase())
         }
+        ProcessSortKey::User => {
+            let av = a.user.as_deref().unwrap_or("\u{ffff}");
+            let bv = b.user.as_deref().unwrap_or("\u{ffff}");
+            av.to_ascii_lowercase().cmp(&bv.to_ascii_lowercase())
+        }
     };
     if desc {
         ord.reverse()
@@ -2783,6 +2819,7 @@ fn render_process_detail(
                             None => "—".to_string(),
                         };
                         detail_kv(ui, "Profile", profile_text);
+                        detail_kv(ui, "User", p.user.as_deref().unwrap_or("—").to_string());
                         let rule_note = p
                             .matched_rule_note
                             .as_deref()
@@ -3548,6 +3585,7 @@ mod tests {
             exe_path: String::new(),
             description: None,
             company: None,
+            user: None,
             priority_class_raw: 0x20, // NORMAL_PRIORITY_CLASS
             affinity_mask: 0xFFFF,
             cpu_percent: 0,
