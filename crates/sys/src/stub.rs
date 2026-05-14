@@ -127,6 +127,25 @@ pub mod process {
     }
 }
 
+pub mod version_info {
+    use super::Result;
+
+    #[derive(Debug, Clone, Default)]
+    pub struct VersionInfo {
+        pub description: Option<String>,
+        pub company: Option<String>,
+        pub product_name: Option<String>,
+    }
+    impl VersionInfo {
+        pub fn is_empty(&self) -> bool {
+            self.description.is_none() && self.company.is_none() && self.product_name.is_none()
+        }
+    }
+    pub fn read_version_info(_path: &str) -> Result<VersionInfo> {
+        Ok(VersionInfo::default())
+    }
+}
+
 pub mod game_mode {
     //! Non-Windows stubs. Game Mode actions are no-ops on a developer host;
     //! the planner and journal still exercise end-to-end via `framesage-sim`,

@@ -127,6 +127,7 @@ enum ProcessSortKey {
     Threads,
     Priority,
     Profile,
+    Description,
 }
 
 /// Visual classification for a Processes-tab row. Drives the colored leading
@@ -1914,6 +1915,14 @@ impl FramesageApp {
                     ProcessSortKey::Threads => a.threads.cmp(&b.threads),
                     ProcessSortKey::Priority => a.priority_class_raw.cmp(&b.priority_class_raw),
                     ProcessSortKey::Profile => a.managed_profile.cmp(&b.managed_profile),
+                    ProcessSortKey::Description => {
+                        // Case-insensitive description sort. None entries
+                        // collate after Some entries so the actually-labelled
+                        // rows cluster together regardless of sort direction.
+                        let av = a.description.as_deref().unwrap_or("\u{ffff}");
+                        let bv = b.description.as_deref().unwrap_or("\u{ffff}");
+                        av.to_ascii_lowercase().cmp(&bv.to_ascii_lowercase())
+                    }
                 };
                 if self.processes.sort_desc {
                     ord.reverse()
@@ -1981,6 +1990,7 @@ impl FramesageApp {
                     .column(Column::exact(6.0)) // State marker (no header)
                     .column(Column::exact(22.0)) // Icon (no header)
                     .column(Column::initial(220.0).at_least(120.0)) // Exe
+                    .column(Column::initial(200.0).at_least(120.0)) // Description
                     .column(Column::initial(60.0).at_least(50.0)) // PID
                     .column(Column::initial(60.0).at_least(45.0)) // CPU%
                     .column(Column::initial(85.0).at_least(60.0)) // Memory
@@ -1994,6 +2004,9 @@ impl FramesageApp {
                         header.col(|_ui| {}); // icon column — no header glyph
                         header
                             .col(|ui| self.sortable_header(ui, "Process", ProcessSortKey::ExeName));
+                        header.col(|ui| {
+                            self.sortable_header(ui, "Description", ProcessSortKey::Description)
+                        });
                         header.col(|ui| self.sortable_header(ui, "PID", ProcessSortKey::Pid));
                         header.col(|ui| self.sortable_header(ui, "CPU %", ProcessSortKey::Cpu));
                         header.col(|ui| self.sortable_header(ui, "Memory", ProcessSortKey::Memory));
@@ -2135,6 +2148,22 @@ impl FramesageApp {
                                         }
                                     });
                                 });
+                            });
+                            // Description: human-readable label from the
+                            // exe's version resource ("Microsoft OneDrive",
+                            // "Steam Client Service Helper"). Truncates with
+                            // an ellipsis when the cell can't fit the full
+                            // string; full text shown on hover.
+                            row.col(|ui| match &p.description {
+                                Some(desc) => {
+                                    let resp = ui.add(egui::Label::new(desc).truncate());
+                                    if desc.len() > 24 {
+                                        let _ = resp.on_hover_text(desc);
+                                    }
+                                }
+                                None => {
+                                    ui.weak("—");
+                                }
                             });
                             row.col(|ui| {
                                 ui.monospace(p.pid.to_string());
@@ -2410,6 +2439,12 @@ fn render_process_detail(
                 }
             });
         });
+        // Subtitle: the version-resource description, when the engine has
+        // it. Sits directly under the heading so the relationship between
+        // exe name and friendly name reads at a glance.
+        if let Some(desc) = &p.description {
+            ui.colored_label(theme::TEXT_MUTED, desc);
+        }
         ui.add_space(4.0);
 
         egui::ScrollArea::vertical()
@@ -3196,6 +3231,7 @@ mod tests {
             pid,
             exe_name: "test.exe".into(),
             exe_path: String::new(),
+            description: None,
             priority_class_raw: 0x20, // NORMAL_PRIORITY_CLASS
             affinity_mask: 0xFFFF,
             cpu_percent: 0,

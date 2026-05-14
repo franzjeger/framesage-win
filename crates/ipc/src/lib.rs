@@ -188,6 +188,14 @@ pub struct ProcessSnapshot {
     /// parse responses written by newer servers and vice-versa.
     #[serde(default)]
     pub exe_path: String,
+    /// Human-readable "FileDescription" string from the exe's version
+    /// resource — what Task Manager shows in its Description column
+    /// ("Microsoft OneDrive", "Steam Client Service Helper"). `None` when
+    /// the resource is missing or the file is unreadable; cached
+    /// engine-side keyed by `exe_path`, so the cost is paid once per exe.
+    /// `serde(default)` so the field is optional on the wire.
+    #[serde(default)]
+    pub description: Option<String>,
     /// Live `GetPriorityClass` value (raw Win32 constant).
     pub priority_class_raw: u32,
     /// Live `GetProcessAffinityMask` value. `u64` so we can grow past 32 CPUs.
