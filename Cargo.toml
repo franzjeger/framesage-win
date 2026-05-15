@@ -14,7 +14,13 @@ members = [
 
 [workspace.package]
 edition = "2021"
-version = "0.1.0"
+# Bumped from 0.1.0 once the project hit Process-Lasso UI/feature parity
+# (live process viewer w/ tree view + icons + Description/Company/User
+# columns, ProBalance, Game Mode w/ crash-safe journal, CPPC + X3D
+# auto-detection, split-pipe ACL, Suspend/Resume/Terminate, etc.). Treating
+# this as the pre-1.0 development series — 1.0 lands when there's a signed
+# installer and a couple of weeks of real-world use under it.
+version = "0.5.0"
 license = "Apache-2.0 OR MIT"
 authors = ["Frank Lia <support@sybr.no>"]
 repository = "https://github.com/franzjeger/framesage-win"
