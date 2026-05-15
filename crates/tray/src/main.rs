@@ -106,6 +106,12 @@ impl EventKind {
 
 /// Signals raised by the tray icon's menu/click handlers, read by the egui
 /// `update` loop on the next frame.
+///
+/// Kept as a flat struct of `Arc<AtomicBool>` / `Arc<Mutex<…>>` rather than a
+/// channel because the current tray-icon thread is fire-and-forget — every
+/// menu click is idempotent on the egui side, so an extra "pause when already
+/// paused" flag bit is harmless and the lock-free atomics keep menu latency
+/// at bare-minimum cost.
 #[derive(Default, Clone)]
 struct TrayCommands {
     show_window: Arc<AtomicBool>,
@@ -122,6 +128,19 @@ struct TrayCommands {
     /// close-requested handler reads this to distinguish "user clicked the
     /// window X" (hide to tray) from "user clicked Exit" (actually quit).
     exit_requested: Arc<AtomicBool>,
+    /// Pause / Resume engine — set by the tray menu, drained in `update()`
+    /// which dispatches the matching `Request` over the admin pipe.
+    pause_engine: Arc<AtomicBool>,
+    resume_engine: Arc<AtomicBool>,
+    /// Panic button — force-revert any active Game Mode session.
+    game_mode_off: Arc<AtomicBool>,
+    /// Reveal `%ProgramData%\framesage\` in Explorer.
+    open_config_folder: Arc<AtomicBool>,
+    /// Open `policy.json` in the system's default text editor.
+    edit_policy: Arc<AtomicBool>,
+    /// Jump to a specific tab. The mutex carries the chosen `Tab`; the egui
+    /// loop swaps it back to `None` after applying.
+    jump_to_tab: Arc<Mutex<Option<Tab>>>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -417,12 +436,14 @@ struct FramesageApp {
     #[cfg(windows)]
     icons: icons::IconCache,
     /// Holding the tray icon for its lifetime — drop = icon disappears.
-    /// `#[allow(dead_code)]` because we never read it after construction;
-    /// the field exists purely to extend the icon's lifetime to match the
-    /// app's.
+    /// Now also a live handle: we call `set_tooltip` from `update()` to
+    /// reflect the current engine state in the tray's hover-tooltip.
     #[cfg(windows)]
-    #[allow(dead_code)]
     tray: TrayIcon,
+    /// Last tooltip we wrote — avoids a `set_tooltip` syscall on every
+    /// frame when the state hasn't changed.
+    #[cfg(windows)]
+    last_tray_tooltip: String,
 }
 
 impl FramesageApp {
@@ -486,6 +507,8 @@ impl FramesageApp {
             icons: icons::IconCache::new(),
             #[cfg(windows)]
             tray,
+            #[cfg(windows)]
+            last_tray_tooltip: String::new(),
         }
     }
 
@@ -548,6 +571,33 @@ impl eframe::App for FramesageApp {
             ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
             self.commands.window_visible.store(false, Ordering::Relaxed);
         }
+        // Engine controls dispatched from the tray menu. Each is a one-shot
+        // admin-pipe round-trip; we use the existing `send_admin_request`
+        // helper so the user-facing echo lands in the status bar.
+        if self.commands.pause_engine.swap(false, Ordering::Relaxed) {
+            self.send_admin_request(Request::Pause, "pause");
+        }
+        if self.commands.resume_engine.swap(false, Ordering::Relaxed) {
+            self.send_admin_request(Request::Resume, "resume");
+        }
+        if self.commands.game_mode_off.swap(false, Ordering::Relaxed) {
+            self.send_admin_request(Request::GameModeOff, "game-mode off");
+        }
+        if self
+            .commands
+            .open_config_folder
+            .swap(false, Ordering::Relaxed)
+        {
+            open_in_shell(&framesage_core::paths::config_dir().to_string_lossy());
+        }
+        if self.commands.edit_policy.swap(false, Ordering::Relaxed) {
+            open_in_shell(&framesage_core::paths::policy_path().to_string_lossy());
+        }
+        // View → Tab. Pre-set the tab BEFORE the window becomes visible so
+        // the first frame painted after show paints the right tab.
+        if let Some(target) = self.commands.jump_to_tab.lock().unwrap().take() {
+            self.tab = target;
+        }
 
         // ─── Close-to-tray ──────────────────────────────────────────────────
         //
@@ -588,6 +638,20 @@ impl eframe::App for FramesageApp {
                     .collect::<Vec<_>>(),
             )
         };
+
+        // Refresh the tray-icon tooltip when the engine state changes. The
+        // tooltip reads on hover, so a stale string would mislead the user
+        // about whether the engine is paused / what profile is active.
+        // `set_tooltip` is a Win32 round-trip; we gate it on a string-equality
+        // check so we only call it when the formatted text actually differs.
+        #[cfg(windows)]
+        {
+            let new_tooltip = format_tray_tooltip(connected, status_snapshot.as_ref());
+            if new_tooltip != self.last_tray_tooltip {
+                let _ = self.tray.set_tooltip(Some(&new_tooltip));
+                self.last_tray_tooltip = new_tooltip;
+            }
+        }
 
         // Hand the latest processes snapshot into the local view buffer. We
         // do this under a separate short lock window so the render path can
@@ -1191,15 +1255,40 @@ impl FramesageApp {
     fn render_tab_strip(&mut self, ui: &mut egui::Ui) {
         ui.horizontal(|ui| {
             ui.spacing_mut().item_spacing.x = 0.0;
-            let tabs = [
-                (Tab::Processes, "Processes"),
-                (Tab::Status, "Status"),
-                (Tab::Activity, "Activity"),
-                (Tab::Rules, "Rules"),
-                (Tab::Profiles, "Profiles"),
+            // Each tab gets a one-line hover-text that names the tab's
+            // job, since the labels themselves are deliberately terse.
+            let tabs: [(Tab, &str, &str); 5] = [
+                (
+                    Tab::Processes,
+                    "Processes",
+                    "Live process viewer — sortable table, tree view, right-click for per-PID actions.",
+                ),
+                (
+                    Tab::Status,
+                    "Status",
+                    "Engine state, active profile, foreground app, ProBalance state.",
+                ),
+                (
+                    Tab::Activity,
+                    "Activity",
+                    "Full event log — filter chips + search.",
+                ),
+                (
+                    Tab::Rules,
+                    "Rules",
+                    "Match rules: when a foreground exe matches, apply the named profile.",
+                ),
+                (
+                    Tab::Profiles,
+                    "Profiles",
+                    "Per-profile editor — CPU sets, throttling, priority, Game Mode actions.",
+                ),
             ];
-            for (t, label) in tabs {
-                if theme::tab_button(ui, label, self.tab == t).clicked() {
+            for (t, label, hover) in tabs {
+                if theme::tab_button(ui, label, self.tab == t)
+                    .on_hover_text(hover)
+                    .clicked()
+                {
                     self.tab = t;
                 }
             }
@@ -2432,23 +2521,41 @@ impl FramesageApp {
             }
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 let count = self.processes.rows.len();
-                ui.colored_label(theme::TEXT_MUTED, format!("{count} processes"));
+                ui.colored_label(theme::TEXT_MUTED, format!("{count} processes"))
+                    .on_hover_text(
+                        "Total live processes the engine can see, including those whose \
+                         exe path it can't open (protected processes still get a row).",
+                    );
                 ui.separator();
-                ui.colored_label(theme::TEXT_MUTED, format!("{total_threads} threads"));
+                ui.colored_label(theme::TEXT_MUTED, format!("{total_threads} threads"))
+                    .on_hover_text("Sum of OS thread counts across every visible process.");
                 ui.separator();
                 ui.colored_label(
                     theme::TEXT_MUTED,
                     format!("{} mem", format_bytes(total_mem)),
-                );
+                )
+                .on_hover_text("Sum of working-set bytes across every visible process.");
                 ui.separator();
-                ui.colored_label(theme::TEXT_MUTED, format!("Total CPU {total_cpu_one_cpu}%"));
+                ui.colored_label(theme::TEXT_MUTED, format!("Total CPU {total_cpu_one_cpu}%"))
+                    .on_hover_text(
+                        "Sum of per-process CPU% in 'percent of one logical CPU' units. \
+                         A 16-thread box maxes at 1600%.",
+                    );
                 if managed > 0 {
                     ui.separator();
-                    ui.colored_label(theme::ACCENT, format!("{managed} managed"));
+                    ui.colored_label(theme::ACCENT, format!("{managed} managed"))
+                        .on_hover_text(
+                            "Processes that have an active FrameSage profile applied — \
+                             matched a rule, manual override, or one-shot ApplyOnce.",
+                        );
                 }
                 if restrained > 0 {
                     ui.separator();
-                    ui.colored_label(theme::WARNING, format!("{restrained} restrained"));
+                    ui.colored_label(theme::WARNING, format!("{restrained} restrained"))
+                        .on_hover_text(
+                            "Processes that ProBalance has temporarily demoted because \
+                             they're hogging CPU under contention.",
+                        );
                 }
             });
         });
@@ -2894,6 +3001,95 @@ impl FramesageApp {
                                                 ui.close_menu();
                                             }
                                         });
+
+                                        // ─── Shell + Copy actions ────────────
+                                        // Show in Explorer / Copy submenu — the
+                                        // standard "where does this thing live
+                                        // and how do I tell someone about it"
+                                        // affordances every Windows process
+                                        // viewer ships. Only meaningful for the
+                                        // single-row case; for bulk select they
+                                        // lose meaning.
+                                        if !bulk {
+                                            ui.separator();
+                                            let show_enabled = !p.exe_path.is_empty();
+                                            if ui
+                                                .add_enabled(
+                                                    show_enabled,
+                                                    egui::Button::new("Show in Explorer"),
+                                                )
+                                                .on_hover_text(
+                                                    "Open the folder containing this exe \
+                                                     in Explorer with the file selected.",
+                                                )
+                                                .on_disabled_hover_text(
+                                                    "Engine couldn't resolve the exe path \
+                                                     (protected process or already exited).",
+                                                )
+                                                .clicked()
+                                            {
+                                                action_queue.push(ProcessAction::ShowInExplorer {
+                                                    path: p.exe_path.clone(),
+                                                });
+                                                ui.close_menu();
+                                            }
+                                            ui.menu_button("Copy", |ui| {
+                                                if ui.button(format!("PID  ({pid})")).clicked() {
+                                                    action_queue.push(
+                                                        ProcessAction::CopyToClipboard {
+                                                            text: pid.to_string(),
+                                                        },
+                                                    );
+                                                    ui.close_menu();
+                                                }
+                                                if ui.button(format!("Exe name  ({exe})")).clicked()
+                                                {
+                                                    action_queue.push(
+                                                        ProcessAction::CopyToClipboard {
+                                                            text: exe.clone(),
+                                                        },
+                                                    );
+                                                    ui.close_menu();
+                                                }
+                                                if !p.exe_path.is_empty()
+                                                    && ui.button("Full path").clicked()
+                                                {
+                                                    action_queue.push(
+                                                        ProcessAction::CopyToClipboard {
+                                                            text: p.exe_path.clone(),
+                                                        },
+                                                    );
+                                                    ui.close_menu();
+                                                }
+                                            });
+                                        }
+
+                                        // ─── Tree-aware bulk: Suspend tree ───
+                                        // Only meaningful when the parent is
+                                        // actually showing children (tr.has_children
+                                        // implies "this row is a parent in the
+                                        // current snapshot"). Single-PID only —
+                                        // for ctrl-multi-select the existing
+                                        // bulk Suspend handles the same use case.
+                                        if !bulk && tr.has_children {
+                                            ui.separator();
+                                            if ui
+                                                .button("Suspend tree (this + children)")
+                                                .on_hover_text(
+                                                    "Suspend this process plus every \
+                                                     descendant reachable via parent-PID. \
+                                                     Same primitive as plain Suspend, just \
+                                                     applied to the whole subtree.",
+                                                )
+                                                .clicked()
+                                            {
+                                                action_queue.push(ProcessAction::SuspendTree {
+                                                    root_pid: pid,
+                                                });
+                                                ui.close_menu();
+                                            }
+                                        }
+
                                         ui.separator();
                                         let trim_label = if bulk {
                                             format!(
@@ -3341,12 +3537,35 @@ impl FramesageApp {
                         mask: initial_mask,
                     });
                 }
+                ProcessAction::ShowInExplorer { path } => {
+                    open_explorer_select(&path);
+                    *self.last_action.lock().unwrap() = Some(format!("show in explorer: {path}"));
+                }
+                ProcessAction::CopyToClipboard { text } => {
+                    ui.ctx().copy_text(text.clone());
+                    *self.last_action.lock().unwrap() =
+                        Some(format!("copied: {}", truncate_for_echo(&text, 40)));
+                }
+                ProcessAction::SuspendTree { root_pid } => {
+                    // Expand to root + descendants against the LIVE snapshot.
+                    // Doing this here (not at click time) means the user
+                    // suspends the actual subtree as of dispatch, not as of
+                    // whichever frame they clicked.
+                    let descendants = descendants_of(&self.processes.rows, root_pid);
+                    for pid in descendants {
+                        self.send_admin_request(
+                            Request::SuspendProcess { pid },
+                            "suspend tree member",
+                        );
+                    }
+                }
             }
         }
     }
 
     /// Header cell that toggles the sort key on click. Shows ▲ / ▼ on the
-    /// active column.
+    /// active column. Hover-text comes from `column_hover_text(key)` so
+    /// every column gets a consistent "what does this mean" tooltip.
     fn sortable_header(&mut self, ui: &mut egui::Ui, label: &str, key: ProcessSortKey) {
         let active = self.processes.sort_by == Some(key);
         // ASCII arrows for the same reason as the tree toggles: ▲/▼ are
@@ -3358,10 +3577,10 @@ impl FramesageApp {
         } else {
             " ^"
         };
-        if ui
+        let resp = ui
             .add(egui::Label::new(format!("{label}{suffix}")).sense(egui::Sense::click()))
-            .clicked()
-        {
+            .on_hover_text(column_hover_text(key));
+        if resp.clicked() {
             if active {
                 self.processes.sort_desc = !self.processes.sort_desc;
             } else {
@@ -3371,6 +3590,43 @@ impl FramesageApp {
                     ProcessSortKey::ExeName | ProcessSortKey::Pid | ProcessSortKey::Profile
                 );
             }
+        }
+    }
+}
+
+/// Long-form hover text for each Processes-tab column header. Same
+/// "explain what this is" affordance every Process Lasso column has.
+/// Returned by-value (not `&'static str`) so callers can compose dynamic
+/// hints in the future without churning every call site.
+fn column_hover_text(key: ProcessSortKey) -> &'static str {
+    match key {
+        ProcessSortKey::ExeName => {
+            "Executable filename. Click to sort alphabetically; click again to flip direction."
+        }
+        ProcessSortKey::Pid => {
+            "Process ID. Stable within a process's lifetime, reused after exit."
+        }
+        ProcessSortKey::Cpu => {
+            "Live CPU usage as % of one logical processor. Sort descending to find the noisy one fast."
+        }
+        ProcessSortKey::Memory => {
+            "Working-set size — resident RAM the process is using right now. Hover the cell for peak + private bytes."
+        }
+        ProcessSortKey::Threads => "Live thread count.",
+        ProcessSortKey::Priority => {
+            "Windows priority class. Game Mode + manual overrides can change this from its default."
+        }
+        ProcessSortKey::Profile => {
+            "Profile FrameSage has applied to this PID. Star ★ marks profiles that came from a Rule (vs one-shot)."
+        }
+        ProcessSortKey::Description => {
+            "Friendly name from the exe's version resource (\"Microsoft Edge\" beside msedge.exe)."
+        }
+        ProcessSortKey::Company => {
+            "Publisher string from the version resource. Useful for spotting unfamiliar binaries."
+        }
+        ProcessSortKey::User => {
+            "User account that owns the process. SYSTEM / NT SERVICE rows render muted so user-owned code stands out."
         }
     }
 }
@@ -3419,6 +3675,26 @@ enum ProcessAction {
     RequestAffinityPicker {
         pid: u32,
         exe_name: String,
+    },
+    /// Reveal the process's exe in Explorer (selects the file in its folder).
+    /// Pure shell-out via `explorer.exe /select,<path>`; nothing to round-
+    /// trip through the service.
+    ShowInExplorer {
+        path: String,
+    },
+    /// Copy a string to the clipboard. The egui `Context::copy_text` helper
+    /// owns the clipboard plumbing; we just package the string here so the
+    /// dispatch loop can call it after the render closure releases its borrow.
+    CopyToClipboard {
+        text: String,
+    },
+    /// Suspend an entire subtree: the parent PID + every descendant
+    /// reachable via parent-PID edges in the current snapshot. Captured
+    /// here as a single action so the dispatch loop expands it once
+    /// against the live snapshot — a stale tree from a prior frame would
+    /// be wrong by the time we send.
+    SuspendTree {
+        root_pid: u32,
     },
 }
 
@@ -3635,6 +3911,27 @@ fn push_run(out: &mut Vec<String>, start: u32, end: u32) {
         // better as a range.
         out.push(format!("{start}–{end}"));
     }
+}
+
+/// Format the tooltip shown when hovering the FrameSage system-tray icon.
+/// Two-line layout: "FrameSage — <state>" + "Active: <profile> · <pid> @ <fg>".
+/// Reads the StatusSnapshot to decide what to show; degrades gracefully
+/// when fields are absent ("Active: — / Foreground: —").
+fn format_tray_tooltip(connected: bool, status: Option<&StatusSnapshot>) -> String {
+    let state = match (connected, status.map(|s| s.paused)) {
+        (false, _) => "disconnected",
+        (true, Some(true)) => "paused",
+        (true, _) => "running",
+    };
+    let active_profile = status
+        .and_then(|s| s.active_profile.as_ref())
+        .map(|p| p.id.0.as_str())
+        .unwrap_or("—");
+    let foreground = status
+        .and_then(|s| s.foreground.as_ref())
+        .map(|f| f.exe_name.as_str())
+        .unwrap_or("—");
+    format!("FrameSage — {state}\nActive: {active_profile}  ·  Foreground: {foreground}")
 }
 
 /// Top-N cores by load, formatted as a multi-line tooltip body:
@@ -4816,6 +5113,112 @@ mod tests {
         // reverse-PID order → 3, then 2.
         assert_eq!(pids, vec![1, 3, 2]);
     }
+
+    use super::{descendants_of, format_tray_tooltip, truncate_for_echo};
+    use framesage_ipc::{ForegroundSnapshot, StatusSnapshot};
+
+    #[test]
+    fn descendants_of_includes_root_and_walks_subtree() {
+        // Tree:
+        //   1
+        //     2
+        //        4
+        //     3
+        //   5
+        let rows = vec![
+            proc_with_parent(1, 0),
+            proc_with_parent(2, 1),
+            proc_with_parent(3, 1),
+            proc_with_parent(4, 2),
+            proc_with_parent(5, 0),
+        ];
+        let mut got = descendants_of(&rows, 1);
+        got.sort_unstable();
+        assert_eq!(got, vec![1, 2, 3, 4]);
+        // Calling on a leaf returns just the leaf.
+        assert_eq!(descendants_of(&rows, 4), vec![4]);
+    }
+
+    #[test]
+    fn descendants_of_handles_cycle_without_looping() {
+        let rows = vec![proc_with_parent(1, 2), proc_with_parent(2, 1)];
+        let got = descendants_of(&rows, 1);
+        // Both PIDs visited exactly once.
+        assert_eq!(got.len(), 2);
+        assert!(got.contains(&1));
+        assert!(got.contains(&2));
+    }
+
+    #[test]
+    fn truncate_for_echo_short_string_unchanged() {
+        assert_eq!(truncate_for_echo("hello", 40), "hello");
+    }
+
+    #[test]
+    fn truncate_for_echo_long_string_gets_ellipsis() {
+        let s = "a".repeat(100);
+        let got = truncate_for_echo(&s, 10);
+        assert_eq!(got.chars().count(), 10);
+        assert!(got.ends_with('…'));
+    }
+
+    #[test]
+    fn truncate_for_echo_respects_chars_not_bytes() {
+        // Norwegian letters are multi-byte in UTF-8 but single-char.
+        // Slicing by byte index would panic on a non-boundary; chars()
+        // is the right primitive.
+        let s = "æøåæøåæøå";
+        let got = truncate_for_echo(s, 5);
+        assert_eq!(got.chars().count(), 5);
+    }
+
+    fn fake_status(paused: bool, profile: Option<&str>, fg: Option<&str>) -> StatusSnapshot {
+        let active_profile = profile.map(|id| {
+            let mut p = framesage_core::Profile::new(id);
+            p.description = format!("test profile {id}");
+            p
+        });
+        let foreground = fg.map(|exe| ForegroundSnapshot {
+            pid: 42,
+            exe_name: exe.to_string(),
+            path: String::new(),
+            title: String::new(),
+        });
+        StatusSnapshot {
+            paused,
+            policy: framesage_core::Policy::default(),
+            foreground,
+            active_profile,
+            manual_override: None,
+        }
+    }
+
+    #[test]
+    fn format_tray_tooltip_disconnected_state() {
+        let s = format_tray_tooltip(false, None);
+        assert!(s.contains("disconnected"));
+        // Active / Foreground always present so the second line is stable.
+        assert!(s.contains("Active: —"));
+        assert!(s.contains("Foreground: —"));
+    }
+
+    #[test]
+    fn format_tray_tooltip_paused_with_profile() {
+        let snap = fake_status(true, Some("game-x3d"), Some("bf6.exe"));
+        let s = format_tray_tooltip(true, Some(&snap));
+        assert!(s.contains("paused"));
+        assert!(s.contains("game-x3d"));
+        assert!(s.contains("bf6.exe"));
+    }
+
+    #[test]
+    fn format_tray_tooltip_running_no_foreground() {
+        let snap = fake_status(false, None, None);
+        let s = format_tray_tooltip(true, Some(&snap));
+        assert!(s.contains("running"));
+        assert!(s.contains("Active: —"));
+        assert!(s.contains("Foreground: —"));
+    }
 }
 
 /// Legacy fixed-width KV row, kept around in case a future editor section
@@ -5396,32 +5799,80 @@ fn build_icon() -> Icon {
 struct TrayMenuIds {
     open: MenuId,
     hide: MenuId,
+    pause: MenuId,
+    resume: MenuId,
+    game_mode_off: MenuId,
+    view_processes: MenuId,
+    view_status: MenuId,
+    view_rules: MenuId,
+    view_profiles: MenuId,
+    open_config: MenuId,
+    edit_policy: MenuId,
     exit: MenuId,
 }
 
 #[cfg(windows)]
 fn build_tray(commands: &TrayCommands, egui_ctx: egui::Context) -> anyhow::Result<TrayIcon> {
+    use tray_icon::menu::Submenu;
+
     let menu = Menu::new();
     let open = MenuItem::new("Open window", true, None);
     let hide = MenuItem::new("Hide window", true, None);
-    let sep = PredefinedMenuItem::separator();
-    let exit = MenuItem::new("Exit framesage tray", true, None);
+
+    let pause = MenuItem::new("Pause engine", true, None);
+    let resume = MenuItem::new("Resume engine", true, None);
+    let game_mode_off = MenuItem::new("Game Mode off (panic)", true, None);
+
+    // View → submenu jumps to a specific tab AND opens the window. Letting
+    // the user land directly on the tab they care about is the entire
+    // reason for surfacing tabs in the tray.
+    let view_processes = MenuItem::new("Processes", true, None);
+    let view_status = MenuItem::new("Status", true, None);
+    let view_rules = MenuItem::new("Rules", true, None);
+    let view_profiles = MenuItem::new("Profiles", true, None);
+    let view_submenu = Submenu::new("View", true);
+    view_submenu.append(&view_processes)?;
+    view_submenu.append(&view_status)?;
+    view_submenu.append(&view_rules)?;
+    view_submenu.append(&view_profiles)?;
+
+    let open_config = MenuItem::new("Open config folder", true, None);
+    let edit_policy = MenuItem::new("Edit policy.json", true, None);
+    let exit = MenuItem::new("Exit FrameSage", true, None);
 
     menu.append(&open)?;
     menu.append(&hide)?;
-    menu.append(&sep)?;
+    menu.append(&PredefinedMenuItem::separator())?;
+    menu.append(&pause)?;
+    menu.append(&resume)?;
+    menu.append(&game_mode_off)?;
+    menu.append(&PredefinedMenuItem::separator())?;
+    menu.append(&view_submenu)?;
+    menu.append(&PredefinedMenuItem::separator())?;
+    menu.append(&open_config)?;
+    menu.append(&edit_policy)?;
+    menu.append(&PredefinedMenuItem::separator())?;
     menu.append(&exit)?;
 
     let ids = TrayMenuIds {
         open: open.id().clone(),
         hide: hide.id().clone(),
+        pause: pause.id().clone(),
+        resume: resume.id().clone(),
+        game_mode_off: game_mode_off.id().clone(),
+        view_processes: view_processes.id().clone(),
+        view_status: view_status.id().clone(),
+        view_rules: view_rules.id().clone(),
+        view_profiles: view_profiles.id().clone(),
+        open_config: open_config.id().clone(),
+        edit_policy: edit_policy.id().clone(),
         exit: exit.id().clone(),
     };
 
     let tray = TrayIconBuilder::new()
         .with_menu(Box::new(menu))
         .with_icon(build_icon())
-        .with_tooltip("framesage — foreground policy supervisor")
+        .with_tooltip("FrameSage — foreground policy supervisor")
         .build()?;
 
     // tray-icon delivers MenuEvent and TrayIconEvent via global crossbeam
@@ -5441,10 +5892,36 @@ fn build_tray(commands: &TrayCommands, egui_ctx: egui::Context) -> anyhow::Resul
         .name("framesage-tray-menu".into())
         .spawn(move || {
             while let Ok(ev) = menu_rx.recv() {
+                // Match each known menu id to its TrayCommands flag. View →
+                // tab items both flip `show_window` (so the window appears
+                // even if hidden) AND set `jump_to_tab`. The egui loop sees
+                // both on the next frame and applies them atomically.
                 if ev.id == ids.open {
                     cmds_menu.show_window.store(true, Ordering::Relaxed);
                 } else if ev.id == ids.hide {
                     cmds_menu.hide_window.store(true, Ordering::Relaxed);
+                } else if ev.id == ids.pause {
+                    cmds_menu.pause_engine.store(true, Ordering::Relaxed);
+                } else if ev.id == ids.resume {
+                    cmds_menu.resume_engine.store(true, Ordering::Relaxed);
+                } else if ev.id == ids.game_mode_off {
+                    cmds_menu.game_mode_off.store(true, Ordering::Relaxed);
+                } else if ev.id == ids.view_processes {
+                    *cmds_menu.jump_to_tab.lock().unwrap() = Some(Tab::Processes);
+                    cmds_menu.show_window.store(true, Ordering::Relaxed);
+                } else if ev.id == ids.view_status {
+                    *cmds_menu.jump_to_tab.lock().unwrap() = Some(Tab::Status);
+                    cmds_menu.show_window.store(true, Ordering::Relaxed);
+                } else if ev.id == ids.view_rules {
+                    *cmds_menu.jump_to_tab.lock().unwrap() = Some(Tab::Rules);
+                    cmds_menu.show_window.store(true, Ordering::Relaxed);
+                } else if ev.id == ids.view_profiles {
+                    *cmds_menu.jump_to_tab.lock().unwrap() = Some(Tab::Profiles);
+                    cmds_menu.show_window.store(true, Ordering::Relaxed);
+                } else if ev.id == ids.open_config {
+                    cmds_menu.open_config_folder.store(true, Ordering::Relaxed);
+                } else if ev.id == ids.edit_policy {
+                    cmds_menu.edit_policy.store(true, Ordering::Relaxed);
                 } else if ev.id == ids.exit {
                     cmds_menu.exit_requested.store(true, Ordering::Relaxed);
                 } else {
@@ -5879,6 +6356,63 @@ fn build_window_icon() -> egui::IconData {
 /// reliable cross-input way to do this on Windows (handles paths with
 /// spaces and URLs identically). On non-Windows hosts this is a no-op so
 /// the rest of the binary still cross-compiles.
+/// Open Explorer with `path`'s containing folder open and `path` selected
+/// in the list. Uses the documented `explorer.exe /select,<path>` switch —
+/// same idiom Task Manager's "Open file location" uses. Best-effort: no
+/// useful recovery if Explorer can't launch (the user always has manual
+/// navigation).
+#[cfg(windows)]
+fn open_explorer_select(path: &str) {
+    let _ = std::process::Command::new("explorer.exe")
+        .arg(format!("/select,{path}"))
+        .spawn();
+}
+#[cfg(not(windows))]
+fn open_explorer_select(_path: &str) {}
+
+/// Trim `s` to fit in a `max`-character status-bar echo, appending `…` when
+/// the original ran longer. Operates on chars (not bytes) so non-ASCII
+/// names don't slice mid-codepoint.
+fn truncate_for_echo(s: &str, max: usize) -> String {
+    if s.chars().count() <= max {
+        s.to_string()
+    } else {
+        let mut out: String = s.chars().take(max - 1).collect();
+        out.push('…');
+        out
+    }
+}
+
+/// Collect `root_pid` and every PID transitively descended from it through
+/// the current snapshot's parent-PID edges. DFS with a visited-set guards
+/// against cycles (which shouldn't exist in real kernel state but a
+/// PID-reuse race could theoretically produce). Returns the root first;
+/// suspending in that order means a parent's signal-handling is paused
+/// before its child's exit propagates back up the tree.
+fn descendants_of(rows: &[framesage_ipc::ProcessSnapshot], root_pid: u32) -> Vec<u32> {
+    use std::collections::{HashMap, HashSet, VecDeque};
+    let mut children: HashMap<u32, Vec<u32>> = HashMap::new();
+    for r in rows {
+        children.entry(r.parent_pid).or_default().push(r.pid);
+    }
+    let mut out = Vec::new();
+    let mut seen: HashSet<u32> = HashSet::new();
+    let mut q: VecDeque<u32> = VecDeque::new();
+    q.push_back(root_pid);
+    while let Some(pid) = q.pop_front() {
+        if !seen.insert(pid) {
+            continue;
+        }
+        out.push(pid);
+        if let Some(kids) = children.get(&pid) {
+            for &c in kids {
+                q.push_back(c);
+            }
+        }
+    }
+    out
+}
+
 fn open_in_shell(target: &str) {
     #[cfg(windows)]
     {
