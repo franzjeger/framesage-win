@@ -186,6 +186,66 @@
       "display_name": "Printer Extensions and Notifications",
       "rationale": "Printer-driver notification overlay. Pair with Spooler if you've already paused that; otherwise leave running.",
       "default_stop": false
+    },
+    {
+      "id": "TrkWks",
+      "display_name": "Distributed Link Tracking Client",
+      "rationale": "Maintains links between NTFS files across volumes. Vestigial on modern Windows; near-zero hits on consumer machines. Safe to stop.",
+      "default_stop": true
+    },
+    {
+      "id": "stisvc",
+      "display_name": "Windows Image Acquisition (WIA)",
+      "rationale": "Service for scanners and cameras. Almost no one uses these on a gaming rig. Safe to stop.",
+      "default_stop": true
+    },
+    {
+      "id": "ssh-agent",
+      "display_name": "OpenSSH Authentication Agent",
+      "rationale": "Caches SSH keys for the user. Most users don't run ssh during games; the few who do can leave this on.",
+      "default_stop": false
+    },
+    {
+      "id": "ClickToRunSvc",
+      "display_name": "Microsoft Office Click-to-Run",
+      "rationale": "Background updater + servicing process for Office 365. Periodic CPU spikes when checking for updates. Safe to pause for a session; resume lets Office update on its own schedule.",
+      "default_stop": true
+    },
+    {
+      "id": "SDRSVC",
+      "display_name": "Windows Backup",
+      "rationale": "Triggers scheduled backups (legacy File History / Windows Backup). Wakes disk I/O. Safe to pause; resume re-enables scheduled runs.",
+      "default_stop": true
+    },
+    {
+      "id": "CertPropSvc",
+      "display_name": "Certificate Propagation",
+      "rationale": "Propagates smart-card certificates. No-op on machines without smart-card readers. Safe to stop.",
+      "default_stop": false
+    },
+    {
+      "id": "ScDeviceEnum",
+      "display_name": "Smart Card Device Enumeration",
+      "rationale": "Enumerates smart-card readers for SCardSvr. Pair with SCardSvr / CertPropSvc.",
+      "default_stop": false
+    },
+    {
+      "id": "FrameServer",
+      "display_name": "Windows Camera Frame Server",
+      "rationale": "Brokers camera frames between apps. Idle unless you're using a webcam; in that case (streaming) don't stop it.",
+      "default_stop": false
+    },
+    {
+      "id": "Wcmsvc",
+      "display_name": "Windows Connection Manager",
+      "rationale": "Auto-connects to wifi/cellular networks. Don't stop on laptops on wifi — wifi will drop. Wired desktops can pause safely.",
+      "default_stop": false
+    },
+    {
+      "id": "WlanSvc",
+      "display_name": "WLAN AutoConfig",
+      "rationale": "Wi-Fi connection manager. STOPPING THIS DROPS WI-FI. Listed for wired-desktop users only; default off.",
+      "default_stop": false
     }
   ],
   "denylist": [

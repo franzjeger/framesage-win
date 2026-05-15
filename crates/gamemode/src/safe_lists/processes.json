@@ -252,6 +252,150 @@
       "display_name": "Google Updater",
       "rationale": "Auto-updates Chrome / other Google apps. Periodic background check.",
       "default_suspend": true
+    },
+    {
+      "exe": "AdobeARM.exe",
+      "display_name": "Adobe Acrobat Update Manager",
+      "rationale": "Adobe Reader auto-update checker. Periodic background work; safe to pause.",
+      "default_suspend": true
+    },
+    {
+      "exe": "AdobeIPCBroker.exe",
+      "display_name": "Adobe IPC Broker",
+      "rationale": "Adobe Creative Cloud inter-process bridge. Idle but allocates and polls. Pause unless you're actively editing.",
+      "default_suspend": false
+    },
+    {
+      "exe": "AdobeCollabSync.exe",
+      "display_name": "Adobe Collaboration Sync",
+      "rationale": "Acrobat collaboration sync. Network + disk poll. Safe to pause.",
+      "default_suspend": false
+    },
+    {
+      "exe": "CCXProcess.exe",
+      "display_name": "Adobe Creative Cloud (CCX)",
+      "rationale": "CC content sync / asset cache. Heavy network + disk in bursts. Pause for clean gaming sessions.",
+      "default_suspend": false
+    },
+    {
+      "exe": "CCLibrary.exe",
+      "display_name": "Adobe Creative Cloud Library",
+      "rationale": "CC asset library. Periodic sync; safe to pause.",
+      "default_suspend": false
+    },
+    {
+      "exe": "Adobe Desktop Service.exe",
+      "display_name": "Adobe Desktop Service",
+      "rationale": "Creative Cloud desktop service. Pair with CCXProcess.",
+      "default_suspend": false
+    },
+    {
+      "exe": "WidgetService.exe",
+      "display_name": "Windows Widgets",
+      "rationale": "Win11 widget panel host. Polls news / weather / stocks. Pure background; safe to pause.",
+      "default_suspend": true
+    },
+    {
+      "exe": "Widgets.exe",
+      "display_name": "Windows Widgets (UI)",
+      "rationale": "Widget board UI host. Pair with WidgetService.",
+      "default_suspend": true
+    },
+    {
+      "exe": "GameBar.exe",
+      "display_name": "Xbox Game Bar",
+      "rationale": "Game Bar overlay process. Most hardcore gamers turn off Game Bar entirely. Suspending here disables overlay + recording for the session.",
+      "default_suspend": true
+    },
+    {
+      "exe": "GameBarFTServer.exe",
+      "display_name": "Game Bar Foreground Server",
+      "rationale": "Game Bar's foreground-detection background helper. Pair with GameBar.",
+      "default_suspend": true
+    },
+    {
+      "exe": "GameBarPresenceWriter.exe",
+      "display_name": "Game Bar Presence Writer",
+      "rationale": "Reports your Game Bar 'presence' to Xbox Live. Pure telemetry; safe to pause.",
+      "default_suspend": true
+    },
+    {
+      "exe": "NahimicService.exe",
+      "display_name": "Nahimic Audio Service",
+      "rationale": "Pre-installed audio enhancement on many gaming laptops/motherboards. Real CPU consumer per audio frame. Safe to pause if you don't rely on its EQ.",
+      "default_suspend": false
+    },
+    {
+      "exe": "NVIDIA Web Helper.exe",
+      "display_name": "NVIDIA Web Helper (GeForce Experience)",
+      "rationale": "GeForce Experience's background poller. Game telemetry + driver-update checks. Suspending doesn't affect drivers — only the GFE app.",
+      "default_suspend": true
+    },
+    {
+      "exe": "DellSupportAssistRemedyService.exe",
+      "display_name": "Dell SupportAssist (Remedy)",
+      "rationale": "Dell preinstalled diagnostic/telemetry service. Safe to pause on personal use.",
+      "default_suspend": true
+    },
+    {
+      "exe": "HPSupportSolutionsFrameworkService.exe",
+      "display_name": "HP Support Solutions Framework",
+      "rationale": "HP preinstalled telemetry / hardware-monitor. Safe to pause.",
+      "default_suspend": true
+    },
+    {
+      "exe": "HpToastSourceApp.exe",
+      "display_name": "HP Toast notifications",
+      "rationale": "HP toast/promo notifier. Pure noise.",
+      "default_suspend": true
+    },
+    {
+      "exe": "LenovoVantageService.exe",
+      "display_name": "Lenovo Vantage",
+      "rationale": "Lenovo preinstalled service. Periodic checks; safe to pause.",
+      "default_suspend": true
+    },
+    {
+      "exe": "MicrosoftEdgeUpdate.exe",
+      "display_name": "Microsoft Edge Update",
+      "rationale": "Edge auto-updater. Periodic background check.",
+      "default_suspend": true
+    },
+    {
+      "exe": "vmnat.exe",
+      "display_name": "VMware NAT",
+      "rationale": "VMware Workstation NAT service. Idle if no VM is running; if a VM is up, pause might affect its network.",
+      "default_suspend": false
+    },
+    {
+      "exe": "vmware-tray.exe",
+      "display_name": "VMware Tray",
+      "rationale": "VMware Workstation tray icon. Idle; safe to pause.",
+      "default_suspend": false
+    },
+    {
+      "exe": "Notion.exe",
+      "display_name": "Notion",
+      "rationale": "Notion desktop app (Electron). Heavy background sync. Pause unless you're taking notes.",
+      "default_suspend": false
+    },
+    {
+      "exe": "Notion Helper.exe",
+      "display_name": "Notion Helper",
+      "rationale": "Notion's Electron renderer helpers. Pair with main Notion process.",
+      "default_suspend": false
+    },
+    {
+      "exe": "Telegram.exe",
+      "display_name": "Telegram Desktop",
+      "rationale": "Messaging client. Pause if you don't need IM during the session.",
+      "default_suspend": false
+    },
+    {
+      "exe": "signal.exe",
+      "display_name": "Signal Desktop",
+      "rationale": "Encrypted messenger (Electron). Same reasoning as WhatsApp.",
+      "default_suspend": false
     }
   ],
   "denylist": [
