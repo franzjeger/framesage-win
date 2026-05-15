@@ -290,23 +290,33 @@ impl Default for Policy {
                     "BITS".into(),
                     "DoSvc".into(),
                     "WaaSMedicSvc".into(),
+                    "UsoSvc".into(),
                     // Notifications + device-platform polling.
                     "WpnService".into(),
                     "CDPSvc".into(),
-                    // Diagnostics infrastructure (DPS family).
+                    // Diagnostics infrastructure (DPS family) + crash reports.
                     "DPS".into(),
                     "WdiServiceHost".into(),
                     "WdiSystemHost".into(),
+                    "WerSvc".into(),
+                    "PcaSvc".into(),
+                    "dmwappushservice".into(),
+                    // Microsoft-app updaters that wake on their own schedule.
+                    "ClickToRunSvc".into(),
+                    // Background backup + maintenance.
+                    "SDRSVC".into(),
+                    "defragsvc".into(),
                     // Vestigial / IoT services that are pure background.
                     "MapsBroker".into(),
                     "AJRouter".into(),
                     "WMPNetworkSvc".into(),
-                    "defragsvc".into(),
                     "Fax".into(),
                     "RetailDemo".into(),
                     "PhoneSvc".into(),
                     "RemoteRegistry".into(),
                     "icssvc".into(),
+                    "TrkWks".into(),
+                    "stisvc".into(),
                 ],
                 suspend_processes: vec![
                     // Cloud-storage syncs — heaviest disk + network bursts.
@@ -320,7 +330,32 @@ impl Default for Policy {
                     // Auto-updaters polling in the background.
                     "OneDriveStandaloneUpdater.exe".into(),
                     "GoogleUpdate.exe".into(),
+                    "MicrosoftEdgeUpdate.exe".into(),
                     "lghub_updater.exe".into(),
+                    "AdobeARM.exe".into(),
+                    // Game Bar + Xbox overlay. Many gamers disable Game Bar
+                    // entirely; suspending here drops its CPU/frame-pacing
+                    // overhead for the session without flipping the registry
+                    // toggle permanently.
+                    "GameBar.exe".into(),
+                    "GameBarFTServer.exe".into(),
+                    "GameBarPresenceWriter.exe".into(),
+                    // Windows Widgets — pure background poller for news /
+                    // weather / stocks.
+                    "WidgetService.exe".into(),
+                    "Widgets.exe".into(),
+                    // Phone Link bridge — periodic Bluetooth/Wi-Fi Direct
+                    // chatter. Pair with CDPSvc stop.
+                    "YourPhone.exe".into(),
+                    "PhoneExperienceHost.exe".into(),
+                    // GeForce Experience background helper (driver itself is
+                    // safe-listed and untouched).
+                    "NVIDIA Web Helper.exe".into(),
+                    // OEM preinstalled telemetry / SupportAssist suites.
+                    "DellSupportAssistRemedyService.exe".into(),
+                    "HPSupportSolutionsFrameworkService.exe".into(),
+                    "HpToastSourceApp.exe".into(),
+                    "LenovoVantageService.exe".into(),
                 ],
                 power_plan: Some(PowerPlanId::HighPerformance),
                 focus_assist: None,
