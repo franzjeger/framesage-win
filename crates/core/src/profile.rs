@@ -211,6 +211,21 @@ pub struct Profile {
     /// non-Aggressive values per defaults D-9 + D-10.
     #[serde(default)]
     pub ac_safe_mode_target: AntiCheatProfile,
+
+    /// Item 2.11. When true, this profile shows up in the tray's
+    /// "Manual Global Game Mode" picker — meaning the user can
+    /// explicitly enter this profile's `game_mode` actions
+    /// system-wide without needing a matching foreground process.
+    /// Useful for "quiet desktop" presets (stop OneDrive / WSearch /
+    /// BITS, hide taskbar, switch to High Performance) that aren't
+    /// tied to a specific app.
+    ///
+    /// Defaults to false so existing policies stay opt-in: the
+    /// picker won't suddenly fill up with every game profile the
+    /// user has authored. The seeded `quiet-desktop` profile (if
+    /// any future migration adds one) would set this to true.
+    #[serde(default)]
+    pub manual_global_eligible: bool,
 }
 
 /// Anti-cheat-aware safety tier for a profile. See

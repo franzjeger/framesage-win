@@ -298,6 +298,7 @@ mod tests {
             foreground,
             active_profile,
             manual_override: None,
+            manual_global_active: None,
         }
     }
 
