@@ -18,7 +18,7 @@
 use std::collections::HashSet;
 
 use anyhow::{anyhow, Result};
-use windows::Win32::Foundation::{CloseHandle, HANDLE, MAX_PATH};
+use windows::Win32::Foundation::MAX_PATH;
 use windows::Win32::System::Diagnostics::ToolHelp::{
     CreateToolhelp32Snapshot, Process32FirstW, Process32NextW, Thread32First, Thread32Next,
     PROCESSENTRY32W, TH32CS_SNAPPROCESS, TH32CS_SNAPTHREAD, THREADENTRY32,
@@ -26,6 +26,8 @@ use windows::Win32::System::Diagnostics::ToolHelp::{
 use windows::Win32::System::Threading::{
     OpenThread, ResumeThread, SuspendThread, THREAD_SUSPEND_RESUME,
 };
+
+use crate::owned_handle::OwnedHandle;
 
 /// All PIDs currently running with an executable name matching `exe`
 /// (case-insensitive, trailing-component match — directories are ignored).
@@ -36,8 +38,10 @@ pub fn find_pids_by_exe(exe: &str) -> Result<Vec<(u32, String)>> {
     let target = exe.to_ascii_lowercase();
 
     // SAFETY: documented call. 0-PID means "all processes."
-    let snapshot = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) }
-        .map_err(|e| anyhow!("CreateToolhelp32Snapshot(processes) failed: {e}"))?;
+    let snapshot = OwnedHandle::assume_valid(
+        unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) }
+            .map_err(|e| anyhow!("CreateToolhelp32Snapshot(processes) failed: {e}"))?,
+    );
 
     let mut out = Vec::new();
     let mut entry = PROCESSENTRY32W {
@@ -45,21 +49,20 @@ pub fn find_pids_by_exe(exe: &str) -> Result<Vec<(u32, String)>> {
         ..Default::default()
     };
     // SAFETY: snapshot is valid; entry has dwSize set.
-    if unsafe { Process32FirstW(snapshot, &mut entry) }.is_ok() {
+    if unsafe { Process32FirstW(snapshot.as_raw(), &mut entry) }.is_ok() {
         loop {
             let exe_name = read_wide_null_terminated(&entry.szExeFile);
             if exe_name.to_ascii_lowercase() == target {
                 out.push((entry.th32ProcessID, exe_name));
             }
             // SAFETY: snapshot still valid; entry reused with original size.
-            if unsafe { Process32NextW(snapshot, &mut entry) }.is_err() {
+            if unsafe { Process32NextW(snapshot.as_raw(), &mut entry) }.is_err() {
                 break;
             }
         }
     }
 
-    // SAFETY: snapshot is the handle we just opened and haven't otherwise used.
-    let _ = unsafe { CloseHandle(snapshot) };
+    // snapshot drops here, closing the handle.
     Ok(out)
 }
 
@@ -80,12 +83,11 @@ pub fn suspend_process(pid: u32) -> Result<u32> {
         if let Some(handle) = open_thread_for_suspend(tid) {
             // SAFETY: handle is valid; SuspendThread returns previous
             // suspend count or DWORD(-1) on failure.
-            let prev = unsafe { SuspendThread(handle) };
+            let prev = unsafe { SuspendThread(handle.as_raw()) };
             if prev != u32::MAX {
                 suspended += 1;
             }
-            // SAFETY: handle is the one we just opened; close once.
-            let _ = unsafe { CloseHandle(handle) };
+            // handle drops at end of scope.
         }
     }
     Ok(suspended)
@@ -107,13 +109,13 @@ pub fn resume_process(pid: u32) -> Result<u32> {
             loop {
                 // SAFETY: handle valid. ResumeThread returns previous suspend
                 // count; 0 means it's now running, DWORD(-1) means error.
-                let prev = unsafe { ResumeThread(handle) };
+                let prev = unsafe { ResumeThread(handle.as_raw()) };
                 if prev == 0 || prev == u32::MAX {
                     break;
                 }
                 resumed += 1;
             }
-            let _ = unsafe { CloseHandle(handle) };
+            // handle drops at end of scope.
         }
     }
     Ok(resumed)
@@ -124,8 +126,10 @@ pub fn resume_process(pid: u32) -> Result<u32> {
 fn list_thread_ids_for_pid(pid: u32) -> Result<HashSet<u32>> {
     // SAFETY: documented call. TH32CS_SNAPTHREAD captures the entire system's
     // thread list; we filter by owning PID below.
-    let snapshot = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0) }
-        .map_err(|e| anyhow!("CreateToolhelp32Snapshot(threads) failed: {e}"))?;
+    let snapshot = OwnedHandle::assume_valid(
+        unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0) }
+            .map_err(|e| anyhow!("CreateToolhelp32Snapshot(threads) failed: {e}"))?,
+    );
 
     let mut out = HashSet::new();
     let mut entry = THREADENTRY32 {
@@ -133,26 +137,28 @@ fn list_thread_ids_for_pid(pid: u32) -> Result<HashSet<u32>> {
         ..Default::default()
     };
     // SAFETY: snapshot valid; entry has dwSize set.
-    if unsafe { Thread32First(snapshot, &mut entry) }.is_ok() {
+    if unsafe { Thread32First(snapshot.as_raw(), &mut entry) }.is_ok() {
         loop {
             if entry.th32OwnerProcessID == pid {
                 out.insert(entry.th32ThreadID);
             }
-            if unsafe { Thread32Next(snapshot, &mut entry) }.is_err() {
+            if unsafe { Thread32Next(snapshot.as_raw(), &mut entry) }.is_err() {
                 break;
             }
         }
     }
 
-    let _ = unsafe { CloseHandle(snapshot) };
+    // snapshot drops here, closing the handle.
     Ok(out)
 }
 
-fn open_thread_for_suspend(tid: u32) -> Option<HANDLE> {
+fn open_thread_for_suspend(tid: u32) -> Option<OwnedHandle> {
     // SAFETY: documented call. THREAD_SUSPEND_RESUME is the minimal access
     // for SuspendThread/ResumeThread. Returns Err on protected threads or
     // race exits — we treat those as "skip this thread."
-    unsafe { OpenThread(THREAD_SUSPEND_RESUME, false, tid) }.ok()
+    unsafe { OpenThread(THREAD_SUSPEND_RESUME, false, tid) }
+        .ok()
+        .map(OwnedHandle::assume_valid)
 }
 
 fn read_wide_null_terminated(buf: &[u16]) -> String {

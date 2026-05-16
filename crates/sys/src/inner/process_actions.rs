@@ -15,10 +15,12 @@
 
 use anyhow::{anyhow, Result};
 
-use windows::Win32::Foundation::{CloseHandle, HANDLE, NTSTATUS};
+use windows::Win32::Foundation::{HANDLE, NTSTATUS};
 use windows::Win32::System::Threading::{
     OpenProcess, TerminateProcess, PROCESS_SUSPEND_RESUME, PROCESS_TERMINATE,
 };
+
+use crate::owned_handle::OwnedHandle;
 
 #[link(name = "ntdll")]
 extern "system" {
@@ -36,9 +38,8 @@ extern "system" {
 pub fn suspend(pid: u32) -> Result<()> {
     let handle = open_for_suspend(pid)?;
     // SAFETY: handle is valid (we just opened it).
-    let status = unsafe { NtSuspendProcess(handle) };
-    // SAFETY: handle owned, last use.
-    let _ = unsafe { CloseHandle(handle) };
+    let status = unsafe { NtSuspendProcess(handle.as_raw()) };
+    // handle drops at end of scope.
     if status.0 < 0 {
         return Err(anyhow!(
             "NtSuspendProcess({pid}) failed: NTSTATUS 0x{:08x}",
@@ -54,9 +55,8 @@ pub fn suspend(pid: u32) -> Result<()> {
 pub fn resume(pid: u32) -> Result<()> {
     let handle = open_for_suspend(pid)?;
     // SAFETY: handle valid.
-    let status = unsafe { NtResumeProcess(handle) };
-    // SAFETY: handle owned, last use.
-    let _ = unsafe { CloseHandle(handle) };
+    let status = unsafe { NtResumeProcess(handle.as_raw()) };
+    // handle drops at end of scope.
     if status.0 < 0 {
         return Err(anyhow!(
             "NtResumeProcess({pid}) failed: NTSTATUS 0x{:08x}",
@@ -76,16 +76,17 @@ pub fn terminate(pid: u32) -> Result<()> {
         ));
     }
     // SAFETY: documented call. Returns Err on protected processes / dead PIDs.
-    let handle = unsafe { OpenProcess(PROCESS_TERMINATE, false, pid) }
-        .map_err(|e| anyhow!("OpenProcess(PROCESS_TERMINATE, pid={pid}) failed: {e}"))?;
+    let handle = OwnedHandle::assume_valid(
+        unsafe { OpenProcess(PROCESS_TERMINATE, false, pid) }
+            .map_err(|e| anyhow!("OpenProcess(PROCESS_TERMINATE, pid={pid}) failed: {e}"))?,
+    );
     // SAFETY: handle valid. Exit code 1 mirrors Task Manager's "End task".
-    let r = unsafe { TerminateProcess(handle, 1) };
-    // SAFETY: handle owned.
-    let _ = unsafe { CloseHandle(handle) };
+    let r = unsafe { TerminateProcess(handle.as_raw(), 1) };
+    // handle drops at end of scope.
     r.map_err(|e| anyhow!("TerminateProcess({pid}) failed: {e}"))
 }
 
-fn open_for_suspend(pid: u32) -> Result<HANDLE> {
+fn open_for_suspend(pid: u32) -> Result<OwnedHandle> {
     if pid == 0 || pid == 4 {
         return Err(anyhow!(
             "refusing to suspend/resume PID {pid} (System Idle / System)"
@@ -93,8 +94,9 @@ fn open_for_suspend(pid: u32) -> Result<HANDLE> {
     }
     // SAFETY: documented call. PROCESS_SUSPEND_RESUME is the minimum right
     // for NtSuspendProcess / NtResumeProcess.
-    unsafe { OpenProcess(PROCESS_SUSPEND_RESUME, false, pid) }
-        .map_err(|e| anyhow!("OpenProcess(PROCESS_SUSPEND_RESUME, pid={pid}) failed: {e}"))
+    let raw = unsafe { OpenProcess(PROCESS_SUSPEND_RESUME, false, pid) }
+        .map_err(|e| anyhow!("OpenProcess(PROCESS_SUSPEND_RESUME, pid={pid}) failed: {e}"))?;
+    Ok(OwnedHandle::assume_valid(raw))
 }
 
 #[cfg(test)]

@@ -4,6 +4,7 @@ pub mod cppc;
 pub mod foreground;
 pub mod game_mode;
 pub mod io_priority;
+pub mod owned_handle;
 pub mod process;
 pub mod process_actions;
 pub mod sys_proc_info;

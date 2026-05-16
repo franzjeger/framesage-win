@@ -15,7 +15,9 @@
 use anyhow::{anyhow, Result};
 
 use windows::core::PWSTR;
-use windows::Win32::Foundation::{CloseHandle, FILETIME, HANDLE, INVALID_HANDLE_VALUE, MAX_PATH};
+use windows::Win32::Foundation::{FILETIME, HANDLE, INVALID_HANDLE_VALUE, MAX_PATH};
+
+use crate::owned_handle::OwnedHandle;
 use windows::Win32::System::Diagnostics::ToolHelp::{
     CreateToolhelp32Snapshot, Process32FirstW, Process32NextW, PROCESSENTRY32W, TH32CS_SNAPPROCESS,
 };
@@ -67,26 +69,27 @@ pub struct PidSnapshot {
 /// which matters when the Processes tab re-snapshots ~200 processes
 /// every second.
 pub fn iter_pid_snapshots() -> Result<Vec<PidSnapshot>> {
-    let snap = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) }
+    let snap_raw = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) }
         .map_err(|e| anyhow!("CreateToolhelp32Snapshot failed: {e}"))?;
-    if snap == INVALID_HANDLE_VALUE {
+    if snap_raw == INVALID_HANDLE_VALUE {
         return Err(anyhow!(
             "CreateToolhelp32Snapshot returned INVALID_HANDLE_VALUE"
         ));
     }
+    let snap = OwnedHandle::assume_valid(snap_raw);
     let mut entry = PROCESSENTRY32W {
         dwSize: std::mem::size_of::<PROCESSENTRY32W>() as u32,
         ..Default::default()
     };
     let mut out = Vec::with_capacity(256);
-    let first_ok = unsafe { Process32FirstW(snap, &mut entry) }.is_ok();
+    let first_ok = unsafe { Process32FirstW(snap.as_raw(), &mut entry) }.is_ok();
     if first_ok {
         out.push(PidSnapshot {
             pid: entry.th32ProcessID,
             parent_pid: entry.th32ParentProcessID,
             thread_count: entry.cntThreads,
         });
-        while unsafe { Process32NextW(snap, &mut entry) }.is_ok() {
+        while unsafe { Process32NextW(snap.as_raw(), &mut entry) }.is_ok() {
             out.push(PidSnapshot {
                 pid: entry.th32ProcessID,
                 parent_pid: entry.th32ParentProcessID,
@@ -94,7 +97,7 @@ pub fn iter_pid_snapshots() -> Result<Vec<PidSnapshot>> {
             });
         }
     }
-    close_handle(snap);
+    // snap drops here, closing the snapshot.
     Ok(out)
 }
 
@@ -105,13 +108,14 @@ pub fn iter_pid_snapshots() -> Result<Vec<PidSnapshot>> {
 /// `PROCESS_QUERY_LIMITED_INFORMATION`.
 pub fn iter_pids() -> Result<Vec<u32>> {
     // SAFETY: documented call. Returns INVALID_HANDLE_VALUE on failure.
-    let snap = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) }
+    let snap_raw = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) }
         .map_err(|e| anyhow!("CreateToolhelp32Snapshot failed: {e}"))?;
-    if snap == INVALID_HANDLE_VALUE {
+    if snap_raw == INVALID_HANDLE_VALUE {
         return Err(anyhow!(
             "CreateToolhelp32Snapshot returned INVALID_HANDLE_VALUE"
         ));
     }
+    let snap = OwnedHandle::assume_valid(snap_raw);
 
     let mut entry = PROCESSENTRY32W {
         dwSize: std::mem::size_of::<PROCESSENTRY32W>() as u32,
@@ -122,17 +126,17 @@ pub fn iter_pids() -> Result<Vec<u32>> {
 
     // SAFETY: snap is a valid snapshot handle from CreateToolhelp32Snapshot.
     // dwSize is initialised. First and Next are documented to return BOOL.
-    let first_ok = unsafe { Process32FirstW(snap, &mut entry) }.is_ok();
+    let first_ok = unsafe { Process32FirstW(snap.as_raw(), &mut entry) }.is_ok();
     if first_ok {
         pids.push(entry.th32ProcessID);
         // SAFETY: entry has been populated by Process32FirstW; reusing for Next
         // is the documented pattern.
-        while unsafe { Process32NextW(snap, &mut entry) }.is_ok() {
+        while unsafe { Process32NextW(snap.as_raw(), &mut entry) }.is_ok() {
             pids.push(entry.th32ProcessID);
         }
     }
 
-    close_handle(snap);
+    // snap drops here, closing the snapshot.
     Ok(pids)
 }
 
@@ -143,9 +147,10 @@ pub fn exe_for_pid(pid: u32) -> Result<Option<String>> {
         // System Idle Process can't be opened.
         return Ok(None);
     }
-    // SAFETY: documented call.
+    // SAFETY: documented call. OwnedHandle (item 3.3) closes the
+    // handle on every return path.
     let handle = match unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid) } {
-        Ok(h) => h,
+        Ok(h) => OwnedHandle::assume_valid(h),
         // ACCESS_DENIED / INVALID_PARAMETER (PID exited): silently skip.
         Err(_) => return Ok(None),
     };
@@ -155,13 +160,13 @@ pub fn exe_for_pid(pid: u32) -> Result<Option<String>> {
     // SAFETY: handle valid; buf + size valid out params.
     let result = unsafe {
         QueryFullProcessImageNameW(
-            handle,
+            handle.as_raw(),
             PROCESS_NAME_FORMAT(0),
             PWSTR(buf.as_mut_ptr()),
             &mut size,
         )
     };
-    close_handle(handle);
+    // handle drops at end of scope.
 
     match result {
         Ok(()) => Ok(Some(String::from_utf16_lossy(&buf[..size as usize]))),
@@ -196,40 +201,44 @@ pub fn user_for_pid(pid: u32) -> Result<Option<String>> {
         return Ok(None);
     }
     // SAFETY: documented call. Returns Err for denied / nonexistent PIDs.
+    // OwnedHandle (item 3.3) closes both the process and token handles
+    // on every return path.
     let proc_handle = match unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid) } {
-        Ok(h) => h,
+        Ok(h) => OwnedHandle::assume_valid(h),
         Err(_) => return Ok(None),
     };
 
-    let mut token: HANDLE = HANDLE::default();
+    let mut token_raw: HANDLE = HANDLE::default();
     // SAFETY: proc_handle is valid; documented call.
-    let token_result = unsafe { OpenProcessToken(proc_handle, TOKEN_QUERY, &mut token) };
-    close_handle(proc_handle);
+    let token_result =
+        unsafe { OpenProcessToken(proc_handle.as_raw(), TOKEN_QUERY, &mut token_raw) };
+    // Don't need proc_handle past this point — let it drop early.
+    drop(proc_handle);
     if token_result.is_err() {
         return Ok(None);
     }
+    let token = OwnedHandle::assume_valid(token_raw);
 
     // GetTokenInformation: classic two-call dance for buffer sizing.
     let mut needed: u32 = 0;
     // SAFETY: NULL buffer + 0 size deliberately triggers
     // ERROR_INSUFFICIENT_BUFFER and writes the required size into `needed`.
-    let _ = unsafe { GetTokenInformation(token, TokenUser, None, 0, &mut needed) };
+    let _ = unsafe { GetTokenInformation(token.as_raw(), TokenUser, None, 0, &mut needed) };
     if needed == 0 {
-        close_handle(token);
         return Ok(None);
     }
     let mut buf = vec![0u8; needed as usize];
     // SAFETY: buf has exactly `needed` bytes.
     let result = unsafe {
         GetTokenInformation(
-            token,
+            token.as_raw(),
             TokenUser,
             Some(buf.as_mut_ptr() as *mut c_void),
             needed,
             &mut needed,
         )
     };
-    close_handle(token);
+    // token drops at end of scope.
     if result.is_err() {
         return Ok(None);
     }
@@ -354,7 +363,7 @@ pub fn cpu_times(pid: u32) -> Result<Option<ProcessCpuTimes>> {
         return Ok(None);
     }
     let handle = match unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid) } {
-        Ok(h) => h,
+        Ok(h) => OwnedHandle::assume_valid(h),
         Err(_) => return Ok(None),
     };
 
@@ -363,9 +372,10 @@ pub fn cpu_times(pid: u32) -> Result<Option<ProcessCpuTimes>> {
     let mut kernel = FILETIME::default();
     let mut user = FILETIME::default();
     // SAFETY: handle valid; the four FILETIME out-params are valid pointers.
-    let result =
-        unsafe { GetProcessTimes(handle, &mut creation, &mut exit, &mut kernel, &mut user) };
-    close_handle(handle);
+    let result = unsafe {
+        GetProcessTimes(handle.as_raw(), &mut creation, &mut exit, &mut kernel, &mut user)
+    };
+    // handle drops at end of scope.
 
     match result {
         Ok(()) => Ok(Some(ProcessCpuTimes {
@@ -420,7 +430,7 @@ pub fn memory_info(pid: u32) -> Result<Option<MemoryInfo>> {
         return Ok(None);
     }
     let handle = match unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid) } {
-        Ok(h) => h,
+        Ok(h) => OwnedHandle::assume_valid(h),
         Err(_) => return Ok(None),
     };
 
@@ -435,12 +445,12 @@ pub fn memory_info(pid: u32) -> Result<Option<MemoryInfo>> {
     // struct so the kernel knows to populate PrivateUsage.
     let r = unsafe {
         GetProcessMemoryInfo(
-            handle,
+            handle.as_raw(),
             &mut ex as *mut _ as *mut PROCESS_MEMORY_COUNTERS,
             size,
         )
     };
-    close_handle(handle);
+    // handle drops at end of scope.
     match r {
         Ok(()) => Ok(Some(MemoryInfo {
             working_set_bytes: ex.WorkingSetSize as u64,
@@ -650,24 +660,20 @@ pub fn affinity_mask(pid: u32) -> Result<Option<u64>> {
         return Ok(None);
     }
     let handle = match unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid) } {
-        Ok(h) => h,
+        Ok(h) => OwnedHandle::assume_valid(h),
         Err(_) => return Ok(None),
     };
     let mut process_mask: usize = 0;
     let mut system_mask: usize = 0;
     // SAFETY: handle valid; both out-params valid.
-    let r = unsafe { GetProcessAffinityMask(handle, &mut process_mask, &mut system_mask) };
-    close_handle(handle);
+    let r = unsafe {
+        GetProcessAffinityMask(handle.as_raw(), &mut process_mask, &mut system_mask)
+    };
+    // handle drops at end of scope.
     match r {
         Ok(()) => Ok(Some(process_mask as u64)),
         Err(_) => Ok(None),
     }
-}
-
-fn close_handle(h: HANDLE) {
-    // SAFETY: h is a handle we own; CloseHandle is idempotent on the same
-    // handle (subsequent closes return an error we don't act on).
-    let _ = unsafe { CloseHandle(h) };
 }
 
 #[cfg(test)]
