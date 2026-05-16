@@ -428,6 +428,35 @@ impl FramesageApp {
             .spawn(move || processes_poll_loop(proc_state, proc_ctx, proc_visible))
             .expect("spawn processes poller thread");
 
+        // Single-instance signal watcher: a secondary tray process (launched
+        // by the user clicking the .exe or Start-menu icon while this tray
+        // is already running) calls `SetEvent` on a named Win32 event;
+        // this thread blocks on it and flips `commands.show_window` so the
+        // egui runtime restores + focuses the window on its next frame.
+        // Without this, re-launching framesage-tray.exe was a silent no-op.
+        #[cfg(windows)]
+        if let Ok(event) = win32::create_show_window_event() {
+            let watch_commands = commands.clone();
+            let watch_ctx = cc.egui_ctx.clone();
+            std::thread::Builder::new()
+                .name("framesage-tray-show-window-watcher".into())
+                .spawn(move || loop {
+                    match event.wait() {
+                        Ok(true) => {
+                            watch_commands.show_window.store(true, Ordering::Relaxed);
+                            watch_ctx.request_repaint();
+                        }
+                        Ok(false) => {
+                            // Abandoned / unexpected — sleep a moment so a
+                            // misbehaving wait doesn't busy-loop the CPU.
+                            std::thread::sleep(std::time::Duration::from_millis(500));
+                        }
+                        Err(_) => break,
+                    }
+                })
+                .expect("spawn show-window watcher thread");
+        }
+
         // The tray runs in a separate thread; pass an egui::Context clone so
         // the menu/click handlers can wake the runtime. Without this, hiding
         // the window parks the message loop and tray clicks fall on the floor
@@ -509,7 +538,15 @@ impl eframe::App for FramesageApp {
         // thread; consume them here on the egui thread where ViewportCommand
         // is valid.
         if self.commands.show_window.swap(false, Ordering::Relaxed) {
+            // Three commands cover every "the window is gone" state:
+            //   * Visible(true)   — restores from hide-to-tray
+            //   * Minimized(false) — restores from taskbar-minimize (this
+            //     was missing; Focus alone won't unminimize a minimized
+            //     window on Windows, so a tray click did nothing visible
+            //     when the user had hit the "─" button)
+            //   * Focus           — brings it forward + activates input
             ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
+            ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
             ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
         }
         if self.commands.hide_window.swap(false, Ordering::Relaxed) {
@@ -5580,14 +5617,25 @@ fn send_request_blocking(pipe_name: &str, req: &Request) -> anyhow::Result<Respo
 // ─── main ────────────────────────────────────────────────────────────────────
 
 fn main() -> eframe::Result<()> {
-    // Singleton + elevation handoff: if another tray is running, wait briefly
-    // for it to exit (in case this is the elevated child taking over from a
-    // non-elevated parent), then fail cleanly if it doesn't.
+    // Singleton + elevation handoff: if another tray is running, wait
+    // briefly for it to exit (covers the elevation-handoff window). If it
+    // doesn't, signal the existing instance to bring its window forward
+    // and exit cleanly — the user clicked the .exe / Start-menu icon
+    // expecting "show the app," not "fail silently."
     #[cfg(windows)]
     let _singleton = match win32::acquire_singleton() {
-        Ok(guard) => guard,
+        Ok(win32::SingletonAttempt::Primary(guard)) => guard,
+        Ok(win32::SingletonAttempt::AlreadyRunning) => {
+            // Best-effort signal — we don't care if it succeeded; either
+            // the primary woke up and showed its window, or we hit the
+            // tiny race window where the primary is starting up and the
+            // event isn't created yet, in which case the primary will
+            // already show its window naturally.
+            let _ = win32::signal_existing_tray_show_window();
+            return Ok(());
+        }
         Err(e) => {
-            eprintln!("framesage-tray: {e}");
+            eprintln!("framesage-tray: singleton check failed: {e}");
             return Ok(());
         }
     };
