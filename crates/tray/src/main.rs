@@ -6049,8 +6049,20 @@ fn send_processes_and_status_blocking() -> anyhow::Result<(
 /// even if the service is down for minutes.
 #[cfg(windows)]
 fn foreground_reporter_loop() {
-    let interval = std::time::Duration::from_millis(250);
+    // Item 2.5 / audit L-02. The reporter polls foreground every
+    // ~250 ms. If the service is down (restart cycle, install/
+    // uninstall, panic-recovery), every IPC send fails. Previous
+    // implementation called `send_request_blocking` on every tick
+    // regardless — 4 retry attempts per second for the entire outage,
+    // each generating a WaitNamedPipeW timeout. Now: exponential
+    // backoff on consecutive failures, capped at 5 s. When the
+    // service comes back, the next successful send resets the
+    // backoff to the normal 250 ms cadence.
+    const NORMAL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(250);
+    const BACKOFF_CAP: std::time::Duration = std::time::Duration::from_secs(5);
+
     let mut last_pid: Option<u32> = None;
+    let mut current_interval = NORMAL_INTERVAL;
     loop {
         let req = match framesage_sys::foreground::current() {
             Ok(Some(fg)) => {
@@ -6077,11 +6089,22 @@ fn foreground_reporter_loop() {
             Err(_) => None,
         };
         if let Some(req) = req {
-            // Best-effort: drop the result. Service might be starting,
-            // not yet running, restarting, etc. The next tick will retry.
-            let _ = send_request_blocking(framesage_ipc::PIPE_NAME_ADMIN, &req);
+            match send_request_blocking(framesage_ipc::PIPE_NAME_ADMIN, &req) {
+                Ok(_) => {
+                    // Success — reset to normal cadence.
+                    current_interval = NORMAL_INTERVAL;
+                }
+                Err(_) => {
+                    // Failure — back off (double the interval, cap at
+                    // BACKOFF_CAP). Avoids hammering the named-pipe
+                    // dispatcher during a service outage; lets the
+                    // service-restart cycle complete without log
+                    // spam.
+                    current_interval = (current_interval.saturating_mul(2)).min(BACKOFF_CAP);
+                }
+            }
         }
-        std::thread::sleep(interval);
+        std::thread::sleep(current_interval);
     }
 }
 
@@ -6090,10 +6113,33 @@ fn foreground_reporter_loop() {
 /// deliberately don't reuse a persistent connection because admin
 /// operations are rare and the simpler per-call lifecycle is easier
 /// to reason about than a long-lived sender.
+///
+/// Item 2.5 / audit H-14. The previous implementation called
+/// `OpenOptions::open(pipe_name)` directly — on Windows, if the named
+/// pipe server has no available instances, that call can block for an
+/// unbounded amount of time (default WaitNamedPipe timeout is 50 ms
+/// but the OS internally retries). During a service restart the tray
+/// UI thread would freeze for the duration of the outage. Now: probe
+/// availability with `WaitNamedPipeW` first, with a hard 2-second
+/// timeout. If the server isn't ready in 2 s, we surface a clear
+/// "service unavailable" error instead of hanging the caller.
 #[cfg(windows)]
 fn send_request_blocking(pipe_name: &str, req: &Request) -> anyhow::Result<Response> {
     use std::fs::OpenOptions;
     use std::io::{BufRead, BufReader, Write};
+
+    /// How long to wait for a pipe instance to become available
+    /// before erroring. 2 s is comfortably above legitimate slow
+    /// connects (worst-case kernel pipe-instance recycling) while
+    /// staying below "user notices UI is frozen" (typical perception
+    /// threshold ~3 s).
+    const PIPE_WAIT_TIMEOUT_MS: u32 = 2000;
+
+    // Probe availability first. WaitNamedPipeW returns immediately if
+    // an instance is available, or after the timeout if none becomes
+    // available. We treat timeout / not-found as a connection failure
+    // — the caller's job is to back off and retry, not hang.
+    wait_for_pipe(pipe_name, PIPE_WAIT_TIMEOUT_MS)?;
 
     let pipe = OpenOptions::new().read(true).write(true).open(pipe_name)?;
     let mut writer = pipe.try_clone()?;
@@ -6108,6 +6154,33 @@ fn send_request_blocking(pipe_name: &str, req: &Request) -> anyhow::Result<Respo
     reader.read_line(&mut line)?;
     let resp: Response = serde_json::from_str(line.trim_end())?;
     Ok(resp)
+}
+
+/// `WaitNamedPipeW(pipe_name, timeout_ms)` — returns immediately if a
+/// server-side pipe instance is available, or errors after the
+/// timeout. Item 2.5 / audit H-14.
+///
+/// The Win32 function returns BOOL; we surface failure as Err so the
+/// caller can distinguish "no service" from "open failed for some
+/// other reason." Common error: ERROR_FILE_NOT_FOUND (service not
+/// running yet) or ERROR_SEM_TIMEOUT (timeout elapsed).
+#[cfg(windows)]
+fn wait_for_pipe(pipe_name: &str, timeout_ms: u32) -> anyhow::Result<()> {
+    use windows::core::PCWSTR;
+    use windows::Win32::System::Pipes::WaitNamedPipeW;
+
+    let wide: Vec<u16> = pipe_name.encode_utf16().chain(std::iter::once(0)).collect();
+    // SAFETY: wide is a null-terminated UTF-16 string alive for the
+    // duration of this call; WaitNamedPipeW is documented as safe
+    // with any non-null timeout value (0 = NMPWAIT_USE_DEFAULT_WAIT,
+    // 0xFFFFFFFF = INFINITE, anything else = ms).
+    let result = unsafe { WaitNamedPipeW(PCWSTR(wide.as_ptr()), timeout_ms) };
+    if result.as_bool() {
+        Ok(())
+    } else {
+        let err = std::io::Error::last_os_error();
+        Err(anyhow::anyhow!("WaitNamedPipeW({pipe_name}) failed: {err}"))
+    }
 }
 
 // ─── main ────────────────────────────────────────────────────────────────────

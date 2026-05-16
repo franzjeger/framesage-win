@@ -176,6 +176,16 @@ struct EngineState {
     /// desktop is idle" from "no helper has ever reported, fall back to
     /// session-local polling".
     foreground_reporter_seen: bool,
+    /// Wall-clock instant of the most recent ReportForeground /
+    /// ReportNoForeground IPC. Item 2.6 / audit H-13. Without this,
+    /// `foreground_reporter_seen=true` was a one-way latch: once the
+    /// tray reported even once, the engine would forever prefer the
+    /// (now-stale) cached report over session-local polling. A
+    /// crashed tray left the engine stuck on whatever profile was
+    /// active at crash time. The staleness check in `tick` compares
+    /// this against [`FOREGROUND_REPORT_STALENESS`] and falls back to
+    /// session-local polling if the tray hasn't reported recently.
+    last_foreground_report_at: Option<Instant>,
     /// PIDs that have had a standalone `AffinityRule` pin applied at
     /// least once. Independent of `applied` because affinity rules live
     /// outside the profile system — a PID can have a rule pin without
@@ -226,6 +236,16 @@ const BACKGROUND_SCAN_INTERVAL: Duration = Duration::from_secs(10);
 /// per managed PID, and persistent-profile PIDs are typically 1–3 (games,
 /// not background apps).
 const PERSISTENT_REASSERT_INTERVAL: Duration = Duration::from_secs(2);
+
+/// Maximum age of the tray's last ReportForeground / ReportNoForeground
+/// IPC before the engine treats the report as stale and falls back to
+/// session-local polling. Item 2.6 / audit H-13.
+///
+/// The tray reports every 250 ms; a 10 s window is 40× normal interval,
+/// generous enough to absorb a slow service-restart cycle without
+/// false-positive fallback, tight enough that a crashed tray doesn't
+/// leave the engine stuck on a phantom foreground for minutes.
+const FOREGROUND_REPORT_STALENESS: Duration = Duration::from_secs(10);
 
 /// How often the engine refreshes its anti-cheat presence probe.
 /// Item 1.9 / AC matrix. 5 s is plenty — Vanguard / EAC / BattlEye
@@ -323,6 +343,7 @@ impl Engine {
                 manual_override: None,
                 reported_foreground: None,
                 foreground_reporter_seen: false,
+                last_foreground_report_at: None,
                 affinity_rule_applied: HashSet::new(),
                 ac_presence: AntiCheatPresence::default(),
                 last_ac_probe: None,
@@ -1170,6 +1191,7 @@ impl Engine {
             title,
         });
         s.foreground_reporter_seen = true;
+        s.last_foreground_report_at = Some(Instant::now());
     }
 
     /// Accept a "no foreground" report (lock screen, UAC, transition).
@@ -1177,6 +1199,7 @@ impl Engine {
         let mut s = self.state.write();
         s.reported_foreground = None;
         s.foreground_reporter_seen = true;
+        s.last_foreground_report_at = Some(Instant::now());
     }
 
     /// Panic button: revert any active system mode regardless of foreground.
@@ -1335,9 +1358,24 @@ impl Engine {
         // user-session helper (the tray, via Request::ReportForeground).
         // If no report has ever arrived (console-mode dev path), we fall
         // back to the in-process poll.
+        //
+        // Item 2.6 / audit H-13: also fall back if the last report is
+        // older than FOREGROUND_REPORT_STALENESS. The previous one-way
+        // latch on `foreground_reporter_seen` meant a crashed tray
+        // left the engine forever stuck on the last cached foreground
+        // (taskbar hidden, services stopped, no way out short of
+        // restart). Now: if 10+ seconds have passed without a fresh
+        // report, the engine treats the helper as gone and resumes
+        // session-local polling. When the tray comes back (auto-restart
+        // via SCM-side install.ps1 Startup shortcut, or user re-launch),
+        // the next ReportForeground refreshes the timestamp and the
+        // engine prefers the report again.
         let foreground = {
             let s = self.state.read();
-            if s.foreground_reporter_seen {
+            let report_is_fresh = s
+                .last_foreground_report_at
+                .is_some_and(|t| t.elapsed() < FOREGROUND_REPORT_STALENESS);
+            if s.foreground_reporter_seen && report_is_fresh {
                 s.reported_foreground.clone()
             } else {
                 drop(s);
