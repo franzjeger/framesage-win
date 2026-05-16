@@ -337,6 +337,30 @@ pub(crate) fn processes_poll_loop(
                 };
                 let cpu_for_history = system.cpu_percent;
                 let mut s = state.lock();
+
+                // Item 3.4 — capture per-PID CPU% into the per-PID
+                // ring buffer BEFORE swapping s.processes, so we can
+                // diff the new and old PID sets in one pass. Each
+                // VecDeque caps at SYSTEM_HISTORY_LEN.
+                let new_pids: std::collections::HashSet<u32> =
+                    snapshots.iter().map(|p| p.pid).collect();
+                for snap in &snapshots {
+                    let entry = s
+                        .per_pid_cpu_history
+                        .entry(snap.pid)
+                        .or_insert_with(|| {
+                            std::collections::VecDeque::with_capacity(SYSTEM_HISTORY_LEN)
+                        });
+                    entry.push_back(snap.cpu_percent.min(255) as u8);
+                    while entry.len() > SYSTEM_HISTORY_LEN {
+                        entry.pop_front();
+                    }
+                }
+                // Evict PIDs that disappeared this tick — keeps the
+                // map bounded to the live process count instead of
+                // growing forever as PIDs come and go.
+                s.per_pid_cpu_history.retain(|pid, _| new_pids.contains(pid));
+
                 s.processes = snapshots;
                 s.system = system;
                 // Refresh the cached Status every tick so the UI never

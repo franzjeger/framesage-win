@@ -24,7 +24,7 @@ use framesage_ipc::ProcessSnapshot;
 
 use crate::formatters::{format_bytes, priority_class_label};
 use crate::theme;
-use crate::widgets::detail_kv;
+use crate::widgets::{detail_kv, draw_single_sparkline};
 
 /// Pending context-menu click captured during the render pass; dispatched
 /// after the render closure releases its borrow on `self`.
@@ -128,11 +128,17 @@ pub(crate) const PRIORITY_CHOICES: &[(&str, PriorityClass)] = &[
 /// The detail card is the discoverability surface for users who never
 /// right-click — Process Lasso ships the same set of actions both ways for
 /// exactly this reason.
+///
+/// `cpu_history` (item 3.4): per-PID CPU% sample history (newest at
+/// the back), capped at `state::SYSTEM_HISTORY_LEN`. Empty when we
+/// haven't seen this PID in any prior tick. Rendered as a sparkline
+/// next to the CPU detail row.
 pub(crate) fn render_process_detail(
     ui: &mut egui::Ui,
     pid: u32,
     rows: &[ProcessSnapshot],
     profile_ids: &[String],
+    cpu_history: &[u8],
     action_queue: &mut Vec<ProcessAction>,
     close_flag: &mut bool,
 ) {
@@ -175,6 +181,21 @@ pub(crate) fn render_process_detail(
                     // Left column: metrics.
                     ui.vertical(|ui| {
                         detail_kv(ui, "CPU", format!("{} %", p.cpu_percent));
+                        // Item 3.4 — 60 s of CPU% history rendered as
+                        // an inline sparkline. Tucked under the CPU
+                        // row in the detail panel so the user can
+                        // see whether the current % is a spike or a
+                        // sustained load without leaving the panel.
+                        // Skipped on first-tick (history.len() < 2)
+                        // — draw_single_sparkline handles that by
+                        // drawing just the background tray.
+                        if !cpu_history.is_empty() {
+                            let desired = egui::vec2(180.0, 22.0);
+                            let (rect, _) =
+                                ui.allocate_exact_size(desired, egui::Sense::hover());
+                            draw_single_sparkline(ui.painter(), rect, cpu_history);
+                            ui.add_space(4.0);
+                        }
                         // Working set + the supporting peak / private values.
                         // The "growth gap" between current working set and
                         // peak working set is the classic memory-leak signal.
