@@ -68,6 +68,14 @@ enum Cmd {
     /// Efficiency), CPPC ranks, SMT siblings. Useful for verifying that X3D
     /// detection picked the right CCD on a new chip.
     Topology,
+    /// Item 3.7 — ask the running service to re-detect CPU topology
+    /// and swap its cached snapshot. The service already refreshes
+    /// automatically on sleep/resume; this verb covers cases where
+    /// the user toggled core-parking or processor-state limits via
+    /// Windows' advanced power settings (which don't fire a resume
+    /// event) and wants the engine to pick up the change without a
+    /// reboot.
+    RefreshTopology,
     /// Game Mode controls — status, panic-off, safe-list inspection.
     #[command(subcommand)]
     GameMode(GameModeCmd),
@@ -145,6 +153,9 @@ fn main() -> Result<()> {
             .await
         }),
         Cmd::Topology => print_topology(),
+        Cmd::RefreshTopology => {
+            tokio_block(async { send_simple(Request::RefreshTopology).await })
+        }
         Cmd::GameMode(sub) => match sub {
             GameModeCmd::Status => tokio_block(async { print_game_mode_status().await }),
             GameModeCmd::Off => tokio_block(async { send_simple(Request::GameModeOff).await }),

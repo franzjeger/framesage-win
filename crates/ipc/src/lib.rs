@@ -181,6 +181,14 @@ pub enum Request {
     /// capped at `limit`. Backs `framesage undo list` and the tray's
     /// undo panel.
     UndoLogList { limit: u32 },
+    /// Item 3.7 — manually trigger a CPU topology re-detection.
+    /// The engine already refreshes topology automatically on
+    /// `SystemEvent::Resume`, but power-plan tweaks (core parking,
+    /// minimum/maximum processor state changes) don't fire a resume
+    /// event. Exposed for the CLI's `framesage refresh-topology` and
+    /// the tray's "Refresh topology" menu item so the user can
+    /// force a refresh after changing those settings without rebooting.
+    RefreshTopology,
 }
 
 impl Request {
@@ -216,7 +224,8 @@ impl Request {
             | Request::DeleteAffinityRule { .. }
             | Request::EnableManualGlobalGameMode { .. }
             | Request::DisableManualGlobalGameMode
-            | Request::Undo => false,
+            | Request::Undo
+            | Request::RefreshTopology => false,
         }
     }
 
@@ -628,6 +637,7 @@ mod tests {
         assert!(!Request::Pause.is_read_only());
         assert!(!Request::Resume.is_read_only());
         assert!(!Request::GameModeOff.is_read_only());
+        assert!(!Request::RefreshTopology.is_read_only());
     }
 
     #[test]
