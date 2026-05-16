@@ -16,6 +16,8 @@ use anyhow::Result;
 use tracing::info;
 
 #[cfg(windows)]
+mod acl;
+#[cfg(windows)]
 mod pipe;
 mod runtime;
 

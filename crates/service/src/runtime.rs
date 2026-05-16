@@ -32,6 +32,37 @@ pub fn run_blocking(shutdown: oneshot::Receiver<()>) -> Result<()> {
 /// already has a runtime.
 pub async fn run(shutdown: oneshot::Receiver<()>) -> Result<()> {
     let policy_path = paths::policy_path();
+
+    // Item 1.2 / audit C-04 — harden the config dir's DACL before any
+    // policy load. Stops the inherited-CREATOR_OWNER vulnerability where a
+    // non-admin who created `%ProgramData%\framesage\` first (e.g. via a
+    // `framesage-svc --console` run before installation) keeps modify
+    // rights on policy.json forever. SetNamedSecurityInfoW from
+    // LocalSystem overwrites whatever DACL was there.
+    //
+    // Two failure modes both result in continuing with a warning, not
+    // refusing to start:
+    //  - We're running in console mode under a non-admin user → we don't
+    //    have SeTakeOwnership; hardening fails. Dev is responsible for
+    //    their own posture; the verify-owner check below will catch it.
+    //  - The dir is on a network drive or some FS that doesn't support
+    //    Windows ACLs → ditto.
+    //
+    // The load-side `verify_owner_is_admin_or_system` is the real safety
+    // gate: it refuses to trust the file if hardening didn't take.
+    #[cfg(windows)]
+    {
+        let config_dir = paths::config_dir();
+        if let Err(e) = crate::acl::harden_config_dir(&config_dir) {
+            warn!(
+                error = %e,
+                "config dir hardening failed — likely running unelevated in console \
+                 mode. policy.json owner will be verified before load; install via SCM \
+                 for the production trust boundary."
+            );
+        }
+    }
+
     let policy = load_policy_or_default(&policy_path);
     let topology = detect_topology()?;
     info!(
@@ -115,6 +146,34 @@ enum PipeKind {
 }
 
 fn load_policy_or_default(path: &std::path::Path) -> Policy {
+    // Defense-in-depth (item 1.2 / audit C-04): verify the file's owner
+    // is SYSTEM or BUILTIN\Administrators before trusting its content.
+    // If hardening failed earlier in startup (console mode, unsupported
+    // FS) or someone managed to plant a file before we hardened, the
+    // owner SID is the catch-net. Loading a user-owned policy.json
+    // would mean an attacker with modify rights could plant arbitrary
+    // AppRule entries that drive `apply_profile` under SYSTEM rights —
+    // exactly the EoP primitive the audit identified.
+    //
+    // Owner check only fires if the file exists; load_or_create_default
+    // handles the missing-file case by writing a fresh default (which
+    // we just created in a dir we own, so the new file is also owned by
+    // SYSTEM via the hardened DACL's inheritance).
+    #[cfg(windows)]
+    if path.exists() {
+        if let Err(e) = crate::acl::verify_owner_is_admin_or_system(path) {
+            warn!(
+                path = %path.display(),
+                error = %e,
+                "policy file owner check failed — using built-in defaults; \
+                 file contents will NOT be loaded until the file is owned \
+                 by SYSTEM or Administrators. Re-install the service \
+                 elevated to re-take ownership."
+            );
+            return Policy::default();
+        }
+    }
+
     match Policy::load_or_create_default(path) {
         Ok(p) => p,
         Err(e) => {
