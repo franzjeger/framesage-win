@@ -446,26 +446,62 @@ impl Default for Policy {
             ..Default::default()
         };
 
+        // Item 1.9 / AC matrix — clone game-x3d into two AC-tier variants
+        // for the seeded BF6 + Valorant rules. Defaults D-9 (Valorant →
+        // SafeMode) and D-10 (BF6 → Hybrid).
+        //
+        // We materialise these as distinct profiles (not per-rule
+        // overrides) so the user can see + edit them in the Profiles
+        // tab. The shared content (services / processes / power plan)
+        // is inherited via clone — keep one source of truth for the
+        // sledgehammer's contents.
+        let mut game_hybrid = game.clone();
+        game_hybrid.id = "game-x3d-hybrid".into();
+        game_hybrid.description =
+            "BF6 / EA Javelin: environment optimizations only — never touches the game process. \
+             Javelin actively blocks affinity changes on dual-CCD Ryzen during multiplayer. \
+             See audit/research/anti-cheat-eac.md."
+                .to_owned();
+        game_hybrid.ac_safe_mode_target = crate::AntiCheatProfile::Hybrid;
+
+        let mut game_safe = game.clone();
+        game_safe.id = "game-x3d-safe".into();
+        game_safe.description =
+            "Vanguard (Valorant) / FACEIT / ESEA: AC-Safe Mode — environment optimizations only, \
+             game process NEVER touched. Vanguard reserves hardware bans; Process Lasso has \
+             produced VAN: Competitive Restrictions. Mirrors Hone's 1M+-user model. See \
+             audit/research/anti-cheat-vanguard.md."
+                .to_owned();
+        game_safe.ac_safe_mode_target = crate::AntiCheatProfile::SafeMode;
+
         profiles.insert(perf.id.clone(), perf);
         profiles.insert(game.id.clone(), game.clone());
+        profiles.insert(game_hybrid.id.clone(), game_hybrid.clone());
+        profiles.insert(game_safe.id.clone(), game_safe.clone());
         profiles.insert(eco.id.clone(), eco);
 
-        // Seed a handful of well-known game executables. Users can edit freely.
+        // Seed a handful of well-known game executables. Per defaults
+        // D-9/D-10 + AC matrix research:
+        //   * Valorant → game-x3d-safe (Vanguard hardware-ban risk)
+        //   * BF6 → game-x3d-hybrid (Javelin affinity-blocking risk)
+        //   * Fortnite → game-x3d (EAC, friendly case, full aggression)
+        // Users can re-point any rule to a different AC tier per profile
+        // editor; these are just the recommended defaults.
         let rules = vec![
             AppRule {
                 r#match: AppMatch::ExeName("bf6.exe".into()),
-                profile: game.id.clone(),
-                note: "Battlefield 6".into(),
+                profile: game_hybrid.id.clone(),
+                note: "Battlefield 6 (EA Javelin Hybrid mode)".into(),
             },
             AppRule {
                 r#match: AppMatch::ExeName("VALORANT-Win64-Shipping.exe".into()),
-                profile: game.id.clone(),
-                note: "Valorant".into(),
+                profile: game_safe.id.clone(),
+                note: "Valorant (Vanguard Safe Mode)".into(),
             },
             AppRule {
                 r#match: AppMatch::ExeName("FortniteClient-Win64-Shipping.exe".into()),
                 profile: game.id.clone(),
-                note: "Fortnite".into(),
+                note: "Fortnite (EAC Aggressive)".into(),
             },
         ];
 

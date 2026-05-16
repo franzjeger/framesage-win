@@ -195,6 +195,63 @@ pub struct Profile {
     /// revert on focus loss, matching the original short-lived semantics.
     #[serde(default)]
     pub persistent: bool,
+
+    /// Item 1.9 / audit `audit/research/ANTI-CHEAT-MATRIX.md`.
+    ///
+    /// Which anti-cheat-aware behavior tier the engine should apply when
+    /// this profile fires. Drives whether direct game-process
+    /// modifications (affinity, priority, CPU sets, I/O priority, power
+    /// throttling) are skipped — i.e. whether the profile is allowed to
+    /// touch the game process itself, or only the environment around it
+    /// (services, processes-to-suspend, power plan, taskbar).
+    ///
+    /// Defaults to `Aggressive` via serde so existing policy.json files
+    /// migrate cleanly to the most permissive (and historically-existing)
+    /// behavior. The seeded BF6 / Valorant rules ship with explicit
+    /// non-Aggressive values per defaults D-9 + D-10.
+    #[serde(default)]
+    pub ac_safe_mode_target: AntiCheatProfile,
+}
+
+/// Anti-cheat-aware safety tier for a profile. See
+/// `audit/research/ANTI-CHEAT-MATRIX.md` for the full rationale and the
+/// per-AC verdicts that drove each tier's design.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum AntiCheatProfile {
+    /// Full sledgehammer — every knob in the Profile applies, including
+    /// direct modifications to the game process (affinity, priority,
+    /// CPU sets, I/O priority, power throttling) AND the system-wide
+    /// Game Mode actions (stop services, suspend processes, power
+    /// plan, taskbar hide). Default for fresh policies and for games
+    /// with no AC concerns (single-player, EAC-with-no-Javelin titles).
+    #[default]
+    Aggressive,
+    /// Hybrid mode — environment actions (services / processes /
+    /// power / taskbar) at full strength, but the game process itself
+    /// is left alone. For BF6 + EA Javelin: Javelin actively blocks
+    /// core parking / affinity changes on dual-CCD Ryzen during
+    /// multiplayer; the press has named Process Lasso as risk-bearing.
+    /// We keep the environment optimizations (free up CPU / RAM /
+    /// power for the game) but don't poke the game process directly.
+    Hybrid,
+    /// AC-Safe Mode — environment actions still fire, game process
+    /// modifications NEVER fire even if the user-authored profile
+    /// requests them. For Vanguard (Valorant): Riot reserves hardware
+    /// bans; documented VAN: Competitive Restrictions have hit
+    /// Process Lasso users; Riot explicitly will not allowlist any
+    /// third-party tool. Mirrors Hone's 1M+-user model — touch the
+    /// environment, never the game. Also the right default for FACEIT-
+    /// /ESEA-protected CS2 matches.
+    SafeMode,
+    /// Engine STANDBY mode — no rule writes, no scans, no actions
+    /// fire while the corresponding AC is detected running. Used for
+    /// ESEA per audit research: ESEA's vendor support KB explicitly
+    /// names Process Lasso as a conflict (Error #107, "uninstall to
+    /// fix"). FrameSage going dark while ESEAClient.exe runs
+    /// sidesteps the conflict entirely. Resumes automatically when
+    /// the AC exits.
+    Disabled,
 }
 
 impl Profile {

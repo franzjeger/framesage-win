@@ -5,15 +5,18 @@
 //! these types onto Win32 APIs; `framesage-engine` decides which profile to
 //! apply based on observed state.
 
+pub mod anti_cheat;
 pub mod game_mode;
 pub mod paths;
 pub mod policy;
 pub mod profile;
 pub mod topology;
 
+pub use anti_cheat::AntiCheatPresence;
 pub use game_mode::{FocusAssistMode, GameModeActions, PowerPlanId};
 pub use policy::{AffinityRule, AppMatch, AppRule, Policy, ProBalanceConfig};
 pub use profile::{
-    IoPriority, MemoryPriority, PowerThrottlingMode, PriorityClass, Profile, ProfileId,
+    AntiCheatProfile, IoPriority, MemoryPriority, PowerThrottlingMode, PriorityClass, Profile,
+    ProfileId,
 };
 pub use topology::{CoreKind, CpuSelector, CpuTopology, LogicalCpu};

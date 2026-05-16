@@ -3,7 +3,19 @@
 //! binaries don't build on non-Windows hosts.
 
 use anyhow::{anyhow, Result};
-use framesage_core::{CpuTopology, PriorityClass, Profile};
+use framesage_core::{AntiCheatPresence, CpuTopology, PriorityClass, Profile};
+
+pub mod ac_detect {
+    use super::*;
+    /// Non-Windows stub: returns "nothing detected" so cross-platform
+    /// engine paths (used by `framesage-sim`) get a consistent
+    /// no-AC-active view. The real probe in `inner::ac_detect`
+    /// requires `framesage_sys::process::iter_pids` which only
+    /// works on Windows.
+    pub fn detect_anti_cheats() -> Result<AntiCheatPresence> {
+        Ok(AntiCheatPresence::default())
+    }
+}
 
 pub mod foreground {
     use super::*;
