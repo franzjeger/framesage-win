@@ -14,7 +14,7 @@
 //!   round-tripping with `activity_log::PersistedActivityEvent`.
 //! * `SYSTEM_HISTORY_LEN` — sample count for the perf-band sparkline.
 
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::time::SystemTime;
 
 use eframe::egui;
@@ -41,11 +41,19 @@ pub(crate) struct AppState {
     /// samples — backs the sparkline in the permanent performance band at
     /// the top of every tab. Newest at the back.
     pub(crate) system_history: VecDeque<(u8, u8)>,
+    /// Item 3.4 — per-PID CPU% history. Each VecDeque caps at
+    /// `SYSTEM_HISTORY_LEN` samples (newest at the back), refreshed
+    /// each `processes_poll_loop` tick. Backs the sparkline shown in
+    /// the Processes-tab detail panel. PIDs that disappear between
+    /// snapshots are evicted to keep the map bounded.
+    pub(crate) per_pid_cpu_history: HashMap<u32, VecDeque<u8>>,
 }
 
-/// Number of samples kept in `AppState.system_history`. 60 samples × 1 Hz
-/// poll = 60 seconds of history, which matches Task Manager / PL's default
-/// graph window. Cheap (120 bytes).
+/// Number of samples kept in `AppState.system_history` and each
+/// per-PID `per_pid_cpu_history` entry. 60 samples × 1 Hz poll = 60
+/// seconds of history, which matches Task Manager / PL's default
+/// graph window. Cheap (120 bytes for the system pair-history; ~120
+/// bytes per managed PID for the per-PID variant).
 pub(crate) const SYSTEM_HISTORY_LEN: usize = 60;
 
 pub(crate) struct RecentEvent {

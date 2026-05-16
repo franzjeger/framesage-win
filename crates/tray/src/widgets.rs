@@ -449,6 +449,43 @@ pub(crate) fn draw_sparkline(painter: &egui::Painter, rect: egui::Rect, history:
     painter.add(PathShape::line(cpu_points, cpu_stroke));
 }
 
+/// Item 3.4 — single-channel sparkline for per-PID CPU% history.
+/// Reuses the styling of `draw_sparkline` (background tray + accent
+/// line + subtle fill) but with one value per sample instead of two.
+/// Used by the Processes-tab detail panel to show 60 s of CPU%
+/// history for the selected PID.
+pub(crate) fn draw_single_sparkline(painter: &egui::Painter, rect: egui::Rect, history: &[u8]) {
+    use egui::epaint::PathShape;
+    use egui::{Color32, Stroke};
+
+    painter.rect_filled(rect, 3.0, theme::SURFACE);
+
+    if history.len() < 2 {
+        return;
+    }
+
+    let count = history.len();
+    let dx = rect.width() / (count - 1) as f32;
+    let mut points: Vec<egui::Pos2> = Vec::with_capacity(count);
+    for (i, &v) in history.iter().enumerate() {
+        let x = rect.left() + i as f32 * dx;
+        let y = rect.bottom() - (v as f32 / 100.0).clamp(0.0, 1.0) * rect.height();
+        points.push(egui::pos2(x, y));
+    }
+
+    // Fill under the line for visual mass; same alpha as the
+    // CPU fill in the system sparkline.
+    let mut fill: Vec<egui::Pos2> = points.clone();
+    fill.push(egui::pos2(rect.right(), rect.bottom()));
+    fill.push(egui::pos2(rect.left(), rect.bottom()));
+    painter.add(PathShape::convex_polygon(
+        fill,
+        Color32::from_rgba_unmultiplied(50, 130, 246, 30),
+        Stroke::NONE,
+    ));
+    painter.add(PathShape::line(points, Stroke::new(1.5, theme::ACCENT)));
+}
+
 /// One-line status bar at the very bottom of the window. Shows engine state,
 /// process counts, version, and the last-action echo. Sections are separated
 /// by thin dividers in `TEXT_DIM` so the eye groups them naturally.

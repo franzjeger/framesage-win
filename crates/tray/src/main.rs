@@ -3825,6 +3825,18 @@ impl FramesageApp {
                 splitter_drag_delta = -splitter_resp.drag_delta().y;
             }
 
+            // Item 3.4 — copy the per-PID CPU history out from
+            // under the lock so render_process_detail can borrow it
+            // without holding `state.lock()` across the egui frame.
+            // Empty Vec when we've never seen this PID; the sparkline
+            // gracefully renders just its background tray in that case.
+            let cpu_history: Vec<u8> = self
+                .state
+                .lock()
+                .per_pid_cpu_history
+                .get(&pid)
+                .map(|q| q.iter().copied().collect())
+                .unwrap_or_default();
             ui.allocate_ui_with_layout(
                 egui::vec2(ui.available_width(), detail_h),
                 egui::Layout::top_down(egui::Align::LEFT),
@@ -3834,6 +3846,7 @@ impl FramesageApp {
                         pid,
                         &rows,
                         &profile_ids,
+                        &cpu_history,
                         &mut action_queue,
                         &mut close_detail,
                     );
