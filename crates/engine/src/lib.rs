@@ -204,6 +204,12 @@ struct EngineState {
     /// Populated when `probalance::decide` returns `Decision::Restrain`,
     /// drained on `Decision::Restore`.
     probalance_restrained: HashMap<u32, probalance::RestrainedRecord>,
+    /// Item 4.6 — per-PID consecutive-hog-sample counter for the
+    /// restrain-side hysteresis. A PID must read as a hog for
+    /// `ProBalanceConfig.min_restrain_samples` ticks in a row before
+    /// `probalance::decide` will demote it. Lives outside `decide` so the
+    /// state survives across ticks; pruned inside `decide` to live PIDs.
+    probalance_hog_streak: HashMap<u32, u32>,
     /// Per-PID CPU-time snapshot from the previous call to
     /// `list_process_snapshots`. Independent of `probalance_prev_samples`
     /// because the Processes tab needs CPU% whether or not the user has
@@ -438,6 +444,7 @@ impl Engine {
                 last_background_scan: None,
                 last_persistent_reassert: None,
                 probalance_prev_samples: HashMap::new(),
+                probalance_hog_streak: HashMap::new(),
                 probalance_last_sample_at: None,
                 probalance_restrained: HashMap::new(),
                 list_processes_prev_samples: HashMap::new(),
@@ -711,6 +718,7 @@ impl Engine {
         s.applied.remove(&pid);
         s.probalance_restrained.remove(&pid);
         s.probalance_prev_samples.remove(&pid);
+        s.probalance_hog_streak.remove(&pid);
         s.list_processes_prev_samples.remove(&pid);
         s.affinity_rule_applied.remove(&pid);
         if s.current_foreground == Some(pid) {
@@ -1988,6 +1996,10 @@ impl Engine {
                 }
                 s.probalance_prev_samples.clear();
                 s.probalance_last_sample_at = None;
+                // Item 4.6 — also clear the hysteresis counter so a
+                // disable-then-re-enable doesn't trigger demotes from
+                // stale streak state.
+                s.probalance_hog_streak.clear();
             }
             return;
         }
@@ -2111,6 +2123,7 @@ impl Engine {
             &safe_list_exes,
             &user_ignore_exes,
             &mut s.probalance_restrained,
+            &mut s.probalance_hog_streak,
         );
 
         for d in decisions {
