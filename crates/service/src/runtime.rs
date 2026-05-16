@@ -84,7 +84,7 @@ pub async fn run(shutdown: oneshot::Receiver<()>) -> Result<()> {
     // loop launches.
     engine.recover_orphan_journal();
     let tick_engine = engine.clone();
-    let tick_handle = tokio::spawn(async move {
+    let mut tick_handle = tokio::spawn(async move {
         let mut interval = tokio::time::interval(Duration::from_millis(300));
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
@@ -100,14 +100,14 @@ pub async fn run(shutdown: oneshot::Receiver<()>) -> Result<()> {
     // the unprivileged tray UI can connect). The handler enforces "status
     // pipe accepts only read-only requests" regardless of caller identity.
     let admin_engine = engine.clone();
-    let admin_handle = tokio::spawn(async move {
+    let mut admin_handle = tokio::spawn(async move {
         if let Err(e) = serve_ipc(admin_engine, PipeKind::Admin).await {
             error!(error = %e, "admin ipc server stopped");
         }
     });
 
     let status_engine = engine.clone();
-    let status_handle = tokio::spawn(async move {
+    let mut status_handle = tokio::spawn(async move {
         if let Err(e) = serve_ipc(status_engine, PipeKind::Status).await {
             error!(error = %e, "status ipc server stopped");
         }
@@ -115,20 +115,53 @@ pub async fn run(shutdown: oneshot::Receiver<()>) -> Result<()> {
 
     let reload_engine = engine.clone();
     let reload_path = policy_path.clone();
-    let reload_handle = tokio::spawn(async move {
+    let mut reload_handle = tokio::spawn(async move {
         if let Err(e) = watch_policy(reload_path, reload_engine).await {
             warn!(error = %e, "policy watcher stopped");
         }
     });
 
-    // Wait for shutdown. We don't try to drain in-flight IPC connections —
-    // they get cancelled when the task is dropped.
-    let _ = shutdown.await;
-    info!("shutdown requested");
+    // Item 1.3 / audit C-06 — task watchdog. Wait for shutdown OR for any
+    // critical task to die unexpectedly. The previous `let _ = shutdown.await`
+    // pattern hid a real failure mode: if the tick task panicked or returned
+    // early, the service's `Running` state survived because main was just
+    // awaiting `shutdown`, leaving the user with a running-but-inert
+    // service. With this select! pattern, any unexpected exit drops us out
+    // of `run` with an Err so the SCM sees the service stop. Combined with
+    // FailureActions configured at install time (item 1.3, cli/install_service),
+    // SCM will restart the service within 5s.
+    //
+    // The four critical tasks are: tick (engine main loop), admin IPC,
+    // status IPC, reload watcher. Any of them returning while shutdown is
+    // not signalled means the service can't do its job — bail out and let
+    // SCM restart us clean.
+    let unexpected_exit: Option<&'static str> = tokio::select! {
+        _ = shutdown => None,
+        r = &mut tick_handle => Some(task_died_msg("tick", &r)),
+        r = &mut admin_handle => Some(task_died_msg("admin-ipc", &r)),
+        r = &mut status_handle => Some(task_died_msg("status-ipc", &r)),
+        r = &mut reload_handle => Some(task_died_msg("policy-watcher", &r)),
+    };
+
+    if let Some(name) = unexpected_exit {
+        error!(
+            task = %name,
+            "critical task exited unexpectedly — returning Err so SCM can restart"
+        );
+    } else {
+        info!("shutdown requested");
+    }
+
     tick_handle.abort();
     admin_handle.abort();
     status_handle.abort();
     reload_handle.abort();
+
+    if let Some(name) = unexpected_exit {
+        return Err(anyhow::anyhow!(
+            "service exited because critical task {name} died; SCM should restart us"
+        ));
+    }
     Ok(())
 }
 
@@ -719,6 +752,22 @@ fn _silence_warnings() {
         std::any::type_name::<AsyncBufReadExt>,
         std::any::type_name::<AsyncWriteExt>,
     );
+}
+
+/// Tag a JoinHandle's result with the task name for the watchdog log
+/// line. Per item 1.3, *any* unexpected exit (panic, clean return, abort
+/// signal we didn't send) means the service can't do its job; the
+/// distinction between `Ok(())` and `Err` isn't useful for the user-
+/// facing message — both are equally fatal.
+fn task_died_msg<T>(
+    name: &'static str,
+    result: &Result<T, tokio::task::JoinError>,
+) -> &'static str {
+    match result {
+        Ok(_) => name,
+        Err(e) if e.is_panic() => name,
+        Err(_) => name,
+    }
 }
 
 /// Walk every profile in `policy` and collect human-readable error

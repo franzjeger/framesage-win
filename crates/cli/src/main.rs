@@ -220,8 +220,11 @@ fn tokio_block<F: std::future::Future<Output = Result<()>>>(fut: F) -> Result<()
 #[cfg(windows)]
 fn install_service(bin_override: Option<&str>) -> Result<()> {
     use std::ffi::OsString;
+    use std::time::Duration;
     use windows_service::service::{
-        ServiceAccess, ServiceErrorControl, ServiceInfo, ServiceStartType, ServiceType,
+        ServiceAccess, ServiceAction, ServiceActionType, ServiceErrorControl,
+        ServiceFailureActions, ServiceFailureResetPeriod, ServiceInfo, ServiceStartType,
+        ServiceType,
     };
     use windows_service::service_manager::{ServiceManager, ServiceManagerAccess};
 
@@ -257,8 +260,53 @@ fn install_service(bin_override: Option<&str>) -> Result<()> {
         .set_description(SERVICE_DESCRIPTION)
         .context("set description")?;
 
-    info!(service = SERVICE_NAME, "installed");
+    // Item 1.3 / audit C-05 — configure SCM FailureActions so any service
+    // crash auto-restarts within 5 seconds instead of leaving the user
+    // with a permanent silent outage until reboot.
+    //
+    // The triple is the canonical "restart aggressively but not forever"
+    // pattern Windows admins recognize: restart, restart, restart-then-
+    // give-up, with a 1-day reset period. If the service crashes more
+    // than 3 times in 24 hours, SCM stops trying — at that point the
+    // user has a real problem that auto-restart won't paper over (likely
+    // a corrupted policy.json or hardware change), and the silence is
+    // the right signal.
+    //
+    // `set_failure_actions_on_non_crash_failures(true)` is critical
+    // because `panic = "abort"` (Cargo.toml:95) makes panics produce a
+    // clean process exit with code 1, not a crash dump. Without this
+    // flag SCM only triggers FailureActions on actual hardware exceptions
+    // (access violations, etc.) and would happily leave a panic-exited
+    // service stopped.
+    let failure_actions = ServiceFailureActions {
+        reset_period: ServiceFailureResetPeriod::After(Duration::from_secs(86_400)),
+        reboot_msg: None,
+        command: None,
+        actions: Some(vec![
+            ServiceAction {
+                action_type: ServiceActionType::Restart,
+                delay: Duration::from_secs(5),
+            },
+            ServiceAction {
+                action_type: ServiceActionType::Restart,
+                delay: Duration::from_secs(5),
+            },
+            ServiceAction {
+                action_type: ServiceActionType::Restart,
+                delay: Duration::from_secs(5),
+            },
+        ]),
+    };
+    service
+        .update_failure_actions(failure_actions)
+        .context("update_failure_actions")?;
+    service
+        .set_failure_actions_on_non_crash_failures(true)
+        .context("set_failure_actions_on_non_crash_failures")?;
+
+    info!(service = SERVICE_NAME, "installed with SCM FailureActions");
     println!("installed: {SERVICE_NAME}");
+    println!("  failure-actions: restart x3 with 5s delay, reset after 24h");
     Ok(())
 }
 
