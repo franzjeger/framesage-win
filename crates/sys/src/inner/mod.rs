@@ -1,3 +1,4 @@
+pub mod ac_detect;
 pub mod apply;
 pub mod cppc;
 pub mod foreground;
