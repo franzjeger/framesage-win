@@ -9,10 +9,12 @@
 use anyhow::{anyhow, Context, Result};
 use std::mem::size_of;
 
-use windows::Win32::Foundation::{CloseHandle, HANDLE};
+use windows::Win32::Foundation::HANDLE;
 use windows::Win32::System::Diagnostics::ToolHelp::{
     CreateToolhelp32Snapshot, Thread32First, Thread32Next, TH32CS_SNAPTHREAD, THREADENTRY32,
 };
+
+use crate::owned_handle::OwnedHandle;
 use windows::Win32::System::ProcessStatus::K32EmptyWorkingSet;
 use windows::Win32::System::SystemInformation::{
     GetSystemCpuSetInformation, SYSTEM_CPU_SET_INFORMATION,
@@ -56,6 +58,7 @@ pub struct AppliedState {
 
 pub fn apply(pid: u32, profile: &Profile, topology: &CpuTopology) -> Result<AppliedState> {
     let handle = open_for_write(pid)?;
+    let h = handle.as_raw();
     let mut state = AppliedState::default();
 
     // The order matters slightly: do throttling/priority before CPU Sets, so
@@ -63,32 +66,32 @@ pub fn apply(pid: u32, profile: &Profile, topology: &CpuTopology) -> Result<Appl
     // trim last — once everything else is in place.
 
     if let Some(class) = profile.priority_class {
-        state.prev_priority_class = Some(get_priority_class(handle)?);
-        set_priority_class(handle, class).context("set priority class")?;
+        state.prev_priority_class = Some(get_priority_class(h)?);
+        set_priority_class(h, class).context("set priority class")?;
     }
 
     if let Some(mode) = profile.power_throttling {
-        state.prev_power_throttling = Some(get_power_throttling(handle).unwrap_or(
+        state.prev_power_throttling = Some(get_power_throttling(h).unwrap_or(
             PROCESS_POWER_THROTTLING_STATE {
                 Version: PROCESS_POWER_THROTTLING_CURRENT_VERSION,
                 ControlMask: 0,
                 StateMask: 0,
             },
         ));
-        set_power_throttling(handle, mode).context("set power throttling")?;
+        set_power_throttling(h, mode).context("set power throttling")?;
     }
 
     if let Some(prio) = profile.memory_priority {
-        state.prev_memory_priority = get_memory_priority(handle).ok();
-        set_memory_priority(handle, prio).context("set memory priority")?;
+        state.prev_memory_priority = get_memory_priority(h).ok();
+        set_memory_priority(h, prio).context("set memory priority")?;
     }
 
     if let Some(prio) = profile.io_priority {
         // Best-effort read of the prior value so revert can restore it. If the
         // query fails (rare — usually permission), fall back to Normal on
         // revert; that's the kernel default for almost every user process.
-        state.prev_io_priority = Some(io_priority::get(handle).unwrap_or(IoPriority::Normal));
-        io_priority::set(handle, prio).context("set I/O priority")?;
+        state.prev_io_priority = Some(io_priority::get(h).unwrap_or(IoPriority::Normal));
+        io_priority::set(h, prio).context("set I/O priority")?;
     }
 
     if let Some(sel) = &profile.cpu_sets {
@@ -144,14 +147,14 @@ pub fn apply(pid: u32, profile: &Profile, topology: &CpuTopology) -> Result<Appl
             //
             // If the user explicitly sets profile.affinity_mask, that wins
             // (overwrites our default mask below).
-            set_default_cpu_sets(handle, &set_ids).context("set default CPU sets")?;
+            set_default_cpu_sets(h, &set_ids).context("set default CPU sets")?;
             let n = apply_thread_cpu_sets(pid, &set_ids);
             tracing::debug!(pid, threads = n, "applied per-thread CPU sets");
 
             let hard_mask = mask_from_indices(&indices);
             if hard_mask != 0 {
-                state.prev_affinity_mask = Some(get_affinity_mask(handle)?);
-                set_affinity_mask(handle, hard_mask).context("set hard affinity from cpu_sets")?;
+                state.prev_affinity_mask = Some(get_affinity_mask(h)?);
+                set_affinity_mask(h, hard_mask).context("set hard affinity from cpu_sets")?;
                 tracing::debug!(
                     pid,
                     mask = format!("{hard_mask:#x}"),
@@ -166,17 +169,17 @@ pub fn apply(pid: u32, profile: &Profile, topology: &CpuTopology) -> Result<Appl
     if let Some(sel) = &profile.affinity_mask {
         let indices = topology.resolve(sel);
         let mask = mask_from_indices(&indices);
-        state.prev_affinity_mask = Some(get_affinity_mask(handle)?);
-        set_affinity_mask(handle, mask).context("set affinity")?;
+        state.prev_affinity_mask = Some(get_affinity_mask(h)?);
+        set_affinity_mask(h, mask).context("set affinity")?;
     }
 
     if profile.trim_working_set {
         // SAFETY: handle is valid.
-        let _ = unsafe { K32EmptyWorkingSet(handle) };
+        let _ = unsafe { K32EmptyWorkingSet(h) };
     }
 
-    // SAFETY: we just used handle and won't again.
-    let _ = unsafe { CloseHandle(handle) };
+    // handle drops here, closing automatically.
+    drop(handle);
     Ok(state)
 }
 
@@ -194,27 +197,28 @@ pub fn reassert(pid: u32, profile: &Profile, topology: &CpuTopology) -> Result<(
         // Process exited; caller will sweep it on the next dead-PID scan.
         Err(_) => return Ok(()),
     };
+    let h = handle.as_raw();
 
     if let Some(class) = profile.priority_class {
-        let _ = set_priority_class(handle, class);
+        let _ = set_priority_class(h, class);
     }
     if let Some(mode) = profile.power_throttling {
-        let _ = set_power_throttling(handle, mode);
+        let _ = set_power_throttling(h, mode);
     }
     if let Some(prio) = profile.memory_priority {
-        let _ = set_memory_priority(handle, prio);
+        let _ = set_memory_priority(h, prio);
     }
     if let Some(prio) = profile.io_priority {
-        let _ = io_priority::set(handle, prio);
+        let _ = io_priority::set(h, prio);
     }
     if let Some(sel) = &profile.cpu_sets {
         let indices = topology.resolve(sel);
         if let Ok(set_ids) = cpuset_ids_for_indices(&indices) {
-            let _ = set_default_cpu_sets(handle, &set_ids);
+            let _ = set_default_cpu_sets(h, &set_ids);
             let _ = apply_thread_cpu_sets(pid, &set_ids);
             let hard_mask = mask_from_indices(&indices);
             if hard_mask != 0 {
-                let _ = set_affinity_mask(handle, hard_mask);
+                let _ = set_affinity_mask(h, hard_mask);
             }
         }
     }
@@ -222,12 +226,12 @@ pub fn reassert(pid: u32, profile: &Profile, topology: &CpuTopology) -> Result<(
         let indices = topology.resolve(sel);
         let mask = mask_from_indices(&indices);
         if mask != 0 {
-            let _ = set_affinity_mask(handle, mask);
+            let _ = set_affinity_mask(h, mask);
         }
     }
 
-    // SAFETY: handle is valid and not used again.
-    let _ = unsafe { CloseHandle(handle) };
+    // handle drops here, closing automatically.
+    drop(handle);
     Ok(())
 }
 
@@ -240,18 +244,19 @@ pub fn revert(pid: u32, state: AppliedState) -> Result<()> {
         Ok(h) => h,
         Err(_) => return Ok(()),
     };
+    let h = handle.as_raw();
 
     if let Some(class_raw) = state.prev_priority_class {
         let class = PROCESS_CREATION_FLAGS(class_raw);
         // SAFETY: handle valid, class is a documented constant.
-        if let Err(e) = unsafe { SetPriorityClass(handle, class) } {
+        if let Err(e) = unsafe { SetPriorityClass(h, class) } {
             warn_revert(pid, "SetPriorityClass", e);
         }
     }
 
     if let Some(mask) = state.prev_affinity_mask {
         // SAFETY: handle valid.
-        if let Err(e) = unsafe { SetProcessAffinityMask(handle, mask) } {
+        if let Err(e) = unsafe { SetProcessAffinityMask(h, mask) } {
             warn_revert(pid, "SetProcessAffinityMask", e);
         }
     }
@@ -259,7 +264,7 @@ pub fn revert(pid: u32, state: AppliedState) -> Result<()> {
     if let Some(prev) = state.prev_power_throttling {
         let res = unsafe {
             SetProcessInformation(
-                handle,
+                h,
                 ProcessPowerThrottling,
                 &prev as *const _ as *const _,
                 size_of::<PROCESS_POWER_THROTTLING_STATE>() as u32,
@@ -273,7 +278,7 @@ pub fn revert(pid: u32, state: AppliedState) -> Result<()> {
     if let Some(prev) = state.prev_memory_priority {
         let res = unsafe {
             SetProcessInformation(
-                handle,
+                h,
                 ProcessMemoryPriority,
                 &prev as *const _ as *const _,
                 size_of::<MEMORY_PRIORITY_INFORMATION>() as u32,
@@ -290,7 +295,7 @@ pub fn revert(pid: u32, state: AppliedState) -> Result<()> {
         // pick up the new process default. Without the thread sweep,
         // threads we constrained on apply would stay pinned even after
         // the process default reverts.
-        if let Err(e) = unsafe { SetProcessDefaultCpuSets(handle, None) }.ok() {
+        if let Err(e) = unsafe { SetProcessDefaultCpuSets(h, None) }.ok() {
             warn_revert(pid, "SetProcessDefaultCpuSets(None)", e);
         }
         let cleared = apply_thread_cpu_sets(pid, &[]);
@@ -298,13 +303,13 @@ pub fn revert(pid: u32, state: AppliedState) -> Result<()> {
     }
 
     if let Some(prio) = state.prev_io_priority {
-        if let Err(e) = io_priority::set(handle, prio) {
+        if let Err(e) = io_priority::set(h, prio) {
             warn_revert(pid, "NtSetInformationProcess(ProcessIoPriority)", e);
         }
     }
 
-    // SAFETY: handle valid, last use.
-    let _ = unsafe { CloseHandle(handle) };
+    // handle drops here, closing automatically.
+    drop(handle);
     Ok(())
 }
 
@@ -314,15 +319,17 @@ fn warn_revert(pid: u32, operation: &str, err: impl std::fmt::Display) {
 
 // ─── helpers ──────────────────────────────────────────────────────────────
 
-fn open_for_write(pid: u32) -> Result<HANDLE> {
+fn open_for_write(pid: u32) -> Result<OwnedHandle> {
     let rights = PROCESS_QUERY_INFORMATION
         | PROCESS_QUERY_LIMITED_INFORMATION
         | PROCESS_SET_INFORMATION
         | PROCESS_SET_LIMITED_INFORMATION;
     // SAFETY: documented call. Returns Err on failure (e.g. protected
-    // process, insufficient privilege).
-    unsafe { OpenProcess(rights, false, pid) }
-        .map_err(|e| anyhow!("OpenProcess({pid}) for write failed: {e}"))
+    // process, insufficient privilege). Item 3.3 — wrap the raw HANDLE
+    // in OwnedHandle so callers get RAII on every return path.
+    let raw = unsafe { OpenProcess(rights, false, pid) }
+        .map_err(|e| anyhow!("OpenProcess({pid}) for write failed: {e}"))?;
+    Ok(OwnedHandle::assume_valid(raw))
 }
 
 /// Read a process's current priority class by PID. Returns the raw Win32
@@ -336,8 +343,9 @@ pub fn get_priority_class_for_pid(pid: u32) -> Result<Option<u32>> {
         Ok(h) => h,
         Err(_) => return Ok(None),
     };
-    let v = unsafe { GetPriorityClass(handle) };
-    let _ = unsafe { CloseHandle(handle) };
+    // SAFETY: handle valid. GetPriorityClass returns 0 on failure.
+    let v = unsafe { GetPriorityClass(handle.as_raw()) };
+    // handle drops at end of scope.
     if v == 0 {
         Ok(None)
     } else {
@@ -354,9 +362,8 @@ pub fn get_priority_class_for_pid(pid: u32) -> Result<Option<u32>> {
 /// be opened (caller logs and moves on).
 pub fn set_priority_class_for_pid(pid: u32, class: PriorityClass) -> Result<()> {
     let handle = open_for_write(pid)?;
-    let r = set_priority_class(handle, class);
-    let _ = unsafe { CloseHandle(handle) };
-    r
+    set_priority_class(handle.as_raw(), class)
+    // handle drops at end of scope.
 }
 
 /// Empty the working set of `pid` — releases the resident pages back to
@@ -371,8 +378,8 @@ pub fn trim_working_set_for_pid(pid: u32) -> Result<()> {
     let handle = open_for_write(pid)?;
     // SAFETY: handle is valid (we just opened it). K32EmptyWorkingSet
     // returns a BOOL; non-zero = success.
-    let ok = unsafe { K32EmptyWorkingSet(handle) }.as_bool();
-    let _ = unsafe { CloseHandle(handle) };
+    let ok = unsafe { K32EmptyWorkingSet(handle.as_raw()) }.as_bool();
+    // handle drops at end of scope.
     if ok {
         Ok(())
     } else {
@@ -400,9 +407,8 @@ pub fn set_affinity_mask_for_pid(pid: u32, mask: u64) -> Result<()> {
         ));
     }
     let handle = open_for_write(pid)?;
-    let r = set_affinity_mask(handle, mask as usize);
-    let _ = unsafe { CloseHandle(handle) };
-    r
+    set_affinity_mask(handle.as_raw(), mask as usize)
+    // handle drops at end of scope.
 }
 
 /// Restore a priority class from a previously-captured raw Win32 constant
@@ -414,10 +420,10 @@ pub fn restore_priority_class_for_pid(pid: u32, raw_class: u32) -> Result<()> {
         Ok(h) => h,
         Err(_) => return Ok(()),
     };
-    let r = unsafe { SetPriorityClass(handle, PROCESS_CREATION_FLAGS(raw_class)) }
-        .map_err(|e| anyhow!("SetPriorityClass(raw={raw_class:#x}) failed: {e}"));
-    let _ = unsafe { CloseHandle(handle) };
-    r
+    // SAFETY: handle valid, raw_class is a documented constant range.
+    unsafe { SetPriorityClass(handle.as_raw(), PROCESS_CREATION_FLAGS(raw_class)) }
+        .map_err(|e| anyhow!("SetPriorityClass(raw={raw_class:#x}) failed: {e}"))
+    // handle drops at end of scope.
 }
 
 fn get_priority_class(handle: HANDLE) -> Result<u32> {
@@ -638,7 +644,7 @@ fn apply_thread_cpu_sets(pid: u32, set_ids: &[u32]) -> usize {
     // SAFETY: documented call. Returns INVALID_HANDLE_VALUE on failure
     // (we treat it as "no threads enumerated" — count stays 0).
     let snap = match unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0) } {
-        Ok(h) => h,
+        Ok(h) => OwnedHandle::assume_valid(h),
         Err(_) => return 0,
     };
 
@@ -649,7 +655,7 @@ fn apply_thread_cpu_sets(pid: u32, set_ids: &[u32]) -> usize {
     let mut count = 0usize;
 
     // SAFETY: snap is a valid snapshot; dwSize initialised.
-    if unsafe { Thread32First(snap, &mut entry) }.is_ok() {
+    if unsafe { Thread32First(snap.as_raw(), &mut entry) }.is_ok() {
         loop {
             if entry.th32OwnerProcessID == pid {
                 // SAFETY: documented call. THREAD_SET_LIMITED_INFORMATION is
@@ -657,26 +663,25 @@ fn apply_thread_cpu_sets(pid: u32, set_ids: &[u32]) -> usize {
                 // commonly: thread exited between snapshot and now) we just
                 // skip — not worth log spam for the dozens of races a busy
                 // process will produce.
-                if let Ok(th) =
+                if let Ok(th_raw) =
                     unsafe { OpenThread(THREAD_SET_LIMITED_INFORMATION, false, entry.th32ThreadID) }
                 {
+                    let th = OwnedHandle::assume_valid(th_raw);
                     // SAFETY: th is valid; set_ids points to a possibly-empty
                     // u32 slice; the API accepts count == 0 to clear.
-                    if unsafe { SetThreadSelectedCpuSets(th, set_ids) }.as_bool() {
+                    if unsafe { SetThreadSelectedCpuSets(th.as_raw(), set_ids) }.as_bool() {
                         count += 1;
                     }
-                    // SAFETY: th was just opened by us.
-                    let _ = unsafe { CloseHandle(th) };
+                    // th drops at end of scope.
                 }
             }
             // SAFETY: snap valid; entry reused as documented.
-            if unsafe { Thread32Next(snap, &mut entry) }.is_err() {
+            if unsafe { Thread32Next(snap.as_raw(), &mut entry) }.is_err() {
                 break;
             }
         }
     }
 
-    // SAFETY: snap valid, last use.
-    let _ = unsafe { CloseHandle(snap) };
+    // snap drops here, closing automatically.
     count
 }

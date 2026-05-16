@@ -7,13 +7,15 @@
 
 use anyhow::{anyhow, Context, Result};
 use windows::core::PWSTR;
-use windows::Win32::Foundation::{CloseHandle, HWND, MAX_PATH};
+use windows::Win32::Foundation::{HWND, MAX_PATH};
 use windows::Win32::System::Threading::{
     OpenProcess, QueryFullProcessImageNameW, PROCESS_NAME_FORMAT, PROCESS_QUERY_LIMITED_INFORMATION,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     GetForegroundWindow, GetWindowTextLengthW, GetWindowTextW, GetWindowThreadProcessId,
 };
+
+use crate::owned_handle::OwnedHandle;
 
 #[derive(Debug, Clone)]
 pub struct ForegroundInfo {
@@ -73,26 +75,26 @@ fn read_window_title(hwnd: HWND) -> Option<String> {
 fn read_process_image_path(pid: u32) -> Result<String> {
     // SAFETY: OpenProcess with LIMITED_INFORMATION is always sound; it returns
     // an error handle if access is denied (e.g. protected processes).
-    let handle = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid) }
-        .map_err(|e| anyhow!("OpenProcess({pid}) failed: {e}"))?;
+    // OwnedHandle wraps the result so the handle closes on every return
+    // path — item 3.3.
+    let handle = OwnedHandle::assume_valid(
+        unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid) }
+            .map_err(|e| anyhow!("OpenProcess({pid}) failed: {e}"))?,
+    );
 
     let mut buf = [0u16; MAX_PATH as usize];
     let mut size = buf.len() as u32;
     // SAFETY: handle is valid (we just opened it). buf and size are valid.
-    let result = unsafe {
+    unsafe {
         QueryFullProcessImageNameW(
-            handle,
+            handle.as_raw(),
             PROCESS_NAME_FORMAT(0),
             PWSTR(buf.as_mut_ptr()),
             &mut size,
         )
-    };
-
-    // Always close the handle; ignore the close result.
-    // SAFETY: handle is the value we just opened and have not invalidated.
-    let _ = unsafe { CloseHandle(handle) };
-
-    result.map_err(|e| anyhow!("QueryFullProcessImageNameW({pid}) failed: {e}"))?;
+    }
+    .map_err(|e| anyhow!("QueryFullProcessImageNameW({pid}) failed: {e}"))?;
+    // handle drops here, closing automatically.
     Ok(String::from_utf16_lossy(&buf[..size as usize]))
 }
 
