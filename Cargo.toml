@@ -84,7 +84,10 @@ tray-icon = "0.24"
 # File-system watcher for policy hot-reload
 notify = "6"
 
-# Internal crates
+# Internal crates. Item 3.8: the workspace dep graph is one-way and
+# acyclic. See ARCHITECTURE.md at the repo root for the full layering
+# diagram + invariants. Adding a new edge between framesage-* crates
+# requires updating that file in the same PR.
 framesage-core = { path = "crates/core" }
 framesage-sys = { path = "crates/sys" }
 framesage-ipc = { path = "crates/ipc" }

@@ -8,6 +8,13 @@
 //! 3. Three tasks run concurrently:
 //!    - Tick loop (calls `engine.tick()` on the policy's cadence).
 //!    - IPC server (accepts named-pipe clients and dispatches `Request`s).
+//!
+//! # Layering (item 3.8)
+//!
+//! The ONLY crate that depends on `framesage-engine`. Service is the
+//! engine's host process; everything else (CLI, tray) interacts via the
+//! `framesage-ipc` named-pipe protocol. See `ARCHITECTURE.md` at the repo
+//! root.
 //!    - Shutdown listener (responds to SCM stop / Ctrl+C in console mode).
 
 #![cfg_attr(not(windows), allow(dead_code, unused_imports))]

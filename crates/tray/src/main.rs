@@ -5,6 +5,14 @@
 //! Closing the window hides it to the tray rather than killing the process —
 //! "Exit framesage tray" from the menu is the only way to actually quit.
 //!
+//! # Layering (item 3.8)
+//!
+//! Depends on `framesage-core` + `framesage-ipc` + `framesage-sys` (the
+//! last for the session-0 foreground workaround in `ipc_client::
+//! foreground_reporter_loop`). It does NOT depend on `framesage-engine`
+//! — every engine-side action is reached via the IPC protocol so the tray
+//! stays a thin UI client. See `ARCHITECTURE.md` at the repo root.
+//!
 //! The window opens an IPC connection to the service on startup, subscribes
 //! to events, and renders live status: active profile, foreground app, recent
 //! profile-application events. The tray runs unprivileged: it uses the
