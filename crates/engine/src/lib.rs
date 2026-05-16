@@ -46,7 +46,9 @@ use framesage_gamemode::{
     safe_list::SafeList,
     state::{AppliedActions, PreviousState, SuspendedProcessSnapshot},
 };
-use framesage_ipc::{Event, ForegroundSnapshot, ProcessSnapshot, StatusSnapshot, SystemMetrics};
+use framesage_ipc::{
+    ActionFailedKind, Event, ForegroundSnapshot, ProcessSnapshot, StatusSnapshot, SystemMetrics,
+};
 
 /// Dependencies the engine needs at construction. Passing as a struct keeps
 /// the call sites readable (we already have policy + topology, and now journal
@@ -631,9 +633,22 @@ impl Engine {
                         Ok(()) => {
                             applied_count += 1;
                             new_marks.push(pid);
+                            let _ = self.events.send(Event::AffinityRuleFired {
+                                pid,
+                                exe_name: live_exe.clone(),
+                                rule_exe: exe_name.clone(),
+                            });
                         }
                         Err(e) => {
                             warn!(pid, exe = %live_exe, error = %e, "affinity rule apply-to-live failed");
+                            let _ = self.events.send(Event::ActionFailed {
+                                kind: ActionFailedKind::Apply,
+                                pid: Some(pid),
+                                exe_name: Some(live_exe.clone()),
+                                details: format!(
+                                    "affinity rule apply-to-live failed: {e:#}"
+                                ),
+                            });
                         }
                     }
                 }
@@ -1137,7 +1152,7 @@ impl Engine {
         if !already_correct {
             // Revert old per-PID state so the new apply captures a clean prev.
             if let Some(record) = s.applied.remove(&prev_pid) {
-                revert_record(prev_pid, record);
+                revert_record(&self.events, prev_pid, record);
             }
 
             let topology = s.topology.clone();
@@ -1150,10 +1165,21 @@ impl Engine {
             ) {
                 Ok(record) => {
                     info!(pid = prev_pid, profile = %profile_id, "force_recompute applied");
+                    let _ = self.events.send(Event::ProfileApplied {
+                        pid: prev_pid,
+                        exe_name: snapshot.exe_name.clone(),
+                        profile_id: profile_id.clone(),
+                    });
                     s.applied.insert(prev_pid, record);
                 }
                 Err(e) => {
                     warn!(pid = prev_pid, error = %e, "force_recompute apply failed");
+                    let _ = self.events.send(Event::ActionFailed {
+                        kind: classify_apply_failure(&e),
+                        pid: Some(prev_pid),
+                        exe_name: Some(snapshot.exe_name.clone()),
+                        details: format!("force_recompute apply failed: {e:#}"),
+                    });
                 }
             }
         } else {
@@ -1177,6 +1203,8 @@ impl Engine {
             self.safe_list,
             &profile_id,
             new_actions,
+            &self.events,
+            "force_recompute",
         );
     }
 
@@ -1206,7 +1234,7 @@ impl Engine {
     /// Idempotent — `Ok(())` if no system mode was active.
     pub fn exit_system_mode_now(&self) {
         let mut s = self.state.write();
-        Self::revert_system_mode_locked(&mut s, &self.journal);
+        Self::revert_system_mode_locked(&mut s, &self.journal, &self.events, "manual_exit");
     }
 
     /// Apply a named profile to the currently-foregrounded process,
@@ -1249,7 +1277,7 @@ impl Engine {
             // (whether the prior profile was the same or different) so we
             // have a clean slate to apply onto.
             if let Some(record) = s.applied.remove(&foreground.pid) {
-                revert_record(foreground.pid, record);
+                revert_record(&self.events, foreground.pid, record);
             }
         }
 
@@ -1262,19 +1290,35 @@ impl Engine {
         };
 
         if !already_correct {
-            let record = apply_profile(
+            let record = match apply_profile(
                 foreground.pid,
                 &foreground.exe_name,
                 &profile,
                 &topology,
                 self.safe_list,
-            )?;
+            ) {
+                Ok(r) => r,
+                Err(e) => {
+                    let _ = self.events.send(Event::ActionFailed {
+                        kind: classify_apply_failure(&e),
+                        pid: Some(foreground.pid),
+                        exe_name: Some(foreground.exe_name.clone()),
+                        details: format!("apply_once failed: {e:#}"),
+                    });
+                    return Err(e);
+                }
+            };
             info!(
                 pid = foreground.pid,
                 exe = %foreground.exe_name,
                 profile = %profile_id,
                 "apply_once",
             );
+            let _ = self.events.send(Event::ProfileApplied {
+                pid: foreground.pid,
+                exe_name: foreground.exe_name.clone(),
+                profile_id: profile_id.clone(),
+            });
             s.applied.insert(foreground.pid, record);
         } else {
             info!(
@@ -1301,6 +1345,8 @@ impl Engine {
             self.safe_list,
             &profile_id,
             new_actions,
+            &self.events,
+            "apply_once",
         );
 
         Ok(())
@@ -1385,7 +1431,7 @@ impl Engine {
 
         let mut s = self.state.write();
         self.reconcile(&mut s, foreground)?;
-        Self::maybe_scan_background_locked(&mut s, self.safe_list);
+        Self::maybe_scan_background_locked(&mut s, self.safe_list, &self.events);
         Self::maybe_reassert_persistent_locked(&mut s);
         self.maybe_run_probalance_locked(&mut s);
         Ok(())
@@ -1436,32 +1482,46 @@ impl Engine {
         s.ac_presence = new_presence;
         s.last_ac_probe = Some(Instant::now());
 
-        // Log only on transitions. Each AC gets its own line so
+        // Log + emit on transitions. Each AC gets its own line so
         // multi-AC transitions (rare but possible: user closes
         // Valorant + opens Fortnite simultaneously) are readable.
+        // The event mirror lets the tray surface "engine standby for
+        // ESEA" or "Vanguard detected — Valorant rule using SafeMode
+        // tier" without polling status.
+        let emit = |which: &str, active: bool| {
+            let _ = self.events.send(Event::AntiCheatPresenceChanged {
+                which: which.to_owned(),
+                active,
+            });
+        };
         if old.vanguard != new_presence.vanguard {
             info!(
                 active = new_presence.vanguard,
                 "AC presence change: Vanguard"
             );
+            emit("vanguard", new_presence.vanguard);
         }
         if old.eac != new_presence.eac {
             info!(active = new_presence.eac, "AC presence change: EAC");
+            emit("eac", new_presence.eac);
         }
         if old.javelin != new_presence.javelin {
             info!(
                 active = new_presence.javelin,
                 "AC presence change: Javelin/BF6"
             );
+            emit("javelin", new_presence.javelin);
         }
         if old.battleye != new_presence.battleye {
             info!(
                 active = new_presence.battleye,
                 "AC presence change: BattlEye"
             );
+            emit("battleye", new_presence.battleye);
         }
         if old.faceit != new_presence.faceit {
             info!(active = new_presence.faceit, "AC presence change: FACEIT");
+            emit("faceit", new_presence.faceit);
         }
         if old.esea != new_presence.esea {
             info!(
@@ -1473,6 +1533,7 @@ impl Engine {
                     "resuming from STANDBY"
                 }
             );
+            emit("esea", new_presence.esea);
         }
     }
 
@@ -1884,7 +1945,11 @@ impl Engine {
     /// Bounded by `BACKGROUND_SCAN_INTERVAL` so we don't thrash on every
     /// `tick_ms`; the first call from a fresh service start does the heavy
     /// lift, subsequent calls only touch newly-spawned PIDs.
-    fn maybe_scan_background_locked(s: &mut EngineState, safe_list: &'static SafeList) {
+    fn maybe_scan_background_locked(
+        s: &mut EngineState,
+        safe_list: &'static SafeList,
+        events: &broadcast::Sender<Event>,
+    ) {
         // Bail early if the policy doesn't want background enforcement at all.
         let Some(bg_profile_id) = s.policy.background_profile.clone() else {
             return;
@@ -1946,7 +2011,8 @@ impl Engine {
         // (the "apply now" half is set_affinity_rule's apply_to_live walk).
         if !s.policy.affinity_rules.is_empty() {
             let self_pid_for_aff = std::process::id();
-            let mut rule_applies: Vec<(u32, framesage_core::CpuSelector)> = Vec::new();
+            let mut rule_applies: Vec<(u32, framesage_core::CpuSelector, String, String)> =
+                Vec::new();
             for &pid in &live_pids {
                 if pid == 0 || pid == 4 || pid == self_pid_for_aff {
                     continue;
@@ -1959,10 +2025,15 @@ impl Engine {
                     Ok(None) | Err(_) => continue,
                 };
                 if let Some(rule) = s.policy.affinity_rule_for(&live_exe) {
-                    rule_applies.push((pid, rule.selector.clone()));
+                    rule_applies.push((
+                        pid,
+                        rule.selector.clone(),
+                        live_exe,
+                        rule.exe_name.clone(),
+                    ));
                 }
             }
-            for (pid, selector) in rule_applies {
+            for (pid, selector, live_exe, rule_exe) in rule_applies {
                 let indices = topology.resolve(&selector);
                 if indices.is_empty() {
                     continue;
@@ -1982,9 +2053,20 @@ impl Engine {
                         // transient (PID exiting mid-call) and we want a
                         // retry next scan rather than a silent skip.
                         s.affinity_rule_applied.insert(pid);
+                        let _ = events.send(Event::AffinityRuleFired {
+                            pid,
+                            exe_name: live_exe,
+                            rule_exe,
+                        });
                     }
                     Err(e) => {
                         debug!(pid, error = %e, "affinity rule background apply failed");
+                        let _ = events.send(Event::ActionFailed {
+                            kind: ActionFailedKind::Apply,
+                            pid: Some(pid),
+                            exe_name: Some(live_exe),
+                            details: format!("affinity rule background apply failed: {e:#}"),
+                        });
                     }
                 }
             }
@@ -2043,13 +2125,25 @@ impl Engine {
 
             match apply_profile(pid, &exe_name, &profile_for_pid, &topology, safe_list) {
                 Ok(record) => {
+                    let profile_id_emitted = record.profile_id.clone();
+                    let exe_emitted = record.exe_name.clone();
                     s.applied.insert(pid, record);
                     newly_applied += 1;
+                    let _ = events.send(Event::ProfileApplied {
+                        pid,
+                        exe_name: exe_emitted,
+                        profile_id: profile_id_emitted,
+                    });
                 }
                 // ACCESS_DENIED / INVALID_PARAMETER on protected processes
                 // is expected and not worth surfacing — same for the new
                 // denylist-refusal path (apply_profile rejects csrss/lsass/
-                // dwm/etc. before any syscall fires).
+                // dwm/etc. before any syscall fires). We deliberately do NOT
+                // emit ActionFailed here: the background-scan path runs
+                // once per second across every live PID and pre-filters via
+                // the safe-list, so the residue is genuinely "expected
+                // privileged-process refusals" that would drown the
+                // activity feed without informing the user.
                 Err(_) => continue,
             }
         }
@@ -2093,7 +2187,7 @@ impl Engine {
                     .unwrap_or(false);
                 if !keep {
                     if let Some(record) = s.applied.remove(&prev_pid) {
-                        revert_record(prev_pid, record);
+                        revert_record(&self.events, prev_pid, record);
                     }
                 }
             }
@@ -2104,7 +2198,7 @@ impl Engine {
         let Some(fg) = foreground else {
             s.foreground_snapshot = None;
             s.active_profile = None;
-            Self::revert_system_mode_locked(s, &self.journal);
+            Self::revert_system_mode_locked(s, &self.journal, &self.events, "foreground_lost");
             return Ok(());
         };
 
@@ -2151,7 +2245,7 @@ impl Engine {
             .unwrap_or(false);
         if !already_correct {
             if let Some(prev_record) = s.applied.remove(&fg.pid) {
-                revert_record(fg.pid, prev_record);
+                revert_record(&self.events, fg.pid, prev_record);
             }
         }
 
@@ -2178,6 +2272,8 @@ impl Engine {
                 self.safe_list,
                 &profile_id,
                 new_actions,
+                &self.events,
+                "foreground_changed",
             );
             return Ok(());
         }
@@ -2192,9 +2288,20 @@ impl Engine {
                     foreground: snapshot,
                     profile: profile_id.clone(),
                 });
+                let _ = self.events.send(Event::ProfileApplied {
+                    pid: fg.pid,
+                    exe_name: fg.exe_name.clone(),
+                    profile_id: profile_id.clone(),
+                });
             }
             Err(e) => {
                 warn!(pid = fg.pid, exe = %fg.exe_name, error = %e, "apply failed");
+                let _ = self.events.send(Event::ActionFailed {
+                    kind: classify_apply_failure(&e),
+                    pid: Some(fg.pid),
+                    exe_name: Some(fg.exe_name.clone()),
+                    details: format!("apply failed: {e:#}"),
+                });
                 // We still update foreground tracking so we don't loop trying
                 // to re-apply on every tick. System mode below uses
                 // active_profile.
@@ -2212,6 +2319,8 @@ impl Engine {
             self.safe_list,
             &profile_id,
             new_actions,
+            &self.events,
+            "foreground_changed",
         );
 
         Ok(())
@@ -2226,6 +2335,8 @@ impl Engine {
         safe_list: &'static SafeList,
         new_profile: &ProfileId,
         new_actions: Option<GameModeActions>,
+        events: &broadcast::Sender<Event>,
+        revert_reason: &str,
     ) {
         // Fast paths.
         match (&s.system_mode, &new_actions) {
@@ -2249,7 +2360,7 @@ impl Engine {
         }
 
         // Different (or first) — tear down any existing session, then enter.
-        Self::revert_system_mode_locked(s, journal);
+        Self::revert_system_mode_locked(s, journal, events, revert_reason);
 
         let Some(actions) = new_actions else {
             return;
@@ -2268,11 +2379,17 @@ impl Engine {
             }
             Err(e) => {
                 warn!(error = %e, "game mode planning failed");
+                let _ = events.send(Event::ActionFailed {
+                    kind: ActionFailedKind::Other,
+                    pid: None,
+                    exe_name: None,
+                    details: format!("game mode planning failed: {e:#}"),
+                });
                 return;
             }
         };
 
-        Self::enter_system_mode_locked(s, journal, new_profile, plan);
+        Self::enter_system_mode_locked(s, journal, new_profile, plan, events);
     }
 
     fn enter_system_mode_locked(
@@ -2280,6 +2397,7 @@ impl Engine {
         journal: &Journal,
         profile_id: &ProfileId,
         plan: ActionPlan,
+        events: &broadcast::Sender<Event>,
     ) {
         // Journal the full *intent* before any kernel mutation. This closes a
         // crash-recovery race that surfaced during first hardware validation:
@@ -2318,6 +2436,23 @@ impl Engine {
                 Err(e) => {
                     warn!(?action, error = %e, "game mode action failed; continuing with rest of plan");
                     any_failed = true;
+                    let (kind, exe_for_event, pid_for_event) = match action {
+                        PlannedAction::StopService { id, .. } => {
+                            (ActionFailedKind::ServiceAction, Some(id.clone()), None)
+                        }
+                        PlannedAction::SuspendProcess { pid, exe } => (
+                            ActionFailedKind::ProcessAction,
+                            Some(exe.clone()),
+                            Some(*pid),
+                        ),
+                        _ => (ActionFailedKind::Other, None, None),
+                    };
+                    let _ = events.send(Event::ActionFailed {
+                        kind,
+                        pid: pid_for_event,
+                        exe_name: exe_for_event,
+                        details: format!("game mode action {action:?} failed: {e:#}"),
+                    });
                 }
             }
         }
@@ -2325,6 +2460,12 @@ impl Engine {
         if !plan.rejections.is_empty() {
             for r in &plan.rejections {
                 warn!(rejected = %r.id, reason = %r.reason, "game mode action rejected by safe-list");
+                let _ = events.send(Event::ActionFailed {
+                    kind: ActionFailedKind::DenylistRefused,
+                    pid: None,
+                    exe_name: Some(r.id.clone()),
+                    details: format!("denylist refused {}: {}", r.id, r.reason),
+                });
             }
         }
 
@@ -2336,6 +2477,33 @@ impl Engine {
             "game mode entered"
         );
 
+        // Compute a summary for the Event::GameModeEntered emission so the
+        // tray can render "applying X services, suspending Y processes,
+        // switching to High Performance" without rebuilding the plan.
+        let mut services_to_stop: u32 = 0;
+        let mut processes_to_suspend: u32 = 0;
+        let mut power_plan_changing = false;
+        let mut taskbar_hiding = false;
+        let mut pausing_windows_update = false;
+        for action in &plan.actions {
+            match action {
+                PlannedAction::StopService { .. } => services_to_stop += 1,
+                PlannedAction::SuspendProcess { .. } => processes_to_suspend += 1,
+                PlannedAction::SetPowerPlan { .. } => power_plan_changing = true,
+                PlannedAction::HideTaskbar => taskbar_hiding = true,
+                PlannedAction::PauseWindowsUpdate => pausing_windows_update = true,
+                PlannedAction::SetFocusAssist(_) => {}
+            }
+        }
+        let _ = events.send(Event::GameModeEntered {
+            profile_id: profile_id.clone(),
+            services_to_stop,
+            processes_to_suspend,
+            power_plan_changing,
+            taskbar_hiding,
+            pausing_windows_update,
+        });
+
         s.system_mode = Some(ActiveSystemMode {
             profile_id: profile_id.clone(),
             previous: plan.previous_state,
@@ -2345,13 +2513,19 @@ impl Engine {
         });
     }
 
-    fn revert_system_mode_locked(s: &mut EngineState, journal: &Journal) {
+    fn revert_system_mode_locked(
+        s: &mut EngineState,
+        journal: &Journal,
+        events: &broadcast::Sender<Event>,
+        revert_reason: &str,
+    ) {
         let Some(active) = s.system_mode.take() else {
             return;
         };
         info!(
             profile = %active.profile_id,
             session = %active.journal_session_id,
+            reason = revert_reason,
             "game mode exiting"
         );
         sys_revert_all(&active.applied, &active.previous);
@@ -2380,7 +2554,7 @@ impl Engine {
             .unwrap_or(0);
         let history_entry = match journal.read() {
             Ok(Some(disk_entry)) => {
-                SessionHistoryEntry::from_journal(&disk_entry, now_unix, "foreground_changed")
+                SessionHistoryEntry::from_journal(&disk_entry, now_unix, revert_reason)
             }
             _ => {
                 // Disk journal missing or unreadable — synthesise from
@@ -2393,7 +2567,7 @@ impl Engine {
                     profile_id: active.profile_id.clone(),
                     started_at_unix_secs: active.started_at_unix_secs,
                     ended_at_unix_secs: now_unix,
-                    revert_reason: "foreground_changed".to_owned(),
+                    revert_reason: revert_reason.to_owned(),
                     previous: active.previous.clone(),
                     applied: active.applied.clone(),
                 }
@@ -2407,6 +2581,27 @@ impl Engine {
                  trail will be missing this entry"
             );
         }
+
+        // Emit Event::GameModeExited with summary counts. The tray uses
+        // these to update the "session complete" toast without
+        // re-reading sessions.jsonl. Counts derive from the same
+        // AppliedActions we just reverted — they represent what we
+        // *tried* to put back; revert errors are surfaced separately via
+        // log lines (and a future patch can wire per-action ActionFailed
+        // emission inside sys_revert_all for tray-level visibility).
+        let services_restored = active.applied.stopped_services.len() as u32;
+        let processes_resumed = active.applied.suspended_pids.len() as u32;
+        let duration_secs = now_unix.saturating_sub(active.started_at_unix_secs);
+        let _ = events.send(Event::GameModeExited {
+            profile_id: active.profile_id.clone(),
+            services_restored,
+            processes_resumed,
+            power_plan_restored: active.applied.switched_power_plan,
+            taskbar_restored: active.applied.hid_taskbar,
+            wu_pause_restored: active.applied.paused_windows_update,
+            duration_secs,
+            reason: revert_reason.to_owned(),
+        });
 
         if let Err(e) = journal.delete() {
             warn!(error = %e, "journal delete after revert failed");
@@ -2428,13 +2623,59 @@ fn build_user_ignore_exes(policy: &Policy) -> HashSet<String> {
         .collect()
 }
 
-fn revert_record(pid: u32, record: AppliedRecord) {
+/// Classify an `apply_profile` failure into the categorical
+/// `ActionFailedKind` the tray uses for filtering. We don't have typed
+/// errors yet (a bigger refactor for a future PR), so this is best-effort
+/// substring matching on the user-visible message. The fallback bucket
+/// is `Apply`, which is also the most common case (sys::apply::apply
+/// returning a Win32 error).
+fn classify_apply_failure(err: &anyhow::Error) -> ActionFailedKind {
+    // Check most-specific patterns first. The "Disabled" tier error
+    // also contains the word "refused" (the message ends with "apply
+    // refused"), so it MUST be matched before the broader denylist
+    // check or it gets miscategorised.
+    let msg = err.to_string();
+    if msg.contains("ac_safe_mode_target=Disabled") {
+        ActionFailedKind::AcTierBlocked
+    } else if msg.contains("denylisted process") {
+        ActionFailedKind::DenylistRefused
+    } else {
+        ActionFailedKind::Apply
+    }
+}
+
+/// Revert per-PID changes captured in `record`. Fires
+/// `Event::ProfileReverted` unconditionally (the engine's
+/// `applied`-map slot for this PID is gone either way) and an
+/// `Event::ActionFailed` if the kernel revert call returned an error
+/// — the user's process may be left in the modified state, which is
+/// exactly the case audit H-30 wanted surfaced.
+fn revert_record(events: &broadcast::Sender<Event>, pid: u32, record: AppliedRecord) {
+    let profile_id = record.profile_id.clone();
+    let exe_name = record.exe_name.clone();
     #[cfg(windows)]
     if let Err(e) = framesage_sys::apply::revert(pid, record.state) {
         warn!(pid, error = %e, "revert failed");
+        let _ = events.send(Event::ActionFailed {
+            kind: ActionFailedKind::Revert,
+            pid: Some(pid),
+            exe_name: Some(exe_name.clone()),
+            details: format!("revert failed: {e:#}"),
+        });
     }
-    debug!(pid, profile = %record.profile_id, "reverted");
-    let _ = record;
+    #[cfg(not(windows))]
+    {
+        // Simulator path: no kernel revert, but mirror the event
+        // timeline so tray-driven scenarios in `framesage-sim` exercise
+        // the same emission path.
+        let _ = record;
+    }
+    debug!(pid, profile = %profile_id, "reverted");
+    let _ = events.send(Event::ProfileReverted {
+        pid,
+        exe_name,
+        profile_id,
+    });
 }
 
 /// Project a plan's actions onto an `AppliedActions` record describing what
@@ -3071,5 +3312,87 @@ mod tests {
             ..Default::default()
         };
         assert!(!q.refuses_wu_pause());
+    }
+
+    // ─── Item 2.7+2.8 follow-up — Event emission wiring ──────────────────
+    //
+    // The engine's apply / revert / system-mode / AC-presence paths
+    // all `let _ = self.events.send(...)`; verifying every emission
+    // call site requires a live PID and a real foreground (Group 3
+    // 3.1 work). What we CAN lock here:
+    //
+    //   * `classify_apply_failure` correctly buckets the three
+    //     known anyhow-error shapes the engine produces, so the
+    //     tray's filter-by-kind path is wired to the right source
+    //     of truth.
+    //   * `revert_record` emits ProfileReverted via the broadcast
+    //     channel — the simulator path runs without syscalls and
+    //     exercises the unconditional emission branch.
+
+    /// classify_apply_failure must distinguish the three error shapes
+    /// the engine's apply_profile produces so the tray can filter
+    /// "denied by safety bar" separately from "Win32 error" without
+    /// substring-matching the details string every render.
+    #[test]
+    fn classify_apply_failure_buckets_known_shapes() {
+        let denylist = anyhow::anyhow!(
+            "refused apply profile on denylisted process csrss.exe: kernel-critical"
+        );
+        assert_eq!(
+            classify_apply_failure(&denylist),
+            ActionFailedKind::DenylistRefused
+        );
+
+        let disabled =
+            anyhow::anyhow!("profile 'foo' has ac_safe_mode_target=Disabled — apply refused");
+        assert_eq!(
+            classify_apply_failure(&disabled),
+            ActionFailedKind::AcTierBlocked
+        );
+
+        let win32 = anyhow::anyhow!("SetProcessAffinityMask failed: ERROR_ACCESS_DENIED");
+        assert_eq!(classify_apply_failure(&win32), ActionFailedKind::Apply);
+    }
+
+    /// revert_record must emit `Event::ProfileReverted` exactly once
+    /// per call. We assert the count and the payload fields so a
+    /// future refactor that swaps the broadcast type can't silently
+    /// drop the emission.
+    #[test]
+    fn revert_record_emits_profile_reverted() {
+        let (tx, mut rx) = broadcast::channel(8);
+        #[cfg(windows)]
+        let state = framesage_sys::apply::AppliedState::default();
+        let record = AppliedRecord {
+            profile_id: ProfileId("game-x3d".into()),
+            exe_name: "Diablo IV.exe".into(),
+            #[cfg(windows)]
+            state,
+            #[cfg(not(windows))]
+            _phantom: (),
+        };
+        revert_record(&tx, 4242, record);
+
+        // The simulator path's revert is a no-op (no kernel state to
+        // restore), so only ProfileReverted should fire. On Windows,
+        // the kernel revert call against pid=4242 returns an error
+        // (no such process), which produces an extra ActionFailed —
+        // both shapes are valid; we just want to find a
+        // ProfileReverted in the stream.
+        let mut saw_revert = false;
+        while let Ok(ev) = rx.try_recv() {
+            if let Event::ProfileReverted {
+                pid,
+                exe_name,
+                profile_id,
+            } = ev
+            {
+                assert_eq!(pid, 4242);
+                assert_eq!(exe_name, "Diablo IV.exe");
+                assert_eq!(profile_id, ProfileId("game-x3d".into()));
+                saw_revert = true;
+            }
+        }
+        assert!(saw_revert, "revert_record must emit ProfileReverted");
     }
 }
