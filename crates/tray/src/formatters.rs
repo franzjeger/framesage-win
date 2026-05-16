@@ -105,6 +105,24 @@ pub fn format_top_cores(percents: &[u8], n: usize) -> String {
         .join("\n")
 }
 
+/// Compact human-readable label for a `CpuSelector`. Used in the Affinity
+/// Rules table so a row reads "diablo iv.exe → X3D CCD" rather than
+/// "diablo iv.exe → Kind(Cache)". Mask values are rendered in hex (Process
+/// Lasso convention); the explicit-cores variants get their natural names.
+pub fn affinity_selector_label(selector: &framesage_core::CpuSelector) -> String {
+    use framesage_core::{CoreKind, CpuSelector};
+    match selector {
+        CpuSelector::All => "All cores".to_owned(),
+        CpuSelector::Kind(CoreKind::Cache) => "X3D CCD (Cache cores)".to_owned(),
+        CpuSelector::Kind(CoreKind::Performance) => "Non-X3D / P-cores".to_owned(),
+        CpuSelector::Kind(CoreKind::Efficiency) => "E-cores".to_owned(),
+        CpuSelector::Ccd(n) => format!("CCD {n}"),
+        CpuSelector::CcdNot(n) => format!("Not CCD {n}"),
+        CpuSelector::TopRanked(n) => format!("Top {n} cores"),
+        CpuSelector::Mask(m) => format!("Mask 0x{m:016X}"),
+    }
+}
+
 /// Map a raw Win32 priority class constant to the short label Task Manager
 /// uses ("Normal", "High", "Realtime", …). Returns "—" for unknown values
 /// so the table doesn't show a stale or garbled string.

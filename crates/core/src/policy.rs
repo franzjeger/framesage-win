@@ -13,6 +13,7 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use crate::profile::{Profile, ProfileId};
+use crate::topology::CpuSelector;
 
 #[derive(Debug, Error)]
 pub enum PolicyError {
@@ -56,6 +57,37 @@ pub struct AppRule {
     pub note: String,
 }
 
+/// Standalone per-exe CPU-affinity rule. Lightweight alternative to creating
+/// a full Profile + AppRule pair when the only thing the user wants is "pin
+/// this exe to the X3D CCD every time it launches."
+///
+/// The engine applies a rule when:
+///   * the user creates it (immediately, to live PIDs with the matching exe)
+///   * a new process spawns whose exe matches (caught by the background scan)
+///   * the persistent re-assert tick fires (so the kernel state stays sticky
+///     against games that touch their own affinity at startup)
+///
+/// Matching is case-insensitive against the bare exe filename (no path), the
+/// Process Lasso model. A power user who needs path discrimination can still
+/// fall back to the full Profile/AppRule mechanism.
+///
+/// Precedence: an `AffinityRule` overrides any `Profile.cpu_sets` /
+/// `affinity_mask` chosen by `AppRule` matching for the same exe. The user
+/// stated affinity intent explicitly, so it wins.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AffinityRule {
+    /// Case-insensitive exact match against the executable filename (no path).
+    /// E.g. `"diablo iv.exe"`, `"valorant-win64-shipping.exe"`.
+    pub exe_name: String,
+    /// What to pin the matching process to. `CpuSelector::All` is treated as
+    /// "no pin" — callers normally delete the rule instead, but storing All
+    /// is harmless and lets the UI treat "reset" as just another pick.
+    pub selector: CpuSelector,
+    /// Free-form human note shown in the rules manager. Defaults to empty.
+    #[serde(default)]
+    pub note: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Policy {
     /// All profiles known to the engine, keyed by id.
@@ -86,6 +118,12 @@ pub struct Policy {
     /// policy.
     #[serde(default)]
     pub probalance: ProBalanceConfig,
+
+    /// Persistent per-exe CPU-affinity rules. Lighter weight than a full
+    /// Profile + AppRule pair; the right call for the common "pin Diablo IV
+    /// to the X3D CCD" case. See [`AffinityRule`] for matching + precedence.
+    #[serde(default)]
+    pub affinity_rules: Vec<AffinityRule>,
 }
 
 /// Tunables for dynamic priority management. Modeled after Process Lasso's
@@ -151,6 +189,39 @@ impl Policy {
 
     pub fn profile(&self, id: &ProfileId) -> Option<&Profile> {
         self.profiles.get(id)
+    }
+
+    /// Find an affinity rule for the given exe name (case-insensitive).
+    pub fn affinity_rule_for(&self, exe_name: &str) -> Option<&AffinityRule> {
+        self.affinity_rules
+            .iter()
+            .find(|r| r.exe_name.eq_ignore_ascii_case(exe_name))
+    }
+
+    /// Insert or replace an affinity rule for the rule's exe name. Returns
+    /// `true` if an existing rule was replaced, `false` if a new one was
+    /// appended. Case-insensitive match for the existing-rule lookup.
+    pub fn upsert_affinity_rule(&mut self, rule: AffinityRule) -> bool {
+        if let Some(slot) = self
+            .affinity_rules
+            .iter_mut()
+            .find(|r| r.exe_name.eq_ignore_ascii_case(&rule.exe_name))
+        {
+            *slot = rule;
+            true
+        } else {
+            self.affinity_rules.push(rule);
+            false
+        }
+    }
+
+    /// Remove the affinity rule for the given exe name (case-insensitive).
+    /// Returns `true` if a rule was removed, `false` if no match existed.
+    pub fn remove_affinity_rule(&mut self, exe_name: &str) -> bool {
+        let before = self.affinity_rules.len();
+        self.affinity_rules
+            .retain(|r| !r.exe_name.eq_ignore_ascii_case(exe_name));
+        self.affinity_rules.len() != before
     }
 
     /// Read a policy from disk. Errors if the file doesn't exist or fails to
@@ -405,6 +476,7 @@ impl Default for Policy {
             background_profile: Some("eco".into()),
             tick_ms: Self::default_tick_ms(),
             probalance: ProBalanceConfig::default(),
+            affinity_rules: Vec::new(),
         }
     }
 }
@@ -444,6 +516,7 @@ mod tests {
             background_profile: None,
             tick_ms: 250,
             probalance: ProBalanceConfig::default(),
+            affinity_rules: Vec::new(),
         }
     }
 
@@ -556,6 +629,65 @@ mod tests {
             }
             other => panic!("expected NotFound, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn affinity_rule_upsert_inserts_new_and_replaces_existing() {
+        use crate::topology::{CoreKind, CpuSelector};
+
+        let mut p = sample_policy();
+        assert!(p.affinity_rules.is_empty());
+
+        let inserted = p.upsert_affinity_rule(AffinityRule {
+            exe_name: "diablo iv.exe".into(),
+            selector: CpuSelector::Kind(CoreKind::Cache),
+            note: String::new(),
+        });
+        assert!(!inserted, "first call should append, not replace");
+        assert_eq!(p.affinity_rules.len(), 1);
+
+        // Different case for the same exe should replace, not append.
+        let replaced = p.upsert_affinity_rule(AffinityRule {
+            exe_name: "DIABLO IV.EXE".into(),
+            selector: CpuSelector::All,
+            note: "updated".into(),
+        });
+        assert!(replaced);
+        assert_eq!(p.affinity_rules.len(), 1);
+        assert_eq!(p.affinity_rules[0].selector, CpuSelector::All);
+        assert_eq!(p.affinity_rules[0].note, "updated");
+    }
+
+    #[test]
+    fn affinity_rule_lookup_is_case_insensitive() {
+        use crate::topology::{CoreKind, CpuSelector};
+
+        let mut p = sample_policy();
+        p.upsert_affinity_rule(AffinityRule {
+            exe_name: "Diablo IV.exe".into(),
+            selector: CpuSelector::Kind(CoreKind::Cache),
+            note: String::new(),
+        });
+
+        assert!(p.affinity_rule_for("diablo iv.exe").is_some());
+        assert!(p.affinity_rule_for("DIABLO IV.EXE").is_some());
+        assert!(p.affinity_rule_for("notepad.exe").is_none());
+    }
+
+    #[test]
+    fn affinity_rule_remove_returns_true_only_when_match_existed() {
+        use crate::topology::{CoreKind, CpuSelector};
+
+        let mut p = sample_policy();
+        p.upsert_affinity_rule(AffinityRule {
+            exe_name: "diablo iv.exe".into(),
+            selector: CpuSelector::Kind(CoreKind::Cache),
+            note: String::new(),
+        });
+
+        assert!(p.remove_affinity_rule("DIABLO IV.EXE"));
+        assert!(p.affinity_rules.is_empty());
+        assert!(!p.remove_affinity_rule("diablo iv.exe"));
     }
 
     #[test]

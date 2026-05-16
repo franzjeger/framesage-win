@@ -155,6 +155,14 @@ struct EngineState {
     /// desktop is idle" from "no helper has ever reported, fall back to
     /// session-local polling".
     foreground_reporter_seen: bool,
+    /// PIDs that have had a standalone `AffinityRule` pin applied at
+    /// least once. Independent of `applied` because affinity rules live
+    /// outside the profile system — a PID can have a rule pin without
+    /// having an `AppliedRecord`. We use the set to avoid re-applying
+    /// every background-scan tick, and prune it as PIDs disappear from
+    /// the live list. The persistent-reassert sweep re-pushes rule pins
+    /// for any PID that's both in this set AND still alive.
+    affinity_rule_applied: HashSet<u32>,
 }
 
 /// How often the engine walks all PIDs to apply `Policy::background_profile`.
@@ -242,6 +250,7 @@ impl Engine {
                 manual_override: None,
                 reported_foreground: None,
                 foreground_reporter_seen: false,
+                affinity_rule_applied: HashSet::new(),
             })),
             events: tx,
             safe_list: deps.safe_list,
@@ -418,10 +427,115 @@ impl Engine {
         s.probalance_restrained.remove(&pid);
         s.probalance_prev_samples.remove(&pid);
         s.list_processes_prev_samples.remove(&pid);
+        s.affinity_rule_applied.remove(&pid);
         if s.current_foreground == Some(pid) {
             s.current_foreground = None;
         }
         Ok(())
+    }
+
+    /// Cheap read-only snapshot of the in-memory policy. Used by the IPC
+    /// service after a `SetAffinityRule` / `DeleteAffinityRule` call so the
+    /// runtime can persist the mutation to disk without holding the engine
+    /// lock for the full write.
+    pub fn policy_snapshot(&self) -> Policy {
+        self.state.read().policy.clone()
+    }
+
+    /// Create or update a persistent CPU-affinity rule keyed by exe name.
+    /// When `apply_to_live` is true, walks the live process list and pins
+    /// every matching PID right now — the "apply to running" UX of the
+    /// "Remember for next time" toggle.
+    ///
+    /// The rule is also stored in the engine's in-memory policy; the caller
+    /// is responsible for persisting the mutation to disk afterward (the
+    /// IPC handler does so via [`Self::policy_snapshot`] + [`Policy::save`]).
+    ///
+    /// Live-PID failures are logged but don't abort the call — the user just
+    /// wanted the rule saved; surfacing a per-PID OpenProcess refusal would
+    /// be more confusing than helpful. The rule still gets stored and will
+    /// re-apply cleanly on the next spawn.
+    pub fn set_affinity_rule(
+        &self,
+        rule: framesage_core::AffinityRule,
+        apply_to_live: bool,
+    ) -> Result<()> {
+        let exe_name = rule.exe_name.clone();
+        let selector = rule.selector.clone();
+        {
+            let mut s = self.state.write();
+            let replaced = s.policy.upsert_affinity_rule(rule);
+            info!(
+                exe = %exe_name,
+                replaced,
+                "set_affinity_rule"
+            );
+            // Forget any prior "rule applied" marker for live PIDs of this
+            // exe — they need re-application against the new selector, not
+            // the old one. The next maybe_scan_background_locked tick (or
+            // the apply_to_live walk below) will re-mark them.
+            s.affinity_rule_applied.clear();
+        }
+
+        if apply_to_live {
+            #[cfg(windows)]
+            {
+                let pids = framesage_sys::process::iter_pids().unwrap_or_default();
+                let mut applied_count: usize = 0;
+                let mut new_marks: Vec<u32> = Vec::new();
+                for pid in pids {
+                    let live_exe = match framesage_sys::process::exe_for_pid(pid) {
+                        Ok(Some(path)) => {
+                            path.rsplit(['\\', '/']).next().unwrap_or(&path).to_owned()
+                        }
+                        Ok(None) | Err(_) => continue,
+                    };
+                    if !live_exe.eq_ignore_ascii_case(&exe_name) {
+                        continue;
+                    }
+                    match self.set_process_affinity(pid, selector.clone()) {
+                        Ok(()) => {
+                            applied_count += 1;
+                            new_marks.push(pid);
+                        }
+                        Err(e) => {
+                            warn!(pid, exe = %live_exe, error = %e, "affinity rule apply-to-live failed");
+                        }
+                    }
+                }
+                if !new_marks.is_empty() {
+                    let mut s = self.state.write();
+                    for pid in new_marks {
+                        s.affinity_rule_applied.insert(pid);
+                    }
+                }
+                info!(
+                    exe = %exe_name,
+                    applied_count,
+                    "affinity rule applied to live PIDs"
+                );
+            }
+            #[cfg(not(windows))]
+            {
+                let _ = selector;
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Remove the persistent affinity rule for `exe_name` (case-insensitive).
+    /// Idempotent; returns the in-memory mutation but does NOT revert the
+    /// affinity on currently-running matching processes — see
+    /// [`framesage_ipc::Request::DeleteAffinityRule`] for the UX rationale.
+    /// Caller persists the policy change.
+    pub fn delete_affinity_rule(&self, exe_name: &str) -> bool {
+        let mut s = self.state.write();
+        let removed = s.policy.remove_affinity_rule(exe_name);
+        if removed {
+            info!(exe = %exe_name, "delete_affinity_rule");
+        }
+        removed
     }
 
     pub fn status(&self) -> StatusSnapshot {
@@ -1333,6 +1447,65 @@ impl Engine {
                 s.current_foreground = None;
             }
         }
+
+        // ─── Re-assert standalone affinity rules ─────────────────────────────
+        // Mirrors the persistent-profile sweep above but for the lightweight
+        // AffinityRule path. Same motivation: some games (POE2, EVE, Unreal
+        // titles) call SetProcessAffinityMask on themselves at startup,
+        // overwriting our pin. The 2 s re-assert defeats that without
+        // requiring the user to also create a full Profile.
+        //
+        // Bounded by `affinity_rule_applied`: we only re-push for PIDs
+        // we've successfully pinned at least once. PID-reuse defense is
+        // the same exe-name comparison as the persistent-profile loop.
+        if !s.affinity_rule_applied.is_empty() && !s.policy.affinity_rules.is_empty() {
+            let topology = s.topology.clone();
+            let mut stale_rule_pids: Vec<u32> = Vec::new();
+            let rule_pids: Vec<u32> = s.affinity_rule_applied.iter().copied().collect();
+            for pid in rule_pids {
+                #[cfg(windows)]
+                {
+                    let live_exe = match framesage_sys::process::exe_for_pid(pid) {
+                        Ok(Some(path)) => {
+                            path.rsplit(['\\', '/']).next().unwrap_or(&path).to_owned()
+                        }
+                        Ok(None) | Err(_) => {
+                            stale_rule_pids.push(pid);
+                            continue;
+                        }
+                    };
+                    let Some(rule) = s.policy.affinity_rule_for(&live_exe).cloned() else {
+                        // Rule was deleted for this exe; release the PID so
+                        // it's not re-pinned on future sweeps.
+                        stale_rule_pids.push(pid);
+                        continue;
+                    };
+                    let indices = topology.resolve(&rule.selector);
+                    if indices.is_empty() {
+                        continue;
+                    }
+                    let mut mask: u64 = 0;
+                    for idx in indices {
+                        if idx < 64 {
+                            mask |= 1u64 << idx;
+                        }
+                    }
+                    if mask == 0 {
+                        continue;
+                    }
+                    if let Err(e) = framesage_sys::apply::set_affinity_mask_for_pid(pid, mask) {
+                        debug!(pid, error = %e, "affinity rule re-assert failed");
+                    }
+                }
+                #[cfg(not(windows))]
+                {
+                    let _ = (pid, &topology);
+                }
+            }
+            for pid in stale_rule_pids {
+                s.affinity_rule_applied.remove(&pid);
+            }
+        }
     }
 
     /// Walk every running PID and apply `Policy::background_profile` to any
@@ -1392,6 +1565,67 @@ impl Engine {
         for pid in stale {
             // Process is gone; no revert syscall would succeed. Just drop.
             s.applied.remove(&pid);
+        }
+        // Same cleanup for the standalone affinity-rule tracker. Prevents
+        // the set growing without bound across long sessions as PIDs come
+        // and go.
+        s.affinity_rule_applied.retain(|p| live_set.contains(p));
+
+        // ─── Apply standalone affinity rules to new matching PIDs ───────────
+        // Independent of the background-profile loop below: a PID can have
+        // an affinity-rule pin without ever entering `s.applied`. We walk
+        // the live PIDs once here, look each one up in the rules table by
+        // exe name, and pin if there's a match and we haven't pinned it
+        // yet. Cost is bounded — the rule table is small (handful of games
+        // per user) and the live exe lookup is the same one the loop below
+        // does for safe-list filtering.
+        //
+        // This is the "apply on next launch" half of the affinity rework
+        // (the "apply now" half is set_affinity_rule's apply_to_live walk).
+        if !s.policy.affinity_rules.is_empty() {
+            let self_pid_for_aff = std::process::id();
+            let mut rule_applies: Vec<(u32, framesage_core::CpuSelector)> = Vec::new();
+            for &pid in &live_pids {
+                if pid == 0 || pid == 4 || pid == self_pid_for_aff {
+                    continue;
+                }
+                if s.affinity_rule_applied.contains(&pid) {
+                    continue;
+                }
+                let live_exe = match framesage_sys::process::exe_for_pid(pid) {
+                    Ok(Some(path)) => path.rsplit(['\\', '/']).next().unwrap_or(&path).to_owned(),
+                    Ok(None) | Err(_) => continue,
+                };
+                if let Some(rule) = s.policy.affinity_rule_for(&live_exe) {
+                    rule_applies.push((pid, rule.selector.clone()));
+                }
+            }
+            for (pid, selector) in rule_applies {
+                let indices = topology.resolve(&selector);
+                if indices.is_empty() {
+                    continue;
+                }
+                let mut mask: u64 = 0;
+                for idx in indices {
+                    if idx < 64 {
+                        mask |= 1u64 << idx;
+                    }
+                }
+                if mask == 0 {
+                    continue;
+                }
+                match framesage_sys::apply::set_affinity_mask_for_pid(pid, mask) {
+                    Ok(()) => {
+                        // Only mark on success — a failed apply might be
+                        // transient (PID exiting mid-call) and we want a
+                        // retry next scan rather than a silent skip.
+                        s.affinity_rule_applied.insert(pid);
+                    }
+                    Err(e) => {
+                        debug!(pid, error = %e, "affinity rule background apply failed");
+                    }
+                }
+            }
         }
 
         // ─── Apply background profile to new PIDs ───────────────────────────

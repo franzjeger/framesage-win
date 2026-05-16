@@ -39,8 +39,8 @@ mod theme;
 mod tree;
 
 use formatters::{
-    cpu_percent_color, decode_affinity_mask, display_profile_id, format_bytes, format_top_cores,
-    format_tray_tooltip, priority_class_label, truncate_for_echo,
+    affinity_selector_label, cpu_percent_color, decode_affinity_mask, display_profile_id,
+    format_bytes, format_top_cores, format_tray_tooltip, priority_class_label, truncate_for_echo,
 };
 use tree::{
     build_tree_view, classify_row, column_hover_text, compare_snapshots, descendants_of,
@@ -217,6 +217,18 @@ struct ProcessesView {
     /// PID anchor for Shift-click range selection. Updated on every
     /// plain or Ctrl click.
     last_clicked_pid: Option<u32>,
+    /// Session-sticky "Remember as rule" toggle that lives at the top of
+    /// the "Set CPU affinity" right-click submenu. When `true`, picking
+    /// X3D / Non-X3D / All-cores ALSO upserts a persistent `AffinityRule`
+    /// for the target exe (in addition to applying to the live PID).
+    /// Defaults to `false` so the affinity submenu's behavior matches its
+    /// pre-rework one-shot semantics until the user opts in.
+    ///
+    /// Sticky across menu opens — once you flip it on for "rule everything
+    /// I touch today," subsequent picks stay persistent until you flip it
+    /// back. This is the explicit trade-off the user picked over the
+    /// noisier "every option splits into now / always" model.
+    remember_affinity: bool,
 }
 
 impl Default for ProcessesView {
@@ -232,6 +244,7 @@ impl Default for ProcessesView {
             detail_height: None,
             multi_selected: std::collections::HashSet::new(),
             last_clicked_pid: None,
+            remember_affinity: false,
         }
     }
 }
@@ -285,6 +298,18 @@ struct AffinityPicker {
     /// Bit `i` set = CPU `i` allowed. Initialised to the process's
     /// current mask so the user can tweak rather than start fresh.
     mask: u64,
+    /// When true, Apply also creates/updates a persistent affinity rule
+    /// for this exe so the same mask is re-applied on every future launch.
+    /// Pre-checked when the picker is opened from a process that already
+    /// has a rule (so unchecking + Apply silently keeps the rule unless
+    /// the user explicitly clicks "Remove rule").
+    save_as_rule: bool,
+    /// True iff a persistent rule already exists for this exe at the
+    /// moment the picker was opened. Drives the "Remove rule" button —
+    /// visible only when there's something to remove. Captured once at
+    /// open so the button doesn't appear and disappear as the user toggles
+    /// `save_as_rule`.
+    rule_existed_at_open: bool,
 }
 
 /// State for the Rules-tab inline editor. Holds only the open form; the
@@ -510,6 +535,66 @@ impl FramesageApp {
     fn send_admin_request(&self, _req: Request, _label: &'static str) {
         // No-op on non-Windows so this stub still compiles in cross-checks.
         *self.last_action.lock().unwrap() = Some("admin requests are Windows-only".to_string());
+    }
+
+    /// Look up a persistent affinity rule by exe name from the last service
+    /// status snapshot. Returns `None` if no rule matches or the snapshot
+    /// hasn't arrived yet. Locks the state mutex briefly to clone the
+    /// matched rule — cheap; rules are tiny.
+    fn policy_snapshot_lookup_rule(&self, exe_name: &str) -> Option<framesage_core::AffinityRule> {
+        let s = self.state.lock().unwrap();
+        s.status
+            .as_ref()?
+            .policy
+            .affinity_rule_for(exe_name)
+            .cloned()
+    }
+}
+
+/// Resolve a `CpuSelector` into a raw u64 affinity bitmap suitable for the
+/// picker's working state. Mirrors the engine-side resolution but uses the
+/// known CPU count instead of live topology (the tray doesn't carry a
+/// CpuTopology); for `Kind(Cache)` / `Kind(Performance)` we fall back to
+/// the lower-half / upper-half heuristic that the picker already uses for
+/// its highlight column.
+///
+/// Returns `!0u64` masked to `cpu_count` bits for `All`, an empty mask for
+/// resolutions that produced no CPUs (so the picker treats them as "no
+/// preset" and stays at whatever the user had).
+fn selector_to_mask(selector: &framesage_core::CpuSelector, cpu_count: usize) -> u64 {
+    let cpu_count = if cpu_count == 0 { 32 } else { cpu_count };
+    let all_mask: u64 = if cpu_count >= 64 {
+        u64::MAX
+    } else {
+        (1u64 << cpu_count) - 1
+    };
+    match selector {
+        framesage_core::CpuSelector::All => all_mask,
+        framesage_core::CpuSelector::Mask(m) => (*m as u64) & all_mask,
+        framesage_core::CpuSelector::Kind(framesage_core::CoreKind::Cache) => {
+            let hi = cpu_count / 2;
+            let mut m = 0u64;
+            for i in 0..hi {
+                if i < 64 {
+                    m |= 1u64 << i;
+                }
+            }
+            m
+        }
+        framesage_core::CpuSelector::Kind(framesage_core::CoreKind::Performance) => {
+            let lo = cpu_count / 2;
+            let mut m = 0u64;
+            for i in lo..cpu_count {
+                if i < 64 {
+                    m |= 1u64 << i;
+                }
+            }
+            m
+        }
+        framesage_core::CpuSelector::Kind(_) => all_mask,
+        framesage_core::CpuSelector::Ccd(_)
+        | framesage_core::CpuSelector::CcdNot(_)
+        | framesage_core::CpuSelector::TopRanked(_) => all_mask,
     }
 }
 
@@ -877,10 +962,13 @@ impl FramesageApp {
         };
         let pid = picker.pid;
         let exe_name = picker.exe_name.clone();
+        let rule_existed_at_open = picker.rule_existed_at_open;
 
         let mut do_apply = false;
         let mut do_cancel = false;
+        let mut do_remove_rule = false;
         let mut new_mask = picker.mask;
+        let mut save_as_rule = picker.save_as_rule;
 
         // CPU count: prefer per_core_cpu_percent length (live), fall back
         // to 32 as a sane default.
@@ -997,6 +1085,34 @@ impl FramesageApp {
                 });
 
                 ui.add_space(10.0);
+                ui.separator();
+                ui.add_space(6.0);
+
+                // ── Save as rule ────────────────────────────────────
+                // Persists the picked mask as an AffinityRule keyed by
+                // the exe name so the same pin is re-applied on every
+                // future launch. Pre-checked when the picker was opened
+                // against a process whose exe already had a rule
+                // (editing existing) — unchecking + Apply doesn't delete
+                // the existing rule (use the explicit Remove button for
+                // that, so deletion is never accidental).
+                let save_label = if save_as_rule {
+                    egui::RichText::new(format!("✓ Save as rule for {exe_name}"))
+                        .color(theme::ACCENT)
+                        .strong()
+                } else {
+                    egui::RichText::new(format!("Save as rule for {exe_name}"))
+                };
+                ui.checkbox(&mut save_as_rule, save_label).on_hover_text(
+                    "When checked, Apply also writes this mask as a \
+                     persistent rule. The same mask is re-applied \
+                     automatically every time a process with this exe \
+                     name launches, and the engine re-asserts it every \
+                     ~2 s to defeat games that override their own \
+                     affinity at startup.",
+                );
+
+                ui.add_space(10.0);
                 ui.horizontal(|ui| {
                     if ui.button("Cancel").clicked() {
                         do_cancel = true;
@@ -1015,13 +1131,35 @@ impl FramesageApp {
                     if !apply_enabled {
                         ui.colored_label(theme::ERROR, "Pick at least one CPU.");
                     }
+
+                    // Remove rule — only visible when a rule existed at
+                    // the time the picker was opened. Decoupled from
+                    // `save_as_rule` so the user can clearly see "yes
+                    // there's a rule, click here to delete it" as a
+                    // distinct action.
+                    if rule_existed_at_open {
+                        ui.add_space(20.0);
+                        if ui
+                            .button(egui::RichText::new("Remove rule").color(theme::ERROR))
+                            .on_hover_text(
+                                "Delete the persistent affinity rule for \
+                                 this exe. The live process keeps its \
+                                 current mask — clearing the rule only \
+                                 stops future launches from being pinned.",
+                            )
+                            .clicked()
+                        {
+                            do_remove_rule = true;
+                        }
+                    }
                 });
             });
 
-        // Commit the working mask back to picker state so it persists across
-        // re-renders while the modal is open.
+        // Commit the working mask + checkbox state back to picker state so
+        // they persist across re-renders while the modal is open.
         if let Some(p) = self.affinity_picker.as_mut() {
             p.mask = new_mask;
+            p.save_as_rule = save_as_rule;
         }
 
         if do_apply {
@@ -1031,6 +1169,33 @@ impl FramesageApp {
                     selector: framesage_core::CpuSelector::Mask(new_mask as u128),
                 },
                 "set affinity",
+            );
+            if save_as_rule {
+                // Persist the full bitmap as a rule so the next launch is
+                // pinned identically. apply_to_live=false because the live
+                // pin above already covers this PID.
+                self.send_admin_request(
+                    Request::SetAffinityRule {
+                        rule: framesage_core::AffinityRule {
+                            exe_name: exe_name.clone(),
+                            selector: framesage_core::CpuSelector::Mask(new_mask as u128),
+                            note: String::new(),
+                        },
+                        apply_to_live: false,
+                    },
+                    "save affinity rule",
+                );
+            }
+            self.affinity_picker = None;
+        } else if do_remove_rule {
+            // Explicit Remove rule click — never inferred. Doesn't touch
+            // the live process; pin sticks until exit. Matches the UX
+            // promise in the button's hover text.
+            self.send_admin_request(
+                Request::DeleteAffinityRule {
+                    exe_name: exe_name.clone(),
+                },
+                "delete affinity rule",
             );
             self.affinity_picker = None;
         } else if do_cancel {
@@ -2028,6 +2193,123 @@ impl FramesageApp {
                 }
             });
         }
+
+        // ─── Affinity Rules section ────────────────────────────────────────
+        // Lightweight per-exe CPU-affinity rules, managed independently of
+        // the heavier Profile + AppRule pair above. Lives in the Rules tab
+        // because it's conceptually the same idea — "when this exe runs,
+        // do X" — and grouping both rule kinds in one place beats hunting
+        // for a separate Affinity Rules tab. View / delete here; creation
+        // happens from the Processes-tab right-click "Remember as rule"
+        // toggle, where the user can pick the exact mask in context.
+        ui.add_space(16.0);
+        ui.separator();
+        ui.add_space(8.0);
+        self.render_affinity_rules_section(ui, &s.policy);
+    }
+
+    /// Affinity-rules sub-section of the Rules tab. Read + delete UX —
+    /// rule creation happens in context from the Processes tab so the
+    /// user picks against the live process they actually care about.
+    /// Shows an empty-state CTA when the rule list is empty, otherwise a
+    /// compact table of exe → mask → note + a Remove button per row.
+    fn render_affinity_rules_section(&mut self, ui: &mut egui::Ui, policy: &Policy) {
+        use egui_extras::{Column, TableBuilder};
+
+        ui.heading("Persistent CPU-Affinity Rules");
+        ui.label(
+            egui::RichText::new(
+                "Each rule pins a CPU mask onto every process whose exe name matches. \
+                 The engine re-applies them on every spawn and re-asserts every ~2 s \
+                 to defeat games that override their own affinity at startup.",
+            )
+            .color(theme::TEXT_MUTED),
+        );
+        ui.add_space(6.0);
+
+        if policy.affinity_rules.is_empty() {
+            ui.colored_label(
+                theme::TEXT_MUTED,
+                "No affinity rules yet. To create one, open the Processes tab, \
+                 right-click a process, tick 'Remember as rule' in the 'Set CPU \
+                 affinity' submenu, then pick a target (X3D CCD, Non-X3D, or Custom…).",
+            );
+            return;
+        }
+
+        // Sort by exe name so the list is stable across renders. Cloning
+        // the rule vec is cheap — handfuls of entries in practice.
+        let mut rules: Vec<framesage_core::AffinityRule> = policy.affinity_rules.clone();
+        rules.sort_by_key(|r| r.exe_name.to_ascii_lowercase());
+
+        let mut remove_exe: Option<String> = None;
+
+        TableBuilder::new(ui)
+            .striped(true)
+            .resizable(true)
+            .cell_layout(egui::Layout::left_to_right(egui::Align::Center))
+            .column(Column::initial(220.0).at_least(140.0)) // Exe
+            .column(Column::initial(200.0).at_least(120.0)) // Selector
+            .column(Column::remainder().at_least(120.0)) // Note
+            .column(Column::exact(90.0)) // Remove
+            .header(20.0, |mut header| {
+                header.col(|ui| {
+                    ui.strong("Exe");
+                });
+                header.col(|ui| {
+                    ui.strong("Pin");
+                });
+                header.col(|ui| {
+                    ui.strong("Note");
+                });
+                header.col(|ui| {
+                    ui.strong("");
+                });
+            })
+            .body(|mut body| {
+                for rule in &rules {
+                    body.row(20.0, |mut row| {
+                        row.col(|ui| {
+                            ui.monospace(&rule.exe_name);
+                        });
+                        row.col(|ui| {
+                            ui.label(affinity_selector_label(&rule.selector));
+                        });
+                        row.col(|ui| {
+                            if rule.note.is_empty() {
+                                ui.colored_label(theme::TEXT_MUTED, "—");
+                            } else {
+                                ui.label(&rule.note);
+                            }
+                        });
+                        row.col(|ui| {
+                            let remove_enabled = self.elevated;
+                            if ui
+                                .add_enabled(
+                                    remove_enabled,
+                                    egui::Button::new(
+                                        egui::RichText::new("Remove").color(theme::ERROR),
+                                    ),
+                                )
+                                .on_hover_text(
+                                    "Delete this affinity rule. Currently-running \
+                                     matching processes keep their pin until they exit.",
+                                )
+                                .clicked()
+                            {
+                                remove_exe = Some(rule.exe_name.clone());
+                            }
+                        });
+                    });
+                }
+            });
+
+        if let Some(exe) = remove_exe {
+            self.send_admin_request(
+                Request::DeleteAffinityRule { exe_name: exe },
+                "delete affinity rule",
+            );
+        }
     }
 
     /// Render the Profiles tab. Profiles are shown as collapsible cards;
@@ -2645,6 +2927,21 @@ impl FramesageApp {
         let mut clicked_pid: Option<u32> = None;
         let mut close_detail = false;
         let mut toggled_pid: Option<u32> = None;
+        // Lowercased exe names that have a persistent affinity rule. Computed
+        // once per render from the latest status snapshot so the per-row
+        // pin-marker lookup is an O(1) set hit instead of a linear scan of
+        // policy.affinity_rules for every row. Empty set when no snapshot
+        // has arrived yet or the policy has no rules.
+        let rule_exists_for_exe: std::collections::HashSet<String> = status
+            .as_ref()
+            .map(|s| {
+                s.policy
+                    .affinity_rules
+                    .iter()
+                    .map(|r| r.exe_name.to_ascii_lowercase())
+                    .collect()
+            })
+            .unwrap_or_default();
         // Per-frame icon extraction budget. Caps the worst-case cost when a
         // wave of new processes hits the table for the first time — without
         // this a fresh poll could trigger 200 SHGetFileInfoW calls in one
@@ -2926,14 +3223,51 @@ impl FramesageApp {
                                             }
                                         });
                                         ui.menu_button("Set CPU affinity", |ui| {
+                                            // ── Remember toggle ─────────────────
+                                            // Session-sticky checkbox at the top of
+                                            // the submenu. When on, every action
+                                            // below also writes a persistent rule
+                                            // keyed by the targeted exe. Kept
+                                            // visually prominent (colored when on)
+                                            // so the user notices it's still
+                                            // armed on next open.
+                                            let label = if self.processes.remember_affinity {
+                                                egui::RichText::new("✓ Remember as rule")
+                                                    .color(theme::ACCENT)
+                                                    .strong()
+                                            } else {
+                                                egui::RichText::new("Remember as rule")
+                                            };
+                                            ui.checkbox(
+                                                &mut self.processes.remember_affinity,
+                                                label,
+                                            )
+                                            .on_hover_text(
+                                                "When checked, the affinity you pick \
+                                                 here also saves as a persistent rule \
+                                                 keyed by exe name — the same mask is \
+                                                 re-applied automatically on every \
+                                                 future launch. 'All cores (reset)' \
+                                                 also clears any existing rule. Stays \
+                                                 on until you uncheck it.",
+                                            );
+                                            ui.separator();
+
+                                            let remember = self.processes.remember_affinity;
                                             let mut affinity_dispatch =
                                                 |sel: framesage_core::CpuSelector,
                                                  close: &mut bool| {
-                                                    for (t_pid, _) in &targets {
+                                                    for (t_pid, t_exe) in &targets {
                                                         action_queue.push(
                                                             ProcessAction::SetAffinity {
                                                                 pid: *t_pid,
                                                                 selector: sel.clone(),
+                                                                save_as_rule_for: if remember
+                                                                {
+                                                                    Some(t_exe.clone())
+                                                                } else {
+                                                                    None
+                                                                },
                                                             },
                                                         );
                                                     }
@@ -3247,14 +3581,69 @@ impl FramesageApp {
                                 ui.label(priority_class_label(p.priority_class_raw));
                             });
                             row.col(|ui| {
-                                // Show the affinity mask in hex (compact) but
-                                // expand to a human-friendly CPU range list on
-                                // hover ("CPUs: 0–7, 14"). 0x0 collapses to
-                                // "(none)" which is what an inaccessible
-                                // process yields.
-                                let resp = ui.monospace(format!("{:#x}", p.affinity_mask));
-                                let decoded = decode_affinity_mask(p.affinity_mask);
-                                let _ = resp.on_hover_text(decoded);
+                                // Affinity cell is now an interactive badge:
+                                // clicking it opens the picker for this PID
+                                // (one click vs right-click → submenu →
+                                // Custom). A leading 📌 marker indicates a
+                                // persistent rule exists for the exe — same
+                                // signal Process Lasso uses in its CPU
+                                // Affinity column. Right-click brings the
+                                // delete option.
+                                let has_rule =
+                                    rule_exists_for_exe.contains(&p.exe_name.to_ascii_lowercase());
+                                let mask_text = format!("{:#x}", p.affinity_mask);
+                                let cell_text = if has_rule {
+                                    egui::RichText::new(format!("📌 {mask_text}"))
+                                        .color(theme::ACCENT)
+                                        .monospace()
+                                } else {
+                                    egui::RichText::new(mask_text).monospace()
+                                };
+                                let resp =
+                                    ui.add(egui::Label::new(cell_text).sense(egui::Sense::click()));
+                                let mut decoded = decode_affinity_mask(p.affinity_mask);
+                                if has_rule {
+                                    decoded.push_str(
+                                        "\n\n📌 Persistent affinity rule active \
+                                         for this exe. Click to edit, right-click \
+                                         to remove.",
+                                    );
+                                } else {
+                                    decoded.push_str(
+                                        "\n\nClick to edit affinity. Toggle the \
+                                         Save-as-rule checkbox in the picker to \
+                                         make it persistent across launches.",
+                                    );
+                                }
+                                let resp = resp.on_hover_text(decoded);
+                                if resp.clicked() {
+                                    action_queue.push(ProcessAction::RequestAffinityPicker {
+                                        pid: p.pid,
+                                        exe_name: p.exe_name.clone(),
+                                    });
+                                }
+                                resp.context_menu(|ui| {
+                                    if ui.button("Edit affinity / rule…").clicked() {
+                                        action_queue.push(ProcessAction::RequestAffinityPicker {
+                                            pid: p.pid,
+                                            exe_name: p.exe_name.clone(),
+                                        });
+                                        ui.close_menu();
+                                    }
+                                    if has_rule
+                                        && ui
+                                            .button(
+                                                egui::RichText::new("Remove persistent rule")
+                                                    .color(theme::ERROR),
+                                            )
+                                            .clicked()
+                                    {
+                                        action_queue.push(ProcessAction::DeleteAffinityRule {
+                                            exe_name: p.exe_name.clone(),
+                                        });
+                                        ui.close_menu();
+                                    }
+                                });
                             });
                             row.col(|ui| match &p.managed_profile {
                                 Some(id) => {
@@ -3496,27 +3885,87 @@ impl FramesageApp {
                     // The modal's "Confirm" click is what actually terminates.
                     self.terminate_confirm = Some(TerminateConfirm { pid, exe_name });
                 }
-                ProcessAction::SetAffinity { pid, selector } => {
+                ProcessAction::SetAffinity {
+                    pid,
+                    selector,
+                    save_as_rule_for,
+                } => {
                     self.send_admin_request(
-                        Request::SetProcessAffinity { pid, selector },
+                        Request::SetProcessAffinity {
+                            pid,
+                            selector: selector.clone(),
+                        },
                         "set affinity",
+                    );
+                    if let Some(exe) = save_as_rule_for {
+                        // Rule + live pin go together: the live pin makes the
+                        // pick take effect immediately on the targeted PID, the
+                        // rule makes it stick for next launch. We send the rule
+                        // with apply_to_live=false because the live pin above
+                        // already covers the running case — saves one walk of
+                        // the live PID list.
+                        //
+                        // "All cores" with a Remember toggle is shorthand for
+                        // "clear the rule": pinning to All explicitly is
+                        // equivalent to having no rule, and removing the rule
+                        // keeps the rules list short. Custom-mask "save full
+                        // bitmap as rule" still goes through SetAffinityRule
+                        // because the user might genuinely want "always all
+                        // cores" as a defense against another tool changing it.
+                        if matches!(selector, framesage_core::CpuSelector::All) {
+                            self.send_admin_request(
+                                Request::DeleteAffinityRule {
+                                    exe_name: exe.clone(),
+                                },
+                                "delete affinity rule (reset)",
+                            );
+                        } else {
+                            self.send_admin_request(
+                                Request::SetAffinityRule {
+                                    rule: framesage_core::AffinityRule {
+                                        exe_name: exe.clone(),
+                                        selector,
+                                        note: String::new(),
+                                    },
+                                    apply_to_live: false,
+                                },
+                                "save affinity rule",
+                            );
+                        }
+                    }
+                }
+                ProcessAction::DeleteAffinityRule { exe_name } => {
+                    self.send_admin_request(
+                        Request::DeleteAffinityRule { exe_name },
+                        "delete affinity rule",
                     );
                 }
                 ProcessAction::RequestAffinityPicker { pid, exe_name } => {
-                    // Pre-populate the picker with the process's CURRENT mask
-                    // so the user can tweak rather than start from scratch.
-                    // Default to all cores if we can't read the live mask.
-                    let initial_mask = self
+                    // Pre-populate the picker with the most useful starting
+                    // mask. Order: persistent rule > current live mask > all
+                    // cores. Editing a rule should show the rule's mask, not
+                    // whatever the process happens to be pinned to right now
+                    // (which might be the rule's mask or might be drift from
+                    // an external change since rule apply).
+                    let topology_cpu_count =
+                        self.state.lock().unwrap().system.per_core_cpu_percent.len();
+                    let existing_rule_mask = self
+                        .policy_snapshot_lookup_rule(&exe_name)
+                        .map(|rule| selector_to_mask(&rule.selector, topology_cpu_count));
+                    let live_mask = self
                         .processes
                         .rows
                         .iter()
                         .find(|p| p.pid == pid)
-                        .map(|p| p.affinity_mask)
-                        .unwrap_or(!0u64);
+                        .map(|p| p.affinity_mask);
+                    let initial_mask = existing_rule_mask.or(live_mask).unwrap_or(!0u64);
+                    let rule_existed = existing_rule_mask.is_some();
                     self.affinity_picker = Some(AffinityPicker {
                         pid,
                         exe_name,
                         mask: initial_mask,
+                        save_as_rule: rule_existed,
+                        rule_existed_at_open: rule_existed,
                     });
                 }
                 ProcessAction::ShowInExplorer { path } => {
@@ -3610,13 +4059,29 @@ enum ProcessAction {
     /// One-shot affinity pin using a topology-aware selector (Kind(Cache)
     /// for X3D, Kind(Performance) for non-X3D, All for reset, etc.).
     /// Engine resolves against live `CpuTopology`.
+    ///
+    /// When `save_as_rule_for` is `Some(exe)`, the live pin is followed by
+    /// a `SetAffinityRule` so the same selector is re-applied next time a
+    /// process with that exe spawns. This is how the "Remember as rule"
+    /// submenu checkbox upgrades a one-shot pick into a persistent rule.
     SetAffinity {
         pid: u32,
         selector: framesage_core::CpuSelector,
+        save_as_rule_for: Option<String>,
+    },
+    /// Delete the persistent affinity rule for `exe_name`. Dispatched from
+    /// the per-row affinity badge's context menu and from the Affinity
+    /// Rules manager view's Remove button. Doesn't touch any currently-
+    /// running matching processes — the live pin persists until the
+    /// process exits (matches Process Lasso).
+    DeleteAffinityRule {
+        exe_name: String,
     },
     /// Opens the custom-mask affinity picker modal for `pid`. The modal's
     /// Apply button is what fires the actual `SetAffinity` IPC with the
-    /// user-built mask.
+    /// user-built mask. `existing_rule_selector` pre-loads the picker mask
+    /// from the persistent rule (if one exists) so editing an existing
+    /// rule starts from its current state, not the live process's mask.
     RequestAffinityPicker {
         pid: u32,
         exe_name: String,
@@ -3801,12 +4266,20 @@ fn render_process_detail(
                 }
             });
             ui.menu_button("Set affinity", |ui| {
+                // Detail-panel affinity submenu mirrors the table's right-
+                // click options but always dispatches one-shot pins
+                // (`save_as_rule_for: None`). The persistent-rule flow
+                // lives on the table's right-click submenu (with the
+                // Remember toggle) and the picker (with the checkbox);
+                // duplicating it here would clutter the action row
+                // without adding capability.
                 if ui.button("X3D CCD").clicked() {
                     action_queue.push(ProcessAction::SetAffinity {
                         pid,
                         selector: framesage_core::CpuSelector::Kind(
                             framesage_core::CoreKind::Cache,
                         ),
+                        save_as_rule_for: None,
                     });
                 }
                 if ui.button("Non-X3D CCD").clicked() {
@@ -3815,12 +4288,14 @@ fn render_process_detail(
                         selector: framesage_core::CpuSelector::Kind(
                             framesage_core::CoreKind::Performance,
                         ),
+                        save_as_rule_for: None,
                     });
                 }
                 if ui.button("All cores").clicked() {
                     action_queue.push(ProcessAction::SetAffinity {
                         pid,
                         selector: framesage_core::CpuSelector::All,
+                        save_as_rule_for: None,
                     });
                 }
                 if ui.button("Custom…").clicked() {

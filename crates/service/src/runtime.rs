@@ -414,6 +414,77 @@ async fn handle_client(
                     .await?;
                 }
             },
+            Request::SetAffinityRule {
+                rule,
+                apply_to_live,
+            } => {
+                // Engine mutates its in-memory policy + walks live PIDs to pin
+                // matches immediately (when apply_to_live), then we persist the
+                // policy snapshot to disk so the rule survives a service
+                // restart. The disk write is the part most likely to fail in
+                // practice — same failure mode as Request::SetPolicy: service
+                // running unelevated against a SYSTEM-owned policy.json. We
+                // surface it the same way.
+                let exe = rule.exe_name.clone();
+                match engine.set_affinity_rule(rule, apply_to_live) {
+                    Ok(()) => {
+                        let snapshot = engine.policy_snapshot();
+                        match snapshot.save(&paths::policy_path()) {
+                            Ok(()) => {
+                                write_response(&mut write_half, &Response::Ok).await?;
+                            }
+                            Err(e) => {
+                                warn!(error = %e, exe = %exe, "policy save after SetAffinityRule failed");
+                                write_response(
+                                    &mut write_half,
+                                    &Response::Error {
+                                        message: format!(
+                                            "policy.json save failed after creating \
+                                             affinity rule for {exe}: {e}. Rule applied \
+                                             in memory but will be lost on service \
+                                             restart."
+                                        ),
+                                    },
+                                )
+                                .await?;
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        write_response(
+                            &mut write_half,
+                            &Response::Error {
+                                message: format!("set_affinity_rule(exe={exe}) failed: {e:#}"),
+                            },
+                        )
+                        .await?;
+                    }
+                }
+            }
+            Request::DeleteAffinityRule { exe_name } => {
+                // Idempotent: delete returns Ok regardless of whether a rule
+                // existed. Still persist on every call so the empty state
+                // also makes it to disk if the user just cleared a rule.
+                engine.delete_affinity_rule(&exe_name);
+                let snapshot = engine.policy_snapshot();
+                match snapshot.save(&paths::policy_path()) {
+                    Ok(()) => write_response(&mut write_half, &Response::Ok).await?,
+                    Err(e) => {
+                        warn!(error = %e, exe = %exe_name, "policy save after DeleteAffinityRule failed");
+                        write_response(
+                            &mut write_half,
+                            &Response::Error {
+                                message: format!(
+                                    "policy.json save failed after deleting affinity \
+                                     rule for {exe_name}: {e}. Deletion applied in \
+                                     memory but will be lost on service restart."
+                                ),
+                            },
+                        )
+                        .await?;
+                    }
+                }
+            }
             Request::SetPolicy { policy } => {
                 // Apply in-memory first so subsequent ticks see the change
                 // immediately, then persist to disk so the edit survives

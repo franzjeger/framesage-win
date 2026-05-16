@@ -22,7 +22,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use framesage_core::{Policy, Profile, ProfileId};
+use framesage_core::{AffinityRule, Policy, Profile, ProfileId};
 
 /// Status pipe — readable + writable by Authenticated Users for round-tripping
 /// status queries. The service rejects any non-read-only request received on
@@ -122,6 +122,28 @@ pub enum Request {
     /// physical RAM headroom. One-shot; the trimmed process re-grows
     /// its working set on its next page-touch.
     TrimWorkingSet { pid: u32 },
+    /// Create or update a persistent CPU-affinity rule keyed by exe name
+    /// (case-insensitive). The engine writes the rule into `policy.json`,
+    /// then — if `apply_to_live` is true — walks the live process list and
+    /// pins every matching PID right now. The same rule is re-applied on
+    /// the spawn of any future matching process, and re-asserted on the
+    /// persistent-reassert tick so the kernel state stays sticky against
+    /// games that touch their own affinity at startup.
+    ///
+    /// This is the "remember for next time" half of the affinity rework —
+    /// for one-shot pinning without persistence, use
+    /// [`Request::SetProcessAffinity`].
+    SetAffinityRule {
+        rule: AffinityRule,
+        apply_to_live: bool,
+    },
+    /// Remove the persistent affinity rule for `exe_name` (case-insensitive).
+    /// Idempotent — no-op if no rule existed. Does NOT revert affinity on
+    /// any currently-running matching processes; the live pin sticks until
+    /// the process exits or the user explicitly resets it. Matches Process
+    /// Lasso's behavior — clearing a rule for next launch should not
+    /// surprise the user by yanking the current session's pin.
+    DeleteAffinityRule { exe_name: String },
 }
 
 impl Request {
@@ -149,7 +171,9 @@ impl Request {
             | Request::ResumeProcess { .. }
             | Request::TerminateProcess { .. }
             | Request::SetProcessAffinity { .. }
-            | Request::TrimWorkingSet { .. } => false,
+            | Request::TrimWorkingSet { .. }
+            | Request::SetAffinityRule { .. }
+            | Request::DeleteAffinityRule { .. } => false,
         }
     }
 
@@ -352,6 +376,7 @@ mod tests {
             background_profile: None,
             tick_ms: 300,
             probalance: framesage_core::ProBalanceConfig::default(),
+            affinity_rules: Vec::new(),
         }
     }
 
@@ -379,6 +404,19 @@ mod tests {
         }
         .is_read_only());
         assert!(!Request::TrimWorkingSet { pid: 1 }.is_read_only());
+        assert!(!Request::SetAffinityRule {
+            rule: AffinityRule {
+                exe_name: "diablo iv.exe".into(),
+                selector: framesage_core::CpuSelector::All,
+                note: String::new(),
+            },
+            apply_to_live: true,
+        }
+        .is_read_only());
+        assert!(!Request::DeleteAffinityRule {
+            exe_name: "diablo iv.exe".into(),
+        }
+        .is_read_only());
         assert!(!Request::SetPolicy {
             policy: sample_policy()
         }
