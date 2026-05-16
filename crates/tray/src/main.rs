@@ -34,6 +34,7 @@ mod icons;
 #[cfg(windows)]
 mod win32;
 
+mod activity_log;
 mod formatters;
 mod theme;
 mod tree;
@@ -102,6 +103,33 @@ impl EventKind {
             EventKind::ProBalanceRestrained => "ProBalance demote",
             EventKind::ProBalanceRestored => "ProBalance restore",
             EventKind::Other => "Other",
+        }
+    }
+
+    /// Snake-case discriminant string used as the on-disk
+    /// `PersistedActivityEvent::kind`. Distinct from `display()` (which
+    /// is the human-friendly UI label) so the wire format stays stable
+    /// even if we rename the UI label.
+    fn persist_tag(self) -> &'static str {
+        match self {
+            EventKind::Foreground => "foreground",
+            EventKind::Engine => "engine",
+            EventKind::ProBalanceRestrained => "probalance_restrained",
+            EventKind::ProBalanceRestored => "probalance_restored",
+            EventKind::Other => "other",
+        }
+    }
+
+    /// Inverse of `persist_tag` — unknown strings (e.g. from a future
+    /// schema variant the running binary doesn't know about) map to
+    /// `Other` rather than dropping the event.
+    fn from_persist_tag(tag: &str) -> Self {
+        match tag {
+            "foreground" => EventKind::Foreground,
+            "engine" => EventKind::Engine,
+            "probalance_restrained" => EventKind::ProBalanceRestrained,
+            "probalance_restored" => EventKind::ProBalanceRestored,
+            _ => EventKind::Other,
         }
     }
     fn color(self) -> egui::Color32 {
@@ -430,6 +458,39 @@ impl FramesageApp {
         theme::apply(&cc.egui_ctx);
 
         let state = Arc::new(Mutex::new(AppState::default()));
+
+        // Item 2.9 — hydrate the in-memory recent-events buffer from
+        // `%LOCALAPPDATA%\framesage\activity.jsonl` before the
+        // background loop spins up so the Activity tab has history
+        // even on first paint after a tray restart. Cap at 200 entries
+        // so the in-memory buffer (max 1000) has headroom for live
+        // events without immediately rolling old persisted entries
+        // off the top.
+        const HYDRATE_LIMIT: usize = 200;
+        match activity_log::ActivityLog::open() {
+            Ok(log) => match log.load_last(HYDRATE_LIMIT) {
+                Ok(persisted) => {
+                    let mut s = state.lock().unwrap();
+                    for pe in persisted {
+                        let kind = EventKind::from_persist_tag(&pe.kind);
+                        let at = std::time::UNIX_EPOCH
+                            + std::time::Duration::from_secs(pe.at_unix_secs);
+                        s.recent.push(RecentEvent {
+                            at,
+                            kind,
+                            label: pe.label,
+                        });
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!(error = %e, "activity-log load failed; starting with empty Activity tab");
+                }
+            },
+            Err(e) => {
+                tracing::warn!(error = %e, "activity-log open failed; Activity tab won't persist this run");
+            }
+        }
+
         let bg_state = state.clone();
         std::thread::spawn(move || {
             background_loop(bg_state);
@@ -5881,8 +5942,26 @@ fn background_loop(state: Arc<Mutex<AppState>>) {
     // Simple blocking client using the std synchronous named-pipe support via
     // `std::fs::OpenOptions`. The pipe path is documented to work with
     // CreateFile semantics under the hood.
+    //
+    // Item 2.9 — the activity-log writer lives here so it survives
+    // reconnect attempts (a service restart doesn't lose the writer
+    // half). Rotation runs once at startup so we don't carry an
+    // unbounded file across launches.
+    let mut activity_log: Option<activity_log::ActivityLog> = match activity_log::ActivityLog::open()
+    {
+        Ok(mut log) => {
+            if let Err(e) = log.rotate_if_oversized() {
+                tracing::warn!(error = %e, "activity-log rotation failed; continuing");
+            }
+            Some(log)
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, "activity-log open failed; events won't persist this run");
+            None
+        }
+    };
     loop {
-        match try_connect_and_serve(state.clone()) {
+        match try_connect_and_serve(state.clone(), activity_log.as_mut()) {
             Ok(()) => {}
             Err(e) => {
                 let mut s = state.lock().unwrap();
@@ -5895,7 +5974,10 @@ fn background_loop(state: Arc<Mutex<AppState>>) {
 }
 
 #[cfg(windows)]
-fn try_connect_and_serve(state: Arc<Mutex<AppState>>) -> anyhow::Result<()> {
+fn try_connect_and_serve(
+    state: Arc<Mutex<AppState>>,
+    mut activity_log: Option<&mut activity_log::ActivityLog>,
+) -> anyhow::Result<()> {
     use std::fs::OpenOptions;
     use std::io::{BufRead, BufReader, Write};
 
@@ -6068,9 +6150,27 @@ fn try_connect_and_serve(state: Arc<Mutex<AppState>>) -> anyhow::Result<()> {
                     ),
                 ),
             };
+            let now = std::time::SystemTime::now();
+            // Item 2.9 — persist the event before pushing into the
+            // in-memory buffer so a crash between push and flush
+            // doesn't leave the UI showing an event that isn't on
+            // disk. Append failures are warn-and-continue: the UI
+            // experience is more important than the persistence
+            // guarantee for any single event.
+            if let Some(log) = activity_log.as_deref_mut() {
+                let pe = activity_log::PersistedActivityEvent::new(
+                    now,
+                    kind.persist_tag(),
+                    label.clone(),
+                );
+                if let Err(e) = log.append(&pe) {
+                    tracing::warn!(error = %e, "activity-log append failed");
+                }
+            }
+
             let mut s = state.lock().unwrap();
             s.recent.push(RecentEvent {
-                at: std::time::SystemTime::now(),
+                at: now,
                 kind,
                 label,
             });

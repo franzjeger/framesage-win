@@ -94,6 +94,11 @@ framesage-gamemode = { path = "crates/gamemode" }
 # UUIDs for journal session ids
 uuid = { version = "1", features = ["v4", "serde"] }
 
+# Test utility — temp dirs that clean up on drop. Used in unit tests
+# that need a filesystem sandbox (activity-log round-trip, journal
+# write tests). Dev-only; not pulled into the runtime binary.
+tempfile = "3"
+
 [profile.release]
 lto = "fat"
 codegen-units = 1

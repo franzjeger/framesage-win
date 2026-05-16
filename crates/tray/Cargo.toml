@@ -23,8 +23,17 @@ anyhow = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 tracing-appender = { workspace = true }
+# Item 2.9 — serde derives for PersistedActivityEvent (activity.jsonl
+# schema). serde_json already pulled the runtime in; deriving here
+# adds only the macro path.
+serde = { workspace = true }
 serde_json = { workspace = true }
 tray-icon = { workspace = true }
+
+[dev-dependencies]
+# Item 2.9 — temp dirs that clean up on drop for the activity-log
+# round-trip + rotation tests.
+tempfile = { workspace = true }
 
 [target.'cfg(windows)'.dependencies]
 framesage-sys = { workspace = true }
