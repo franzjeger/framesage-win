@@ -51,6 +51,16 @@ pub trait SysApi: Send + Sync {
     /// active AC tier.
     fn detect_anti_cheats(&self) -> Result<AntiCheatPresence>;
 
+    // ─── Topology ──────────────────────────────────────────────────
+
+    /// Re-enumerate the machine's CPU topology via
+    /// `GetLogicalProcessorInformationEx` + CPPC + L3 cache
+    /// enrichment. Called once at engine startup and again on
+    /// `SystemEvent::Resume` (item 3.7) so the engine picks up power-
+    /// plan-driven core parking or VM hot-plug events that happened
+    /// while the system was suspended.
+    fn detect_topology(&self) -> Result<CpuTopology>;
+
     // ─── Process enumeration ───────────────────────────────────────
 
     /// Enumerate every PID currently running.
@@ -184,6 +194,10 @@ pub struct RealSysApi;
 impl SysApi for RealSysApi {
     fn detect_anti_cheats(&self) -> Result<AntiCheatPresence> {
         crate::ac_detect::detect_anti_cheats()
+    }
+
+    fn detect_topology(&self) -> Result<CpuTopology> {
+        crate::topology::detect()
     }
 
     fn iter_pids(&self) -> Result<Vec<u32>> {

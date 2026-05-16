@@ -661,6 +661,14 @@ async fn handle_client(
                 let entries = engine.undo_log_snapshot(limit as usize);
                 write_response(&mut write_half, &Response::UndoLog { entries }).await?;
             }
+            Request::RefreshTopology => {
+                // Item 3.7 — manual topology refresh. The engine
+                // logs the outcome internally and falls back to the
+                // previous snapshot if detection fails, so we
+                // always answer Ok.
+                engine.refresh_topology();
+                write_response(&mut write_half, &Response::Ok).await?;
+            }
             Request::DeleteAffinityRule { exe_name } => {
                 // Idempotent: delete returns Ok regardless of whether a rule
                 // existed. Still persist on every call so the empty state

@@ -507,6 +507,52 @@ impl Engine {
         info!("policy replaced");
     }
 
+    /// Item 3.7 — re-detect CPU topology and swap the engine's
+    /// cached `Arc<CpuTopology>`. Cheap because all consumers hold
+    /// the topology behind an `Arc` already (item 2.3 / audit H-04):
+    /// the swap is a single pointer write, existing readers keep
+    /// their old Arc valid until they release it, and the next
+    /// `topology.clone()` in the tick path picks up the new layout.
+    ///
+    /// Triggers:
+    ///
+    /// * `SystemEvent::Resume` — the most realistic trigger on
+    ///   desktop hardware. Sleep/resume can land in a different
+    ///   power plan that parks cores, and (rarely) in a Hyper-V
+    ///   guest the host can hot-add / hot-remove vCPUs across the
+    ///   suspend boundary.
+    /// * `Request::RefreshTopology` (manual) — exposed so the user
+    ///   can force a refresh after toggling Windows' "Minimum
+    ///   processor state" / "Processor performance core parking"
+    ///   advanced power-plan options without rebooting.
+    ///
+    /// If detection fails (extremely unusual — would mean the kernel
+    /// is refusing `GetLogicalProcessorInformationEx`), we keep the
+    /// previous topology and log; better to operate on a slightly
+    /// stale snapshot than to blow away the working one.
+    pub fn refresh_topology(&self) {
+        match self.sys.detect_topology() {
+            Ok(mut new_topology) => {
+                new_topology.retag_ccds_from_signals();
+                let old_count = self.state.read().topology.cpus.len();
+                let new_count = new_topology.cpus.len();
+                self.state.write().topology = Arc::new(new_topology);
+                if old_count != new_count {
+                    info!(
+                        old = old_count,
+                        new = new_count,
+                        "topology refreshed; logical CPU count changed"
+                    );
+                } else {
+                    debug!(cpus = new_count, "topology refreshed; layout unchanged");
+                }
+            }
+            Err(e) => {
+                warn!(error = %e, "topology refresh failed; keeping previous snapshot");
+            }
+        }
+    }
+
     /// One-off priority change against any live PID. Bypasses the profile
     /// system — used by the Processes tab's right-click "Set priority"
     /// submenu. If the PID is currently managed by us via a rule, the
@@ -1572,6 +1618,13 @@ impl Engine {
                     // even if the user's gaming session is gone.
                     s.current_foreground = None;
                 }
+                // Item 3.7 — re-detect CPU topology. Sleep/resume can
+                // land in a different power plan that parks cores; if
+                // we don't refresh, every selector that resolves
+                // through topology will target the pre-sleep core
+                // layout and silently miss the now-parked CPUs (or
+                // worse, pin to indices the kernel won't honour).
+                self.refresh_topology();
                 self.resume();
             }
             SystemEvent::SessionConsoleDisconnect => {
@@ -3734,6 +3787,246 @@ mod tests {
         );
     }
 
+    /// Item 3.7 — refresh_topology swaps the engine's cached
+    /// Arc<CpuTopology> with whatever SysApi::detect_topology
+    /// returns. Pin the swap by exercising it directly: prime the
+    /// mock with a 4-CPU topology, call refresh, confirm the
+    /// engine's view now reports 4 CPUs.
+    #[test]
+    fn refresh_topology_swaps_engine_snapshot() {
+        let sys = Arc::new(MockSysApi::new());
+        let clock = Arc::new(FakeClock::new());
+        // Engine starts with CpuTopology::default() = 0 CPUs.
+        let (engine, _events) = engine_with_mocks(sys.clone(), clock);
+        assert_eq!(engine.state.read().topology.cpus.len(), 0);
+
+        // Prime a new topology: 4 logical CPUs on a single CCD.
+        sys.set_topology(framesage_core::CpuTopology {
+            cpus: (0..4)
+                .map(|i| framesage_core::LogicalCpu {
+                    index: i,
+                    physical_core: i / 2,
+                    ccd: 0,
+                    kind: framesage_core::CoreKind::Performance,
+                    cppc_rank: Some(100 - i),
+                    l3_cache_bytes: None,
+                    is_smt_sibling: i % 2 == 1,
+                })
+                .collect(),
+        });
+
+        engine.refresh_topology();
+        assert_eq!(
+            sys.topology_call_count(),
+            1,
+            "refresh_topology must call SysApi::detect_topology exactly once"
+        );
+        assert_eq!(
+            engine.state.read().topology.cpus.len(),
+            4,
+            "engine must adopt the new topology"
+        );
+    }
+
+    /// Item 3.7 — SystemEvent::Resume must fire refresh_topology so
+    /// power-plan-driven core parking that landed during the sleep
+    /// window gets picked up automatically. Without this, every
+    /// selector resolved through topology after resume targets the
+    /// pre-sleep layout.
+    #[test]
+    fn system_event_resume_triggers_topology_refresh() {
+        let sys = Arc::new(MockSysApi::new());
+        let clock = Arc::new(FakeClock::new());
+        let (engine, _events) = engine_with_mocks(sys.clone(), clock);
+        assert_eq!(sys.topology_call_count(), 0);
+
+        engine.handle_system_event(SystemEvent::Suspend);
+        // Suspend must NOT refresh topology — the system is going
+        // to sleep, no point detecting now.
+        assert_eq!(sys.topology_call_count(), 0);
+
+        engine.handle_system_event(SystemEvent::Resume);
+        assert_eq!(
+            sys.topology_call_count(),
+            1,
+            "Resume must fire exactly one topology refresh"
+        );
+    }
+
+    /// Item 3.7 — if SysApi::detect_topology fails (extremely
+    /// unusual; would mean the kernel is refusing
+    /// GetLogicalProcessorInformationEx), refresh_topology must
+    /// keep the previous snapshot rather than blow it away. Better
+    /// to operate on a slightly stale topology than no topology.
+    #[test]
+    fn refresh_topology_preserves_previous_on_detect_failure() {
+        /// Mock that returns an error from detect_topology.
+        struct FailingSys;
+        impl framesage_sys::SysApi for FailingSys {
+            fn detect_anti_cheats(&self) -> Result<framesage_core::AntiCheatPresence> {
+                Ok(framesage_core::AntiCheatPresence::default())
+            }
+            fn detect_topology(&self) -> Result<framesage_core::CpuTopology> {
+                Err(anyhow::anyhow!("simulated kernel failure"))
+            }
+            fn iter_pids(&self) -> Result<Vec<u32>> {
+                Ok(Vec::new())
+            }
+            fn iter_pid_snapshots(&self) -> Result<Vec<framesage_sys::process::PidSnapshot>> {
+                Ok(Vec::new())
+            }
+            fn enumerate_processes(
+                &self,
+            ) -> Result<Vec<framesage_sys::sys_proc_info::SysProcInfo>> {
+                Err(anyhow::anyhow!("mock: not supported"))
+            }
+            fn exe_for_pid(&self, _pid: u32) -> Result<Option<String>> {
+                Ok(None)
+            }
+            fn user_for_pid(&self, _pid: u32) -> Result<Option<String>> {
+                Ok(None)
+            }
+            fn cpu_times(
+                &self,
+                _pid: u32,
+            ) -> Result<Option<framesage_sys::process::ProcessCpuTimes>> {
+                Ok(None)
+            }
+            fn memory_info(
+                &self,
+                _pid: u32,
+            ) -> Result<Option<framesage_sys::process::MemoryInfo>> {
+                Ok(None)
+            }
+            fn affinity_mask(&self, _pid: u32) -> Result<Option<u64>> {
+                Ok(None)
+            }
+            fn system_cpu_times(&self) -> Result<framesage_sys::process::SystemCpuTimes> {
+                Ok(framesage_sys::process::SystemCpuTimes {
+                    idle_100ns: 0,
+                    kernel_100ns: 0,
+                    user_100ns: 0,
+                })
+            }
+            fn per_cpu_times(&self) -> Result<Vec<framesage_sys::process::PerCpuTimes>> {
+                Ok(Vec::new())
+            }
+            fn memory_status(&self) -> Result<(u64, u64)> {
+                Ok((0, 0))
+            }
+            fn current_foreground(
+                &self,
+            ) -> Result<Option<framesage_sys::foreground::ForegroundInfo>> {
+                Ok(None)
+            }
+            fn apply(
+                &self,
+                _pid: u32,
+                _profile: &Profile,
+                _topology: &CpuTopology,
+            ) -> Result<framesage_sys::apply::AppliedState> {
+                Err(anyhow::anyhow!("mock: not supported"))
+            }
+            fn revert(
+                &self,
+                _pid: u32,
+                _state: framesage_sys::apply::AppliedState,
+            ) -> Result<()> {
+                Ok(())
+            }
+            fn reassert(
+                &self,
+                _pid: u32,
+                _profile: &Profile,
+                _topology: &CpuTopology,
+            ) -> Result<()> {
+                Ok(())
+            }
+            fn get_priority_class_for_pid(&self, _pid: u32) -> Result<Option<u32>> {
+                Ok(None)
+            }
+            fn set_priority_class_for_pid(
+                &self,
+                _pid: u32,
+                _class: framesage_core::PriorityClass,
+            ) -> Result<()> {
+                Ok(())
+            }
+            fn restore_priority_class_for_pid(
+                &self,
+                _pid: u32,
+                _raw_class: u32,
+            ) -> Result<()> {
+                Ok(())
+            }
+            fn set_affinity_mask_for_pid(&self, _pid: u32, _mask: u64) -> Result<()> {
+                Ok(())
+            }
+            fn trim_working_set_for_pid(&self, _pid: u32) -> Result<()> {
+                Ok(())
+            }
+            fn suspend_process(&self, _pid: u32) -> Result<()> {
+                Ok(())
+            }
+            fn resume_process(&self, _pid: u32) -> Result<()> {
+                Ok(())
+            }
+            fn terminate_process(&self, _pid: u32) -> Result<()> {
+                Ok(())
+            }
+            fn read_version_info(
+                &self,
+                _exe_path: &str,
+            ) -> Result<framesage_sys::version_info::VersionInfo> {
+                Ok(framesage_sys::version_info::VersionInfo::default())
+            }
+        }
+
+        // Build an engine with a non-empty starting topology so we
+        // can verify it survives the failed refresh.
+        let starting_topology = framesage_core::CpuTopology {
+            cpus: (0..2)
+                .map(|i| framesage_core::LogicalCpu {
+                    index: i,
+                    physical_core: i,
+                    ccd: 0,
+                    kind: framesage_core::CoreKind::Performance,
+                    cppc_rank: None,
+                    l3_cache_bytes: None,
+                    is_smt_sibling: false,
+                })
+                .collect(),
+        };
+        let policy = Policy {
+            default_profile: ProfileId("default".into()),
+            profiles: {
+                let mut m = std::collections::HashMap::new();
+                m.insert(ProfileId("default".into()), Profile::default());
+                m
+            },
+            ..Default::default()
+        };
+        let sys: Arc<dyn framesage_sys::SysApi> = Arc::new(FailingSys);
+        let clock: Arc<dyn Clock> = Arc::new(FakeClock::new());
+        let deps = EngineDeps {
+            policy,
+            topology: starting_topology,
+            safe_list: SafeList::bundled(),
+            journal: Journal::at_default_path(),
+            sys,
+            clock,
+        };
+        let engine = Engine::new(deps);
+        assert_eq!(engine.state.read().topology.cpus.len(), 2);
+
+        engine.refresh_topology();
+        assert_eq!(
+            engine.state.read().topology.cpus.len(),
+            2,
+            "failed refresh must NOT clobber the previous topology"
+        );
+    }
+
     /// SessionLock / SessionUnlock must NOT tear down Game Mode —
     /// locking the screen while gaming is a normal event (user steps
     /// away for a moment) and the game is still running. Pinning the
@@ -3865,6 +4158,8 @@ mod tests {
     struct MockSysApi {
         next_ac: std::sync::Mutex<framesage_core::AntiCheatPresence>,
         ac_calls: std::sync::atomic::AtomicUsize,
+        next_topology: std::sync::Mutex<framesage_core::CpuTopology>,
+        topology_calls: std::sync::atomic::AtomicUsize,
     }
 
     impl MockSysApi {
@@ -3872,6 +4167,8 @@ mod tests {
             Self {
                 next_ac: std::sync::Mutex::new(framesage_core::AntiCheatPresence::default()),
                 ac_calls: std::sync::atomic::AtomicUsize::new(0),
+                next_topology: std::sync::Mutex::new(framesage_core::CpuTopology::default()),
+                topology_calls: std::sync::atomic::AtomicUsize::new(0),
             }
         }
         fn set_ac(&self, p: framesage_core::AntiCheatPresence) {
@@ -3880,6 +4177,13 @@ mod tests {
         fn ac_call_count(&self) -> usize {
             self.ac_calls.load(std::sync::atomic::Ordering::Relaxed)
         }
+        fn set_topology(&self, t: framesage_core::CpuTopology) {
+            *self.next_topology.lock().unwrap() = t;
+        }
+        fn topology_call_count(&self) -> usize {
+            self.topology_calls
+                .load(std::sync::atomic::Ordering::Relaxed)
+        }
     }
 
     impl framesage_sys::SysApi for MockSysApi {
@@ -3887,6 +4191,11 @@ mod tests {
             self.ac_calls
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             Ok(*self.next_ac.lock().unwrap())
+        }
+        fn detect_topology(&self) -> Result<framesage_core::CpuTopology> {
+            self.topology_calls
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            Ok(self.next_topology.lock().unwrap().clone())
         }
         fn iter_pids(&self) -> Result<Vec<u32>> {
             Ok(Vec::new())
