@@ -96,15 +96,70 @@ mod service_main {
     }
 }
 
-fn init_tracing() {
-    use tracing_subscriber::{fmt, EnvFilter};
+/// Item 2.7 / audit H-29. Initialize tracing with a rolling file
+/// appender writing to `%ProgramData%\framesage\logs\`. Daily rotation;
+/// no retention cap built into `tracing-appender` (it just rotates,
+/// doesn't prune) but the directory only accumulates rolled files —
+/// each is small enough that years of operation stays well under any
+/// reasonable disk budget.
+///
+/// Stderr/stdout output is preserved (still wired to the fmt subscriber
+/// when running in `--console` mode) so a dev running console-mode
+/// still gets immediate log output; the file sink is additive.
+///
+/// File handle: held by a static `WorkerGuard` returned to `main` so
+/// the appender's background-flush thread stays alive for the
+/// program's lifetime.
+fn init_tracing() -> Option<tracing_appender::non_blocking::WorkerGuard> {
+    use tracing_subscriber::{fmt, layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
+
     let filter =
         EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("framesage=info,info"));
-    let _ = fmt().with_env_filter(filter).try_init();
+
+    // Try to set up the file appender. On failure (dir not writable —
+    // typical when running as a non-admin user before service install,
+    // or in `--console` mode under a restricted token) fall back to
+    // stderr-only so the binary still works.
+    let logs_dir = framesage_core::paths::config_dir().join("logs");
+    if let Err(e) = std::fs::create_dir_all(&logs_dir) {
+        eprintln!(
+            "framesage-svc: log directory create failed at {}: {e}. \
+             Falling back to stderr-only logging.",
+            logs_dir.display()
+        );
+        let _ = fmt().with_env_filter(filter).try_init();
+        return None;
+    }
+
+    let file_appender = tracing_appender::rolling::daily(&logs_dir, "framesage-svc.log");
+    let (non_blocking, guard) = tracing_appender::non_blocking(file_appender);
+    let file_layer = fmt::layer()
+        .with_writer(non_blocking)
+        .with_ansi(false) // no ANSI codes in files
+        .with_target(true);
+    let stderr_layer = fmt::layer().with_writer(std::io::stderr);
+
+    let init_result = tracing_subscriber::registry()
+        .with(filter)
+        .with(file_layer)
+        .with(stderr_layer)
+        .try_init();
+
+    if init_result.is_err() {
+        // try_init only fails if a subscriber's already installed —
+        // shouldn't happen in our process model, but if it does, the
+        // existing subscriber is already serving logs; just drop the
+        // guard via early return.
+        return None;
+    }
+    Some(guard)
 }
 
 fn main() -> Result<()> {
-    init_tracing();
+    // Hold the log-flusher guard for the program's lifetime. If the
+    // appender failed to initialize (no write access to ProgramData),
+    // _log_guard is None and tracing falls back to stderr-only.
+    let _log_guard = init_tracing();
 
     // If we're launched outside the SCM (e.g. for development), fall back to
     // running the engine inline. Detect "is this an SCM start?" by checking

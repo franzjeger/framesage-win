@@ -361,6 +361,128 @@ pub enum Event {
         exe_name: String,
         restored_class: u32,
     },
+
+    // ─── Item 2.8 / audit H-28 — Game Mode + profile + AC lifecycle ──
+    //
+    // Pre-2.8 the engine fired exactly 5 events (ForegroundChanged,
+    // Paused, Resumed, ProBalance×2). The audit caught that the 30+
+    // other actions the engine takes (Game Mode entry/exit, per-PID
+    // profile apply/revert, affinity rule firing, action failures)
+    // were silent. The user had no way to see what FrameSage actually
+    // did to their system. These variants close the gap.
+    /// Game Mode session entered. Carries a summary of the actions
+    /// planned (services to stop, processes to suspend, power plan
+    /// change) — the tray can render "applying X services, suspending
+    /// Y processes, switching to High Performance" without re-fetching.
+    GameModeEntered {
+        profile_id: ProfileId,
+        services_to_stop: u32,
+        processes_to_suspend: u32,
+        power_plan_changing: bool,
+        taskbar_hiding: bool,
+        pausing_windows_update: bool,
+    },
+
+    /// Game Mode session exited. Carries the SessionHistoryEntry
+    /// summary (counts of what was reverted + duration + reason). The
+    /// tray uses this to surface a "session complete" toast or update
+    /// the Sessions history view without re-reading sessions.jsonl.
+    GameModeExited {
+        profile_id: ProfileId,
+        services_restored: u32,
+        processes_resumed: u32,
+        power_plan_restored: bool,
+        taskbar_restored: bool,
+        wu_pause_restored: bool,
+        duration_secs: u64,
+        reason: String,
+    },
+
+    /// A per-PID profile was applied. Fires from reconcile() on
+    /// foreground change, from the background-scan path, and from
+    /// the persistent-reassert sweep. Distinct from
+    /// ForegroundChanged — that one says "the foreground is now X
+    /// with intended profile P"; this one confirms the per-process
+    /// kernel writes actually happened.
+    ProfileApplied {
+        pid: u32,
+        exe_name: String,
+        profile_id: ProfileId,
+    },
+
+    /// A per-PID profile was reverted. Mirror of ProfileApplied; fires
+    /// when a non-persistent profile's foreground moves away, or on
+    /// PID exit for tracked PIDs.
+    ProfileReverted {
+        pid: u32,
+        exe_name: String,
+        profile_id: ProfileId,
+    },
+
+    /// An AffinityRule's pin was applied to a matching PID (either
+    /// freshly-spawned or on rule creation). Lets the Activity tab
+    /// show users "rule for Diablo IV.exe fired against pid 1234".
+    AffinityRuleFired {
+        pid: u32,
+        exe_name: String,
+        rule_exe: String,
+    },
+
+    /// An apply/revert/suspend/stop action failed. Closes audit
+    /// H-30: 32 warn!/error! sites in engine, zero surfaced to user.
+    /// The `kind` field categorises the failure so the tray can
+    /// filter ("show only failures") or aggregate ("3 actions failed
+    /// in the last hour"); `details` is a free-form one-liner from
+    /// the original log message.
+    ActionFailed {
+        kind: ActionFailedKind,
+        pid: Option<u32>,
+        exe_name: Option<String>,
+        details: String,
+    },
+
+    /// AC presence changed. Fires per-AC on the transition boundary
+    /// — Vanguard appearing / disappearing, ESEA appearing /
+    /// disappearing (which triggers / clears engine STANDBY), etc.
+    /// Lets the tray surface a banner "engine standby for ESEA"
+    /// without polling status.
+    AntiCheatPresenceChanged {
+        which: String, // "vanguard" / "eac" / "javelin" / "battleye" / "faceit" / "esea"
+        active: bool,
+    },
+}
+
+/// Categorisation of `Event::ActionFailed` for the tray's filtering.
+/// Free-form strings ARE flexible, but a small enum lets the tray's
+/// activity-tab UI distinguish "this is a critical safety bar
+/// rejection" from "this is a transient PID-exited race" without
+/// substring-matching.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ActionFailedKind {
+    /// Apply (engine -> sys::apply::apply) returned an error.
+    Apply,
+    /// Revert (sys::apply::revert) returned an error. User-visible
+    /// because the previous state may not be restored.
+    Revert,
+    /// Suspend / Resume / Terminate failed (typically PID exited
+    /// mid-call, or process is protected).
+    ProcessAction,
+    /// Service stop / restart failed (anti-virus locked it, service
+    /// in unstoppable state, etc.).
+    ServiceAction,
+    /// SafeList denylist rejected the action — the user attempted to
+    /// modify a kernel-critical / AV / anti-cheat process. Shows the
+    /// safety bar working as designed.
+    DenylistRefused,
+    /// AC tier (Hybrid / SafeMode) blocked the action — the user-
+    /// authored profile asked to touch a game process protected by
+    /// an AC, but the tier configured for the rule said skip.
+    AcTierBlocked,
+    /// Anything else — covers config-load failures, IPC errors at
+    /// engine boundaries, etc. Free-form `details` carries the
+    /// original error.
+    Other,
 }
 
 #[cfg(test)]
