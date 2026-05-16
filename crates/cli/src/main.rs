@@ -317,18 +317,423 @@ fn install_service(_bin: Option<&str>) -> Result<()> {
 
 #[cfg(windows)]
 fn uninstall_service() -> Result<()> {
-    use windows_service::service::ServiceAccess;
+    use std::thread::sleep;
+    use std::time::{Duration, Instant};
+    use windows_service::service::{ServiceAccess, ServiceState};
     use windows_service::service_manager::{ServiceManager, ServiceManagerAccess};
 
-    let manager = ServiceManager::local_computer(None::<&str>, ServiceManagerAccess::CONNECT)
-        .context("open SCM")?;
-    let service = manager
-        .open_service(SERVICE_NAME, ServiceAccess::DELETE)
-        .context("open service")?;
-    service.delete().context("delete service")?;
+    // Item 1.5 / audit C-08 + C-09 + H-32. Before this, `uninstall`
+    // deleted the SCM service registration and called it done. The audit
+    // caught the residue: 4 orphan binaries in the install dir, three
+    // shortcuts (Start Menu, Desktop, Startup), and — most damaging — a
+    // potentially-active `game-mode.journal` that nobody will ever
+    // revert now that the service is gone. The user is left with a
+    // half-modified system, a tray that respawns at every logon
+    // pointing at a missing exe, and no tool to fix any of it.
+    //
+    // This implementation does the full clean-up. Each step is
+    // best-effort independent — if one fails, the others still run, so
+    // a partial uninstall is still mostly-clean.
 
-    println!("uninstalled: {SERVICE_NAME}");
+    let mut report = UninstallReport::default();
+
+    // Step 1 — Recover any orphan Game Mode journal BEFORE killing the
+    // service. We do this by asking the service itself (if still
+    // running) to fire its panic-button revert path. If the service is
+    // already stopped, we leave the journal to the next service start —
+    // but the service is about to be deleted, so we fall back to a
+    // best-effort manual revert via the gamemode crate's recovery API.
+    //
+    // The journal contains the only record of what services we stopped
+    // and what processes we suspended. Failing to recover it means
+    // those system mutations are permanent until reboot.
+    recover_journal_before_uninstall(&mut report);
+
+    // Step 2 — Open the service. If it's not registered, we still want
+    // to do shortcut + binary cleanup, so a "service not found" is not
+    // fatal.
+    let manager_res = ServiceManager::local_computer(None::<&str>, ServiceManagerAccess::CONNECT);
+    let service_present = match &manager_res {
+        Ok(manager) => manager
+            .open_service(
+                SERVICE_NAME,
+                ServiceAccess::QUERY_STATUS | ServiceAccess::STOP | ServiceAccess::DELETE,
+            )
+            .is_ok(),
+        Err(_) => false,
+    };
+
+    if let Ok(manager) = &manager_res {
+        if service_present {
+            // Step 3 — Stop the service before delete. If we don't, SCM
+            // marks the service "deletion pending" and won't actually
+            // remove the registration until every handle closes — which
+            // on a running service won't happen until reboot, blocking
+            // re-install in the meantime (H-32).
+            if let Ok(service) = manager.open_service(
+                SERVICE_NAME,
+                ServiceAccess::QUERY_STATUS | ServiceAccess::STOP,
+            ) {
+                let current = service
+                    .query_status()
+                    .map(|s| s.current_state)
+                    .unwrap_or(ServiceState::Stopped);
+
+                if current != ServiceState::Stopped {
+                    println!("stopping {SERVICE_NAME}...");
+                    let _ = service.stop();
+                    // Poll for STOPPED up to 30 s. SCM stop is async;
+                    // the call returns once the request is accepted,
+                    // not once the service has actually stopped.
+                    let deadline = Instant::now() + Duration::from_secs(30);
+                    while Instant::now() < deadline {
+                        match service.query_status() {
+                            Ok(s) if s.current_state == ServiceState::Stopped => break,
+                            _ => sleep(Duration::from_millis(500)),
+                        }
+                    }
+                    let final_state = service
+                        .query_status()
+                        .map(|s| s.current_state)
+                        .unwrap_or(ServiceState::Stopped);
+                    if final_state != ServiceState::Stopped {
+                        // The service hung in STOP_PENDING or refused
+                        // to stop. Fall back to killing the process by
+                        // name so DeleteService doesn't leave us with a
+                        // "marked for deletion" zombie until reboot.
+                        eprintln!(
+                            "  warning: service did not stop cleanly within 30s — force-killing"
+                        );
+                        force_kill_service_process();
+                        sleep(Duration::from_millis(500));
+                    }
+                }
+                report.service_stopped = true;
+            }
+
+            // Step 4 — Delete the SCM registration.
+            if let Ok(service) = manager.open_service(SERVICE_NAME, ServiceAccess::DELETE) {
+                match service.delete() {
+                    Ok(()) => {
+                        println!("  unregistered SCM service: {SERVICE_NAME}");
+                        report.service_unregistered = true;
+                    }
+                    Err(e) => {
+                        eprintln!("  service delete failed: {e}");
+                    }
+                }
+            }
+        } else {
+            println!("note: service '{SERVICE_NAME}' is not registered (already uninstalled?)");
+        }
+    } else {
+        eprintln!("warning: could not open SCM — service cleanup skipped");
+    }
+
+    // Step 5 — Remove shortcuts. The Startup-folder one is the worst
+    // residue because the tray respawns at every logon, fails to find
+    // the (deleted) service, and either errors or sits broken. The
+    // user has no way to trace that broken tray icon back to
+    // framesage. This step is the single highest-impact cleanup.
+    remove_user_shortcuts(&mut report);
+
+    // Step 6 — Remove install-dir binaries. The 4 .exes are dead weight
+    // and take up ~40 MB. Best-effort: a binary file lock (tray still
+    // running somewhere, AV scan in progress) means we skip that file
+    // and log it. The user can re-run after rebooting.
+    remove_install_dir(&mut report);
+
+    // Step 7 — Print final report. Tell the user EXACTLY what's left
+    // (notably `%ProgramData%\framesage\` which we preserve by default
+    // — it contains policy.json + sessions.jsonl, which the user may
+    // want for a future reinstall).
+    print_uninstall_summary(&report);
+
     Ok(())
+}
+
+#[derive(Default)]
+struct UninstallReport {
+    service_stopped: bool,
+    service_unregistered: bool,
+    journal_reverted: bool,
+    journal_path_for_user: Option<std::path::PathBuf>,
+    shortcuts_removed: Vec<std::path::PathBuf>,
+    shortcuts_failed: Vec<(std::path::PathBuf, String)>,
+    binaries_removed: Vec<std::path::PathBuf>,
+    binaries_failed: Vec<(std::path::PathBuf, String)>,
+    install_dir_removed: bool,
+    install_dir_path: Option<std::path::PathBuf>,
+}
+
+#[cfg(windows)]
+fn recover_journal_before_uninstall(report: &mut UninstallReport) {
+    let journal_path = framesage_core::paths::config_dir().join("game-mode.journal");
+    if !journal_path.exists() {
+        return;
+    }
+
+    report.journal_path_for_user = Some(journal_path.clone());
+    println!(
+        "found active Game Mode journal at {}",
+        journal_path.display()
+    );
+    println!("  attempting recovery via running service...");
+
+    // First try: ask the live service to revert via the panic-button
+    // IPC. This is the cleanest path because the engine already knows
+    // how to read the journal + call the right syscalls + emit events.
+    let rt = match tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+    {
+        Ok(rt) => rt,
+        Err(e) => {
+            eprintln!("  could not start runtime for IPC revert: {e}");
+            return;
+        }
+    };
+    let ipc_ok = rt.block_on(async {
+        match send_simple(Request::GameModeOff).await {
+            Ok(()) => true,
+            Err(e) => {
+                eprintln!("  IPC revert failed: {e} (service may already be stopped)");
+                false
+            }
+        }
+    });
+
+    if ipc_ok {
+        println!("  service-driven revert succeeded");
+        report.journal_reverted = true;
+        // Service should have deleted the journal as part of its revert
+        // path. Confirm and stop here.
+        if !journal_path.exists() {
+            return;
+        }
+    }
+
+    // Second try: read the journal ourselves and reconstruct the
+    // revert. Same machinery the engine's recovery path uses on next
+    // start — but the service is about to be deleted, so we run it
+    // here.
+    eprintln!("  service-driven revert not available; attempting offline recovery");
+    let journal = framesage_gamemode::journal::Journal::at(&journal_path);
+    match journal.read() {
+        Ok(Some(entry)) => {
+            #[cfg(windows)]
+            {
+                framesage_sys::game_mode::revert_all(&entry.applied, &entry.previous);
+            }
+            println!(
+                "  offline revert ran for session {} ({} services, {} processes)",
+                entry.session_id,
+                entry.applied.stopped_services.len(),
+                entry.applied.suspended_pids.len()
+            );
+
+            // Append to history before deleting — same contract as the
+            // engine's revert path (item 1.4). The user later launching
+            // the reinstalled service will still see this session in
+            // sessions.jsonl.
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0);
+            let history = framesage_gamemode::journal::SessionHistoryEntry::from_journal(
+                &entry,
+                now,
+                "uninstall",
+            );
+            if let Err(e) = journal.append_to_history(&history) {
+                eprintln!("  history append failed: {e}");
+            }
+            if let Err(e) = journal.delete() {
+                eprintln!("  journal delete failed: {e}");
+            }
+            report.journal_reverted = true;
+        }
+        Ok(None) => {
+            // Race: journal disappeared between exists() check and read.
+        }
+        Err(e) => {
+            eprintln!("  journal read failed: {e}");
+        }
+    }
+}
+
+#[cfg(windows)]
+fn force_kill_service_process() {
+    // Use taskkill to force-terminate framesage-svc.exe by image name.
+    // We invoke it as a child process so the shell-out is auditable
+    // and we don't drag TerminateProcess into the CLI binary.
+    let _ = std::process::Command::new("taskkill")
+        .args(["/F", "/IM", "framesage-svc.exe"])
+        .output();
+}
+
+#[cfg(windows)]
+fn remove_user_shortcuts(report: &mut UninstallReport) {
+    // install.ps1 creates three .lnk files. Cleanup mirrors the install
+    // — we use the same well-known folder lookups so a Group Policy
+    // redirected Startup folder still gets hit.
+    let appdata = std::env::var_os("APPDATA").map(std::path::PathBuf::from);
+    let userprofile = std::env::var_os("USERPROFILE").map(std::path::PathBuf::from);
+
+    let mut targets: Vec<std::path::PathBuf> = Vec::new();
+    if let Some(appdata) = appdata.as_ref() {
+        // Start Menu → Programs → FrameSage.lnk
+        targets.push(
+            appdata
+                .join("Microsoft")
+                .join("Windows")
+                .join("Start Menu")
+                .join("Programs")
+                .join("FrameSage.lnk"),
+        );
+        // Startup folder — the load-bearing cleanup target.
+        targets.push(
+            appdata
+                .join("Microsoft")
+                .join("Windows")
+                .join("Start Menu")
+                .join("Programs")
+                .join("Startup")
+                .join("FrameSage.lnk"),
+        );
+    }
+    if let Some(profile) = userprofile.as_ref() {
+        targets.push(profile.join("Desktop").join("FrameSage.lnk"));
+    }
+
+    for target in targets {
+        if !target.exists() {
+            continue;
+        }
+        match std::fs::remove_file(&target) {
+            Ok(()) => {
+                println!("  removed shortcut: {}", target.display());
+                report.shortcuts_removed.push(target);
+            }
+            Err(e) => {
+                eprintln!("  shortcut removal failed: {} ({e})", target.display());
+                report.shortcuts_failed.push((target, e.to_string()));
+            }
+        }
+    }
+}
+
+#[cfg(windows)]
+fn remove_install_dir(report: &mut UninstallReport) {
+    // install.ps1 puts binaries at %LOCALAPPDATA%\Programs\FrameSage\.
+    // Item 1.6 will move this to %ProgramFiles%; for now match the
+    // current install location.
+    let install_dir = match std::env::var_os("LOCALAPPDATA") {
+        Some(p) => std::path::PathBuf::from(p)
+            .join("Programs")
+            .join("FrameSage"),
+        None => return,
+    };
+    report.install_dir_path = Some(install_dir.clone());
+    if !install_dir.exists() {
+        return;
+    }
+
+    // Walk the dir and remove each binary individually so we can report
+    // which specific file is locked (vs a single recursive remove that
+    // bails on the first error with no context).
+    for name in &[
+        "framesage-tray.exe",
+        "framesage-svc.exe",
+        "framesage.exe",
+        "framesage-sim.exe",
+        "README.md",
+        "LICENSE",
+    ] {
+        let path = install_dir.join(name);
+        if !path.exists() {
+            continue;
+        }
+        match std::fs::remove_file(&path) {
+            Ok(()) => {
+                println!("  removed: {}", path.display());
+                report.binaries_removed.push(path);
+            }
+            Err(e) => {
+                eprintln!("  removal failed: {} ({e})", path.display());
+                report.binaries_failed.push((path, e.to_string()));
+            }
+        }
+    }
+
+    // Try removing the now-empty dir. If something we didn't know about
+    // is left (user-dropped file, unfinished download), keep it but
+    // don't fail.
+    match std::fs::remove_dir(&install_dir) {
+        Ok(()) => {
+            println!("  removed install dir: {}", install_dir.display());
+            report.install_dir_removed = true;
+        }
+        Err(_) => {
+            println!(
+                "  install dir not removed (contains other files): {}",
+                install_dir.display()
+            );
+        }
+    }
+}
+
+#[cfg(windows)]
+fn print_uninstall_summary(report: &UninstallReport) {
+    println!();
+    println!("uninstall summary:");
+    println!(
+        "  SCM service: {}",
+        if report.service_unregistered {
+            "removed"
+        } else {
+            "skipped (not present or removal failed)"
+        }
+    );
+    if report.journal_reverted {
+        println!("  Game Mode journal: reverted");
+    } else if report.journal_path_for_user.is_some() {
+        println!(
+            "  Game Mode journal: NOT reverted — system state may have residual modifications. \
+             Reboot recommended."
+        );
+    }
+    println!(
+        "  shortcuts removed: {} ({} failed)",
+        report.shortcuts_removed.len(),
+        report.shortcuts_failed.len()
+    );
+    println!(
+        "  binaries removed: {} ({} failed)",
+        report.binaries_removed.len(),
+        report.binaries_failed.len()
+    );
+    if !report.binaries_failed.is_empty() {
+        println!(
+            "  retry uninstall after rebooting if any binary is still locked by AV / running process"
+        );
+    }
+
+    // %ProgramData% preservation is deliberate. policy.json is the
+    // user's authored config; sessions.jsonl is their audit history.
+    // We don't auto-delete either — the user can reinstall and recover
+    // both. We DO tell them where it is so a manual purge is possible.
+    let config_dir = framesage_core::paths::config_dir();
+    if config_dir.exists() {
+        println!();
+        println!(
+            "preserved: {} (policy.json + sessions.jsonl)",
+            config_dir.display()
+        );
+        println!(
+            "  delete this dir manually if you want a clean uninstall, or leave it for a future reinstall."
+        );
+    }
 }
 
 #[cfg(not(windows))]
