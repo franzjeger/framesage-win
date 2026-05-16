@@ -293,16 +293,16 @@ pub(crate) fn build_tray(
                 } else if ev.id == ids.game_mode_off {
                     cmds_menu.game_mode_off.store(true, Ordering::Relaxed);
                 } else if ev.id == ids.view_processes {
-                    *cmds_menu.jump_to_tab.lock().unwrap() = Some(Tab::Processes);
+                    *cmds_menu.jump_to_tab.lock() = Some(Tab::Processes);
                     cmds_menu.show_window.store(true, Ordering::Relaxed);
                 } else if ev.id == ids.view_status {
-                    *cmds_menu.jump_to_tab.lock().unwrap() = Some(Tab::Status);
+                    *cmds_menu.jump_to_tab.lock() = Some(Tab::Status);
                     cmds_menu.show_window.store(true, Ordering::Relaxed);
                 } else if ev.id == ids.view_rules {
-                    *cmds_menu.jump_to_tab.lock().unwrap() = Some(Tab::Rules);
+                    *cmds_menu.jump_to_tab.lock() = Some(Tab::Rules);
                     cmds_menu.show_window.store(true, Ordering::Relaxed);
                 } else if ev.id == ids.view_profiles {
-                    *cmds_menu.jump_to_tab.lock().unwrap() = Some(Tab::Profiles);
+                    *cmds_menu.jump_to_tab.lock() = Some(Tab::Profiles);
                     cmds_menu.show_window.store(true, Ordering::Relaxed);
                 } else if ev.id == ids.open_config {
                     cmds_menu.open_config_folder.store(true, Ordering::Relaxed);

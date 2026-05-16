@@ -20,6 +20,12 @@ egui = { workspace = true }
 egui_extras = { workspace = true }
 tokio = { workspace = true }
 anyhow = { workspace = true }
+# Item 3.2 — parking_lot::Mutex for AppState + TrayCommands. Smaller +
+# faster than std::sync::Mutex on the uncontended path and the
+# infallible `.lock()` API removes 31 `.lock().unwrap()` callsites
+# in this crate. Engine already uses parking_lot::RwLock for the
+# same reasons (item 2.10).
+parking_lot = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 tracing-appender = { workspace = true }
