@@ -28,7 +28,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 use anyhow::Result;
 use parking_lot::RwLock;
@@ -39,7 +39,7 @@ pub mod probalance;
 
 use framesage_core::{CpuTopology, GameModeActions, Policy, Profile, ProfileId};
 use framesage_gamemode::{
-    journal::{Journal, JournalEntry},
+    journal::{Journal, JournalEntry, SessionHistoryEntry},
     planner::{plan as plan_game_mode, ActionPlan, PlannedAction, SystemStateQuery},
     safe_list::SafeList,
     state::{AppliedActions, PreviousState, SuspendedProcessSnapshot},
@@ -220,6 +220,10 @@ struct ActiveSystemMode {
     /// The session UUID, kept so logs and status can correlate with the
     /// journal file we wrote.
     journal_session_id: uuid::Uuid,
+    /// UNIX timestamp of session start. Captured at apply time so the
+    /// session-history append on revert can record duration. Item 1.4 /
+    /// audit C-07.
+    started_at_unix_secs: u64,
 }
 
 impl Engine {
@@ -2021,6 +2025,7 @@ impl Engine {
             previous: plan.previous_state,
             applied: intended,
             journal_session_id: entry.session_id,
+            started_at_unix_secs: entry.created_at_unix_secs,
         });
     }
 
@@ -2034,6 +2039,59 @@ impl Engine {
             "game mode exiting"
         );
         sys_revert_all(&active.applied, &active.previous);
+
+        // Item 1.4 / audit C-07: BEFORE deleting the active journal,
+        // append a SessionHistoryEntry to sessions.jsonl so the user has
+        // a permanent record of what Game Mode did. Without this, a 2-
+        // hour session touching 30+ services and 24+ processes
+        // evaporated the moment the user alt-tabbed away from the game
+        // — the worst trust failure in the audit.
+        //
+        // We re-read the active journal from disk (it's still there
+        // until we call delete below) to get the canonical entry; this
+        // is the same data the recovery path would use, so the history
+        // record is byte-for-byte the same as what a crash recovery
+        // would have seen. Fall back to constructing from ActiveSystemMode
+        // state if the journal file is somehow missing (shouldn't happen
+        // in steady state but a self-healing fallback is cheap).
+        //
+        // History-append failure is logged but NEVER blocks the revert
+        // proper — the user's system state is the load-bearing thing;
+        // losing one audit-log line is regrettable but recoverable.
+        let now_unix = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let history_entry = match journal.read() {
+            Ok(Some(disk_entry)) => {
+                SessionHistoryEntry::from_journal(&disk_entry, now_unix, "foreground_changed")
+            }
+            _ => {
+                // Disk journal missing or unreadable — synthesise from
+                // in-memory state. Less authoritative (the disk version
+                // might have had more recent action additions we didn't
+                // mirror here) but still useful as a record.
+                SessionHistoryEntry {
+                    schema_version: 1,
+                    session_id: active.journal_session_id,
+                    profile_id: active.profile_id.clone(),
+                    started_at_unix_secs: active.started_at_unix_secs,
+                    ended_at_unix_secs: now_unix,
+                    revert_reason: "foreground_changed".to_owned(),
+                    previous: active.previous.clone(),
+                    applied: active.applied.clone(),
+                }
+            }
+        };
+        if let Err(e) = journal.append_to_history(&history_entry) {
+            warn!(
+                session = %active.journal_session_id,
+                error = %e,
+                "sessions.jsonl append failed — Game Mode reverted cleanly but post-session audit \
+                 trail will be missing this entry"
+            );
+        }
+
         if let Err(e) = journal.delete() {
             warn!(error = %e, "journal delete after revert failed");
         }
