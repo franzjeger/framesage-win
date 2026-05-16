@@ -17,6 +17,42 @@ pub mod ac_detect {
     }
 }
 
+pub mod sys_proc_info {
+    use super::*;
+    use std::time::Duration;
+
+    /// Stub mirror of `inner::sys_proc_info::SysProcInfo` so callers
+    /// type-check on non-Windows.
+    #[derive(Debug, Clone, Default)]
+    pub struct SysProcInfo {
+        pub pid: u32,
+        pub parent_pid: u32,
+        pub exe_name: String,
+        pub thread_count: u32,
+        pub handle_count: u32,
+        pub total_cpu_100ns: u64,
+        pub working_set_bytes: u64,
+        pub peak_working_set_bytes: u64,
+        pub private_bytes: u64,
+        pub base_priority: i32,
+    }
+
+    /// Non-Windows: no kernel to query. Returns empty Vec so the
+    /// engine's fallback path (per-PID ToolHelp + OpenProcess) is
+    /// the only active code path in `framesage-sim`.
+    pub fn enumerate_processes() -> Result<Vec<SysProcInfo>> {
+        Err(anyhow!("framesage-sys: not supported on this host"))
+    }
+
+    pub fn kpriority_to_win32_class(_kpriority: i32) -> u32 {
+        0
+    }
+
+    pub fn duration_from_100ns(units: u64) -> Duration {
+        Duration::from_nanos(units.saturating_mul(100))
+    }
+}
+
 pub mod foreground {
     use super::*;
     #[derive(Debug, Clone)]

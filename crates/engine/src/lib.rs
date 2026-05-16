@@ -184,6 +184,14 @@ struct EngineState {
     /// the live list. The persistent-reassert sweep re-pushes rule pins
     /// for any PID that's both in this set AND still alive.
     affinity_rule_applied: HashSet<u32>,
+    /// Per-PID full-image-path cache. Item 2.1. NTQSI gives us the
+    /// bare filename (`notepad.exe`); the full path
+    /// (`C:\Windows\system32\notepad.exe`) requires an OpenProcess +
+    /// QueryFullProcessImageNameW. We cache the result per-PID so a
+    /// stable process list does this lookup once per PID per session,
+    /// not once per tick. Pruned to live PIDs each
+    /// `list_process_snapshots` call.
+    exe_path_cache: HashMap<u32, String>,
     /// Most-recent anti-cheat presence snapshot. Item 1.9 / AC matrix.
     /// Refreshed by the AC detection probe (typically piggybacked on the
     /// persistent-reassert tick). Drives two behaviors:
@@ -318,6 +326,7 @@ impl Engine {
                 affinity_rule_applied: HashSet::new(),
                 ac_presence: AntiCheatPresence::default(),
                 last_ac_probe: None,
+                exe_path_cache: HashMap::new(),
             })),
             events: tx,
             safe_list: deps.safe_list,
@@ -663,11 +672,18 @@ impl Engine {
     /// handles, manages its own per-PID CPU-time history so the % is
     /// computed even when ProBalance is disabled.
     ///
-    /// Costs ~1 ToolHelp snapshot + 4 `OpenProcess`/`CloseHandle` pairs per
-    /// PID (priority, affinity, mem, cpu_times) + 2 cheap system syscalls
-    /// (`GetSystemTimes`, `GlobalMemoryStatusEx`). On a 200-process machine
-    /// that's ~800 syscalls per call — fine at 1 Hz from the tray, not fine
-    /// at 100 Hz, which is why the tray polls.
+    /// Item 2.1 / audit C-02. Previously this opened 5 separate
+    /// per-PID handles (priority, affinity, mem, cpu_times, exe_path)
+    /// — ~1250 OpenProcess/CloseHandle pairs per second on a 250-PID
+    /// box. Now: one NTQSI call returns most of that in a single
+    /// kernel hit; only affinity_mask + exe_path (full path, only on
+    /// cache miss) + user SID (budgeted) still need per-PID
+    /// OpenProcess. Steady-state cost on a stable process list:
+    /// ~1 OpenProcess per PID per tick (just affinity).
+    ///
+    /// On NTQSI failure we fall back to the legacy per-PID path so a
+    /// kernel quirk on some host doesn't blank the tray's Processes
+    /// tab — the slow path still works, it's just expensive.
     pub fn list_process_snapshots(&self) -> (Vec<ProcessSnapshot>, SystemMetrics) {
         #[cfg(not(windows))]
         return (Vec::new(), SystemMetrics::default());
@@ -685,11 +701,52 @@ impl Engine {
                 .saturating_add(elapsed.subsec_nanos() as u64 / 100);
             s.list_processes_last_sample_at = Some(now);
 
-            let pid_snapshots = match framesage_sys::process::iter_pid_snapshots() {
-                Ok(v) => v,
+            // Single-syscall snapshot via NtQuerySystemInformation. On
+            // failure (rare; kernel quirks on some hosts), fall back to
+            // ToolHelp so the tray's Processes tab still works — just
+            // expensively.
+            let ntqsi_processes = framesage_sys::sys_proc_info::enumerate_processes();
+            let (pid_snapshots, ntqsi_ok) = match ntqsi_processes {
+                Ok(v) => (v, true),
                 Err(e) => {
-                    warn!(error = %e, "list_process_snapshots: iter_pid_snapshots failed");
-                    return (Vec::new(), SystemMetrics::default());
+                    warn!(error = %e, "NTQSI failed; falling back to ToolHelp per-PID path");
+                    // Construct a stub Vec from the legacy iter_pid_snapshots
+                    // so the downstream loop has something to iterate. The
+                    // legacy path doesn't have CPU times or memory in the
+                    // initial snapshot — those have to come from per-PID
+                    // calls below. For brevity in the fallback path we just
+                    // surface empty values; the fallback is a degraded mode
+                    // that should self-recover next tick when NTQSI works
+                    // again.
+                    match framesage_sys::process::iter_pid_snapshots() {
+                        Ok(legacy) => (
+                            legacy
+                                .into_iter()
+                                .map(|p| framesage_sys::sys_proc_info::SysProcInfo {
+                                    pid: p.pid,
+                                    parent_pid: p.parent_pid,
+                                    // Legacy ToolHelp doesn't give us
+                                    // exe_name directly here; the loop
+                                    // below will look it up via
+                                    // exe_for_pid when ntqsi_ok is
+                                    // false. Stub empty for now.
+                                    exe_name: String::new(),
+                                    thread_count: p.thread_count,
+                                    handle_count: 0,
+                                    total_cpu_100ns: 0,
+                                    working_set_bytes: 0,
+                                    peak_working_set_bytes: 0,
+                                    private_bytes: 0,
+                                    base_priority: 0,
+                                })
+                                .collect(),
+                            false,
+                        ),
+                        Err(e) => {
+                            warn!(error = %e, "ToolHelp fallback also failed; returning empty");
+                            return (Vec::new(), SystemMetrics::default());
+                        }
+                    }
                 }
             };
 
@@ -706,6 +763,12 @@ impl Engine {
             // accounts but can touch a domain controller on AD-joined
             // boxes — keeping the budget small protects the worst case.
             let mut user_budget: u32 = 8;
+            // Same bounded-cost idea for exe-path lookups. The cache
+            // makes this near-zero on a stable process list (each
+            // PID's full path is looked up once and reused for the
+            // PID's lifetime); the budget catches the cold-cache /
+            // process-spawn-storm case.
+            let mut exe_path_budget: u32 = 8;
 
             for ps in &pid_snapshots {
                 let pid = ps.pid;
@@ -713,47 +776,90 @@ impl Engine {
                     continue;
                 }
 
-                // exe path + bare filename. We surface BOTH in the snapshot:
-                // the tray uses the filename for the table label and matching,
-                // and the full path to extract the exe's icon via
-                // `SHGetFileInfoW`.
-                let exe_path = match framesage_sys::process::exe_for_pid(pid) {
-                    Ok(Some(path)) => path,
-                    Ok(None) | Err(_) => continue,
+                // exe_path: from per-PID cache; on miss, look up via
+                // OpenProcess + QueryFullProcessImageNameW (budgeted).
+                // Empty string is fine — tray icon extraction handles
+                // missing paths gracefully.
+                let exe_path = if let Some(cached) = s.exe_path_cache.get(&pid) {
+                    cached.clone()
+                } else if exe_path_budget > 0 {
+                    exe_path_budget -= 1;
+                    let path = framesage_sys::process::exe_for_pid(pid)
+                        .ok()
+                        .flatten()
+                        .unwrap_or_default();
+                    if !path.is_empty() {
+                        s.exe_path_cache.insert(pid, path.clone());
+                    }
+                    path
+                } else {
+                    String::new()
                 };
-                let exe_name = exe_path
-                    .rsplit(['\\', '/'])
-                    .next()
-                    .unwrap_or(&exe_path)
-                    .to_owned();
 
-                let priority_class_raw = framesage_sys::apply::get_priority_class_for_pid(pid)
-                    .ok()
-                    .flatten()
-                    .unwrap_or(0);
+                // exe_name: from NTQSI directly (bare filename). On
+                // the fallback path NTQSI returned empty, so derive
+                // from exe_path. Skip processes we have no name for
+                // — they're likely PID 0/4 or transiently unreadable.
+                let exe_name = if !ps.exe_name.is_empty() {
+                    ps.exe_name.clone()
+                } else if !exe_path.is_empty() {
+                    exe_path
+                        .rsplit(['\\', '/'])
+                        .next()
+                        .unwrap_or(&exe_path)
+                        .to_owned()
+                } else {
+                    continue;
+                };
+
+                // Priority class via NTQSI BasePriority → Win32 class
+                // mapping. Saves one OpenProcess per PID. On fallback
+                // path BasePriority is 0; if the mapping returns 0,
+                // we accept that as "unknown" — same fallback as the
+                // legacy "0 means unknown" semantic.
+                let priority_class_raw = if ntqsi_ok {
+                    framesage_sys::sys_proc_info::kpriority_to_win32_class(ps.base_priority)
+                } else {
+                    framesage_sys::apply::get_priority_class_for_pid(pid)
+                        .ok()
+                        .flatten()
+                        .unwrap_or(0)
+                };
 
                 let affinity_mask = framesage_sys::process::affinity_mask(pid)
                     .ok()
                     .flatten()
                     .unwrap_or(0);
 
-                // Multi-field memory snapshot. Same syscall as the old
-                // working-set-only path; PROCESS_MEMORY_COUNTERS_EX just
-                // gets us peak + private bytes for free, which feeds the
-                // tray's hover tooltip and the detail pane.
-                let mem = framesage_sys::process::memory_info(pid)
-                    .ok()
-                    .flatten()
-                    .unwrap_or_default();
-                let memory_bytes = mem.working_set_bytes;
-                let peak_working_set_bytes = mem.peak_working_set_bytes;
-                let private_bytes = mem.private_bytes;
+                // Memory from NTQSI directly — no extra syscall. On
+                // fallback path these are zero (legacy iter_pid_snapshots
+                // doesn't carry them); the tray rendering handles 0
+                // gracefully.
+                let memory_bytes = if ntqsi_ok {
+                    ps.working_set_bytes
+                } else {
+                    // Fallback: per-PID memory_info call (the original
+                    // pre-2.1 path).
+                    framesage_sys::process::memory_info(pid)
+                        .ok()
+                        .flatten()
+                        .map(|m| m.working_set_bytes)
+                        .unwrap_or(0)
+                };
+                let peak_working_set_bytes = ps.peak_working_set_bytes;
+                let private_bytes = ps.private_bytes;
 
-                let total_cpu = framesage_sys::process::cpu_times(pid)
-                    .ok()
-                    .flatten()
-                    .map(|t| t.total_100ns())
-                    .unwrap_or(0);
+                // Total CPU time from NTQSI directly. Fallback path
+                // does a per-PID cpu_times call.
+                let total_cpu = if ntqsi_ok {
+                    ps.total_cpu_100ns
+                } else {
+                    framesage_sys::process::cpu_times(pid)
+                        .ok()
+                        .flatten()
+                        .map(|t| t.total_100ns())
+                        .unwrap_or(0)
+                };
                 let cpu_percent: u16 = if elapsed_100ns > 0 {
                     let prev = s
                         .list_processes_prev_samples
@@ -857,6 +963,11 @@ impl Engine {
             let live_pids: std::collections::HashSet<u32> =
                 pid_snapshots.iter().map(|p| p.pid).collect();
             s.user_cache.retain(|p, _| live_pids.contains(p));
+            // Item 2.1: same prune for exe_path_cache. PID reuse means
+            // tomorrow's PID 1234 may be a different binary than
+            // today's; dropping cached paths on PID-exit avoids
+            // surfacing a stale path on the next reuse.
+            s.exe_path_cache.retain(|p, _| live_pids.contains(p));
 
             // ─── System-wide metrics ─────────────────────────────────────
             //
