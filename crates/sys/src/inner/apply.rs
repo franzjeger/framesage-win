@@ -92,48 +92,75 @@ pub fn apply(pid: u32, profile: &Profile, topology: &CpuTopology) -> Result<Appl
     }
 
     if let Some(sel) = &profile.cpu_sets {
-        let indices = topology.resolve(sel);
-        let set_ids = cpuset_ids_for_indices(&indices)?;
-
-        // Three layers, belt + suspenders + safety net:
+        // Item 1.7 / audit H-09. Before this fix, `Kind(Cache)` on a
+        // non-X3D box resolved to an empty index list. `cpuset_ids_for_indices(&[])`
+        // returns `Ok(vec![])`, then `set_default_cpu_sets(handle, &[])`
+        // calls `SetProcessDefaultCpuSets(handle, None)` which silently
+        // CLEARS any existing CPU sets on the target — i.e. we
+        // un-pinned the process while still applying the rest of
+        // game-x3d's aggressive Game Mode (services stopped, taskbar
+        // hidden, power plan flipped). All of the cost, none of the
+        // CPU benefit.
         //
-        //   1. SetProcessDefaultCpuSets — soft hint for threads created
-        //      AFTER this call.
-        //   2. SetThreadSelectedCpuSets per existing thread — soft hint
-        //      for the threads the process already spawned (a game's
-        //      threadpool is built at startup, so without this we miss
-        //      ~all of it).
-        //   3. SetProcessAffinityMask — HARD pin to the same set of
-        //      logical CPUs, atomic across existing + future threads.
-        //      We save the prior mask under prev_affinity_mask so revert
-        //      restores it.
-        //
-        // The README's "CPU Sets, not affinity, to avoid starvation"
-        // stance was right in theory but didn't survive contact with
-        // hardware: hardware validation showed games spawning across
-        // all cores even with sets applied because the soft hint isn't
-        // enforced under load. The X3D CCD has 16 logical CPUs — more
-        // than enough headroom for any single game — so the starvation
-        // concern is theoretical. We apply the hard mask too.
-        //
-        // If the user explicitly sets profile.affinity_mask, that wins
-        // (overwrites our default mask below).
-        set_default_cpu_sets(handle, &set_ids).context("set default CPU sets")?;
-        let n = apply_thread_cpu_sets(pid, &set_ids);
-        tracing::debug!(pid, threads = n, "applied per-thread CPU sets");
-
-        let hard_mask = mask_from_indices(&indices);
-        if hard_mask != 0 {
-            state.prev_affinity_mask = Some(get_affinity_mask(handle)?);
-            set_affinity_mask(handle, hard_mask).context("set hard affinity from cpu_sets")?;
+        // Fix: if the selector resolves to nothing, try a sensible
+        // fallback chain before giving up. For `Kind(Cache)`
+        // specifically, fall through to `TopRanked(8)` (best 8 cores
+        // by CPPC perf rank) — the closest approximation to "give me
+        // the highest-performance cores on this chip." If that's also
+        // empty (CPU without CPPC data), give up gracefully without
+        // calling SetProcessDefaultCpuSets(None) — leave the OS
+        // scheduler's existing setup alone instead of nuking it.
+        let indices = topology.resolve_with_aggressive_fallback(sel);
+        if indices.is_empty() {
             tracing::debug!(
                 pid,
-                mask = format!("{hard_mask:#x}"),
-                "applied hard affinity"
+                selector = ?sel,
+                "cpu_sets selector resolved to empty even after fallbacks; \
+                 leaving OS scheduler defaults in place instead of silent-clearing"
             );
-        }
+        } else {
+            let set_ids = cpuset_ids_for_indices(&indices)?;
 
-        state.cpu_sets_set = true;
+            // Three layers, belt + suspenders + safety net:
+            //
+            //   1. SetProcessDefaultCpuSets — soft hint for threads created
+            //      AFTER this call.
+            //   2. SetThreadSelectedCpuSets per existing thread — soft hint
+            //      for the threads the process already spawned (a game's
+            //      threadpool is built at startup, so without this we miss
+            //      ~all of it).
+            //   3. SetProcessAffinityMask — HARD pin to the same set of
+            //      logical CPUs, atomic across existing + future threads.
+            //      We save the prior mask under prev_affinity_mask so revert
+            //      restores it.
+            //
+            // The README's "CPU Sets, not affinity, to avoid starvation"
+            // stance was right in theory but didn't survive contact with
+            // hardware: hardware validation showed games spawning across
+            // all cores even with sets applied because the soft hint isn't
+            // enforced under load. The X3D CCD has 16 logical CPUs — more
+            // than enough headroom for any single game — so the starvation
+            // concern is theoretical. We apply the hard mask too.
+            //
+            // If the user explicitly sets profile.affinity_mask, that wins
+            // (overwrites our default mask below).
+            set_default_cpu_sets(handle, &set_ids).context("set default CPU sets")?;
+            let n = apply_thread_cpu_sets(pid, &set_ids);
+            tracing::debug!(pid, threads = n, "applied per-thread CPU sets");
+
+            let hard_mask = mask_from_indices(&indices);
+            if hard_mask != 0 {
+                state.prev_affinity_mask = Some(get_affinity_mask(handle)?);
+                set_affinity_mask(handle, hard_mask).context("set hard affinity from cpu_sets")?;
+                tracing::debug!(
+                    pid,
+                    mask = format!("{hard_mask:#x}"),
+                    "applied hard affinity"
+                );
+            }
+
+            state.cpu_sets_set = true;
+        }
     }
 
     if let Some(sel) = &profile.affinity_mask {
