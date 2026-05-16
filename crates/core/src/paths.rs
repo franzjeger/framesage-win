@@ -13,6 +13,7 @@ use std::path::PathBuf;
 
 const APP_DIR_NAME: &str = "framesage";
 const POLICY_FILE_NAME: &str = "policy.json";
+const ACTIVITY_LOG_FILE_NAME: &str = "activity.jsonl";
 
 /// Directory holding all framesage state.
 pub fn config_dir() -> PathBuf {
@@ -50,6 +51,48 @@ pub fn policy_path() -> PathBuf {
     config_dir().join(POLICY_FILE_NAME)
 }
 
+/// Item 2.9 / audit M-03. Per-user data directory — distinct from
+/// [`config_dir`] because the service hardens the latter's DACL to
+/// LocalSystem + Administrators (so an unprivileged tray running in
+/// the user's session can't write there). Tray-owned data
+/// (activity.jsonl, future per-user UI state) lives here under
+/// `%LOCALAPPDATA%\framesage\`.
+///
+/// On non-Windows we follow XDG: `$XDG_DATA_HOME/framesage/` or
+/// `~/.local/share/framesage/`.
+pub fn user_data_dir() -> PathBuf {
+    #[cfg(windows)]
+    {
+        if let Some(p) = std::env::var_os("LOCALAPPDATA") {
+            return PathBuf::from(p).join(APP_DIR_NAME);
+        }
+        // Fallback to config_dir if LOCALAPPDATA isn't set — better
+        // to share with the engine than crash.
+        config_dir()
+    }
+    #[cfg(not(windows))]
+    {
+        if let Some(p) = std::env::var_os("XDG_DATA_HOME") {
+            return PathBuf::from(p).join(APP_DIR_NAME);
+        }
+        if let Some(home) = std::env::var_os("HOME") {
+            return PathBuf::from(home)
+                .join(".local")
+                .join("share")
+                .join(APP_DIR_NAME);
+        }
+        PathBuf::from(format!("./.{APP_DIR_NAME}-data"))
+    }
+}
+
+/// Item 2.9 / audit M-03. The tray's activity event log
+/// (`activity.jsonl`). Append-only line-delimited JSON, one event per
+/// line. Lives in [`user_data_dir`] so an unprivileged tray can write
+/// to it without elevation.
+pub fn activity_log_path() -> PathBuf {
+    user_data_dir().join(ACTIVITY_LOG_FILE_NAME)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -69,5 +112,16 @@ mod tests {
     fn config_dir_ends_with_framesage() {
         let dir = config_dir();
         assert_eq!(dir.file_name().unwrap(), "framesage");
+    }
+
+    #[test]
+    fn activity_log_lives_under_user_data_dir() {
+        let dir = user_data_dir();
+        let file = activity_log_path();
+        assert!(
+            file.starts_with(&dir),
+            "activity log {file:?} is not under {dir:?}"
+        );
+        assert_eq!(file.file_name().unwrap(), "activity.jsonl");
     }
 }
