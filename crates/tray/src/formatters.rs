@@ -123,6 +123,28 @@ pub fn affinity_selector_label(selector: &framesage_core::CpuSelector) -> String
     }
 }
 
+/// Profile-summary variant of the CPU selector label. Used in the
+/// read-only profile cards on the Status tab, where the value lives
+/// inside a key/value grid and `None` should render as an em-dash
+/// rather than blank. Slightly more verbose than
+/// `affinity_selector_label` (says "Everything except CCD 0" instead
+/// of "Not CCD 0", "Top N by CPPC rank" instead of "Top N cores")
+/// because the card has the horizontal real estate that the rules
+/// table doesn't. Item 3.6 — lifted out of main.rs alongside the
+/// widget extractions.
+pub fn format_cpu_selector(sel: Option<&framesage_core::CpuSelector>) -> String {
+    use framesage_core::CpuSelector;
+    match sel {
+        None => "—".to_owned(),
+        Some(CpuSelector::All) => "All cores".to_owned(),
+        Some(CpuSelector::Kind(k)) => k.to_string(),
+        Some(CpuSelector::Ccd(c)) => format!("CCD {c}"),
+        Some(CpuSelector::CcdNot(c)) => format!("Everything except CCD {c}"),
+        Some(CpuSelector::TopRanked(n)) => format!("Top {n} by CPPC rank"),
+        Some(CpuSelector::Mask(m)) => format!("Mask 0x{m:016x}"),
+    }
+}
+
 /// Map a raw Win32 priority class constant to the short label Task Manager
 /// uses ("Normal", "High", "Realtime", …). Returns "—" for unknown values
 /// so the table doesn't show a stale or garbled string.
