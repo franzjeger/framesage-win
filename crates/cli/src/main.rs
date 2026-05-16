@@ -625,60 +625,92 @@ fn remove_user_shortcuts(report: &mut UninstallReport) {
 
 #[cfg(windows)]
 fn remove_install_dir(report: &mut UninstallReport) {
-    // install.ps1 puts binaries at %LOCALAPPDATA%\Programs\FrameSage\.
-    // Item 1.6 will move this to %ProgramFiles%; for now match the
-    // current install location.
-    let install_dir = match std::env::var_os("LOCALAPPDATA") {
-        Some(p) => std::path::PathBuf::from(p)
-            .join("Programs")
-            .join("FrameSage"),
-        None => return,
-    };
-    report.install_dir_path = Some(install_dir.clone());
-    if !install_dir.exists() {
-        return;
+    // Item 1.6 / audit C-10. Clean BOTH the current install location
+    // (%ProgramFiles%\FrameSage) and the legacy per-user location
+    // (%LOCALAPPDATA%\Programs\FrameSage) so users who installed
+    // before the path move don't end up with permanent orphans.
+    //
+    // Reports against the primary (%ProgramFiles%) install — that's
+    // the canonical location post-1.6. Legacy cleanup is silent on
+    // success, noisy on failure.
+    let mut candidates: Vec<std::path::PathBuf> = Vec::new();
+    if let Some(pf) = std::env::var_os("ProgramFiles") {
+        candidates.push(std::path::PathBuf::from(pf).join("FrameSage"));
+    }
+    if let Some(local) = std::env::var_os("LOCALAPPDATA") {
+        candidates.push(
+            std::path::PathBuf::from(local)
+                .join("Programs")
+                .join("FrameSage"),
+        );
     }
 
-    // Walk the dir and remove each binary individually so we can report
-    // which specific file is locked (vs a single recursive remove that
-    // bails on the first error with no context).
-    for name in &[
-        "framesage-tray.exe",
-        "framesage-svc.exe",
-        "framesage.exe",
-        "framesage-sim.exe",
-        "README.md",
-        "LICENSE",
-    ] {
-        let path = install_dir.join(name);
-        if !path.exists() {
+    if let Some(primary) = candidates.first() {
+        report.install_dir_path = Some(primary.clone());
+    }
+
+    for install_dir in candidates {
+        if !install_dir.exists() {
             continue;
         }
-        match std::fs::remove_file(&path) {
-            Ok(()) => {
-                println!("  removed: {}", path.display());
-                report.binaries_removed.push(path);
-            }
-            Err(e) => {
-                eprintln!("  removal failed: {} ({e})", path.display());
-                report.binaries_failed.push((path, e.to_string()));
-            }
-        }
-    }
+        let is_primary = report
+            .install_dir_path
+            .as_deref()
+            .is_some_and(|p| p == install_dir);
 
-    // Try removing the now-empty dir. If something we didn't know about
-    // is left (user-dropped file, unfinished download), keep it but
-    // don't fail.
-    match std::fs::remove_dir(&install_dir) {
-        Ok(()) => {
-            println!("  removed install dir: {}", install_dir.display());
-            report.install_dir_removed = true;
+        // Walk the dir and remove each known artifact individually so
+        // we can report which specific file is locked (vs a single
+        // recursive remove that bails on first error with no context).
+        let mut any_removed = false;
+        for name in &[
+            "framesage-tray.exe",
+            "framesage-svc.exe",
+            "framesage.exe",
+            "framesage-sim.exe",
+            "README.md",
+            "LICENSE",
+        ] {
+            let path = install_dir.join(name);
+            if !path.exists() {
+                continue;
+            }
+            match std::fs::remove_file(&path) {
+                Ok(()) => {
+                    println!("  removed: {}", path.display());
+                    if is_primary {
+                        report.binaries_removed.push(path);
+                    } else {
+                        any_removed = true;
+                    }
+                }
+                Err(e) => {
+                    eprintln!("  removal failed: {} ({e})", path.display());
+                    if is_primary {
+                        report.binaries_failed.push((path, e.to_string()));
+                    }
+                }
+            }
         }
-        Err(_) => {
-            println!(
-                "  install dir not removed (contains other files): {}",
-                install_dir.display()
-            );
+
+        // Try removing the now-empty dir.
+        match std::fs::remove_dir(&install_dir) {
+            Ok(()) => {
+                println!("  removed install dir: {}", install_dir.display());
+                if is_primary {
+                    report.install_dir_removed = true;
+                } else if any_removed {
+                    println!(
+                        "  (legacy install dir from pre-1.6 era cleaned up: {})",
+                        install_dir.display()
+                    );
+                }
+            }
+            Err(_) => {
+                println!(
+                    "  install dir not removed (contains other files): {}",
+                    install_dir.display()
+                );
+            }
         }
     }
 }

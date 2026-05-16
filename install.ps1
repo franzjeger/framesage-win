@@ -41,8 +41,25 @@ Write-Host ""
 $repoRoot = Split-Path -Parent $MyInvocation.MyCommand.Path
 Set-Location $repoRoot
 Write-Host "[install] repo:    $repoRoot"
-$installDir = Join-Path $env:LOCALAPPDATA "Programs\FrameSage"
+
+# Item 1.6 / audit C-10. Install dir is now %ProgramFiles%\FrameSage —
+# system-wide, Administrators+SYSTEM only, NOT in any user's profile.
+# The previous %LOCALAPPDATA%\Programs\FrameSage location was a classic
+# admin-to-SYSTEM persistence primitive: SCM ran framesage-svc.exe as
+# LocalSystem from a directory the installing user could write to.
+# Compromise the user account → swap the binary → arbitrary code as
+# SYSTEM at next boot.
+$installDir = Join-Path $env:ProgramFiles "FrameSage"
 Write-Host "[install] target:  $installDir"
+
+# Migration: if the legacy per-user install dir exists, we'll move
+# binaries to the new system-wide location and then clean it up. This
+# preserves existing config (policy.json + sessions.jsonl live in
+# %ProgramData%\framesage\, untouched by install location).
+$legacyInstallDir = Join-Path $env:LOCALAPPDATA "Programs\FrameSage"
+if (Test-Path $legacyInstallDir) {
+    Write-Host "[install] legacy install detected at $legacyInstallDir -- will migrate" -ForegroundColor Yellow
+}
 Write-Host ""
 
 # --- Stop anything running ---------------------------------------------------
@@ -83,6 +100,46 @@ foreach ($exe in @("framesage-tray.exe", "framesage-svc.exe", "framesage.exe", "
 }
 Copy-Item -Force (Join-Path $repoRoot "README.md") (Join-Path $installDir "README.md")
 Copy-Item -Force (Join-Path $repoRoot "LICENSE") (Join-Path $installDir "LICENSE")
+
+# --- Harden install dir ACL --------------------------------------------------
+# Item 1.6 / audit C-10. %ProgramFiles% already has a sane default ACL
+# (Administrators+SYSTEM full, Users read+execute), but we set it
+# explicitly so a misconfigured parent doesn't leak modify rights to
+# the user. Inheritance is preserved from %ProgramFiles% — we don't
+# need PROTECTED here because Windows defaults already block user
+# writes to %ProgramFiles%.
+Write-Host ""
+Write-Host "[install] hardening install dir ACL..." -ForegroundColor Cyan
+$icaclsArgs = @(
+    $installDir,
+    '/inheritance:r',
+    '/grant:r', 'NT AUTHORITY\SYSTEM:(OI)(CI)F',
+    '/grant:r', 'BUILTIN\Administrators:(OI)(CI)F',
+    '/grant:r', 'BUILTIN\Users:(OI)(CI)RX'
+)
+$icaclsOut = & icacls @icaclsArgs 2>&1
+if ($LASTEXITCODE -ne 0) {
+    Write-Host "  warning: icacls failed -- install dir may have weaker permissions" -ForegroundColor Yellow
+    Write-Host "  $icaclsOut"
+} else {
+    Write-Host "  SYSTEM:F  Administrators:F  Users:RX"
+}
+
+# --- Legacy install cleanup --------------------------------------------------
+# If we migrated from %LOCALAPPDATA%, remove the old dir + binaries
+# now that the new install is in place. Shortcuts get rebuilt below
+# pointing at the new location.
+if (Test-Path $legacyInstallDir) {
+    Write-Host ""
+    Write-Host "[install] removing legacy install dir at $legacyInstallDir..." -ForegroundColor Cyan
+    try {
+        Remove-Item -Recurse -Force $legacyInstallDir -ErrorAction Stop
+        Write-Host "  done"
+    } catch {
+        Write-Host "  warning: legacy dir cleanup failed: $_" -ForegroundColor Yellow
+        Write-Host "  remove manually: Remove-Item -Recurse -Force '$legacyInstallDir'"
+    }
+}
 
 # --- Shortcuts ---------------------------------------------------------------
 Write-Host ""
