@@ -97,12 +97,12 @@ pub async fn run(inputs: RuntimeInputs) -> Result<()> {
         "framesage engine starting"
     );
 
-    let engine = Arc::new(Engine::new(EngineDeps {
+    let engine = Arc::new(Engine::new(EngineDeps::with_real_sys(
         policy,
         topology,
-        safe_list: SafeList::bundled(),
-        journal: Journal::at_default_path(),
-    }));
+        SafeList::bundled(),
+        Journal::at_default_path(),
+    )));
 
     // Recover anything a previous (possibly crashed) session left behind
     // before we start applying new state. This MUST happen before the tick
