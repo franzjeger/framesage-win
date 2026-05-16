@@ -361,10 +361,10 @@ struct AppliedRecord {
     /// our settings onto an unrelated process. Compared case-insensitively.
     exe_name: String,
     /// Opaque per-platform state used to revert per-process changes.
-    #[cfg(windows)]
+    /// Item 3.1b — uses the unified `framesage_sys::apply::AppliedState`
+    /// type that's defined on both Windows (real syscalls) and non-
+    /// Windows (unit struct via the stub module).
     state: framesage_sys::apply::AppliedState,
-    #[cfg(not(windows))]
-    _phantom: (),
 }
 
 /// What we entered into Game Mode for; mirrors the journal on disk.
@@ -493,16 +493,9 @@ impl Engine {
         pid: u32,
         class: framesage_core::PriorityClass,
     ) -> Result<()> {
-        let exe = resolve_exe_for_pid_or_err(pid, "set priority")?;
+        let exe = resolve_exe_for_pid_or_err(self.sys.as_ref(), pid, "set priority")?;
         check_process_modifiable(self.safe_list, &exe, "set priority")?;
-        #[cfg(windows)]
-        {
-            framesage_sys::apply::set_priority_class_for_pid(pid, class)?;
-        }
-        #[cfg(not(windows))]
-        {
-            let _ = (pid, class);
-        }
+        self.sys.set_priority_class_for_pid(pid, class)?;
         Ok(())
     }
 
@@ -513,16 +506,9 @@ impl Engine {
     /// the reason — usually "PID is protected", "PID exited", or "this
     /// process is on the framesage denylist for safety".
     pub fn suspend_process(&self, pid: u32) -> Result<()> {
-        let exe = resolve_exe_for_pid_or_err(pid, "suspend")?;
+        let exe = resolve_exe_for_pid_or_err(self.sys.as_ref(), pid, "suspend")?;
         check_process_modifiable(self.safe_list, &exe, "suspend")?;
-        #[cfg(windows)]
-        {
-            framesage_sys::process_actions::suspend(pid)?;
-        }
-        #[cfg(not(windows))]
-        {
-            let _ = pid;
-        }
+        self.sys.suspend_process(pid)?;
         Ok(())
     }
 
@@ -535,16 +521,9 @@ impl Engine {
     /// denylisted PID indicates either a bug or an externally-suspended
     /// process — neither is our responsibility to recover.
     pub fn resume_process(&self, pid: u32) -> Result<()> {
-        let exe = resolve_exe_for_pid_or_err(pid, "resume")?;
+        let exe = resolve_exe_for_pid_or_err(self.sys.as_ref(), pid, "resume")?;
         check_process_modifiable(self.safe_list, &exe, "resume")?;
-        #[cfg(windows)]
-        {
-            framesage_sys::process_actions::resume(pid)?;
-        }
-        #[cfg(not(windows))]
-        {
-            let _ = pid;
-        }
+        self.sys.resume_process(pid)?;
         Ok(())
     }
 
@@ -558,17 +537,10 @@ impl Engine {
     /// causing a disk-I/O storm. MsMpEng is on the bundled denylist, so the
     /// gate refuses the action with the documented rationale.
     pub fn trim_working_set(&self, pid: u32) -> Result<()> {
-        let exe = resolve_exe_for_pid_or_err(pid, "trim working set")?;
+        let exe = resolve_exe_for_pid_or_err(self.sys.as_ref(), pid, "trim working set")?;
         check_process_modifiable(self.safe_list, &exe, "trim working set")?;
-        #[cfg(windows)]
-        {
-            framesage_sys::apply::trim_working_set_for_pid(pid)?;
-            info!(pid, "trim_working_set");
-        }
-        #[cfg(not(windows))]
-        {
-            let _ = pid;
-        }
+        self.sys.trim_working_set_for_pid(pid)?;
+        info!(pid, "trim_working_set");
         Ok(())
     }
 
@@ -586,37 +558,30 @@ impl Engine {
         pid: u32,
         selector: framesage_core::CpuSelector,
     ) -> Result<()> {
-        let exe = resolve_exe_for_pid_or_err(pid, "set affinity")?;
+        let exe = resolve_exe_for_pid_or_err(self.sys.as_ref(), pid, "set affinity")?;
         check_process_modifiable(self.safe_list, &exe, "set affinity")?;
-        #[cfg(windows)]
-        {
-            let topology = self.state.read().topology.clone();
-            let indices = topology.resolve(&selector);
-            if indices.is_empty() {
-                return Err(anyhow::anyhow!(
-                    "selector {:?} resolved to no CPUs on this topology",
-                    selector
-                ));
-            }
-            let mut mask: u64 = 0;
-            for idx in indices {
-                if idx < 64 {
-                    mask |= 1u64 << idx;
-                }
-            }
-            if mask == 0 {
-                return Err(anyhow::anyhow!(
-                    "selector {:?} produced an empty mask (all indices >= 64?)",
-                    selector
-                ));
-            }
-            framesage_sys::apply::set_affinity_mask_for_pid(pid, mask)?;
-            info!(pid, mask = format!("{:#x}", mask), "set_process_affinity");
+        let topology = self.state.read().topology.clone();
+        let indices = topology.resolve(&selector);
+        if indices.is_empty() {
+            return Err(anyhow::anyhow!(
+                "selector {:?} resolved to no CPUs on this topology",
+                selector
+            ));
         }
-        #[cfg(not(windows))]
-        {
-            let _ = (pid, selector);
+        let mut mask: u64 = 0;
+        for idx in indices {
+            if idx < 64 {
+                mask |= 1u64 << idx;
+            }
         }
+        if mask == 0 {
+            return Err(anyhow::anyhow!(
+                "selector {:?} produced an empty mask (all indices >= 64?)",
+                selector
+            ));
+        }
+        self.sys.set_affinity_mask_for_pid(pid, mask)?;
+        info!(pid, mask = format!("{:#x}", mask), "set_process_affinity");
         Ok(())
     }
 
@@ -631,16 +596,9 @@ impl Engine {
     /// check is the BSOD-prevention layer. `process_actions::terminate`
     /// already refuses PID 0 / 4 as a final belt-and-suspenders backstop.
     pub fn terminate_process(&self, pid: u32) -> Result<()> {
-        let exe = resolve_exe_for_pid_or_err(pid, "terminate")?;
+        let exe = resolve_exe_for_pid_or_err(self.sys.as_ref(), pid, "terminate")?;
         check_process_modifiable(self.safe_list, &exe, "terminate")?;
-        #[cfg(windows)]
-        {
-            framesage_sys::process_actions::terminate(pid)?;
-        }
-        #[cfg(not(windows))]
-        {
-            let _ = pid;
-        }
+        self.sys.terminate_process(pid)?;
         let mut s = self.state.write();
         s.applied.remove(&pid);
         s.probalance_restrained.remove(&pid);
@@ -697,60 +655,51 @@ impl Engine {
         }
 
         if apply_to_live {
-            #[cfg(windows)]
-            {
-                let pids = framesage_sys::process::iter_pids().unwrap_or_default();
-                let mut applied_count: usize = 0;
-                let mut new_marks: Vec<u32> = Vec::new();
-                for pid in pids {
-                    let live_exe = match framesage_sys::process::exe_for_pid(pid) {
-                        Ok(Some(path)) => {
-                            path.rsplit(['\\', '/']).next().unwrap_or(&path).to_owned()
-                        }
-                        Ok(None) | Err(_) => continue,
-                    };
-                    if !live_exe.eq_ignore_ascii_case(&exe_name) {
-                        continue;
+            let pids = self.sys.iter_pids().unwrap_or_default();
+            let mut applied_count: usize = 0;
+            let mut new_marks: Vec<u32> = Vec::new();
+            for pid in pids {
+                let live_exe = match self.sys.exe_for_pid(pid) {
+                    Ok(Some(path)) => {
+                        path.rsplit(['\\', '/']).next().unwrap_or(&path).to_owned()
                     }
-                    match self.set_process_affinity(pid, selector.clone()) {
-                        Ok(()) => {
-                            applied_count += 1;
-                            new_marks.push(pid);
-                            let _ = self.events.send(Event::AffinityRuleFired {
-                                pid,
-                                exe_name: live_exe.clone(),
-                                rule_exe: exe_name.clone(),
-                            });
-                        }
-                        Err(e) => {
-                            warn!(pid, exe = %live_exe, error = %e, "affinity rule apply-to-live failed");
-                            let _ = self.events.send(Event::ActionFailed {
-                                kind: ActionFailedKind::Apply,
-                                pid: Some(pid),
-                                exe_name: Some(live_exe.clone()),
-                                details: format!(
-                                    "affinity rule apply-to-live failed: {e:#}"
-                                ),
-                            });
-                        }
+                    Ok(None) | Err(_) => continue,
+                };
+                if !live_exe.eq_ignore_ascii_case(&exe_name) {
+                    continue;
+                }
+                match self.set_process_affinity(pid, selector.clone()) {
+                    Ok(()) => {
+                        applied_count += 1;
+                        new_marks.push(pid);
+                        let _ = self.events.send(Event::AffinityRuleFired {
+                            pid,
+                            exe_name: live_exe.clone(),
+                            rule_exe: exe_name.clone(),
+                        });
+                    }
+                    Err(e) => {
+                        warn!(pid, exe = %live_exe, error = %e, "affinity rule apply-to-live failed");
+                        let _ = self.events.send(Event::ActionFailed {
+                            kind: ActionFailedKind::Apply,
+                            pid: Some(pid),
+                            exe_name: Some(live_exe.clone()),
+                            details: format!("affinity rule apply-to-live failed: {e:#}"),
+                        });
                     }
                 }
-                if !new_marks.is_empty() {
-                    let mut s = self.state.write();
-                    for pid in new_marks {
-                        s.affinity_rule_applied.insert(pid);
-                    }
+            }
+            if !new_marks.is_empty() {
+                let mut s = self.state.write();
+                for pid in new_marks {
+                    s.affinity_rule_applied.insert(pid);
                 }
-                info!(
-                    exe = %exe_name,
-                    applied_count,
-                    "affinity rule applied to live PIDs"
-                );
             }
-            #[cfg(not(windows))]
-            {
-                let _ = selector;
-            }
+            info!(
+                exe = %exe_name,
+                applied_count,
+                "affinity rule applied to live PIDs"
+            );
         }
 
         Ok(())
@@ -825,7 +774,7 @@ impl Engine {
             // failure (rare; kernel quirks on some hosts), fall back to
             // ToolHelp so the tray's Processes tab still works — just
             // expensively.
-            let ntqsi_processes = framesage_sys::sys_proc_info::enumerate_processes();
+            let ntqsi_processes = self.sys.enumerate_processes();
             let (pid_snapshots, ntqsi_ok) = match ntqsi_processes {
                 Ok(v) => (v, true),
                 Err(e) => {
@@ -838,7 +787,7 @@ impl Engine {
                     // surface empty values; the fallback is a degraded mode
                     // that should self-recover next tick when NTQSI works
                     // again.
-                    match framesage_sys::process::iter_pid_snapshots() {
+                    match self.sys.iter_pid_snapshots() {
                         Ok(legacy) => (
                             legacy
                                 .into_iter()
@@ -904,7 +853,9 @@ impl Engine {
                     cached.clone()
                 } else if exe_path_budget > 0 {
                     exe_path_budget -= 1;
-                    let path = framesage_sys::process::exe_for_pid(pid)
+                    let path = self
+                        .sys
+                        .exe_for_pid(pid)
                         .ok()
                         .flatten()
                         .unwrap_or_default();
@@ -940,16 +891,14 @@ impl Engine {
                 let priority_class_raw = if ntqsi_ok {
                     framesage_sys::sys_proc_info::kpriority_to_win32_class(ps.base_priority)
                 } else {
-                    framesage_sys::apply::get_priority_class_for_pid(pid)
+                    self.sys
+                        .get_priority_class_for_pid(pid)
                         .ok()
                         .flatten()
                         .unwrap_or(0)
                 };
 
-                let affinity_mask = framesage_sys::process::affinity_mask(pid)
-                    .ok()
-                    .flatten()
-                    .unwrap_or(0);
+                let affinity_mask = self.sys.affinity_mask(pid).ok().flatten().unwrap_or(0);
 
                 // Memory from NTQSI directly — no extra syscall. On
                 // fallback path these are zero (legacy iter_pid_snapshots
@@ -960,7 +909,8 @@ impl Engine {
                 } else {
                     // Fallback: per-PID memory_info call (the original
                     // pre-2.1 path).
-                    framesage_sys::process::memory_info(pid)
+                    self.sys
+                        .memory_info(pid)
                         .ok()
                         .flatten()
                         .map(|m| m.working_set_bytes)
@@ -974,7 +924,8 @@ impl Engine {
                 let total_cpu = if ntqsi_ok {
                     ps.total_cpu_100ns
                 } else {
-                    framesage_sys::process::cpu_times(pid)
+                    self.sys
+                        .cpu_times(pid)
                         .ok()
                         .flatten()
                         .map(|t| t.total_100ns())
@@ -1024,7 +975,9 @@ impl Engine {
                     None => {
                         if version_info_budget > 0 {
                             version_info_budget -= 1;
-                            let v = framesage_sys::version_info::read_version_info(&exe_path)
+                            let v = self
+                                .sys
+                                .read_version_info(&exe_path)
                                 .unwrap_or_default();
                             s.version_info_cache.insert(exe_path.clone(), v.clone());
                             v
@@ -1043,7 +996,7 @@ impl Engine {
                     None => {
                         if user_budget > 0 {
                             user_budget -= 1;
-                            let u = framesage_sys::process::user_for_pid(pid).ok().flatten();
+                            let u = self.sys.user_for_pid(pid).ok().flatten();
                             s.user_cache.insert(pid, u.clone());
                             u
                         } else {
@@ -1096,7 +1049,7 @@ impl Engine {
             // from `GetSystemTimes` rather than summing per-process CPU%
             // because per-process omits whatever fraction of kernel time
             // we couldn't open (protected processes) and undercounts.
-            let sys_cpu_now = framesage_sys::process::system_cpu_times().ok();
+            let sys_cpu_now = self.sys.system_cpu_times().ok();
             let system_cpu_percent: u8 = match (&sys_cpu_now, &s.list_processes_prev_system_cpu) {
                 (Some(now_t), Some(prev_t)) => {
                     let total_delta = now_t.total_100ns().saturating_sub(prev_t.total_100ns());
@@ -1119,7 +1072,7 @@ impl Engine {
             // — would require a hot-plug) fall through to an empty Vec so
             // the tray draws no per-core matrix until two compatible samples
             // accumulate.
-            let per_cpu_now = framesage_sys::process::per_cpu_times().ok();
+            let per_cpu_now = self.sys.per_cpu_times().ok();
             let per_core_cpu_percent: Vec<u8> = match (&per_cpu_now, &s.list_processes_prev_per_cpu)
             {
                 (Some(now_v), Some(prev_v)) if now_v.len() == prev_v.len() => now_v
@@ -1140,7 +1093,7 @@ impl Engine {
             };
             s.list_processes_prev_per_cpu = per_cpu_now;
 
-            let (mem_total, mem_avail) = framesage_sys::process::memory_status().unwrap_or((0, 0));
+            let (mem_total, mem_avail) = self.sys.memory_status().unwrap_or((0, 0));
             let mem_used = mem_total.saturating_sub(mem_avail);
 
             let metrics = SystemMetrics {
@@ -1236,11 +1189,12 @@ impl Engine {
         if !already_correct {
             // Revert old per-PID state so the new apply captures a clean prev.
             if let Some(record) = s.applied.remove(&prev_pid) {
-                revert_record(&self.events, prev_pid, record);
+                revert_record(self.sys.as_ref(), &self.events, prev_pid, record);
             }
 
             let topology = s.topology.clone();
             match apply_profile(
+                self.sys.as_ref(),
                 prev_pid,
                 &snapshot.exe_name,
                 &profile,
@@ -1514,7 +1468,9 @@ impl Engine {
     /// "Apply now" per-profile button. Errors if no foreground exists or
     /// if the profile id isn't in the active policy.
     pub fn apply_once(&self, profile_id: ProfileId) -> Result<()> {
-        let foreground = framesage_sys::foreground::current()?
+        let foreground = self
+            .sys
+            .current_foreground()?
             .ok_or_else(|| anyhow::anyhow!("no foreground process to apply to"))?;
         let mut s = self.state.write();
 
@@ -1545,7 +1501,7 @@ impl Engine {
             // (whether the prior profile was the same or different) so we
             // have a clean slate to apply onto.
             if let Some(record) = s.applied.remove(&foreground.pid) {
-                revert_record(&self.events, foreground.pid, record);
+                revert_record(self.sys.as_ref(), &self.events, foreground.pid, record);
             }
         }
 
@@ -1559,6 +1515,7 @@ impl Engine {
 
         if !already_correct {
             let record = match apply_profile(
+                self.sys.as_ref(),
                 foreground.pid,
                 &foreground.exe_name,
                 &profile,
@@ -1693,14 +1650,14 @@ impl Engine {
                 s.reported_foreground.clone()
             } else {
                 drop(s);
-                framesage_sys::foreground::current()?
+                self.sys.current_foreground()?
             }
         };
 
         let mut s = self.state.write();
         self.reconcile(&mut s, foreground)?;
-        Self::maybe_scan_background_locked(&mut s, self.safe_list, &self.events);
-        Self::maybe_reassert_persistent_locked(&mut s);
+        Self::maybe_scan_background_locked(&mut s, self.safe_list, &self.events, self.sys.as_ref());
+        Self::maybe_reassert_persistent_locked(&mut s, self.sys.as_ref());
         self.maybe_run_probalance_locked(&mut s);
         Ok(())
     }
@@ -1824,11 +1781,10 @@ impl Engine {
                 let drained: Vec<(u32, probalance::RestrainedRecord)> =
                     s.probalance_restrained.drain().collect();
                 for (pid, rec) in drained {
-                    #[cfg(windows)]
-                    if let Err(e) = framesage_sys::apply::restore_priority_class_for_pid(
-                        pid,
-                        rec.original_raw_class,
-                    ) {
+                    if let Err(e) = self
+                        .sys
+                        .restore_priority_class_for_pid(pid, rec.original_raw_class)
+                    {
                         warn!(pid, error = %e, "probalance: failed to release restraint on disable");
                     }
                     let _ = self.events.send(Event::ProBalanceRestored {
@@ -1855,7 +1811,7 @@ impl Engine {
         let foreground_pid = s.current_foreground;
         let managed_pids: HashSet<u32> = s.applied.keys().copied().collect();
 
-        let live_pids: Vec<u32> = match framesage_sys::process::iter_pids() {
+        let live_pids: Vec<u32> = match self.sys.iter_pids() {
             Ok(v) => v,
             Err(e) => {
                 debug!(error = %e, "probalance: iter_pids failed; skipping sample");
@@ -1867,26 +1823,19 @@ impl Engine {
         // (protected, exited) are silently skipped — they aren't candidates.
         let mut current_samples: HashMap<u32, (u64, String)> = HashMap::new();
         for pid in &live_pids {
-            #[cfg(windows)]
-            {
-                let times = match framesage_sys::process::cpu_times(*pid) {
-                    Ok(Some(t)) => t,
-                    Ok(None) | Err(_) => continue,
-                };
-                let exe_name = match framesage_sys::process::exe_for_pid(*pid) {
-                    Ok(Some(p)) => p
-                        .rsplit(['\\', '/'])
-                        .next()
-                        .unwrap_or(&p)
-                        .to_ascii_lowercase(),
-                    Ok(None) | Err(_) => continue,
-                };
-                current_samples.insert(*pid, (times.total_100ns(), exe_name));
-            }
-            #[cfg(not(windows))]
-            {
-                let _ = pid;
-            }
+            let times = match self.sys.cpu_times(*pid) {
+                Ok(Some(t)) => t,
+                Ok(None) | Err(_) => continue,
+            };
+            let exe_name = match self.sys.exe_for_pid(*pid) {
+                Ok(Some(p)) => p
+                    .rsplit(['\\', '/'])
+                    .next()
+                    .unwrap_or(&p)
+                    .to_ascii_lowercase(),
+                Ok(None) | Err(_) => continue,
+            };
+            current_samples.insert(*pid, (times.total_100ns(), exe_name));
         }
 
         s.probalance_last_sample_at = Some(now);
@@ -1929,13 +1878,10 @@ impl Engine {
             let cpu_percent_of_one = ((delta as u128).saturating_mul(100) / elapsed_100ns as u128)
                 .min(u16::MAX as u128) as u16;
             // Query the current priority class for the demotion-target gate.
-            #[cfg(windows)]
-            let current_raw_class = match framesage_sys::apply::get_priority_class_for_pid(*pid) {
+            let current_raw_class = match self.sys.get_priority_class_for_pid(*pid) {
                 Ok(Some(c)) => c,
                 _ => continue,
             };
-            #[cfg(not(windows))]
-            let current_raw_class = 0x20u32;
             decision_samples.push(probalance::ProcessSample {
                 pid: *pid,
                 exe_name: exe.clone(),
@@ -1983,13 +1929,7 @@ impl Engine {
                     demote_to,
                     demote_to_raw_class,
                 } => {
-                    #[cfg(windows)]
-                    let result = framesage_sys::apply::set_priority_class_for_pid(pid, demote_to);
-                    #[cfg(not(windows))]
-                    let result: Result<()> = {
-                        let _ = demote_to;
-                        Ok(())
-                    };
+                    let result = self.sys.set_priority_class_for_pid(pid, demote_to);
                     match result {
                         Ok(()) => {
                             info!(
@@ -2019,11 +1959,10 @@ impl Engine {
                     exe_name,
                     restored_raw_class,
                 } => {
-                    #[cfg(windows)]
-                    if let Err(e) = framesage_sys::apply::restore_priority_class_for_pid(
-                        pid,
-                        restored_raw_class,
-                    ) {
+                    if let Err(e) = self
+                        .sys
+                        .restore_priority_class_for_pid(pid, restored_raw_class)
+                    {
                         debug!(pid, error = %e, "probalance: restore syscall failed (process likely exited)");
                     }
                     info!(
@@ -2064,7 +2003,10 @@ impl Engine {
     /// Bounded by `PERSISTENT_REASSERT_INTERVAL` (2 s). Each sweep just calls
     /// the per-knob setters; no prev-state capture, no revert plan rewrite —
     /// the original `AppliedRecord` continues to describe what to undo.
-    fn maybe_reassert_persistent_locked(s: &mut EngineState) {
+    fn maybe_reassert_persistent_locked(
+        s: &mut EngineState,
+        sys: &dyn framesage_sys::SysApi,
+    ) {
         let now = Instant::now();
         if let Some(last) = s.last_persistent_reassert {
             if now.duration_since(last) < PERSISTENT_REASSERT_INTERVAL {
@@ -2103,34 +2045,27 @@ impl Engine {
             // happens to hold the PID now. Query the live exe and skip on
             // mismatch — the background-scan path will drop the record on
             // its next sweep (or we drop it here once we know it's stale).
-            #[cfg(windows)]
-            {
-                let live_exe = match framesage_sys::process::exe_for_pid(pid) {
-                    Ok(Some(path)) => path.rsplit(['\\', '/']).next().unwrap_or(&path).to_owned(),
-                    Ok(None) | Err(_) => {
-                        // Process gone (or unreadable — same outcome: we
-                        // can't re-assert anyway). Mark for cleanup.
-                        stale_pids.push(pid);
-                        continue;
-                    }
-                };
-                if !live_exe.eq_ignore_ascii_case(&expected_exe) {
-                    debug!(
-                        pid,
-                        expected = %expected_exe,
-                        live = %live_exe,
-                        "re-assert: PID was reassigned to a different exe; dropping record"
-                    );
+            let live_exe = match sys.exe_for_pid(pid) {
+                Ok(Some(path)) => path.rsplit(['\\', '/']).next().unwrap_or(&path).to_owned(),
+                Ok(None) | Err(_) => {
+                    // Process gone (or unreadable — same outcome: we
+                    // can't re-assert anyway). Mark for cleanup.
                     stale_pids.push(pid);
                     continue;
                 }
-                if let Err(e) = framesage_sys::apply::reassert(pid, &profile, &topology) {
-                    debug!(pid, error = %e, "persistent re-assert failed");
-                }
+            };
+            if !live_exe.eq_ignore_ascii_case(&expected_exe) {
+                debug!(
+                    pid,
+                    expected = %expected_exe,
+                    live = %live_exe,
+                    "re-assert: PID was reassigned to a different exe; dropping record"
+                );
+                stale_pids.push(pid);
+                continue;
             }
-            #[cfg(not(windows))]
-            {
-                let _ = (pid, expected_exe, profile, &topology);
+            if let Err(e) = sys.reassert(pid, &profile, &topology) {
+                debug!(pid, error = %e, "persistent re-assert failed");
             }
         }
 
@@ -2156,43 +2091,36 @@ impl Engine {
             let mut stale_rule_pids: Vec<u32> = Vec::new();
             let rule_pids: Vec<u32> = s.affinity_rule_applied.iter().copied().collect();
             for pid in rule_pids {
-                #[cfg(windows)]
-                {
-                    let live_exe = match framesage_sys::process::exe_for_pid(pid) {
-                        Ok(Some(path)) => {
-                            path.rsplit(['\\', '/']).next().unwrap_or(&path).to_owned()
-                        }
-                        Ok(None) | Err(_) => {
-                            stale_rule_pids.push(pid);
-                            continue;
-                        }
-                    };
-                    let Some(rule) = s.policy.affinity_rule_for(&live_exe).cloned() else {
-                        // Rule was deleted for this exe; release the PID so
-                        // it's not re-pinned on future sweeps.
+                let live_exe = match sys.exe_for_pid(pid) {
+                    Ok(Some(path)) => {
+                        path.rsplit(['\\', '/']).next().unwrap_or(&path).to_owned()
+                    }
+                    Ok(None) | Err(_) => {
                         stale_rule_pids.push(pid);
                         continue;
-                    };
-                    let indices = topology.resolve(&rule.selector);
-                    if indices.is_empty() {
-                        continue;
                     }
-                    let mut mask: u64 = 0;
-                    for idx in indices {
-                        if idx < 64 {
-                            mask |= 1u64 << idx;
-                        }
-                    }
-                    if mask == 0 {
-                        continue;
-                    }
-                    if let Err(e) = framesage_sys::apply::set_affinity_mask_for_pid(pid, mask) {
-                        debug!(pid, error = %e, "affinity rule re-assert failed");
+                };
+                let Some(rule) = s.policy.affinity_rule_for(&live_exe).cloned() else {
+                    // Rule was deleted for this exe; release the PID so
+                    // it's not re-pinned on future sweeps.
+                    stale_rule_pids.push(pid);
+                    continue;
+                };
+                let indices = topology.resolve(&rule.selector);
+                if indices.is_empty() {
+                    continue;
+                }
+                let mut mask: u64 = 0;
+                for idx in indices {
+                    if idx < 64 {
+                        mask |= 1u64 << idx;
                     }
                 }
-                #[cfg(not(windows))]
-                {
-                    let _ = (pid, &topology);
+                if mask == 0 {
+                    continue;
+                }
+                if let Err(e) = sys.set_affinity_mask_for_pid(pid, mask) {
+                    debug!(pid, error = %e, "affinity rule re-assert failed");
                 }
             }
             for pid in stale_rule_pids {
@@ -2219,6 +2147,7 @@ impl Engine {
         s: &mut EngineState,
         safe_list: &'static SafeList,
         events: &broadcast::Sender<Event>,
+        sys: &dyn framesage_sys::SysApi,
     ) {
         // Bail early if the policy doesn't want background enforcement at all.
         let Some(bg_profile_id) = s.policy.background_profile.clone() else {
@@ -2240,7 +2169,7 @@ impl Engine {
         }
         s.last_background_scan = Some(now);
 
-        let live_pids: Vec<u32> = match framesage_sys::process::iter_pids() {
+        let live_pids: Vec<u32> = match sys.iter_pids() {
             Ok(v) => v,
             Err(e) => {
                 warn!(error = %e, "process enumeration failed; skipping background scan");
@@ -2290,7 +2219,7 @@ impl Engine {
                 if s.affinity_rule_applied.contains(&pid) {
                     continue;
                 }
-                let live_exe = match framesage_sys::process::exe_for_pid(pid) {
+                let live_exe = match sys.exe_for_pid(pid) {
                     Ok(Some(path)) => path.rsplit(['\\', '/']).next().unwrap_or(&path).to_owned(),
                     Ok(None) | Err(_) => continue,
                 };
@@ -2317,7 +2246,7 @@ impl Engine {
                 if mask == 0 {
                     continue;
                 }
-                match framesage_sys::apply::set_affinity_mask_for_pid(pid, mask) {
+                match sys.set_affinity_mask_for_pid(pid, mask) {
                     Ok(()) => {
                         // Only mark on success — a failed apply might be
                         // transient (PID exiting mid-call) and we want a
@@ -2361,7 +2290,7 @@ impl Engine {
             // Filter against the safe-list denylist — same denylist that
             // protects suspend_processes, repurposed here so we don't, e.g.,
             // throttle dwm or audiodg into stuttering territory.
-            let exe_name = match framesage_sys::process::exe_for_pid(pid) {
+            let exe_name = match sys.exe_for_pid(pid) {
                 Ok(Some(path)) => path.rsplit(['\\', '/']).next().unwrap_or(&path).to_owned(),
                 Ok(None) => continue, // exited mid-snapshot, or unreadable
                 Err(_) => continue,
@@ -2393,7 +2322,7 @@ impl Engine {
                 .and_then(|r| s.policy.profile(&r.profile).cloned())
                 .unwrap_or_else(|| bg_profile.clone());
 
-            match apply_profile(pid, &exe_name, &profile_for_pid, &topology, safe_list) {
+            match apply_profile(sys, pid, &exe_name, &profile_for_pid, &topology, safe_list) {
                 Ok(record) => {
                     let profile_id_emitted = record.profile_id.clone();
                     let exe_emitted = record.exe_name.clone();
@@ -2457,7 +2386,7 @@ impl Engine {
                     .unwrap_or(false);
                 if !keep {
                     if let Some(record) = s.applied.remove(&prev_pid) {
-                        revert_record(&self.events, prev_pid, record);
+                        revert_record(self.sys.as_ref(), &self.events, prev_pid, record);
                     }
                 }
             }
@@ -2525,7 +2454,7 @@ impl Engine {
             .unwrap_or(false);
         if !already_correct {
             if let Some(prev_record) = s.applied.remove(&fg.pid) {
-                revert_record(&self.events, fg.pid, prev_record);
+                revert_record(self.sys.as_ref(), &self.events, fg.pid, prev_record);
             }
         }
 
@@ -2557,7 +2486,14 @@ impl Engine {
             );
             return Ok(());
         }
-        match apply_profile(fg.pid, &fg.exe_name, &profile, &topology, self.safe_list) {
+        match apply_profile(
+            self.sys.as_ref(),
+            fg.pid,
+            &fg.exe_name,
+            &profile,
+            &topology,
+            self.safe_list,
+        ) {
             Ok(record) => {
                 info!(pid = fg.pid, exe = %fg.exe_name, profile = %profile_id, "applied");
                 s.applied.insert(fg.pid, record);
@@ -2949,11 +2885,15 @@ fn classify_apply_failure(err: &anyhow::Error) -> ActionFailedKind {
 /// `Event::ActionFailed` if the kernel revert call returned an error
 /// — the user's process may be left in the modified state, which is
 /// exactly the case audit H-30 wanted surfaced.
-fn revert_record(events: &broadcast::Sender<Event>, pid: u32, record: AppliedRecord) {
+fn revert_record(
+    sys: &dyn framesage_sys::SysApi,
+    events: &broadcast::Sender<Event>,
+    pid: u32,
+    record: AppliedRecord,
+) {
     let profile_id = record.profile_id.clone();
     let exe_name = record.exe_name.clone();
-    #[cfg(windows)]
-    if let Err(e) = framesage_sys::apply::revert(pid, record.state) {
+    if let Err(e) = sys.revert(pid, record.state) {
         warn!(pid, error = %e, "revert failed");
         let _ = events.send(Event::ActionFailed {
             kind: ActionFailedKind::Revert,
@@ -2961,13 +2901,6 @@ fn revert_record(events: &broadcast::Sender<Event>, pid: u32, record: AppliedRec
             exe_name: Some(exe_name.clone()),
             details: format!("revert failed: {e:#}"),
         });
-    }
-    #[cfg(not(windows))]
-    {
-        // Simulator path: no kernel revert, but mirror the event
-        // timeline so tray-driven scenarios in `framesage-sim` exercise
-        // the same emission path.
-        let _ = record;
     }
     debug!(pid, profile = %profile_id, "reverted");
     let _ = events.send(Event::ProfileReverted {
@@ -3005,8 +2938,8 @@ fn applied_from_plan(plan: &ActionPlan) -> AppliedActions {
     a
 }
 
-#[cfg(windows)]
 fn apply_profile(
+    sys: &dyn framesage_sys::SysApi,
     pid: u32,
     exe_name: &str,
     profile: &Profile,
@@ -3065,35 +2998,11 @@ fn apply_profile(
         }
     };
 
-    let state = framesage_sys::apply::apply(pid, &effective_profile, topology)?;
+    let state = sys.apply(pid, &effective_profile, topology)?;
     Ok(AppliedRecord {
         profile_id: profile.id.clone(),
         exe_name: exe_name.to_owned(),
         state,
-    })
-}
-
-#[cfg(not(windows))]
-fn apply_profile(
-    _pid: u32,
-    exe_name: &str,
-    profile: &Profile,
-    _topology: &CpuTopology,
-    safe_list: &'static SafeList,
-) -> Result<AppliedRecord> {
-    check_process_modifiable(safe_list, exe_name, "apply profile")?;
-    // Mirror the Windows side's AC-tier check so sim builds catch
-    // Disabled-tier misuse.
-    if matches!(profile.ac_safe_mode_target, AntiCheatProfile::Disabled) {
-        return Err(anyhow::anyhow!(
-            "profile '{}' has ac_safe_mode_target=Disabled — apply refused",
-            profile.id.0
-        ));
-    }
-    Ok(AppliedRecord {
-        profile_id: profile.id.clone(),
-        exe_name: exe_name.to_owned(),
-        _phantom: (),
     })
 }
 
@@ -3144,9 +3053,16 @@ fn check_process_modifiable(
 /// IPC handler before consulting the safe-list. PID-lookup failure is
 /// surfaced cleanly so the tray's status banner can explain "process is
 /// gone" instead of swallowing the action silently.
-#[cfg(windows)]
-fn resolve_exe_for_pid_or_err(pid: u32, action: &str) -> Result<String> {
-    match framesage_sys::process::exe_for_pid(pid) {
+///
+/// Item 3.1b — takes `sys` explicitly so this stays a free function
+/// callable from both `&self` Engine methods and free apply/revert
+/// helpers without a borrow split.
+fn resolve_exe_for_pid_or_err(
+    sys: &dyn framesage_sys::SysApi,
+    pid: u32,
+    action: &str,
+) -> Result<String> {
+    match sys.exe_for_pid(pid) {
         Ok(Some(path)) => Ok(path.rsplit(['\\', '/']).next().unwrap_or(&path).to_owned()),
         Ok(None) => Err(anyhow::anyhow!(
             "cannot {action} on pid {pid}: process not found or inaccessible \
@@ -3156,15 +3072,6 @@ fn resolve_exe_for_pid_or_err(pid: u32, action: &str) -> Result<String> {
             "cannot {action} on pid {pid}: exe lookup failed: {e}",
         )),
     }
-}
-
-#[cfg(not(windows))]
-fn resolve_exe_for_pid_or_err(pid: u32, action: &str) -> Result<String> {
-    let _ = (pid, action);
-    // On non-Windows (sim builds), there's no real process — return a
-    // placeholder exe that's never on the denylist so handlers exercise
-    // their full path without spurious refusals.
-    Ok(format!("pid-{pid}.exe"))
 }
 
 // ─── platform-specific shims ──────────────────────────────────────────────
@@ -3844,13 +3751,102 @@ mod tests {
         fn iter_pids(&self) -> Result<Vec<u32>> {
             Ok(Vec::new())
         }
+        fn iter_pid_snapshots(&self) -> Result<Vec<framesage_sys::process::PidSnapshot>> {
+            Ok(Vec::new())
+        }
+        fn enumerate_processes(&self) -> Result<Vec<framesage_sys::sys_proc_info::SysProcInfo>> {
+            Err(anyhow::anyhow!("mock: not supported"))
+        }
         fn exe_for_pid(&self, _pid: u32) -> Result<Option<String>> {
             Ok(None)
+        }
+        fn user_for_pid(&self, _pid: u32) -> Result<Option<String>> {
+            Ok(None)
+        }
+        fn cpu_times(
+            &self,
+            _pid: u32,
+        ) -> Result<Option<framesage_sys::process::ProcessCpuTimes>> {
+            Ok(None)
+        }
+        fn memory_info(&self, _pid: u32) -> Result<Option<framesage_sys::process::MemoryInfo>> {
+            Ok(None)
+        }
+        fn affinity_mask(&self, _pid: u32) -> Result<Option<u64>> {
+            Ok(None)
+        }
+        fn system_cpu_times(&self) -> Result<framesage_sys::process::SystemCpuTimes> {
+            // No Default impl in the Windows variant; construct
+            // explicitly with zeros.
+            Ok(framesage_sys::process::SystemCpuTimes {
+                idle_100ns: 0,
+                kernel_100ns: 0,
+                user_100ns: 0,
+            })
+        }
+        fn per_cpu_times(&self) -> Result<Vec<framesage_sys::process::PerCpuTimes>> {
+            Ok(Vec::new())
+        }
+        fn memory_status(&self) -> Result<(u64, u64)> {
+            Ok((0, 0))
         }
         fn current_foreground(
             &self,
         ) -> Result<Option<framesage_sys::foreground::ForegroundInfo>> {
             Ok(None)
+        }
+        fn apply(
+            &self,
+            _pid: u32,
+            _profile: &Profile,
+            _topology: &CpuTopology,
+        ) -> Result<framesage_sys::apply::AppliedState> {
+            Err(anyhow::anyhow!("mock: not supported"))
+        }
+        fn revert(&self, _pid: u32, _state: framesage_sys::apply::AppliedState) -> Result<()> {
+            Ok(())
+        }
+        fn reassert(
+            &self,
+            _pid: u32,
+            _profile: &Profile,
+            _topology: &CpuTopology,
+        ) -> Result<()> {
+            Ok(())
+        }
+        fn get_priority_class_for_pid(&self, _pid: u32) -> Result<Option<u32>> {
+            Ok(None)
+        }
+        fn set_priority_class_for_pid(
+            &self,
+            _pid: u32,
+            _class: framesage_core::PriorityClass,
+        ) -> Result<()> {
+            Ok(())
+        }
+        fn restore_priority_class_for_pid(&self, _pid: u32, _raw_class: u32) -> Result<()> {
+            Ok(())
+        }
+        fn set_affinity_mask_for_pid(&self, _pid: u32, _mask: u64) -> Result<()> {
+            Ok(())
+        }
+        fn trim_working_set_for_pid(&self, _pid: u32) -> Result<()> {
+            Ok(())
+        }
+        fn suspend_process(&self, _pid: u32) -> Result<()> {
+            Ok(())
+        }
+        fn resume_process(&self, _pid: u32) -> Result<()> {
+            Ok(())
+        }
+        fn terminate_process(&self, _pid: u32) -> Result<()> {
+            Ok(())
+        }
+        fn read_version_info(
+            &self,
+            _exe_path: &str,
+        ) -> Result<framesage_sys::version_info::VersionInfo> {
+            Ok(framesage_sys::version_info::VersionInfo::default())
         }
     }
 
@@ -3978,17 +3974,13 @@ mod tests {
     #[test]
     fn revert_record_emits_profile_reverted() {
         let (tx, mut rx) = broadcast::channel(8);
-        #[cfg(windows)]
-        let state = framesage_sys::apply::AppliedState::default();
+        let sys: Arc<dyn framesage_sys::SysApi> = Arc::new(MockSysApi::new());
         let record = AppliedRecord {
             profile_id: ProfileId("game-x3d".into()),
             exe_name: "Diablo IV.exe".into(),
-            #[cfg(windows)]
-            state,
-            #[cfg(not(windows))]
-            _phantom: (),
+            state: framesage_sys::apply::AppliedState::default(),
         };
-        revert_record(&tx, 4242, record);
+        revert_record(sys.as_ref(), &tx, 4242, record);
 
         // The simulator path's revert is a no-op (no kernel state to
         // restore), so only ProfileReverted should fire. On Windows,
