@@ -394,6 +394,31 @@ async fn handle_client(
     let mut reader = BufReader::new(read_half).lines();
 
     while let Some(line) = reader.next_line().await? {
+        // Item 1.8 / audit H-15. Cap per-line size at 1 MB to defeat
+        // "send a multi-GB JSON line and watch the LocalSystem service
+        // OOM" attacks. Legitimate `SetPolicy` payloads are <100 KB;
+        // legitimate everything-else is <1 KB. 1 MB is generous headroom
+        // without leaving an attack window.
+        //
+        // The kernel pipe buffer (64 KB default) already throttles
+        // attackers' throughput, but doesn't bound our Vec growth — a
+        // patient attacker could trickle 1 GB through over time.
+        // Post-read size check + connection close is the right wall.
+        const MAX_LINE_BYTES: usize = 1024 * 1024;
+        if line.len() > MAX_LINE_BYTES {
+            warn!(
+                bytes = line.len(),
+                "IPC request exceeds {MAX_LINE_BYTES} byte cap — closing connection"
+            );
+            let resp = Response::Error {
+                message: format!(
+                    "request exceeds {MAX_LINE_BYTES}-byte size limit; connection closed"
+                ),
+            };
+            let _ = write_response(&mut write_half, &resp).await;
+            break;
+        }
+
         let req: Request = match serde_json::from_str(&line) {
             Ok(r) => r,
             Err(e) => {
@@ -702,6 +727,60 @@ async fn handle_client(
                 write_response(&mut write_half, &Response::Ok).await?;
             }
             Request::Subscribe => {
+                // Item 1.8 / audit H-16. Status pipe has unlimited
+                // instances (PIPE_UNLIMITED_INSTANCES = 255 max), and
+                // any Authenticated User can call Subscribe — which
+                // holds a pipe instance open indefinitely while
+                // streaming events. Without a cap, an unprivileged
+                // user could spawn ~255 Subscribe clients, exhaust
+                // the kernel pipe-instance table, and prevent the
+                // legitimate tray's status traffic from connecting.
+                //
+                // 32 is well above legitimate use (one tray + a
+                // handful of debug CLIs) and well below the 255
+                // pipe cap so the rest of the IPC plane keeps
+                // working. The counter is process-wide rather than
+                // per-PID because per-PID would require plumbing
+                // `GetNamedPipeClientProcessId` through every
+                // accept; if 32 connections are actually open from
+                // one PID that's already pathological.
+                use std::sync::atomic::{AtomicUsize, Ordering};
+                static ACTIVE_SUBSCRIBES: AtomicUsize = AtomicUsize::new(0);
+                const MAX_SUBSCRIBES: usize = 32;
+
+                let prev = ACTIVE_SUBSCRIBES.fetch_add(1, Ordering::Relaxed);
+                if prev >= MAX_SUBSCRIBES {
+                    ACTIVE_SUBSCRIBES.fetch_sub(1, Ordering::Relaxed);
+                    warn!(
+                        active = prev + 1,
+                        max = MAX_SUBSCRIBES,
+                        "Subscribe rejected: active subscriber cap reached"
+                    );
+                    write_response(
+                        &mut write_half,
+                        &Response::Error {
+                            message: format!(
+                                "Subscribe rejected: maximum of {MAX_SUBSCRIBES} concurrent \
+                                 subscribers reached — close another client first"
+                            ),
+                        },
+                    )
+                    .await?;
+                    continue;
+                }
+
+                // RAII guard ensures the counter decrements even if
+                // the connection dies mid-stream / panics / hits an
+                // IO error. Without this, every dropped Subscribe
+                // would leak a count and we'd hit the cap quickly.
+                struct SubGuard;
+                impl Drop for SubGuard {
+                    fn drop(&mut self) {
+                        ACTIVE_SUBSCRIBES.fetch_sub(1, Ordering::Relaxed);
+                    }
+                }
+                let _sub_guard = SubGuard;
+
                 write_response(&mut write_half, &Response::Ok).await?;
                 let mut rx = engine.subscribe();
                 while let Ok(event) = rx.recv().await {
