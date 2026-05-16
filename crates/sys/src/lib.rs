@@ -17,3 +17,9 @@ mod stub;
 
 #[cfg(not(windows))]
 pub use stub::*;
+
+// Item 3.1 — trait abstraction over the syscall surface. Lives at
+// the crate root so the production `RealSysApi` can forward to either
+// `inner` or `stub` modules transparently.
+mod api;
+pub use api::{RealSysApi, SysApi};
