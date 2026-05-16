@@ -169,6 +169,20 @@ pub fn apply(pid: u32, profile: &Profile, topology: &CpuTopology) -> Result<Appl
     if let Some(sel) = &profile.affinity_mask {
         let indices = topology.resolve(sel);
         let mask = mask_from_indices(&indices);
+        // Item 4.4 — refuse a zero result. A profile resolving to an
+        // empty mask would otherwise call SetProcessAffinityMask(0),
+        // which the kernel rejects with ERROR_INVALID_PARAMETER —
+        // surface the issue with a clear local error instead. The
+        // `set_affinity_mask` helper enforces the same invariant after
+        // intersecting with system_mask, but failing here keeps the
+        // `prev_affinity_mask` capture (one extra `get_affinity_mask`
+        // syscall) out of the rejection path.
+        if mask == 0 {
+            return Err(anyhow!(
+                "profile {} affinity_mask resolves to 0 on this topology; refusing apply",
+                profile.id
+            ));
+        }
         state.prev_affinity_mask = Some(get_affinity_mask(h)?);
         set_affinity_mask(h, mask).context("set affinity")?;
     }
@@ -459,8 +473,30 @@ fn get_affinity_mask(handle: HANDLE) -> Result<usize> {
 }
 
 fn set_affinity_mask(handle: HANDLE, mask: usize) -> Result<()> {
-    // SAFETY: handle valid.
-    unsafe { SetProcessAffinityMask(handle, mask) }
+    // Item 4.4 — sanitize against the live system affinity mask.
+    // Without this, a profile carrying a hand-edited 64-bit mask
+    // (e.g. all-bits-set on a 16-thread box) gets passed through
+    // unchanged; SetProcessAffinityMask then rejects it with
+    // ERROR_INVALID_PARAMETER because the requested set isn't a
+    // subset of system_mask. Intersecting upstream both turns the
+    // request into something the kernel WILL accept AND surfaces a
+    // clear local error when the intersection is empty (rather than
+    // the opaque kernel-level error we'd otherwise propagate).
+    let mut process_mask: usize = 0;
+    let mut system_mask: usize = 0;
+    // SAFETY: handle valid, out params are valid.
+    unsafe { GetProcessAffinityMask(handle, &mut process_mask, &mut system_mask) }
+        .map_err(|e| anyhow!("GetProcessAffinityMask (for sanitization) failed: {e}"))?;
+    let sanitized = mask & system_mask;
+    if sanitized == 0 {
+        return Err(anyhow!(
+            "refusing SetProcessAffinityMask: requested mask 0x{:x} has no intersection with system mask 0x{:x} (would leave the process with no CPU)",
+            mask,
+            system_mask
+        ));
+    }
+    // SAFETY: handle valid; sanitized is non-zero and a subset of system_mask.
+    unsafe { SetProcessAffinityMask(handle, sanitized) }
         .map_err(|e| anyhow!("SetProcessAffinityMask failed: {e}"))
 }
 
