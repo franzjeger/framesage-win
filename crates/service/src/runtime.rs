@@ -724,6 +724,36 @@ async fn handle_client(
                     continue;
                 }
 
+                // Item 4.11 — structural validation against current
+                // topology. Catches dangling rule refs (rule.profile
+                // points at a profile id that doesn't exist), out-of-
+                // range CCD selectors (`Ccd(7)` on a single-CCD chip
+                // would silently resolve to empty + then skip apply
+                // entirely), and `Mask(0)` (would refuse at apply time
+                // anyway — surface here so the user sees the issue
+                // before they save).
+                let topology = engine.topology_snapshot();
+                let structural = policy.validate_structure(&topology);
+                if !structural.is_empty() {
+                    warn!(
+                        count = structural.len(),
+                        "SetPolicy rejected: structural errors"
+                    );
+                    write_response(
+                        &mut write_half,
+                        &Response::Error {
+                            message: format!(
+                                "SetPolicy rejected: {} structural error{}:\n  {}",
+                                structural.len(),
+                                if structural.len() == 1 { "" } else { "s" },
+                                structural.join("\n  "),
+                            ),
+                        },
+                    )
+                    .await?;
+                    continue;
+                }
+
                 // Apply in-memory first so subsequent ticks see the change
                 // immediately, then persist to disk so the edit survives
                 // service restart. The FS watcher will fire a redundant

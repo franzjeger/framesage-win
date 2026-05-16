@@ -539,6 +539,14 @@ impl Engine {
         }
     }
 
+    /// Item 4.11 — expose the current topology snapshot so the IPC
+    /// layer can validate incoming policies before forwarding to
+    /// `set_policy`. Cheap (Arc clone). Returned snapshot is the same
+    /// one the engine resolves selectors against on the next tick.
+    pub fn topology_snapshot(&self) -> Arc<CpuTopology> {
+        self.state.read().topology.clone()
+    }
+
     pub fn set_policy(&self, policy: Policy) {
         // Refresh the cached user-ignore set whenever policy changes —
         // the ignore list is the only ProBalance-relevant field the user
