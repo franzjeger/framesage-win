@@ -32,7 +32,9 @@
 #![cfg_attr(not(windows), allow(dead_code))]
 
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
+
+use parking_lot::Mutex;
 
 use eframe::egui;
 use framesage_ipc::{Event, ProcessSnapshot, Request, Response, StatusSnapshot, SystemMetrics};
@@ -69,7 +71,7 @@ pub(crate) fn background_loop(state: Arc<Mutex<AppState>>) {
         match try_connect_and_serve(state.clone(), activity_log.as_mut()) {
             Ok(()) => {}
             Err(e) => {
-                let mut s = state.lock().unwrap();
+                let mut s = state.lock();
                 s.connected = false;
                 s.last_error = Some(format!("{e:#}"));
             }
@@ -97,7 +99,7 @@ fn try_connect_and_serve(
         .write(true)
         .open(framesage_ipc::PIPE_NAME_STATUS)?;
     {
-        let mut s = state.lock().unwrap();
+        let mut s = state.lock();
         s.connected = true;
         s.last_error = None;
     }
@@ -113,7 +115,7 @@ fn try_connect_and_serve(
     let mut line = String::new();
     reader.read_line(&mut line)?;
     if let Ok(Response::Status(snap)) = serde_json::from_str::<Response>(&line) {
-        state.lock().unwrap().status = Some(*snap);
+        state.lock().status = Some(*snap);
     }
 
     // Then subscribe to events.
@@ -271,7 +273,7 @@ fn try_connect_and_serve(
                 }
             }
 
-            let mut s = state.lock().unwrap();
+            let mut s = state.lock();
             s.recent.push(RecentEvent {
                 at: now,
                 kind,
@@ -300,7 +302,7 @@ fn try_connect_and_serve(
 
 #[cfg(not(windows))]
 pub(crate) fn background_loop(state: Arc<Mutex<AppState>>) {
-    let mut s = state.lock().unwrap();
+    let mut s = state.lock();
     s.last_error = Some("tray UI only operates against a Windows service".into());
 }
 
@@ -334,7 +336,7 @@ pub(crate) fn processes_poll_loop(
                     0
                 };
                 let cpu_for_history = system.cpu_percent;
-                let mut s = state.lock().unwrap();
+                let mut s = state.lock();
                 s.processes = snapshots;
                 s.system = system;
                 // Refresh the cached Status every tick so the UI never

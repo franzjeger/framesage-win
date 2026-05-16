@@ -14,7 +14,9 @@
 #![cfg_attr(windows, windows_subsystem = "windows")]
 
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
+
+use parking_lot::Mutex;
 
 use eframe::egui;
 
@@ -388,7 +390,7 @@ impl FramesageApp {
         match activity_log::ActivityLog::open() {
             Ok(log) => match log.load_last(HYDRATE_LIMIT) {
                 Ok(persisted) => {
-                    let mut s = state.lock().unwrap();
+                    let mut s = state.lock();
                     for pe in persisted {
                         let kind = EventKind::from_persist_tag(&pe.kind);
                         let at = std::time::UNIX_EPOCH
@@ -513,14 +515,14 @@ impl FramesageApp {
                 Ok(Response::Error { message }) => format!("{label}: error — {message}"),
                 Err(e) => format!("{label}: error — {e}"),
             };
-            *last_action.lock().unwrap() = Some(msg);
+            *last_action.lock() = Some(msg);
         });
     }
 
     #[cfg(not(windows))]
     fn send_admin_request(&self, _req: Request, _label: &'static str) {
         // No-op on non-Windows so this stub still compiles in cross-checks.
-        *self.last_action.lock().unwrap() = Some("admin requests are Windows-only".to_string());
+        *self.last_action.lock() = Some("admin requests are Windows-only".to_string());
     }
 
     /// Look up a persistent affinity rule by exe name from the last service
@@ -528,7 +530,7 @@ impl FramesageApp {
     /// hasn't arrived yet. Locks the state mutex briefly to clone the
     /// matched rule — cheap; rules are tiny.
     fn policy_snapshot_lookup_rule(&self, exe_name: &str) -> Option<framesage_core::AffinityRule> {
-        let s = self.state.lock().unwrap();
+        let s = self.state.lock();
         s.status
             .as_ref()?
             .policy
@@ -648,7 +650,7 @@ impl eframe::App for FramesageApp {
         }
         // View → Tab. Pre-set the tab BEFORE the window becomes visible so
         // the first frame painted after show paints the right tab.
-        if let Some(target) = self.commands.jump_to_tab.lock().unwrap().take() {
+        if let Some(target) = self.commands.jump_to_tab.lock().take() {
             self.tab = target;
         }
 
@@ -678,7 +680,7 @@ impl eframe::App for FramesageApp {
         // edit form needs &mut self.rules which conflicts with a long-held
         // immutable borrow of state.
         let (connected, last_error, status_snapshot, recent_events) = {
-            let s = self.state.lock().unwrap();
+            let s = self.state.lock();
             (
                 s.connected,
                 s.last_error.clone(),
@@ -712,7 +714,7 @@ impl eframe::App for FramesageApp {
         // virtualized list and we don't want a long borrow blocking the
         // poller thread on its 1 Hz refresh).
         {
-            let s = self.state.lock().unwrap();
+            let s = self.state.lock();
             if !s.processes.is_empty() || self.processes.rows.is_empty() {
                 self.processes.rows = s.processes.clone();
             }
@@ -720,7 +722,7 @@ impl eframe::App for FramesageApp {
 
         // Pull metrics + activity for the always-visible top/bottom strips.
         let (system_metrics, system_history, recent_for_strip) = {
-            let s = self.state.lock().unwrap();
+            let s = self.state.lock();
             (
                 s.system.clone(),
                 s.system_history.iter().copied().collect::<Vec<_>>(),
@@ -747,7 +749,7 @@ impl eframe::App for FramesageApp {
             .iter()
             .filter(|p| p.managed_profile.is_some())
             .count();
-        let last_action_text = self.last_action.lock().unwrap().clone();
+        let last_action_text = self.last_action.lock().clone();
 
         // ─── Menu bar ──────────────────────────────────────────────────────
         // File / Engine / View / Tools / Help on the left, FrameSage brand
@@ -959,7 +961,7 @@ impl FramesageApp {
         // CPU count: prefer per_core_cpu_percent length (live), fall back
         // to 32 as a sane default.
         let cpu_count = {
-            let s = self.state.lock().unwrap();
+            let s = self.state.lock();
             let n = s.system.per_core_cpu_percent.len();
             if n == 0 {
                 32
@@ -1721,7 +1723,7 @@ impl FramesageApp {
                                     self.commands.exit_requested.store(true, Ordering::Relaxed);
                                 }
                                 Err(e) => {
-                                    *self.last_action.lock().unwrap() =
+                                    *self.last_action.lock() =
                                         Some(format!("relaunch failed: {e}"));
                                 }
                             }
@@ -1729,7 +1731,7 @@ impl FramesageApp {
                     });
                 });
             });
-            if let Some(msg) = self.last_action.lock().unwrap().as_ref() {
+            if let Some(msg) = self.last_action.lock().as_ref() {
                 ui.add_space(2.0);
                 ui.small(msg);
             }
@@ -1819,7 +1821,7 @@ impl FramesageApp {
                 }
             }
 
-            if let Some(msg) = self.last_action.lock().unwrap().as_ref() {
+            if let Some(msg) = self.last_action.lock().as_ref() {
                 ui.add_space(4.0);
                 ui.small(msg);
             }
@@ -1839,7 +1841,7 @@ impl FramesageApp {
         // Snapshot the event buffer + clear flag under a short lock so the
         // render closure doesn't hold the mutex across the table walk.
         let events: Vec<RecentEvent> = {
-            let s = self.state.lock().unwrap();
+            let s = self.state.lock();
             s.recent
                 .iter()
                 .map(|e| RecentEvent {
@@ -1878,7 +1880,7 @@ impl FramesageApp {
                 let total = events.len();
                 ui.colored_label(theme::TEXT_MUTED, format!("{total} events"));
                 if ui.button("Clear log").clicked() {
-                    self.state.lock().unwrap().recent.clear();
+                    self.state.lock().recent.clear();
                 }
             });
         });
@@ -2072,7 +2074,7 @@ impl FramesageApp {
             }
         });
 
-        if let Some(msg) = self.last_action.lock().unwrap().as_ref() {
+        if let Some(msg) = self.last_action.lock().as_ref() {
             ui.small(msg);
         }
 
@@ -2586,7 +2588,7 @@ impl FramesageApp {
                 "Profile edits need admin — open the Status tab and click Enable controls.",
             );
         }
-        if let Some(msg) = self.last_action.lock().unwrap().as_ref() {
+        if let Some(msg) = self.last_action.lock().as_ref() {
             ui.small(msg);
         }
         ui.add_space(8.0);
@@ -3951,7 +3953,7 @@ impl FramesageApp {
                                 );
                             }
                             None => {
-                                *self.last_action.lock().unwrap() =
+                                *self.last_action.lock() =
                                     Some(format!("Rule for {exe_name} already exists"));
                             }
                         }
@@ -4039,7 +4041,7 @@ impl FramesageApp {
                     // (which might be the rule's mask or might be drift from
                     // an external change since rule apply).
                     let topology_cpu_count =
-                        self.state.lock().unwrap().system.per_core_cpu_percent.len();
+                        self.state.lock().system.per_core_cpu_percent.len();
                     let existing_rule_mask = self
                         .policy_snapshot_lookup_rule(&exe_name)
                         .map(|rule| selector_to_mask(&rule.selector, topology_cpu_count));
@@ -4061,11 +4063,11 @@ impl FramesageApp {
                 }
                 ProcessAction::ShowInExplorer { path } => {
                     open_explorer_select(&path);
-                    *self.last_action.lock().unwrap() = Some(format!("show in explorer: {path}"));
+                    *self.last_action.lock() = Some(format!("show in explorer: {path}"));
                 }
                 ProcessAction::CopyToClipboard { text } => {
                     ui.ctx().copy_text(text.clone());
-                    *self.last_action.lock().unwrap() =
+                    *self.last_action.lock() =
                         Some(format!("copied: {}", truncate_for_echo(&text, 40)));
                 }
                 ProcessAction::SuspendTree { root_pid } => {
