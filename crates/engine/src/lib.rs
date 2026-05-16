@@ -420,6 +420,17 @@ struct AppliedRecord {
     /// type that's defined on both Windows (real syscalls) and non-
     /// Windows (unit struct via the stub module).
     state: framesage_sys::apply::AppliedState,
+    /// Item 4.7 — raw Win32 priority class observed RIGHT after our
+    /// apply landed. Acts as the ground-truth "we applied this" value
+    /// the revert path compares against; if the live value has since
+    /// drifted (user changed via Task Manager), revert skips that
+    /// PID rather than silently undoing the user's manual choice.
+    /// `None` means the profile didn't touch priority — no drift
+    /// signal to read, revert proceeds as before.
+    applied_priority_class_raw: Option<u32>,
+    /// Item 4.7 — process affinity mask observed right after apply.
+    /// Same drift semantic as `applied_priority_class_raw`.
+    applied_affinity_mask: Option<u64>,
 }
 
 /// What we entered into Game Mode for; mirrors the journal on disk.
@@ -3174,6 +3185,34 @@ fn revert_record(
 ) {
     let profile_id = record.profile_id.clone();
     let exe_name = record.exe_name.clone();
+
+    // Item 4.7 — revert-state-drift detection. If the user changed
+    // priority/affinity via Task Manager mid-session, our revert
+    // would silently undo their manual choice. Detect drift first;
+    // on detect, skip the revert entirely and surface
+    // ActionFailed::DriftDetected so the activity feed makes the
+    // skipped revert visible.
+    if let Some(drift) = detect_apply_drift(sys, pid, &record) {
+        warn!(
+            pid,
+            exe = %exe_name,
+            detail = %drift,
+            "revert: skipping — live state drifted from what we applied (likely user-edited via Task Manager)"
+        );
+        let _ = events.send(Event::ActionFailed {
+            kind: ActionFailedKind::DriftDetected,
+            pid: Some(pid),
+            exe_name: Some(exe_name.clone()),
+            details: format!(
+                "revert skipped: live process state drifted ({drift}); manual change preserved"
+            ),
+        });
+        // We do NOT emit ProfileReverted on the drift skip — we
+        // didn't revert anything, so claiming we did would
+        // mis-label the activity feed.
+        return;
+    }
+
     if let Err(e) = sys.revert(pid, record.state) {
         warn!(pid, error = %e, "revert failed");
         let _ = events.send(Event::ActionFailed {
@@ -3189,6 +3228,40 @@ fn revert_record(
         exe_name,
         profile_id,
     });
+}
+
+/// Item 4.7 — return `Some(reason)` if the live priority class or
+/// affinity mask differs from what `AppliedRecord` captured at apply
+/// time. Returns `None` for no detectable drift (either we never
+/// touched the knob, or the live value still matches). Best-effort:
+/// if the kernel queries fail (rare; process exited mid-call), we
+/// return `None` and let the revert proceed — better to attempt a
+/// no-op revert on an exited PID than skip a legitimate revert based
+/// on a transient error.
+fn detect_apply_drift(
+    sys: &dyn framesage_sys::SysApi,
+    pid: u32,
+    record: &AppliedRecord,
+) -> Option<String> {
+    if let Some(applied_class) = record.applied_priority_class_raw {
+        if let Ok(Some(live_class)) = sys.get_priority_class_for_pid(pid) {
+            if live_class != applied_class {
+                return Some(format!(
+                    "priority class: applied 0x{applied_class:x}, live 0x{live_class:x}"
+                ));
+            }
+        }
+    }
+    if let Some(applied_mask) = record.applied_affinity_mask {
+        if let Ok(Some(live_mask)) = sys.affinity_mask(pid) {
+            if live_mask != applied_mask {
+                return Some(format!(
+                    "affinity mask: applied 0x{applied_mask:x}, live 0x{live_mask:x}"
+                ));
+            }
+        }
+    }
+    None
 }
 
 /// Project a plan's actions onto an `AppliedActions` record describing what
@@ -3296,10 +3369,32 @@ fn apply_profile(
     };
 
     let state = sys.apply(pid, &effective_profile, topology)?;
+
+    // Item 4.7 — capture the live values right after the apply landed
+    // for drift detection at revert time. Only capture knobs the
+    // profile actually wrote (`None` for the others so revert knows
+    // there's no signal to read). Best-effort: a syscall failure here
+    // doesn't roll back the apply — we just record `None` and forgo
+    // drift detection for that knob.
+    let applied_priority_class_raw = if effective_profile.priority_class.is_some() {
+        sys.get_priority_class_for_pid(pid).ok().flatten()
+    } else {
+        None
+    };
+    let applied_affinity_mask = if effective_profile.affinity_mask.is_some()
+        || effective_profile.cpu_sets.is_some()
+    {
+        sys.affinity_mask(pid).ok().flatten()
+    } else {
+        None
+    };
+
     Ok(AppliedRecord {
         profile_id: profile.id.clone(),
         exe_name: exe_name.to_owned(),
         state,
+        applied_priority_class_raw,
+        applied_affinity_mask,
     })
 }
 
@@ -4244,6 +4339,109 @@ mod tests {
         assert_eq!(APPLY_FAILURE_BACKOFF, Duration::from_secs(30));
     }
 
+    // ─── Item 4.7 — revert-state-drift detection ────────────────────────
+
+    fn drift_record(
+        applied_priority_class_raw: Option<u32>,
+        applied_affinity_mask: Option<u64>,
+    ) -> AppliedRecord {
+        AppliedRecord {
+            profile_id: ProfileId("perf".into()),
+            exe_name: "notepad.exe".into(),
+            state: framesage_sys::apply::AppliedState::default(),
+            applied_priority_class_raw,
+            applied_affinity_mask,
+        }
+    }
+
+    /// No drift to report: live priority matches what we recorded,
+    /// affinity matches, predicate returns None → revert proceeds.
+    #[test]
+    fn detect_apply_drift_returns_none_when_live_matches_applied() {
+        let sys = Arc::new(MockSysApi::new());
+        sys.set_live_priority_class(Some(0x80)); // HIGH
+        sys.set_live_affinity_mask(Some(0xFFFF));
+        let record = drift_record(Some(0x80), Some(0xFFFF));
+        assert!(detect_apply_drift(sys.as_ref(), 1234, &record).is_none());
+    }
+
+    /// Load-bearing case: live priority is AboveNormal (0x8000) but
+    /// we recorded High (0x80) at apply time. Predicate must return
+    /// Some(_) so revert_record skips the kernel revert.
+    #[test]
+    fn detect_apply_drift_returns_some_when_priority_drifted() {
+        let sys = Arc::new(MockSysApi::new());
+        sys.set_live_priority_class(Some(0x8000)); // ABOVE_NORMAL
+        let record = drift_record(Some(0x80), None);
+        let drift = detect_apply_drift(sys.as_ref(), 1234, &record);
+        let msg = drift.expect("drift expected when live class differs from applied");
+        assert!(
+            msg.contains("priority"),
+            "drift message must mention which knob: {msg}"
+        );
+    }
+
+    /// Mirror case for the affinity knob — user pinned to a single
+    /// core via Task Manager after we'd applied a wider mask.
+    #[test]
+    fn detect_apply_drift_returns_some_when_affinity_drifted() {
+        let sys = Arc::new(MockSysApi::new());
+        sys.set_live_affinity_mask(Some(0x01)); // user pinned to CPU 0
+        let record = drift_record(None, Some(0xFFFF));
+        let drift = detect_apply_drift(sys.as_ref(), 1234, &record);
+        let msg = drift.expect("drift expected when live mask differs from applied");
+        assert!(
+            msg.contains("affinity"),
+            "drift message must mention affinity: {msg}"
+        );
+    }
+
+    /// A profile that didn't touch priority or affinity leaves both
+    /// `applied_*` fields as None. Predicate has no signal to read
+    /// and must return None → revert proceeds. Belt-and-suspenders
+    /// against a future regression where we wrongly treat None as
+    /// "always drifted."
+    #[test]
+    fn detect_apply_drift_returns_none_when_no_applied_fields_recorded() {
+        let sys = Arc::new(MockSysApi::new());
+        sys.set_live_priority_class(Some(0x8000));
+        sys.set_live_affinity_mask(Some(0x01));
+        let record = drift_record(None, None);
+        assert!(detect_apply_drift(sys.as_ref(), 1234, &record).is_none());
+    }
+
+    /// revert_record on a drifted record must:
+    ///   1. NOT call sys.revert (no kernel mutation)
+    ///   2. emit ActionFailed { kind: DriftDetected }
+    ///   3. NOT emit ProfileReverted (since nothing reverted)
+    #[test]
+    fn revert_record_emits_drift_detected_and_skips_revert() {
+        let (tx, mut rx) = broadcast::channel(8);
+        let sys = Arc::new(MockSysApi::new());
+        // Live priority drifted from applied.
+        sys.set_live_priority_class(Some(0x8000));
+        let record = drift_record(Some(0x80), None);
+        revert_record(sys.as_ref(), &tx, 4242, record);
+
+        let mut saw_drift = false;
+        let mut saw_reverted = false;
+        while let Ok(ev) = rx.try_recv() {
+            match ev {
+                Event::ActionFailed {
+                    kind: ActionFailedKind::DriftDetected,
+                    ..
+                } => saw_drift = true,
+                Event::ProfileReverted { .. } => saw_reverted = true,
+                _ => {}
+            }
+        }
+        assert!(saw_drift, "expected ActionFailed::DriftDetected event");
+        assert!(
+            !saw_reverted,
+            "must NOT emit ProfileReverted when we skipped the revert"
+        );
+    }
+
     fn test_engine_with_profile(profile: Profile) -> Engine {
         let policy = Policy {
             default_profile: profile.id.clone(),
@@ -4306,6 +4504,13 @@ mod tests {
         ac_calls: std::sync::atomic::AtomicUsize,
         next_topology: std::sync::Mutex<framesage_core::CpuTopology>,
         topology_calls: std::sync::atomic::AtomicUsize,
+        /// Item 4.7 — scripted live priority class. `Some(class)` is
+        /// returned from `get_priority_class_for_pid` regardless of
+        /// PID; `None` mimics "PID exited / unreadable" (the engine
+        /// skips drift detection on this signal).
+        next_priority_class: std::sync::Mutex<Option<u32>>,
+        /// Item 4.7 — scripted live affinity mask. Same semantics.
+        next_affinity_mask: std::sync::Mutex<Option<u64>>,
     }
 
     impl MockSysApi {
@@ -4315,6 +4520,8 @@ mod tests {
                 ac_calls: std::sync::atomic::AtomicUsize::new(0),
                 next_topology: std::sync::Mutex::new(framesage_core::CpuTopology::default()),
                 topology_calls: std::sync::atomic::AtomicUsize::new(0),
+                next_priority_class: std::sync::Mutex::new(None),
+                next_affinity_mask: std::sync::Mutex::new(None),
             }
         }
         fn set_ac(&self, p: framesage_core::AntiCheatPresence) {
@@ -4329,6 +4536,12 @@ mod tests {
         fn topology_call_count(&self) -> usize {
             self.topology_calls
                 .load(std::sync::atomic::Ordering::Relaxed)
+        }
+        fn set_live_priority_class(&self, raw: Option<u32>) {
+            *self.next_priority_class.lock().unwrap() = raw;
+        }
+        fn set_live_affinity_mask(&self, mask: Option<u64>) {
+            *self.next_affinity_mask.lock().unwrap() = mask;
         }
     }
 
@@ -4368,7 +4581,7 @@ mod tests {
             Ok(None)
         }
         fn affinity_mask(&self, _pid: u32) -> Result<Option<u64>> {
-            Ok(None)
+            Ok(*self.next_affinity_mask.lock().unwrap())
         }
         fn system_cpu_times(&self) -> Result<framesage_sys::process::SystemCpuTimes> {
             // No Default impl in the Windows variant; construct
@@ -4410,7 +4623,7 @@ mod tests {
             Ok(())
         }
         fn get_priority_class_for_pid(&self, _pid: u32) -> Result<Option<u32>> {
-            Ok(None)
+            Ok(*self.next_priority_class.lock().unwrap())
         }
         fn set_priority_class_for_pid(
             &self,
@@ -4574,6 +4787,11 @@ mod tests {
             profile_id: ProfileId("game-x3d".into()),
             exe_name: "Diablo IV.exe".into(),
             state: framesage_sys::apply::AppliedState::default(),
+            // Item 4.7 — leave the drift-detection fields as None so
+            // detect_apply_drift sees no signal to read and lets the
+            // revert proceed (the existing assertion still holds).
+            applied_priority_class_raw: None,
+            applied_affinity_mask: None,
         };
         revert_record(sys.as_ref(), &tx, 4242, record);
 

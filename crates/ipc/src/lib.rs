@@ -553,6 +553,12 @@ pub enum ActionFailedKind {
     /// authored profile asked to touch a game process protected by
     /// an AC, but the tier configured for the rule said skip.
     AcTierBlocked,
+    /// Item 4.7 — revert was skipped because the live process state
+    /// no longer matches what we applied. Typically: user changed
+    /// priority / affinity via Task Manager mid-session. Skipping
+    /// the revert preserves the user's manual choice instead of
+    /// silently undoing it.
+    DriftDetected,
     /// Anything else — covers config-load failures, IPC errors at
     /// engine boundaries, etc. Free-form `details` carries the
     /// original error.
