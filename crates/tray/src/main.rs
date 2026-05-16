@@ -5884,6 +5884,97 @@ fn try_connect_and_serve(state: Arc<Mutex<AppState>>) -> anyhow::Result<()> {
                         exe_name, pid, restored_class
                     ),
                 ),
+                // ─── Item 2.8 / audit H-28 ──────────────────────
+                Event::GameModeEntered {
+                    profile_id,
+                    services_to_stop,
+                    processes_to_suspend,
+                    power_plan_changing,
+                    taskbar_hiding,
+                    pausing_windows_update,
+                } => (
+                    EventKind::Engine,
+                    format!(
+                        "Game Mode entered: {} ({} svcs, {} procs{}{}{})",
+                        profile_id,
+                        services_to_stop,
+                        processes_to_suspend,
+                        if *power_plan_changing {
+                            ", power plan"
+                        } else {
+                            ""
+                        },
+                        if *taskbar_hiding { ", taskbar" } else { "" },
+                        if *pausing_windows_update { ", WU" } else { "" },
+                    ),
+                ),
+                Event::GameModeExited {
+                    profile_id,
+                    services_restored,
+                    processes_resumed,
+                    duration_secs,
+                    reason,
+                    ..
+                } => (
+                    EventKind::Engine,
+                    format!(
+                        "Game Mode exited: {} after {}s ({}; {} svcs / {} procs restored)",
+                        profile_id, duration_secs, reason, services_restored, processes_resumed
+                    ),
+                ),
+                Event::ProfileApplied {
+                    pid,
+                    exe_name,
+                    profile_id,
+                } => (
+                    EventKind::Engine,
+                    format!("applied {} -> {} (pid {})", profile_id, exe_name, pid),
+                ),
+                Event::ProfileReverted {
+                    pid,
+                    exe_name,
+                    profile_id,
+                } => (
+                    EventKind::Engine,
+                    format!("reverted {} from {} (pid {})", profile_id, exe_name, pid),
+                ),
+                Event::AffinityRuleFired {
+                    pid,
+                    exe_name,
+                    rule_exe,
+                } => (
+                    EventKind::Engine,
+                    format!(
+                        "affinity rule '{}' fired against {} (pid {})",
+                        rule_exe, exe_name, pid
+                    ),
+                ),
+                Event::ActionFailed {
+                    kind,
+                    pid,
+                    exe_name,
+                    details,
+                } => (
+                    EventKind::Other,
+                    format!(
+                        "action failed: {:?}{}{}{}",
+                        kind,
+                        exe_name
+                            .as_deref()
+                            .map(|n| format!(" {n}"))
+                            .unwrap_or_default(),
+                        pid.map(|p| format!(" (pid {p})")).unwrap_or_default(),
+                        format_args!(" — {details}"),
+                    ),
+                ),
+                Event::AntiCheatPresenceChanged { which, active } => (
+                    EventKind::Engine,
+                    format!(
+                        "AC presence change: {} {}",
+                        which,
+                        if *active { "active" } else { "inactive" }
+                    ),
+                ),
             };
             let mut s = state.lock().unwrap();
             s.recent.push(RecentEvent {

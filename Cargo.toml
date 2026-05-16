@@ -34,6 +34,11 @@ thiserror = "1"
 # Logging
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+# Item 2.7 — rolling file appender for service + tray on-disk logs.
+# Service writes daily-rotated logs to %ProgramData%\framesage\logs\;
+# tray writes daily-rotated logs to %LOCALAPPDATA%\FrameSage\logs\.
+# Closes audit H-29 (no file-sink logging anywhere).
+tracing-appender = "0.2"
 
 # Serde
 serde = { version = "1", features = ["derive"] }
