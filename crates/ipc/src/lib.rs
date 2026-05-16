@@ -157,6 +157,19 @@ pub enum Request {
     /// and resumes normal foreground-driven reconcile. Idempotent:
     /// no-op if manual global wasn't active.
     DisableManualGlobalGameMode,
+    /// Item 3.5 — pop the most recent entry from the engine's
+    /// per-action undo log and apply its reverse. Returns
+    /// `Response::UndoResult { undone }` where `undone` is `None`
+    /// for an empty log. The reverse call may itself fail (PID
+    /// exited mid-undo); when that happens `summary.failure` is
+    /// `Some` but the entry is still removed (idempotent semantic:
+    /// subsequent undo invocations walk further back, never retry
+    /// the same entry).
+    Undo,
+    /// Item 3.5 — read-only view of the undo log, newest first,
+    /// capped at `limit`. Backs `framesage undo list` and the tray's
+    /// undo panel.
+    UndoLogList { limit: u32 },
 }
 
 impl Request {
@@ -169,7 +182,10 @@ impl Request {
     /// current variant by name.
     pub fn is_read_only(&self) -> bool {
         match self {
-            Request::Status | Request::Subscribe | Request::ListProcesses => true,
+            Request::Status
+            | Request::Subscribe
+            | Request::ListProcesses
+            | Request::UndoLogList { .. } => true,
             Request::SetPolicy { .. }
             | Request::ApplyOnce { .. }
             | Request::SetManualOverride { .. }
@@ -188,7 +204,8 @@ impl Request {
             | Request::SetAffinityRule { .. }
             | Request::DeleteAffinityRule { .. }
             | Request::EnableManualGlobalGameMode { .. }
-            | Request::DisableManualGlobalGameMode => false,
+            | Request::DisableManualGlobalGameMode
+            | Request::Undo => false,
         }
     }
 
@@ -220,6 +237,18 @@ pub enum Response {
         /// the current reading.
         #[serde(default)]
         system: SystemMetrics,
+    },
+    /// Item 3.5 — result of `Request::Undo`. `undone` is `None` when
+    /// the log was empty (nothing to undo); `Some(summary)` carries
+    /// the popped entry plus a human-readable description plus an
+    /// optional failure message if the reverse syscall didn't take.
+    UndoResult {
+        undone: Option<framesage_core::UndoSummary>,
+    },
+    /// Item 3.5 — result of `Request::UndoLogList`. Entries are
+    /// ordered newest-first.
+    UndoLog {
+        entries: Vec<framesage_core::UndoEntry>,
     },
     Error {
         message: String,

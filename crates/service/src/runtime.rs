@@ -643,6 +643,24 @@ async fn handle_client(
                 engine.disable_manual_global_game_mode();
                 write_response(&mut write_half, &Response::Ok).await?;
             }
+            Request::Undo => match engine.undo_last() {
+                Ok(undone) => {
+                    write_response(&mut write_half, &Response::UndoResult { undone }).await?;
+                }
+                Err(e) => {
+                    write_response(
+                        &mut write_half,
+                        &Response::Error {
+                            message: format!("undo_last failed: {e:#}"),
+                        },
+                    )
+                    .await?;
+                }
+            },
+            Request::UndoLogList { limit } => {
+                let entries = engine.undo_log_snapshot(limit as usize);
+                write_response(&mut write_half, &Response::UndoLog { entries }).await?;
+            }
             Request::DeleteAffinityRule { exe_name } => {
                 // Idempotent: delete returns Ok regardless of whether a rule
                 // existed. Still persist on every call so the empty state

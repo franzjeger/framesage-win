@@ -509,7 +509,11 @@ impl FramesageApp {
         std::thread::spawn(move || {
             let result = send_request_blocking(framesage_ipc::PIPE_NAME_ADMIN, &req);
             let msg = match result {
-                Ok(Response::Ok) | Ok(Response::Status(_)) | Ok(Response::Processes { .. }) => {
+                Ok(Response::Ok)
+                | Ok(Response::Status(_))
+                | Ok(Response::Processes { .. })
+                | Ok(Response::UndoResult { .. })
+                | Ok(Response::UndoLog { .. }) => {
                     format!("{label}: ok")
                 }
                 Ok(Response::Error { message }) => format!("{label}: error — {message}"),

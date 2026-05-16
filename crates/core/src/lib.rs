@@ -11,6 +11,7 @@ pub mod paths;
 pub mod policy;
 pub mod profile;
 pub mod topology;
+pub mod undo;
 
 pub use anti_cheat::AntiCheatPresence;
 pub use game_mode::{FocusAssistMode, GameModeActions, PowerPlanId};
@@ -20,3 +21,4 @@ pub use profile::{
     ProfileId,
 };
 pub use topology::{CoreKind, CpuSelector, CpuTopology, LogicalCpu};
+pub use undo::{UndoEntry, UndoSummary, UndoableAction};

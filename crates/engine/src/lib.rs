@@ -37,8 +37,10 @@ use tracing::{debug, info, warn};
 
 pub mod clock;
 pub mod probalance;
+pub mod undo;
 
 pub use clock::{Clock, SystemClock};
+pub use undo::{UndoEntry, UndoSummary, UndoableAction};
 
 use framesage_core::{
     AntiCheatPresence, AntiCheatProfile, CpuTopology, GameModeActions, Policy, Profile, ProfileId,
@@ -284,6 +286,16 @@ struct EngineState {
     /// not once per tick. Pruned to live PIDs each
     /// `list_process_snapshots` call.
     exe_path_cache: HashMap<u32, String>,
+    /// Item 3.5 — ring buffer of the last `UNDO_LOG_CAP` user-
+    /// initiated mutations + the prior state needed to reverse each.
+    /// Driven by `set_process_priority` / `set_process_affinity` /
+    /// `suspend_process` / `resume_process` (the four Processes-tab
+    /// right-click actions). User invokes `framesage undo` (or the
+    /// tray's Undo button — future PR) to pop and reverse the most
+    /// recent entry. In-memory only; a service restart drops the
+    /// log, which matches the user's expectation that undo is a
+    /// "right now" affordance, not a session-history archive.
+    undo_log: undo::UndoLog,
     /// Most-recent anti-cheat presence snapshot. Item 1.9 / AC matrix.
     /// Refreshed by the AC detection probe (typically piggybacked on the
     /// persistent-reassert tick). Drives two behaviors:
@@ -431,6 +443,7 @@ impl Engine {
                 ac_presence: AntiCheatPresence::default(),
                 last_ac_probe: None,
                 exe_path_cache: HashMap::new(),
+                undo_log: undo::UndoLog::default(),
             })),
             events: tx,
             safe_list: deps.safe_list,
@@ -495,7 +508,22 @@ impl Engine {
     ) -> Result<()> {
         let exe = resolve_exe_for_pid_or_err(self.sys.as_ref(), pid, "set priority")?;
         check_process_modifiable(self.safe_list, &exe, "set priority")?;
+        // Item 3.5 — capture pre-change state BEFORE the apply so the
+        // undo record knows what to restore. If the read fails we
+        // skip recording rather than fabricate a value — better to
+        // lose undo capability for this one action than to "undo" by
+        // overwriting with a wrong class. The action itself still
+        // fires.
+        let previous_raw_class = self.sys.get_priority_class_for_pid(pid).ok().flatten();
         self.sys.set_priority_class_for_pid(pid, class)?;
+        if let Some(previous_raw_class) = previous_raw_class {
+            self.state.write().undo_log.record(UndoableAction::SetPriority {
+                pid,
+                exe_name: exe,
+                previous_raw_class,
+                applied_class: class,
+            });
+        }
         Ok(())
     }
 
@@ -509,6 +537,12 @@ impl Engine {
         let exe = resolve_exe_for_pid_or_err(self.sys.as_ref(), pid, "suspend")?;
         check_process_modifiable(self.safe_list, &exe, "suspend")?;
         self.sys.suspend_process(pid)?;
+        // Item 3.5 — no prior state to capture; undo reverses by
+        // calling resume_process on the same PID.
+        self.state.write().undo_log.record(UndoableAction::SuspendProcess {
+            pid,
+            exe_name: exe,
+        });
         Ok(())
     }
 
@@ -524,6 +558,11 @@ impl Engine {
         let exe = resolve_exe_for_pid_or_err(self.sys.as_ref(), pid, "resume")?;
         check_process_modifiable(self.safe_list, &exe, "resume")?;
         self.sys.resume_process(pid)?;
+        // Item 3.5 — symmetric with suspend_process; undo re-suspends.
+        self.state.write().undo_log.record(UndoableAction::ResumeProcess {
+            pid,
+            exe_name: exe,
+        });
         Ok(())
     }
 
@@ -580,8 +619,19 @@ impl Engine {
                 selector
             ));
         }
+        // Item 3.5 — capture pre-change mask before the apply. `None`
+        // means the read failed (PID protected mid-call); the undo
+        // path will refuse to "restore" to None rather than zeroing
+        // the affinity (which would be catastrophic).
+        let previous_mask = self.sys.affinity_mask(pid).ok().flatten();
         self.sys.set_affinity_mask_for_pid(pid, mask)?;
         info!(pid, mask = format!("{:#x}", mask), "set_process_affinity");
+        self.state.write().undo_log.record(UndoableAction::SetAffinity {
+            pid,
+            exe_name: exe,
+            previous_mask,
+            applied_mask: mask,
+        });
         Ok(())
     }
 
@@ -717,6 +767,84 @@ impl Engine {
             info!(exe = %exe_name, "delete_affinity_rule");
         }
         removed
+    }
+
+    /// Item 3.5 — read-only view of the undo log, newest entry
+    /// first, capped at `limit`. Used by `framesage undo list` and
+    /// the tray's Undo panel (follow-up PR).
+    pub fn undo_log_snapshot(&self, limit: usize) -> Vec<UndoEntry> {
+        self.state.read().undo_log.snapshot_newest_first(limit)
+    }
+
+    /// Item 3.5 — pop the most recent undo entry and apply its
+    /// reverse. Returns:
+    ///
+    /// * `Ok(None)` if the log is empty.
+    /// * `Ok(Some(summary))` if an entry was popped, regardless of
+    ///   whether the reverse syscall succeeded. `summary.failure` is
+    ///   `Some` when the reverse failed (typically because the PID
+    ///   has since exited) — the entry is still removed so a second
+    ///   `undo` invocation pops the next one, not the failed one.
+    ///
+    /// Idempotency: each undo invocation removes one entry. The user
+    /// can chain `framesage undo` calls to walk further back.
+    pub fn undo_last(&self) -> Result<Option<UndoSummary>> {
+        let entry = {
+            let mut s = self.state.write();
+            match s.undo_log.pop_last() {
+                Some(e) => e,
+                None => return Ok(None),
+            }
+        };
+        // Perform the reverse outside the lock. Each undo branch
+        // calls one syscall through self.sys; failure is recorded in
+        // the summary, not propagated as Err — the caller (CLI / tray
+        // / IPC) wants the description either way.
+        let failure = match &entry.action {
+            UndoableAction::SetPriority {
+                pid,
+                previous_raw_class,
+                ..
+            } => self
+                .sys
+                .restore_priority_class_for_pid(*pid, *previous_raw_class)
+                .err()
+                .map(|e| format!("restore priority failed: {e:#}")),
+            UndoableAction::SetAffinity {
+                pid, previous_mask, ..
+            } => match previous_mask {
+                None => Some(
+                    "cannot undo: previous affinity mask was unreadable at capture time".into(),
+                ),
+                Some(mask) => self
+                    .sys
+                    .set_affinity_mask_for_pid(*pid, *mask)
+                    .err()
+                    .map(|e| format!("restore affinity failed: {e:#}")),
+            },
+            UndoableAction::SuspendProcess { pid, .. } => self
+                .sys
+                .resume_process(*pid)
+                .err()
+                .map(|e| format!("resume (undo of suspend) failed: {e:#}")),
+            UndoableAction::ResumeProcess { pid, .. } => self
+                .sys
+                .suspend_process(*pid)
+                .err()
+                .map(|e| format!("suspend (undo of resume) failed: {e:#}")),
+        };
+        let summary = format!("undone: {}", entry.action.describe());
+        info!(
+            id = entry.id,
+            action = %entry.action.describe(),
+            failed = failure.is_some(),
+            "undo_last"
+        );
+        Ok(Some(UndoSummary {
+            entry,
+            summary,
+            failure,
+        }))
     }
 
     pub fn status(&self) -> StatusSnapshot {
