@@ -304,6 +304,8 @@ impl Engine {
         pid: u32,
         class: framesage_core::PriorityClass,
     ) -> Result<()> {
+        let exe = resolve_exe_for_pid_or_err(pid, "set priority")?;
+        check_process_modifiable(self.safe_list, &exe, "set priority")?;
         #[cfg(windows)]
         {
             framesage_sys::apply::set_priority_class_for_pid(pid, class)?;
@@ -319,8 +321,11 @@ impl Engine {
     /// the Game Mode `suspend_processes` plan does, but as a one-shot for
     /// the Processes-tab right-click. Errors bubble back to the caller
     /// (the service translates into a `Response::Error`) so the user sees
-    /// the reason — usually "PID is protected" or "PID exited".
+    /// the reason — usually "PID is protected", "PID exited", or "this
+    /// process is on the framesage denylist for safety".
     pub fn suspend_process(&self, pid: u32) -> Result<()> {
+        let exe = resolve_exe_for_pid_or_err(pid, "suspend")?;
+        check_process_modifiable(self.safe_list, &exe, "suspend")?;
         #[cfg(windows)]
         {
             framesage_sys::process_actions::suspend(pid)?;
@@ -334,7 +339,15 @@ impl Engine {
 
     /// Release a previous suspend via `NtResumeProcess`. Safe on processes
     /// that aren't currently suspended (kernel returns success).
+    ///
+    /// Gated on the denylist for symmetry with `suspend_process`. The
+    /// denylist members should never have been suspended in the first
+    /// place (suspend_process refuses), so a resume call against a
+    /// denylisted PID indicates either a bug or an externally-suspended
+    /// process — neither is our responsibility to recover.
     pub fn resume_process(&self, pid: u32) -> Result<()> {
+        let exe = resolve_exe_for_pid_or_err(pid, "resume")?;
+        check_process_modifiable(self.safe_list, &exe, "resume")?;
         #[cfg(windows)]
         {
             framesage_sys::process_actions::resume(pid)?;
@@ -350,7 +363,14 @@ impl Engine {
     /// pre-launch nudge — trim fat background processes (browsers, mail
     /// clients) so a heavy app has more resident RAM headroom without
     /// hitting the pagefile.
+    ///
+    /// Denylist gate covers the audit's H1 finding: trimming Defender's
+    /// working set forces it to page-fault its signature database back in,
+    /// causing a disk-I/O storm. MsMpEng is on the bundled denylist, so the
+    /// gate refuses the action with the documented rationale.
     pub fn trim_working_set(&self, pid: u32) -> Result<()> {
+        let exe = resolve_exe_for_pid_or_err(pid, "trim working set")?;
+        check_process_modifiable(self.safe_list, &exe, "trim working set")?;
         #[cfg(windows)]
         {
             framesage_sys::apply::trim_working_set_for_pid(pid)?;
@@ -377,6 +397,8 @@ impl Engine {
         pid: u32,
         selector: framesage_core::CpuSelector,
     ) -> Result<()> {
+        let exe = resolve_exe_for_pid_or_err(pid, "set affinity")?;
+        check_process_modifiable(self.safe_list, &exe, "set affinity")?;
         #[cfg(windows)]
         {
             let topology = self.state.read().topology.clone();
@@ -413,7 +435,15 @@ impl Engine {
     /// user's intent before the request reaches us; the engine performs
     /// no further confirmation. Also strips our internal bookkeeping for
     /// the PID so a stale row doesn't haunt the next reconcile.
+    ///
+    /// Denylist gate is the most important of all — terminating csrss /
+    /// lsass / wininit / smss blue-screens the box with CRITICAL_PROCESS_DIED.
+    /// The bundled denylist covers every documented critical process; this
+    /// check is the BSOD-prevention layer. `process_actions::terminate`
+    /// already refuses PID 0 / 4 as a final belt-and-suspenders backstop.
     pub fn terminate_process(&self, pid: u32) -> Result<()> {
+        let exe = resolve_exe_for_pid_or_err(pid, "terminate")?;
+        check_process_modifiable(self.safe_list, &exe, "terminate")?;
         #[cfg(windows)]
         {
             framesage_sys::process_actions::terminate(pid)?;
@@ -905,7 +935,13 @@ impl Engine {
             }
 
             let topology = s.topology.clone();
-            match apply_profile(prev_pid, &snapshot.exe_name, &profile, &topology) {
+            match apply_profile(
+                prev_pid,
+                &snapshot.exe_name,
+                &profile,
+                &topology,
+                self.safe_list,
+            ) {
                 Ok(record) => {
                     info!(pid = prev_pid, profile = %profile_id, "force_recompute applied");
                     s.applied.insert(prev_pid, record);
@@ -1018,7 +1054,13 @@ impl Engine {
         };
 
         if !already_correct {
-            let record = apply_profile(foreground.pid, &foreground.exe_name, &profile, &topology)?;
+            let record = apply_profile(
+                foreground.pid,
+                &foreground.exe_name,
+                &profile,
+                &topology,
+                self.safe_list,
+            )?;
             info!(
                 pid = foreground.pid,
                 exe = %foreground.exe_name,
@@ -1679,13 +1721,15 @@ impl Engine {
                 .and_then(|r| s.policy.profile(&r.profile).cloned())
                 .unwrap_or_else(|| bg_profile.clone());
 
-            match apply_profile(pid, &exe_name, &profile_for_pid, &topology) {
+            match apply_profile(pid, &exe_name, &profile_for_pid, &topology, safe_list) {
                 Ok(record) => {
                     s.applied.insert(pid, record);
                     newly_applied += 1;
                 }
                 // ACCESS_DENIED / INVALID_PARAMETER on protected processes
-                // is expected and not worth surfacing.
+                // is expected and not worth surfacing — same for the new
+                // denylist-refusal path (apply_profile rejects csrss/lsass/
+                // dwm/etc. before any syscall fires).
                 Err(_) => continue,
             }
         }
@@ -1817,7 +1861,7 @@ impl Engine {
             );
             return Ok(());
         }
-        match apply_profile(fg.pid, &fg.exe_name, &profile, &topology) {
+        match apply_profile(fg.pid, &fg.exe_name, &profile, &topology, self.safe_list) {
             Ok(record) => {
                 info!(pid = fg.pid, exe = %fg.exe_name, profile = %profile_id, "applied");
                 s.applied.insert(fg.pid, record);
@@ -2039,7 +2083,19 @@ fn apply_profile(
     exe_name: &str,
     profile: &Profile,
     topology: &CpuTopology,
+    safe_list: &'static SafeList,
 ) -> Result<AppliedRecord> {
+    // Defense-in-depth: the rule-match path resolves exe_name from the
+    // foreground reporter and matches against policy rules; without this
+    // guard, a policy.json with a rule `ExeName("csrss.exe") → game-x3d`
+    // would happily push IDLE priority and a 1-CPU affinity onto csrss
+    // the moment Windows reused that PID for any briefly-foregrounded
+    // child (in practice csrss is never foregrounded, but the apply path
+    // also fires from background-scan + persistent re-assert sweeps, so
+    // narrowing the trust boundary here covers every entry path through
+    // apply()). The IPC layer also gates per-PID actions in the same way
+    // — this is the second layer for the rule-driven path.
+    check_process_modifiable(safe_list, exe_name, "apply profile")?;
     let state = framesage_sys::apply::apply(pid, profile, topology)?;
     Ok(AppliedRecord {
         profile_id: profile.id.clone(),
@@ -2054,12 +2110,84 @@ fn apply_profile(
     exe_name: &str,
     profile: &Profile,
     _topology: &CpuTopology,
+    safe_list: &'static SafeList,
 ) -> Result<AppliedRecord> {
+    check_process_modifiable(safe_list, exe_name, "apply profile")?;
     Ok(AppliedRecord {
         profile_id: profile.id.clone(),
         exe_name: exe_name.to_owned(),
         _phantom: (),
     })
+}
+
+/// Trust-boundary gate: refuse to touch a process whose exe is on the
+/// bundled denylist (kernel/session-critical, AV, anti-cheat, GPU drivers,
+/// RPC, DNS, audio stack, shell-critical). The rationale string from
+/// `gamemode/src/safe_lists/processes.json` is surfaced in the returned
+/// error so the user sees *why* it was refused, not just that it was.
+///
+/// `action` is a short human-readable label (e.g. "set priority", "suspend",
+/// "apply profile") used in the error message and log line.
+///
+/// This is the narrow safety bar the product positioning explicitly carves
+/// out: aggression on BITS / WSearch / ClickToRunSvc / OneDrive / etc. is the
+/// feature. Aggression on csrss / lsass / wininit / dwm / MsMpEng / vgc is
+/// BSOD-or-ban territory and is non-negotiable. Items not on the denylist
+/// pass through unchanged.
+fn check_process_modifiable(
+    safe_list: &'static SafeList,
+    exe_name: &str,
+    action: &str,
+) -> Result<()> {
+    use framesage_gamemode::safe_list::ProcessVerdict;
+    match safe_list.check_process(exe_name) {
+        ProcessVerdict::Denied(reason) => {
+            warn!(
+                exe = %exe_name,
+                action,
+                reason,
+                "refused {action} on denylisted process",
+            );
+            Err(anyhow::anyhow!(
+                "refused {action} on {exe_name}: this process is on the \
+                 framesage denylist for safety — {reason}",
+            ))
+        }
+        // Allowed or Unlisted both pass — the denylist is the only authority.
+        // "Unlisted" is the default state for every process the user might
+        // legitimately want to modify (notepad, chrome, the user's own
+        // game). The product position is explicit: anything not on the
+        // narrow denylist is fair game.
+        ProcessVerdict::Allowed(_) | ProcessVerdict::Unlisted => Ok(()),
+    }
+}
+
+/// Resolve a PID to its bare exe filename for denylist checking, or return
+/// an error if the PID has exited / is inaccessible. Used by every per-PID
+/// IPC handler before consulting the safe-list. PID-lookup failure is
+/// surfaced cleanly so the tray's status banner can explain "process is
+/// gone" instead of swallowing the action silently.
+#[cfg(windows)]
+fn resolve_exe_for_pid_or_err(pid: u32, action: &str) -> Result<String> {
+    match framesage_sys::process::exe_for_pid(pid) {
+        Ok(Some(path)) => Ok(path.rsplit(['\\', '/']).next().unwrap_or(&path).to_owned()),
+        Ok(None) => Err(anyhow::anyhow!(
+            "cannot {action} on pid {pid}: process not found or inaccessible \
+             (likely exited or protected)",
+        )),
+        Err(e) => Err(anyhow::anyhow!(
+            "cannot {action} on pid {pid}: exe lookup failed: {e}",
+        )),
+    }
+}
+
+#[cfg(not(windows))]
+fn resolve_exe_for_pid_or_err(pid: u32, action: &str) -> Result<String> {
+    let _ = (pid, action);
+    // On non-Windows (sim builds), there's no real process — return a
+    // placeholder exe that's never on the denylist so handlers exercise
+    // their full path without spurious refusals.
+    Ok(format!("pid-{pid}.exe"))
 }
 
 // ─── platform-specific shims ──────────────────────────────────────────────
@@ -2202,5 +2330,154 @@ mod tests {
             rejections: vec![],
         };
         assert_eq!(applied_from_plan(&plan), AppliedActions::default());
+    }
+
+    // ─── Group 1 / item 1.1 — denylist enforcement at every kernel-write entry ───
+    //
+    // These tests lock the safety bar: the bundled denylist (csrss / lsass /
+    // wininit / dwm / audiodg / MsMpEng / Vanguard / EAC / BattlEye / RPC /
+    // DHCP / DNS / audio / GPU drivers) is refused at every per-PID action
+    // path, with the JSON rationale string in the error message. Items NOT
+    // on the denylist (WSearch / BITS-svchost / OneDrive / GameBar / random
+    // user processes) MUST still pass the gate — they're the product's
+    // aggression surface.
+    //
+    // Each test exercises the engine-level helper directly because that's
+    // the trust boundary; the per-PID IPC handlers all call it before any
+    // syscall. Testing via the IPC handlers themselves would require a
+    // live PID, which would either be fragile (need a real process) or
+    // require trait-injection of the syscall layer (Group 3 item 3.1).
+
+    /// csrss / lsass / wininit / smss / services — terminating any of
+    /// these blue-screens the box with CRITICAL_PROCESS_DIED. The gate
+    /// must refuse with the JSON rationale visible in the error message.
+    #[test]
+    fn check_process_modifiable_refuses_kernel_critical() {
+        let safe_list = framesage_gamemode::safe_list::SafeList::bundled();
+        for exe in &[
+            "csrss.exe",
+            "lsass.exe",
+            "wininit.exe",
+            "services.exe",
+            "smss.exe",
+            "winlogon.exe",
+        ] {
+            let err = check_process_modifiable(safe_list, exe, "terminate")
+                .expect_err(&format!("expected denial for {exe}"));
+            let msg = err.to_string();
+            assert!(
+                msg.contains("denylist"),
+                "error for {exe} should mention denylist, got: {msg}"
+            );
+            assert!(
+                msg.to_ascii_lowercase().contains(&exe.to_ascii_lowercase()),
+                "error for {exe} should name the exe, got: {msg}"
+            );
+        }
+    }
+
+    /// Shell / audio / GPU-driver / font-rendering — modifying these
+    /// freezes the session or breaks the desktop. Same denial path.
+    #[test]
+    fn check_process_modifiable_refuses_shell_audio_gpu() {
+        let safe_list = framesage_gamemode::safe_list::SafeList::bundled();
+        for exe in &[
+            "dwm.exe",
+            "explorer.exe",
+            "audiodg.exe",
+            "fontdrvhost.exe",
+            "nvcontainer.exe",
+            "atiesrxx.exe",
+            "sihost.exe",
+        ] {
+            assert!(
+                check_process_modifiable(safe_list, exe, "set affinity").is_err(),
+                "{exe} must be refused",
+            );
+        }
+    }
+
+    /// AV / anti-cheat — modifying these is a textbook anti-cheat bypass
+    /// attempt and the canonical malware tactic for AV. Vanguard's HWID-ban
+    /// risk and BattlEye's instant-ban precedent both apply.
+    #[test]
+    fn check_process_modifiable_refuses_av_and_anticheat() {
+        let safe_list = framesage_gamemode::safe_list::SafeList::bundled();
+        for exe in &["MsMpEng.exe", "NisSrv.exe", "SecurityHealthService.exe"] {
+            assert!(
+                check_process_modifiable(safe_list, exe, "suspend").is_err(),
+                "{exe} (AV/security) must be refused",
+            );
+        }
+    }
+
+    /// The other direction of the safety bar — non-denylisted exes MUST
+    /// pass the gate. These are the product's aggression surface; refusing
+    /// them would defeat the point of the product positioning.
+    #[test]
+    fn check_process_modifiable_allows_aggression_targets() {
+        let safe_list = framesage_gamemode::safe_list::SafeList::bundled();
+        for exe in &[
+            // Cloud sync — aggressive default suspends these
+            "OneDrive.exe",
+            "Dropbox.exe",
+            "googledrivesync.exe",
+            "MEGAsync.exe",
+            // Game Bar — aggressive default suspends these
+            "GameBar.exe",
+            "GameBarFTServer.exe",
+            // OEM updaters
+            "DellSupportAssistRemedyService.exe",
+            "LenovoVantageService.exe",
+            // Random user processes — gate must not block these
+            "notepad.exe",
+            "chrome.exe",
+            "code.exe",
+            "steam.exe",
+            // Games — must pass (per-game safety is enforced elsewhere
+            // via the AC matrix profile, not at this gate)
+            "VALORANT-Win64-Shipping.exe",
+            "FortniteClient-Win64-Shipping.exe",
+            "bf6.exe",
+        ] {
+            check_process_modifiable(safe_list, exe, "set priority")
+                .unwrap_or_else(|e| panic!("{exe} must pass the gate, got error: {e}"));
+        }
+    }
+
+    /// Case-insensitive matching — the JSON denylist uses canonical case
+    /// (csrss.exe) but the gate must match regardless of how the exe name
+    /// arrives from `framesage_sys::process::exe_for_pid`. Windows preserves
+    /// the original case from the file system; same exe on different
+    /// systems can vary.
+    #[test]
+    fn check_process_modifiable_is_case_insensitive() {
+        let safe_list = framesage_gamemode::safe_list::SafeList::bundled();
+        for variant in &["CSRSS.EXE", "csrss.exe", "CsRsS.ExE"] {
+            assert!(
+                check_process_modifiable(safe_list, variant, "terminate").is_err(),
+                "case variant {variant} of csrss must still be refused",
+            );
+        }
+    }
+
+    /// The error message must surface the rationale string from the JSON
+    /// denylist so the user understands *why* the action was refused — not
+    /// just "denied." The product positioning requires informed consent;
+    /// the converse is informed refusal.
+    #[test]
+    fn check_process_modifiable_surfaces_rationale() {
+        let safe_list = framesage_gamemode::safe_list::SafeList::bundled();
+        let err = check_process_modifiable(safe_list, "csrss.exe", "terminate")
+            .expect_err("csrss must be refused");
+        let msg = err.to_string();
+        // The rationale at safe_lists/processes.json for csrss.exe says
+        // "blue-screens the machine." Anchor on the substring; if the JSON
+        // is reworded this test reveals a coupling that's actually the
+        // contract we want — the error message MUST tell the user why.
+        assert!(
+            msg.contains("blue-screen") || msg.contains("BSOD"),
+            "error should explain WHY (rationale from JSON), got: {msg}"
+        );
     }
 }
