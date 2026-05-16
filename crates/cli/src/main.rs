@@ -2,6 +2,14 @@
 //!
 //! Subcommands map roughly 1:1 to `framesage_ipc::Request`. The exception is
 //! `install` / `uninstall` / `start` / `stop`, which talk to the SCM directly.
+//!
+//! # Layering (item 3.8)
+//!
+//! Depends on `framesage-core` + `framesage-gamemode` + `framesage-ipc` +
+//! `framesage-sys` (for topology detection in `framesage topology`). It
+//! does NOT depend on `framesage-engine` — every engine-side action is
+//! reached via the IPC protocol so the CLI stays a thin client. See
+//! `ARCHITECTURE.md` at the repo root.
 
 #![cfg_attr(not(windows), allow(unused_imports, dead_code))]
 

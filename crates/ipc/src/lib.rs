@@ -4,6 +4,17 @@
 //! Wire format: newline-delimited JSON. Cheap to write, easy to debug with a
 //! pipe-cat tool, no codegen, plenty fast for 10–50 messages per second.
 //!
+//! # Layering (item 3.8)
+//!
+//! Depends on `framesage-core` only. This is a pure protocol crate —
+//! `Request`, `Response`, `Event`, the pipe names, the request-routing
+//! helpers. It must NOT depend on `framesage-engine` (or
+//! `framesage-sys`); if it did, the tray and CLI would transitively drag
+//! in the engine + Win32 surface just to send a `Request::Status`. Types
+//! the engine ships over IPC (e.g. `UndoEntry`) therefore live in
+//! `framesage-core`, not `framesage-engine`. See `ARCHITECTURE.md` at the
+//! repo root for the layering rules.
+//!
 //! # Two pipes, one ACL split
 //!
 //! The service binds two named pipes:

@@ -5,6 +5,18 @@
 //! process right now? — and reconciles the running state against what the
 //! policy says it should be.
 //!
+//! # Layering (item 3.8)
+//!
+//! Depends on `framesage-core` + `framesage-sys` + `framesage-ipc` +
+//! `framesage-gamemode`. It is the orchestrator — it takes `Policy` from
+//! core, drives Win32 calls through sys (mediated by the `SysApi` trait
+//! that lives in sys), runs the gamemode planner against the live system,
+//! and emits events over IPC.
+//!
+//! The engine has exactly ONE host: `framesage-service`. The CLI and tray
+//! talk to it via the IPC named-pipe protocol; neither depends on this
+//! crate. See `ARCHITECTURE.md` at the repo root.
+//!
 //! Two dimensions of state are tracked:
 //!
 //! 1. **Per-process** state — what we changed on the foregrounded process

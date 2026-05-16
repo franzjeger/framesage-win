@@ -6,6 +6,14 @@
 //! by `CpuTopology::resolve` — both of which are platform-agnostic. This
 //! binary exercises those on macOS or Linux so we can iterate on rules,
 //! profiles, and CCD/CPU selectors without rebooting into Windows.
+//!
+//! # Layering (item 3.8)
+//!
+//! Depends on `framesage-core` + `framesage-gamemode`. It deliberately does
+//! NOT depend on `framesage-engine` or `framesage-sys`; the sim drives the
+//! gamemode planner and policy matcher directly against synthetic state,
+//! which is what keeps those test paths exercised on non-Windows hosts.
+//! See `ARCHITECTURE.md` at the repo root.
 
 use std::path::PathBuf;
 

@@ -4,6 +4,15 @@
 //! does (profiles, rules, topology), not *how*. The `framesage-sys` crate maps
 //! these types onto Win32 APIs; `framesage-engine` decides which profile to
 //! apply based on observed state.
+//!
+//! # Layering (item 3.8)
+//!
+//! `framesage-core` is the bottom of the workspace dep graph. It depends on
+//! `std` + `serde` + (on Windows) the `windows` crate for `paths` helpers.
+//! It has **zero** dependencies on other framesage-* crates. Every other
+//! crate in the workspace may depend on this one; no crate above is allowed
+//! to flow types back down via this crate's surface. See `ARCHITECTURE.md`
+//! at the repo root for the full layering rules.
 
 pub mod anti_cheat;
 pub mod game_mode;
@@ -12,6 +21,11 @@ pub mod policy;
 pub mod profile;
 pub mod topology;
 pub mod undo;
+
+// Test-only module — workspace layering invariants. See
+// `ARCHITECTURE.md` at the repo root.
+#[cfg(test)]
+mod layering;
 
 pub use anti_cheat::AntiCheatPresence;
 pub use game_mode::{FocusAssistMode, GameModeActions, PowerPlanId};

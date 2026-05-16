@@ -13,6 +13,15 @@
 //! The actual Win32 calls live in `framesage-sys::game_mode::*`. This crate
 //! is platform-agnostic and runs on macOS / Linux during development; the
 //! `framesage-sim` harness drives the planner here against synthetic state.
+//!
+//! # Layering (item 3.8)
+//!
+//! Depends on `framesage-core` only. The dep direction is `sys → gamemode`,
+//! not the reverse: this crate defines the `SystemStateQuery` trait + data
+//! shapes (`PreviousState`, `AppliedActions`, `ServiceStatus`); the Win32
+//! impls live in `framesage-sys::inner::game_mode`. This crate must NOT
+//! depend on `framesage-sys`, `framesage-engine`, or any consumer crate.
+//! See `ARCHITECTURE.md` at the repo root.
 
 pub mod journal;
 pub mod planner;
