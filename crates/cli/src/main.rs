@@ -63,6 +63,31 @@ enum Cmd {
     /// Game Mode controls — status, panic-off, safe-list inspection.
     #[command(subcommand)]
     GameMode(GameModeCmd),
+    /// Item 3.5 — undo the most recent user-initiated action
+    /// (priority change, affinity change, suspend, resume).
+    /// Pops one entry from the engine's in-memory undo log and
+    /// applies its reverse. With no subcommand, undoes the last
+    /// action; `undo list` shows the recent log.
+    #[command(subcommand)]
+    Undo(UndoCmd),
+}
+
+#[derive(Subcommand, Debug)]
+enum UndoCmd {
+    /// Pop the most recent entry from the engine's undo log and
+    /// apply its reverse. Idempotent: each invocation removes one
+    /// entry. If the reverse fails (typically because the target
+    /// PID exited between the original action and the undo), the
+    /// failure is printed but the entry is still removed.
+    #[command(name = "last")]
+    Last,
+    /// List the recent undo-log entries, newest first. Default
+    /// limit is 20 entries; the engine keeps up to 50 in memory.
+    List {
+        /// Maximum entries to show (default 20).
+        #[arg(long, default_value_t = 20)]
+        limit: u32,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -127,6 +152,12 @@ fn main() -> Result<()> {
             }),
             GameModeCmd::OffGlobal => {
                 tokio_block(async { send_simple(Request::DisableManualGlobalGameMode).await })
+            }
+        },
+        Cmd::Undo(sub) => match sub {
+            UndoCmd::Last => tokio_block(async { send_simple(Request::Undo).await }),
+            UndoCmd::List { limit } => {
+                tokio_block(async { send_simple(Request::UndoLogList { limit }).await })
             }
         },
     }
@@ -897,10 +928,71 @@ async fn send_simple(req: Request) -> Result<()> {
             Response::Ok => println!("ok"),
             Response::Status(_) => println!("ok"),
             Response::Processes { .. } => println!("ok"),
+            Response::UndoResult { undone } => match undone {
+                Some(summary) => {
+                    println!("{}", summary.summary);
+                    if let Some(failure) = summary.failure {
+                        println!("(reverse failed: {failure})");
+                    }
+                }
+                None => println!("nothing to undo"),
+            },
+            Response::UndoLog { entries } => print_undo_log(&entries),
             Response::Error { message } => return Err(anyhow!(message)),
         }
     }
     Ok(())
+}
+
+/// Format an undo-log snapshot for `framesage undo list`. Newest entry
+/// first; each row is `id  YYYY-MM-DD HH:MM:SS  description`. Item 3.5.
+fn print_undo_log(entries: &[framesage_core::UndoEntry]) {
+    if entries.is_empty() {
+        println!("undo log is empty");
+        return;
+    }
+    println!(
+        "{:<6}  {:<19}  description",
+        "id", "timestamp (UTC)"
+    );
+    for e in entries {
+        let ts = format_unix_local_or_utc(e.at_unix_secs);
+        println!("{:<6}  {:<19}  {}", e.id, ts, e.action.describe());
+    }
+}
+
+/// `unix_secs` → `YYYY-MM-DD HH:MM:SS UTC`. The CLI emits UTC so the
+/// output is stable across machines / users / log captures and
+/// doesn't drag in a chrono dependency or the `windows` crate.
+/// (The tray's Activity Log already does local-time formatting via
+/// its existing windows-rs dep; the CLI's row table is the place
+/// where stable UTC is the better default.)
+fn format_unix_local_or_utc(secs: u64) -> String {
+    let days = secs / 86_400;
+    let h = (secs / 3_600) % 24;
+    let m = (secs / 60) % 60;
+    let s = secs % 60;
+    // Days since epoch → Y-M-D via a simple Gregorian walk. Cheap and
+    // covers the next ~thousand years without external deps.
+    let (y, mo, d) = epoch_days_to_ymd(days as i64);
+    format!("{y:04}-{mo:02}-{d:02} {h:02}:{m:02}:{s:02}")
+}
+
+/// Convert days-since-unix-epoch to (year, month, day). Algorithm
+/// from Howard Hinnant's date library (public domain) — handles
+/// the Gregorian calendar correctly and runs in constant time.
+fn epoch_days_to_ymd(z: i64) -> (i64, u32, u32) {
+    let z = z + 719_468; // shift epoch from 1970-01-01 to 0000-03-01
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = (z - era * 146_097) as u64; // [0, 146097)
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365; // [0, 399]
+    let y = yoe as i64 + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100); // [0, 365]
+    let mp = (5 * doy + 2) / 153; // [0, 11]
+    let d = (doy - (153 * mp + 2) / 5 + 1) as u32;
+    let m = (if mp < 10 { mp + 3 } else { mp - 9 }) as u32;
+    let y = y + if m <= 2 { 1 } else { 0 };
+    (y, m, d)
 }
 
 #[cfg(windows)]
@@ -926,6 +1018,7 @@ async fn print_status() -> Result<()> {
         Response::Status(s) => print_status_snapshot(&s),
         Response::Ok => println!("ok"),
         Response::Processes { .. } => println!("ok"),
+        Response::UndoResult { .. } | Response::UndoLog { .. } => println!("ok"),
         Response::Error { message } => return Err(anyhow!(message)),
     }
     Ok(())
