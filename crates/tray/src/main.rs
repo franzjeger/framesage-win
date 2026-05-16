@@ -570,7 +570,7 @@ fn selector_to_mask(selector: &framesage_core::CpuSelector, cpu_count: usize) ->
     };
     match selector {
         framesage_core::CpuSelector::All => all_mask,
-        framesage_core::CpuSelector::Mask(m) => (*m as u64) & all_mask,
+        framesage_core::CpuSelector::Mask(m) => *m & all_mask,
         framesage_core::CpuSelector::Kind(framesage_core::CoreKind::Cache) => {
             let hi = cpu_count / 2;
             let mut m = 0u64;
@@ -1163,27 +1163,35 @@ impl FramesageApp {
         }
 
         if do_apply {
-            self.send_admin_request(
-                Request::SetProcessAffinity {
-                    pid,
-                    selector: framesage_core::CpuSelector::Mask(new_mask as u128),
-                },
-                "set affinity",
-            );
             if save_as_rule {
-                // Persist the full bitmap as a rule so the next launch is
-                // pinned identically. apply_to_live=false because the live
-                // pin above already covers this PID.
+                // Single round-trip when persisting: SetAffinityRule with
+                // apply_to_live=true both writes the rule and pins every
+                // matching live PID via the engine's walk — which also
+                // marks each pinned PID in `affinity_rule_applied` so the
+                // 2 s re-assert sweep immediately keeps it sticky. Doing
+                // a separate SetProcessAffinity first would leave the PID
+                // unmarked (because set_affinity_rule clears the marker
+                // set when policy mutates), opening a ~10 s window where
+                // a game could overwrite our pin before the background
+                // scan re-marked it.
                 self.send_admin_request(
                     Request::SetAffinityRule {
                         rule: framesage_core::AffinityRule {
                             exe_name: exe_name.clone(),
-                            selector: framesage_core::CpuSelector::Mask(new_mask as u128),
+                            selector: framesage_core::CpuSelector::Mask(new_mask),
                             note: String::new(),
                         },
-                        apply_to_live: false,
+                        apply_to_live: true,
                     },
                     "save affinity rule",
+                );
+            } else {
+                self.send_admin_request(
+                    Request::SetProcessAffinity {
+                        pid,
+                        selector: framesage_core::CpuSelector::Mask(new_mask),
+                    },
+                    "set affinity",
                 );
             }
             self.affinity_picker = None;
@@ -3890,44 +3898,49 @@ impl FramesageApp {
                     selector,
                     save_as_rule_for,
                 } => {
-                    self.send_admin_request(
-                        Request::SetProcessAffinity {
-                            pid,
-                            selector: selector.clone(),
-                        },
-                        "set affinity",
-                    );
-                    if let Some(exe) = save_as_rule_for {
-                        // Rule + live pin go together: the live pin makes the
-                        // pick take effect immediately on the targeted PID, the
-                        // rule makes it stick for next launch. We send the rule
-                        // with apply_to_live=false because the live pin above
-                        // already covers the running case — saves one walk of
-                        // the live PID list.
-                        //
-                        // "All cores" with a Remember toggle is shorthand for
-                        // "clear the rule": pinning to All explicitly is
-                        // equivalent to having no rule, and removing the rule
-                        // keeps the rules list short. Custom-mask "save full
-                        // bitmap as rule" still goes through SetAffinityRule
-                        // because the user might genuinely want "always all
-                        // cores" as a defense against another tool changing it.
-                        if matches!(selector, framesage_core::CpuSelector::All) {
+                    match save_as_rule_for {
+                        None => {
+                            // One-shot pin: no rule, just the live PID.
+                            self.send_admin_request(
+                                Request::SetProcessAffinity { pid, selector },
+                                "set affinity",
+                            );
+                        }
+                        Some(exe) if matches!(selector, framesage_core::CpuSelector::All) => {
+                            // "All cores" with Remember = "clear the rule
+                            // and reset the live pin." The rule deletion
+                            // is the persistent intent; the live pin reset
+                            // makes the change visible immediately on the
+                            // targeted PID.
                             self.send_admin_request(
                                 Request::DeleteAffinityRule {
                                     exe_name: exe.clone(),
                                 },
                                 "delete affinity rule (reset)",
                             );
-                        } else {
+                            self.send_admin_request(
+                                Request::SetProcessAffinity { pid, selector },
+                                "reset affinity",
+                            );
+                        }
+                        Some(exe) => {
+                            // Persistent intent: one IPC does both the
+                            // rule write AND the live-PID pin (via the
+                            // engine's apply_to_live walk by exe name).
+                            // Critically, the engine marks each pinned
+                            // PID in `affinity_rule_applied` during that
+                            // walk, so the 2 s re-assert sweep immediately
+                            // keeps the pin sticky against game-overrides
+                            // — Process Lasso parity for the "pin holds
+                            // under load" behavior.
                             self.send_admin_request(
                                 Request::SetAffinityRule {
                                     rule: framesage_core::AffinityRule {
-                                        exe_name: exe.clone(),
+                                        exe_name: exe,
                                         selector,
                                         note: String::new(),
                                     },
-                                    apply_to_live: false,
+                                    apply_to_live: true,
                                 },
                                 "save affinity rule",
                             );
@@ -5457,13 +5470,14 @@ fn cpu_selector_edit(ui: &mut egui::Ui, label: &str, sel: &mut Option<CpuSelecto
                 ui.add(egui::DragValue::new(n).range(1..=128).speed(0.25));
             }
             Some(CpuSelector::Mask(m)) => {
-                // u128 isn't a DragValue primitive on egui 0.28. Render as a
-                // hex text field with parse-on-change; on bad input we keep
-                // the old value rather than zero out destructively.
+                // Hex text field with parse-on-change; on bad input we keep
+                // the old value rather than zero out destructively. Width
+                // is u64 (Windows KAFFINITY), so up to 64 logical CPUs in
+                // one processor group.
                 let mut buf = format!("{m:#x}");
                 if ui.text_edit_singleline(&mut buf).changed() {
                     let trimmed = buf.trim().trim_start_matches("0x");
-                    if let Ok(parsed) = u128::from_str_radix(trimmed, 16) {
+                    if let Ok(parsed) = u64::from_str_radix(trimmed, 16) {
                         *m = parsed;
                     }
                 }
