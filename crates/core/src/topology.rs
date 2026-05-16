@@ -184,6 +184,46 @@ impl CpuTopology {
         }
     }
 
+    /// Like [`Self::resolve`] but with sensible aggressive-fallback
+    /// behavior for the soft-CPU-Sets path. Item 1.7 / audit H-09.
+    ///
+    /// Background: on a non-X3D box, `Kind(Cache)` resolves to an
+    /// empty index list. The original `apply.rs` flow would then call
+    /// `SetProcessDefaultCpuSets(handle, None)` — which silently
+    /// **clears** any existing CPU sets on the target. The user ended
+    /// up unpinned while still paying the rest of the aggressive
+    /// Game Mode tax (services stopped, taskbar hidden, power plan
+    /// flipped). All of the cost, none of the CPU benefit.
+    ///
+    /// Fallback chain:
+    ///   1. Try `resolve(selector)`. If non-empty, return.
+    ///   2. If selector is `Kind(Cache)`, try `TopRanked(8)` — best 8
+    ///      cores by CPPC perf rank, the closest approximation to
+    ///      "give me the highest-performance cores on this chip."
+    ///   3. If still empty (machine has no CPPC data either), give up
+    ///      and return empty. Caller must NOT call
+    ///      `SetProcessDefaultCpuSets(None)` in that case — better to
+    ///      leave the scheduler's existing setup alone.
+    ///
+    /// Only used by the `cpu_sets` soft-hint path. The
+    /// `affinity_mask` hard-pin path stays strict: if the user
+    /// explicitly sets `Mask(0)`, that's their stated intent, not a
+    /// silent fallback opportunity.
+    pub fn resolve_with_aggressive_fallback(&self, sel: &CpuSelector) -> Vec<u32> {
+        let primary = self.resolve(sel);
+        if !primary.is_empty() {
+            return primary;
+        }
+        match sel {
+            CpuSelector::Kind(CoreKind::Cache) => self.resolve(&CpuSelector::TopRanked(8)),
+            // No other selectors get fallbacks. Kind(Performance) /
+            // Kind(Efficiency) coming back empty means "the user
+            // asked for a kind their machine doesn't have" — closer
+            // to a config error than an unsatisfiable optimization.
+            _ => Vec::new(),
+        }
+    }
+
     /// Resolve a `CpuSelector` against this topology into the concrete set of
     /// logical-processor indices the policy targets.
     pub fn resolve(&self, sel: &CpuSelector) -> Vec<u32> {
@@ -501,5 +541,128 @@ mod tests {
             let parsed: CpuSelector = serde_json::from_str(&json).expect("deserialize");
             assert_eq!(sel, parsed, "round-trip mismatch via {json}");
         }
+    }
+
+    // ─── Item 1.7 — Kind(Cache) fallback on non-X3D hardware ────────
+    //
+    // Audit H-09: original apply path called SetProcessDefaultCpuSets
+    // with the empty result of Kind(Cache).resolve() on non-X3D
+    // hardware, silently clearing existing CPU sets while still
+    // applying the rest of the aggressive Game Mode tax. These tests
+    // lock the fix: on a topology where Kind(Cache) is satisfiable,
+    // it returns the X3D cores unchanged; on a topology where it's
+    // NOT satisfiable, it falls back to TopRanked(8) instead of empty.
+
+    /// 8-core / 16-thread synthetic single-CCD chip with no Cache
+    /// cores, with CPPC ranks present. Looks like a 7700X — non-X3D
+    /// but modern enough to expose CPPC. The Kind(Cache) fallback
+    /// should land on TopRanked(8) here.
+    fn no_x3d_with_cppc() -> CpuTopology {
+        let mut cpus = Vec::new();
+        for core in 0..8u32 {
+            for smt in 0..2u32 {
+                cpus.push(LogicalCpu {
+                    index: core * 2 + smt,
+                    physical_core: core,
+                    ccd: 0,
+                    kind: CoreKind::Performance, // no Cache CCD on this chip
+                    cppc_rank: Some(200 - core), // descending ranks
+                    l3_cache_bytes: None,
+                    is_smt_sibling: smt == 1,
+                });
+            }
+        }
+        CpuTopology { cpus }
+    }
+
+    /// Same shape, but with no CPPC data at all — e.g. an older non-
+    /// X3D CPU. Both Kind(Cache) AND TopRanked(8) fail. Fallback
+    /// chain must give up gracefully (return empty) instead of
+    /// silently expanding to All.
+    fn no_x3d_no_cppc() -> CpuTopology {
+        let mut cpus = Vec::new();
+        for core in 0..8u32 {
+            for smt in 0..2u32 {
+                cpus.push(LogicalCpu {
+                    index: core * 2 + smt,
+                    physical_core: core,
+                    ccd: 0,
+                    kind: CoreKind::Performance,
+                    cppc_rank: None,
+                    l3_cache_bytes: None,
+                    is_smt_sibling: smt == 1,
+                });
+            }
+        }
+        CpuTopology { cpus }
+    }
+
+    /// X3D path: Kind(Cache) is satisfiable, so fallback is a no-op.
+    /// Result must match plain `resolve` byte-for-byte.
+    #[test]
+    fn fallback_is_noop_when_cache_kind_satisfiable() {
+        let topo = x3d_dual_ccd();
+        let plain = topo.resolve(&CpuSelector::Kind(CoreKind::Cache));
+        let fallback = topo.resolve_with_aggressive_fallback(&CpuSelector::Kind(CoreKind::Cache));
+        assert_eq!(plain, fallback, "fallback should not perturb X3D path");
+        assert!(
+            !fallback.is_empty(),
+            "X3D Cache resolution must be non-empty"
+        );
+    }
+
+    /// Non-X3D with CPPC: Kind(Cache) is empty, fallback returns
+    /// TopRanked(8) — the load-bearing fix. Was previously empty →
+    /// silent-clear in apply.
+    #[test]
+    fn fallback_resolves_top_ranked_when_cache_empty_on_non_x3d() {
+        let topo = no_x3d_with_cppc();
+        assert!(
+            topo.resolve(&CpuSelector::Kind(CoreKind::Cache)).is_empty(),
+            "precondition: plain resolve returns empty"
+        );
+        let fallback = topo.resolve_with_aggressive_fallback(&CpuSelector::Kind(CoreKind::Cache));
+        let top8 = topo.resolve(&CpuSelector::TopRanked(8));
+        assert_eq!(
+            fallback, top8,
+            "Kind(Cache) on non-X3D must fall back to TopRanked(8)"
+        );
+        assert_eq!(fallback.len(), 8, "TopRanked(8) returns 8 threads");
+    }
+
+    /// Non-X3D without CPPC: both Kind(Cache) and TopRanked are
+    /// empty. Fallback must NOT expand to All — calling
+    /// SetProcessDefaultCpuSets with the full machine is its own
+    /// kind of wrong, and the caller already has the empty-result
+    /// case wired to skip cleanly.
+    #[test]
+    fn fallback_returns_empty_on_chip_with_no_cppc_and_no_cache() {
+        let topo = no_x3d_no_cppc();
+        assert!(topo.resolve(&CpuSelector::Kind(CoreKind::Cache)).is_empty());
+        assert!(topo.resolve(&CpuSelector::TopRanked(8)).is_empty());
+        let fallback = topo.resolve_with_aggressive_fallback(&CpuSelector::Kind(CoreKind::Cache));
+        assert!(
+            fallback.is_empty(),
+            "no fallback path available; must NOT expand to All"
+        );
+    }
+
+    /// Fallback is ONLY for Kind(Cache). Other selectors that come
+    /// back empty (e.g. `Kind(Performance)` on a hypothetical
+    /// Performance-less chip, `Ccd(7)` on a single-CCD chip) stay
+    /// empty — those are user errors / explicit unsatisfiable intents,
+    /// not "optimizer asked for the best cores" cases.
+    #[test]
+    fn fallback_does_not_fire_for_non_cache_selectors() {
+        let topo = no_x3d_with_cppc();
+        // Ccd(7) doesn't exist on this single-CCD chip.
+        assert!(topo
+            .resolve_with_aggressive_fallback(&CpuSelector::Ccd(7))
+            .is_empty());
+        // Mask(0) is explicit "no cores" — fallback would betray
+        // user intent.
+        assert!(topo
+            .resolve_with_aggressive_fallback(&CpuSelector::Mask(0))
+            .is_empty());
     }
 }
