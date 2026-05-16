@@ -27,9 +27,10 @@ mod service_main {
     use std::ffi::OsString;
     use std::time::Duration;
 
+    use framesage_engine::SystemEvent;
     use windows_service::service::{
-        ServiceControl, ServiceControlAccept, ServiceExitCode, ServiceState, ServiceStatus,
-        ServiceType,
+        PowerEventParam, ServiceControl, ServiceControlAccept, ServiceExitCode,
+        SessionChangeReason, ServiceState, ServiceStatus, ServiceType,
     };
     use windows_service::service_control_handler::{self, ServiceControlHandlerResult};
     use windows_service::service_dispatcher;
@@ -55,6 +56,13 @@ mod service_main {
         let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
         let mut shutdown_tx = Some(shutdown_tx);
 
+        // Item 2.4 / audit M-02 — system-events channel. The SCM
+        // handler runs synchronously and must return within a few ms or
+        // Windows kills the service; sending into an unbounded mpsc is
+        // a non-blocking ~lock-free push, well within budget. The
+        // runtime drains it in a dedicated tokio task.
+        let (sys_events_tx, sys_events_rx) = tokio::sync::mpsc::unbounded_channel::<SystemEvent>();
+
         let handler = move |control_event| -> ServiceControlHandlerResult {
             match control_event {
                 ServiceControl::Stop | ServiceControl::Shutdown => {
@@ -64,6 +72,18 @@ mod service_main {
                     ServiceControlHandlerResult::NoError
                 }
                 ServiceControl::Interrogate => ServiceControlHandlerResult::NoError,
+                ServiceControl::PowerEvent(param) => {
+                    if let Some(ev) = power_event_to_system_event(param) {
+                        let _ = sys_events_tx.send(ev);
+                    }
+                    ServiceControlHandlerResult::NoError
+                }
+                ServiceControl::SessionChange(param) => {
+                    if let Some(ev) = session_change_to_system_event(param.reason) {
+                        let _ = sys_events_tx.send(ev);
+                    }
+                    ServiceControlHandlerResult::NoError
+                }
                 _ => ServiceControlHandlerResult::NotImplemented,
             }
         };
@@ -73,14 +93,20 @@ mod service_main {
         status_handle.set_service_status(ServiceStatus {
             service_type: SERVICE_TYPE,
             current_state: ServiceState::Running,
-            controls_accepted: ServiceControlAccept::STOP | ServiceControlAccept::SHUTDOWN,
+            controls_accepted: ServiceControlAccept::STOP
+                | ServiceControlAccept::SHUTDOWN
+                | ServiceControlAccept::POWER_EVENT
+                | ServiceControlAccept::SESSION_CHANGE,
             exit_code: ServiceExitCode::Win32(0),
             checkpoint: 0,
             wait_hint: Duration::default(),
             process_id: None,
         })?;
 
-        super::runtime::run_blocking(shutdown_rx)?;
+        super::runtime::run_blocking(super::runtime::RuntimeInputs {
+            shutdown: shutdown_rx,
+            system_events: Some(sys_events_rx),
+        })?;
 
         status_handle.set_service_status(ServiceStatus {
             service_type: SERVICE_TYPE,
@@ -93,6 +119,57 @@ mod service_main {
         })?;
 
         Ok(())
+    }
+
+    /// Map a SCM PowerEvent payload to the engine's abstract
+    /// `SystemEvent`. Returns `None` for payload variants we don't
+    /// care about (battery-low warnings, OEM events, power-status
+    /// changes that aren't transitions). Item 2.4 / audit M-02.
+    fn power_event_to_system_event(param: PowerEventParam) -> Option<SystemEvent> {
+        match param {
+            // System is about to enter low-power state.
+            PowerEventParam::Suspend => Some(SystemEvent::Suspend),
+            // System resumed. PBT_APMRESUMEAUTOMATIC fires on every resume
+            // (timer or user-initiated); PBT_APMRESUMESUSPEND fires only
+            // when user input triggered the resume. We treat them
+            // identically — the engine wants to re-probe AC presence
+            // and force foreground re-check either way.
+            PowerEventParam::ResumeAutomatic | PowerEventParam::ResumeSuspend => {
+                Some(SystemEvent::Resume)
+            }
+            // PBT_APMRESUMECRITICAL: the system resumed without
+            // notifying anyone of the suspend (battery died, hard
+            // reset). State is unreliable; treat as resume.
+            PowerEventParam::ResumeCritical => Some(SystemEvent::Resume),
+            // Everything else is informational (battery low, status
+            // change, query-suspend handshakes) — no engine action.
+            _ => None,
+        }
+    }
+
+    /// Map a SCM SessionChange payload to the engine's abstract
+    /// `SystemEvent`. Item 2.4 / audit M-02.
+    fn session_change_to_system_event(reason: SessionChangeReason) -> Option<SystemEvent> {
+        match reason {
+            // Console session connected (FUS to this user, RDP login).
+            // RemoteConnect is the RDP version of the same idea.
+            SessionChangeReason::ConsoleConnect | SessionChangeReason::RemoteConnect => {
+                Some(SystemEvent::SessionConsoleConnect)
+            }
+            // Console session disconnected (FUS away, RDP logoff
+            // without closing). The user we were optimising for is no
+            // longer in front of the screen.
+            SessionChangeReason::ConsoleDisconnect | SessionChangeReason::RemoteDisconnect => {
+                Some(SystemEvent::SessionConsoleDisconnect)
+            }
+            SessionChangeReason::SessionLock => Some(SystemEvent::SessionLock),
+            SessionChangeReason::SessionUnlock => Some(SystemEvent::SessionUnlock),
+            // Logon/logoff/create/terminate fire for system-init
+            // sequences and FUS, but the engine's per-user state lives
+            // in the console-session lifecycle, not the underlying
+            // session-create/destroy events.
+            _ => None,
+        }
     }
 }
 
@@ -180,7 +257,7 @@ fn main() -> Result<()> {
         .build()?
         .block_on(async move {
             tokio::select! {
-                r = runtime::run(shutdown_rx) => r,
+                r = runtime::run(runtime::RuntimeInputs::shutdown_only(shutdown_rx)) => r,
                 _ = tokio::signal::ctrl_c() => Ok(()),
             }
         });
