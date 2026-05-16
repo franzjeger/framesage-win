@@ -8,29 +8,54 @@ use std::time::Duration;
 
 use anyhow::{Context, Result};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-use tokio::sync::oneshot;
+use tokio::sync::{mpsc, oneshot};
 use tracing::{debug, error, info, warn};
 
 use framesage_core::{paths, Policy};
-use framesage_engine::{Engine, EngineDeps};
+use framesage_engine::{Engine, EngineDeps, SystemEvent};
 use framesage_gamemode::{journal::Journal, safe_list::SafeList};
 use framesage_ipc::{Event, Request, Response, PIPE_NAME_ADMIN, PIPE_NAME_STATUS};
+
+/// Optional input channels into the runtime. Item 2.4 / audit M-02:
+/// the SCM service-control handler dispatches PowerEvent /
+/// SessionChange via `system_events`; in `--console` mode the caller
+/// passes `None` and the engine simply doesn't react to suspend/
+/// session events (consoles run interactively, the user is at the
+/// keyboard).
+pub struct RuntimeInputs {
+    pub shutdown: oneshot::Receiver<()>,
+    pub system_events: Option<mpsc::UnboundedReceiver<SystemEvent>>,
+}
+
+impl RuntimeInputs {
+    /// Convenience for console mode where we only have a shutdown signal.
+    pub fn shutdown_only(shutdown: oneshot::Receiver<()>) -> Self {
+        Self {
+            shutdown,
+            system_events: None,
+        }
+    }
+}
 
 /// Synchronous entry point used by the Windows service main fn. Owns its
 /// tokio runtime so the SCM thread can block on it.
 #[cfg(windows)]
-pub fn run_blocking(shutdown: oneshot::Receiver<()>) -> Result<()> {
+pub fn run_blocking(inputs: RuntimeInputs) -> Result<()> {
     tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .worker_threads(2)
         .build()
         .context("build tokio runtime")?
-        .block_on(run(shutdown))
+        .block_on(run(inputs))
 }
 
 /// Async entry point. Used in console mode (`--console`) where the caller
 /// already has a runtime.
-pub async fn run(shutdown: oneshot::Receiver<()>) -> Result<()> {
+pub async fn run(inputs: RuntimeInputs) -> Result<()> {
+    let RuntimeInputs {
+        shutdown,
+        system_events,
+    } = inputs;
     let policy_path = paths::policy_path();
 
     // Item 1.2 / audit C-04 — harden the config dir's DACL before any
@@ -121,6 +146,26 @@ pub async fn run(shutdown: oneshot::Receiver<()>) -> Result<()> {
         }
     });
 
+    // Item 2.4 / audit M-02 — system-events handler task. Drains the
+    // mpsc receiver, forwards each event to engine.handle_system_event.
+    // In console mode `system_events` is None and this branch is
+    // skipped; the watchdog `select!` below uses a permanently-pending
+    // future for that slot so the task structure stays uniform.
+    let sys_engine = engine.clone();
+    let mut sys_handle = tokio::spawn(async move {
+        let Some(mut rx) = system_events else {
+            // Console mode: nothing to do. Park forever so the watchdog
+            // doesn't think this task died.
+            std::future::pending::<()>().await;
+            return;
+        };
+        while let Some(ev) = rx.recv().await {
+            sys_engine.handle_system_event(ev);
+        }
+        // Channel closed (SCM handler dropped sender) — exit cleanly.
+        info!("system-events channel closed");
+    });
+
     // Item 1.3 / audit C-06 — task watchdog. Wait for shutdown OR for any
     // critical task to die unexpectedly. The previous `let _ = shutdown.await`
     // pattern hid a real failure mode: if the tick task panicked or returned
@@ -141,6 +186,7 @@ pub async fn run(shutdown: oneshot::Receiver<()>) -> Result<()> {
         r = &mut admin_handle => Some(task_died_msg("admin-ipc", &r)),
         r = &mut status_handle => Some(task_died_msg("status-ipc", &r)),
         r = &mut reload_handle => Some(task_died_msg("policy-watcher", &r)),
+        r = &mut sys_handle => Some(task_died_msg("system-events", &r)),
     };
 
     if let Some(name) = unexpected_exit {
@@ -156,6 +202,7 @@ pub async fn run(shutdown: oneshot::Receiver<()>) -> Result<()> {
     admin_handle.abort();
     status_handle.abort();
     reload_handle.abort();
+    sys_handle.abort();
 
     if let Some(name) = unexpected_exit {
         return Err(anyhow::anyhow!(

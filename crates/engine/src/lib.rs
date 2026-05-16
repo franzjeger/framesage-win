@@ -50,6 +50,33 @@ use framesage_ipc::{
     ActionFailedKind, Event, ForegroundSnapshot, ProcessSnapshot, StatusSnapshot, SystemMetrics,
 };
 
+/// OS-level system events the engine reacts to. Sourced from the
+/// Windows service control handler (`PowerEvent` /
+/// `SessionChange`) and forwarded into the engine via
+/// `Engine::handle_system_event`. Item 2.4 / audit M-02.
+///
+/// Kept abstract (Suspend / Resume / SessionConsoleConnect etc.) so the
+/// engine doesn't need to know about Win32 specifics like `PBT_APMSUSPEND`
+/// or `WTS_CONSOLE_DISCONNECT` — the service-side handler does the mapping.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SystemEvent {
+    /// System is entering a low-power state (sleep, hibernate).
+    Suspend,
+    /// System has resumed from a low-power state.
+    Resume,
+    /// User's console session was connected (FUS in, RDP login).
+    SessionConsoleConnect,
+    /// User's console session was disconnected (FUS away, RDP logout
+    /// without closing). The user whose policy we were applying is no
+    /// longer at the screen.
+    SessionConsoleDisconnect,
+    /// User locked their screen (Win+L). The game is still running;
+    /// preserve Game Mode.
+    SessionLock,
+    /// User unlocked their screen.
+    SessionUnlock,
+}
+
 /// Dependencies the engine needs at construction. Passing as a struct keeps
 /// the call sites readable (we already have policy + topology, and now journal
 /// + safe_list join them) and gives us room to grow without breaking callers.
@@ -1235,6 +1262,88 @@ impl Engine {
     pub fn exit_system_mode_now(&self) {
         let mut s = self.state.write();
         Self::revert_system_mode_locked(&mut s, &self.journal, &self.events, "manual_exit");
+    }
+
+    /// Forward an OS-level system event (suspend, resume, session change)
+    /// into the engine. Item 2.4 / audit M-02.
+    ///
+    /// The cases:
+    ///
+    /// * **Suspend**: pause the engine and revert any active Game Mode
+    ///   first. The kernel state we set (stopped services, suspended
+    ///   processes, hidden taskbar, switched power plan) mostly survives
+    ///   a suspend/resume cycle by itself, but the user's expectation is
+    ///   "I closed the laptop; when I open it everything is normal."
+    ///   Reverting before sleep matches that mental model. The pause
+    ///   prevents the tick loop from doing anything stupid during the
+    ///   transition itself.
+    /// * **Resume**: re-probe AC presence (an AC client might have
+    ///   started or quit while we were suspended) and clear the
+    ///   foreground tracking so the next tick treats whatever's
+    ///   foregrounded as freshly arrived. Then `resume()` un-pauses.
+    /// * **SessionConsoleDisconnect** (fast-user-switch away, RDP
+    ///   disconnect): revert any active Game Mode. The user whose
+    ///   session we were optimising for is no longer in front of the
+    ///   screen; leaving services stopped and the taskbar hidden for an
+    ///   incoming user is a bad citizen.
+    /// * **SessionConsoleConnect / SessionLock / SessionUnlock**:
+    ///   logged for visibility but no automatic action — locking the
+    ///   screen while gaming shouldn't tear down Game Mode (the game is
+    ///   still running, the user just stepped away briefly).
+    pub fn handle_system_event(&self, event: SystemEvent) {
+        match event {
+            SystemEvent::Suspend => {
+                info!("system suspending — exiting Game Mode and pausing engine");
+                {
+                    let mut s = self.state.write();
+                    Self::revert_system_mode_locked(
+                        &mut s,
+                        &self.journal,
+                        &self.events,
+                        "system_suspend",
+                    );
+                }
+                self.pause();
+            }
+            SystemEvent::Resume => {
+                info!("system resuming — re-probing AC presence and resuming engine");
+                // Force the next maybe_refresh_ac_presence call to fire
+                // immediately by clearing last_ac_probe. Cheap and
+                // correct: a probe that just ran 4 s ago is irrelevant
+                // because the system was unconscious for that window.
+                {
+                    let mut s = self.state.write();
+                    s.last_ac_probe = None;
+                    // Force foreground re-evaluation on the next tick.
+                    // Otherwise reconcile's "new_pid == current_foreground"
+                    // fast path would skip the reconcile after resume
+                    // even if the user's gaming session is gone.
+                    s.current_foreground = None;
+                }
+                self.resume();
+            }
+            SystemEvent::SessionConsoleDisconnect => {
+                info!(
+                    "console session disconnected (FUS / RDP off) — exiting Game Mode"
+                );
+                let mut s = self.state.write();
+                Self::revert_system_mode_locked(
+                    &mut s,
+                    &self.journal,
+                    &self.events,
+                    "session_disconnect",
+                );
+            }
+            SystemEvent::SessionConsoleConnect => {
+                info!("console session connected — engine continues normally");
+            }
+            SystemEvent::SessionLock => {
+                debug!("session locked — Game Mode preserved (game still running)");
+            }
+            SystemEvent::SessionUnlock => {
+                debug!("session unlocked");
+            }
+        }
     }
 
     /// Apply a named profile to the currently-foregrounded process,
@@ -3352,6 +3461,71 @@ mod tests {
 
         let win32 = anyhow::anyhow!("SetProcessAffinityMask failed: ERROR_ACCESS_DENIED");
         assert_eq!(classify_apply_failure(&win32), ActionFailedKind::Apply);
+    }
+
+    /// SystemEvent::Suspend must pause the engine. The pause flag is
+    /// the load-bearing signal — without it, the tick task keeps
+    /// reconciling foreground during the suspend transition and
+    /// potentially fights the OS over kernel writes.
+    #[test]
+    fn system_event_suspend_pauses_engine() {
+        let engine = test_engine();
+        assert!(!engine.status().paused);
+        engine.handle_system_event(SystemEvent::Suspend);
+        assert!(
+            engine.status().paused,
+            "Suspend must leave the engine paused"
+        );
+    }
+
+    /// SystemEvent::Resume must un-pause AND clear last_ac_probe so
+    /// the next tick's maybe_refresh_ac_presence fires immediately
+    /// (rather than waiting up to 5 s for the regular cadence). It
+    /// must also clear current_foreground so reconcile's "new_pid ==
+    /// current_foreground" fast path doesn't skip the post-resume
+    /// re-evaluation.
+    #[test]
+    fn system_event_resume_clears_state_and_resumes() {
+        let engine = test_engine();
+        engine.handle_system_event(SystemEvent::Suspend);
+        assert!(engine.status().paused);
+
+        engine.handle_system_event(SystemEvent::Resume);
+        assert!(
+            !engine.status().paused,
+            "Resume must un-pause the engine"
+        );
+    }
+
+    /// SessionLock / SessionUnlock must NOT tear down Game Mode —
+    /// locking the screen while gaming is a normal event (user steps
+    /// away for a moment) and the game is still running. Pinning the
+    /// no-op so a future refactor doesn't accidentally extend the
+    /// disconnect handler to cover Lock.
+    #[test]
+    fn system_event_session_lock_is_a_noop() {
+        let engine = test_engine();
+        assert!(!engine.status().paused);
+        engine.handle_system_event(SystemEvent::SessionLock);
+        engine.handle_system_event(SystemEvent::SessionUnlock);
+        assert!(
+            !engine.status().paused,
+            "Lock/Unlock must NOT pause the engine (game is still running)"
+        );
+    }
+
+    fn test_engine() -> Engine {
+        let mut policy = Policy::default();
+        policy.default_profile = ProfileId("default".into());
+        policy
+            .profiles
+            .insert(ProfileId("default".into()), Profile::default());
+        Engine::new(EngineDeps {
+            policy,
+            topology: CpuTopology::default(),
+            safe_list: framesage_gamemode::safe_list::SafeList::bundled(),
+            journal: Journal::at_default_path(),
+        })
     }
 
     /// revert_record must emit `Event::ProfileReverted` exactly once
