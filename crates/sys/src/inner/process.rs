@@ -15,7 +15,9 @@
 use anyhow::{anyhow, Result};
 
 use windows::core::PWSTR;
-use windows::Win32::Foundation::{FILETIME, HANDLE, INVALID_HANDLE_VALUE, MAX_PATH};
+use windows::Win32::Foundation::{
+    ERROR_ACCESS_DENIED, ERROR_INVALID_PARAMETER, FILETIME, HANDLE, INVALID_HANDLE_VALUE, MAX_PATH,
+};
 
 use crate::owned_handle::OwnedHandle;
 use windows::Win32::System::Diagnostics::ToolHelp::{
@@ -151,8 +153,18 @@ pub fn exe_for_pid(pid: u32) -> Result<Option<String>> {
     // handle on every return path.
     let handle = match unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid) } {
         Ok(h) => OwnedHandle::assume_valid(h),
-        // ACCESS_DENIED / INVALID_PARAMETER (PID exited): silently skip.
-        Err(_) => return Ok(None),
+        // Item 4.8 — classify so a genuinely unexpected error
+        // (something other than PID-exited / protected-process)
+        // surfaces instead of being mis-classified as a routine
+        // race.
+        Err(e) => {
+            return match classify_open_process_error(&e) {
+                OpenProcessClass::Exited | OpenProcessClass::AccessDenied => Ok(None),
+                OpenProcessClass::Unexpected => {
+                    Err(anyhow!("OpenProcess({pid}) for exe lookup failed unexpectedly: {e}"))
+                }
+            };
+        }
     };
 
     let mut buf = [0u16; MAX_PATH as usize];
@@ -205,7 +217,15 @@ pub fn user_for_pid(pid: u32) -> Result<Option<String>> {
     // on every return path.
     let proc_handle = match unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid) } {
         Ok(h) => OwnedHandle::assume_valid(h),
-        Err(_) => return Ok(None),
+        // Item 4.8 — classify Expected vs Unexpected.
+        Err(e) => {
+            return match classify_open_process_error(&e) {
+                OpenProcessClass::Exited | OpenProcessClass::AccessDenied => Ok(None),
+                OpenProcessClass::Unexpected => {
+                    Err(anyhow!("OpenProcess({pid}) for user lookup failed unexpectedly: {e}"))
+                }
+            };
+        }
     };
 
     let mut token_raw: HANDLE = HANDLE::default();
@@ -364,7 +384,15 @@ pub fn cpu_times(pid: u32) -> Result<Option<ProcessCpuTimes>> {
     }
     let handle = match unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid) } {
         Ok(h) => OwnedHandle::assume_valid(h),
-        Err(_) => return Ok(None),
+        // Item 4.8 — classify Expected vs Unexpected.
+        Err(e) => {
+            return match classify_open_process_error(&e) {
+                OpenProcessClass::Exited | OpenProcessClass::AccessDenied => Ok(None),
+                OpenProcessClass::Unexpected => {
+                    Err(anyhow!("OpenProcess({pid}) for cpu times failed unexpectedly: {e}"))
+                }
+            };
+        }
     };
 
     let mut creation = FILETIME::default();
@@ -431,7 +459,15 @@ pub fn memory_info(pid: u32) -> Result<Option<MemoryInfo>> {
     }
     let handle = match unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid) } {
         Ok(h) => OwnedHandle::assume_valid(h),
-        Err(_) => return Ok(None),
+        // Item 4.8 — classify Expected vs Unexpected.
+        Err(e) => {
+            return match classify_open_process_error(&e) {
+                OpenProcessClass::Exited | OpenProcessClass::AccessDenied => Ok(None),
+                OpenProcessClass::Unexpected => {
+                    Err(anyhow!("OpenProcess({pid}) for memory info failed unexpectedly: {e}"))
+                }
+            };
+        }
     };
 
     // The EX variant is layout-compatible with the base — its first
@@ -661,7 +697,15 @@ pub fn affinity_mask(pid: u32) -> Result<Option<u64>> {
     }
     let handle = match unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid) } {
         Ok(h) => OwnedHandle::assume_valid(h),
-        Err(_) => return Ok(None),
+        // Item 4.8 — classify Expected vs Unexpected.
+        Err(e) => {
+            return match classify_open_process_error(&e) {
+                OpenProcessClass::Exited | OpenProcessClass::AccessDenied => Ok(None),
+                OpenProcessClass::Unexpected => {
+                    Err(anyhow!("OpenProcess({pid}) for affinity mask failed unexpectedly: {e}"))
+                }
+            };
+        }
     };
     let mut process_mask: usize = 0;
     let mut system_mask: usize = 0;
@@ -672,13 +716,114 @@ pub fn affinity_mask(pid: u32) -> Result<Option<u64>> {
     // handle drops at end of scope.
     match r {
         Ok(()) => Ok(Some(process_mask as u64)),
-        Err(_) => Ok(None),
+        Err(e) => match classify_open_process_error(&e) {
+            OpenProcessClass::Exited | OpenProcessClass::AccessDenied => Ok(None),
+            OpenProcessClass::Unexpected => {
+                Err(anyhow!("GetProcessAffinityMask({pid}) failed unexpectedly: {e}"))
+            }
+        },
+    }
+}
+
+/// Item 4.8 — classification of an OpenProcess (and related per-PID
+/// query) error. Used to distinguish "this is an expected race against
+/// the OS — silently return Ok(None)" from "something genuinely
+/// unexpected went wrong — surface it."
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum OpenProcessClass {
+    /// `ERROR_INVALID_PARAMETER` — the PID exited between when the
+    /// engine snapshotted the process list and when we tried to open
+    /// it. Common; expected; not worth logging.
+    Exited,
+    /// `ERROR_ACCESS_DENIED` — the process is protected (anti-cheat,
+    /// AV, kernel-protected service, PPL). Common on a typical
+    /// Windows desktop; we will never be able to touch these. Not
+    /// worth logging on every retry — the caller (engine) suppresses
+    /// further attempts via the per-PID apply-failure backoff (item
+    /// 4.9).
+    AccessDenied,
+    /// Anything else — surface to caller. Most likely a kernel call
+    /// failing in a way we haven't seen before, which deserves a log
+    /// line even if the immediate effect is the same as `Exited` for
+    /// the per-PID call site.
+    Unexpected,
+}
+
+/// Item 4.8 — map a windows-rs Error to an OpenProcessClass.
+pub(crate) fn classify_open_process_error(e: &windows::core::Error) -> OpenProcessClass {
+    // HRESULT_FROM_WIN32 prefixes the Win32 error code with 0x80070000.
+    // Both ERROR_INVALID_PARAMETER (0x57) and ERROR_ACCESS_DENIED (0x5)
+    // come through with that prefix; ERROR_* constants from windows-rs
+    // are typed WIN32_ERROR which converts to HRESULT via Into.
+    let code = e.code();
+    if code == ERROR_INVALID_PARAMETER.to_hresult() {
+        OpenProcessClass::Exited
+    } else if code == ERROR_ACCESS_DENIED.to_hresult() {
+        OpenProcessClass::AccessDenied
+    } else {
+        OpenProcessClass::Unexpected
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ─── Item 4.8 — OpenProcess error classification ──────────────────
+
+    #[test]
+    fn classify_invalid_parameter_is_exited() {
+        // Construct a windows::core::Error wrapping ERROR_INVALID_PARAMETER.
+        // Real OpenProcess produces these when the PID has exited
+        // between snapshot and open; we synthesize one for the unit test.
+        let e: windows::core::Error = ERROR_INVALID_PARAMETER.into();
+        assert_eq!(
+            classify_open_process_error(&e),
+            OpenProcessClass::Exited
+        );
+    }
+
+    #[test]
+    fn classify_access_denied_is_access_denied() {
+        let e: windows::core::Error = ERROR_ACCESS_DENIED.into();
+        assert_eq!(
+            classify_open_process_error(&e),
+            OpenProcessClass::AccessDenied
+        );
+    }
+
+    /// Anything not in the {INVALID_PARAMETER, ACCESS_DENIED} set
+    /// must fall through to Unexpected so the caller surfaces it
+    /// rather than silently swallowing a genuinely new failure
+    /// mode.
+    #[test]
+    fn classify_unfamiliar_error_is_unexpected() {
+        // ERROR_OUTOFMEMORY (0xE) — has never been observed from
+        // OpenProcess in practice but is a plausible Win32 error.
+        use windows::Win32::Foundation::ERROR_OUTOFMEMORY;
+        let e: windows::core::Error = ERROR_OUTOFMEMORY.into();
+        assert_eq!(
+            classify_open_process_error(&e),
+            OpenProcessClass::Unexpected
+        );
+    }
+
+    /// `exe_for_pid` against a PID that's definitely gone must
+    /// return `Ok(None)` (not Err) — that's the entire reason we
+    /// classify INVALID_PARAMETER as Exited. Real OS path, not the
+    /// synthesized-error path.
+    #[test]
+    fn exe_for_pid_classifies_dead_pid_as_ok_none() {
+        // High-number PID that's almost certainly not live on the
+        // test host. If by accident it IS live, exe_for_pid returns
+        // a real path; both outcomes pass the assertion ("not Err").
+        let result = exe_for_pid(0x7FFF_FFFE);
+        assert!(
+            result.is_ok(),
+            "definitely-dead PID must not produce Err, got {:?}",
+            result
+        );
+    }
 
     /// We're a running process — at minimum, our own PID must show up.
     #[test]
