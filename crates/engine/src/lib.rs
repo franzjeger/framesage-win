@@ -67,7 +67,26 @@ pub struct Engine {
 
 struct EngineState {
     policy: Policy,
-    topology: CpuTopology,
+    /// Item 2.3 / audit H-04. Topology is immutable after startup —
+    /// CPU layout doesn't change while the engine runs (modulo
+    /// hot-plug, which Group 3 item 3.7 will handle separately). The
+    /// previous `Vec<LogicalCpu>` field made every `topology.clone()`
+    /// (4+ per tick path) a full vector copy with ~50-100-byte
+    /// per-LogicalCpu entries; the Arc wrap turns each clone into a
+    /// single refcount bump (~1 ns).
+    topology: Arc<CpuTopology>,
+    /// Pre-computed lowercased denylist of process names that
+    /// ProBalance / background scan must never touch. Built once in
+    /// `Engine::new` from the bundled SafeList — never changes at
+    /// runtime, so a single `Arc<HashSet>` shared across all readers
+    /// eliminates the per-1s rebuild ProBalance was doing
+    /// (audit H-06).
+    safe_list_denied_exes: Arc<HashSet<String>>,
+    /// Pre-computed lowercased copy of the policy's `probalance.
+    /// ignore_processes` list. Refreshed in `set_policy`; otherwise
+    /// stable for the lifetime of the policy version. Eliminates the
+    /// per-1s rebuild from the ProBalance sample path.
+    user_ignore_exes: Arc<HashSet<String>>,
     paused: bool,
     /// What we've applied per-pid, so we can revert per-process state.
     applied: HashMap<u32, AppliedRecord>,
@@ -257,10 +276,25 @@ impl Engine {
     /// Construct an engine with full dependencies.
     pub fn new(deps: EngineDeps) -> Self {
         let (tx, _) = broadcast::channel(64);
+        // Item 2.3 — pre-compute the static safe-list denied-process set
+        // once. The previous ProBalance sample path rebuilt this every
+        // 1 s; it never changes (the bundled SafeList is a `&'static`),
+        // so a single Arc shared across all readers is enough. Audit
+        // H-06.
+        let safe_list_denied_exes: Arc<HashSet<String>> = Arc::new(
+            deps.safe_list
+                .denied_process_names()
+                .map(|n| n.to_ascii_lowercase())
+                .collect(),
+        );
+        let user_ignore_exes = Arc::new(build_user_ignore_exes(&deps.policy));
+        let topology = Arc::new(deps.topology);
         Self {
             state: Arc::new(RwLock::new(EngineState {
                 policy: deps.policy,
-                topology: deps.topology,
+                topology,
+                safe_list_denied_exes,
+                user_ignore_exes,
                 paused: false,
                 applied: HashMap::new(),
                 current_foreground: None,
@@ -322,7 +356,14 @@ impl Engine {
     }
 
     pub fn set_policy(&self, policy: Policy) {
-        self.state.write().policy = policy;
+        // Refresh the cached user-ignore set whenever policy changes —
+        // the ignore list is the only ProBalance-relevant field the user
+        // can edit at runtime. Building once here beats rebuilding every
+        // 1 s in the sample loop.
+        let new_ignore = Arc::new(build_user_ignore_exes(&policy));
+        let mut s = self.state.write();
+        s.policy = policy;
+        s.user_ignore_exes = new_ignore;
         info!("policy replaced");
     }
 
@@ -1430,19 +1471,16 @@ impl Engine {
             / (elapsed_100ns as u128 * cpu_count))
             .min(100)) as u8;
 
-        // Build the safe-list-name set. The game-mode safe-list's process
-        // denylist already covers the system-critical names ProBalance must
-        // never touch (dwm, audiodg, csrss, anti-cheat, AV, GPU drivers …).
-        let safe_list_exes: HashSet<String> = self
-            .safe_list
-            .denied_process_names()
-            .map(|n| n.to_ascii_lowercase())
-            .collect();
-        let user_ignore_exes: HashSet<String> = cfg
-            .ignore_processes
-            .iter()
-            .map(|n| n.to_ascii_lowercase())
-            .collect();
+        // Item 2.3 / audit H-06. Both sets are pre-computed and cached
+        // on EngineState — `safe_list_denied_exes` is built once in
+        // `Engine::new` (immutable bundled SafeList), `user_ignore_exes`
+        // is rebuilt only on `set_policy`. Clone is a single refcount
+        // bump on the Arcs, not a HashSet allocation. The previous path
+        // rebuilt both sets every 1 s — handful of allocations + per-
+        // entry lowercase, easily 10+ μs of pointless work per
+        // ProBalance sample.
+        let safe_list_exes = Arc::clone(&s.safe_list_denied_exes);
+        let user_ignore_exes = Arc::clone(&s.user_ignore_exes);
 
         let decisions = probalance::decide(
             &cfg,
@@ -2225,6 +2263,20 @@ impl Engine {
             warn!(error = %e, "journal delete after revert failed");
         }
     }
+}
+
+/// Build the lowercased user-ignore-list from a Policy's
+/// `probalance.ignore_processes` field. Pulled out as a free fn so
+/// `Engine::new` and `Engine::set_policy` share the same construction —
+/// keeps the cached set consistent with what the user authored.
+/// Item 2.3 / audit H-06.
+fn build_user_ignore_exes(policy: &Policy) -> HashSet<String> {
+    policy
+        .probalance
+        .ignore_processes
+        .iter()
+        .map(|n| n.to_ascii_lowercase())
+        .collect()
 }
 
 fn revert_record(pid: u32, record: AppliedRecord) {

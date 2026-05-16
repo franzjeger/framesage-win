@@ -156,8 +156,15 @@ struct TrayCommands {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 enum Tab {
-    Status,
+    /// Item 2.10 / audit H-24 partial: Status is the right landing
+    /// page on first launch — hero strip, active-profile summary,
+    /// foreground card, ProBalance card, quick actions. The previous
+    /// default (`Processes`) dropped users into a data-dense table
+    /// they didn't ask for, with no explanation of what FrameSage
+    /// does. Status answers "what's happening?" at a glance; the user
+    /// can click into Processes when they want to inspect.
     #[default]
+    Status,
     Processes,
     Activity,
     Rules,
