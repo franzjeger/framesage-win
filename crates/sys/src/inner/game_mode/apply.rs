@@ -94,12 +94,49 @@ pub fn revert_all(applied: &AppliedActions, previous: &PreviousState) {
     }
 
     for snap in &applied.suspended_pids {
-        match process::resume_process(snap.pid) {
-            Ok(count) => {
-                debug!(pid = snap.pid, exe = %snap.exe, resumed_threads = count, "revert: resume_process")
+        // Item 4.10 / audit M-16. Before resuming, verify the live exe
+        // at this PID still matches what we suspended. The journal
+        // outlives the suspended process: after a crash + reboot, the
+        // PID number we recorded may now belong to an entirely
+        // unrelated process (Windows reuses PIDs). Resuming the wrong
+        // process via NtResumeProcess is a silent kernel mutation —
+        // every `ResumeThread` increments the suspend counter towards
+        // zero, so we'd be flipping random background processes into a
+        // "now twice-not-suspended" state if they happened to be
+        // self-suspended.
+        match resume_check_for_pid(snap.pid, &snap.exe) {
+            ResumeCheck::Proceed => {
+                match process::resume_process(snap.pid) {
+                    Ok(count) => {
+                        debug!(pid = snap.pid, exe = %snap.exe, resumed_threads = count, "revert: resume_process")
+                    }
+                    Err(e) => {
+                        warn!(pid = snap.pid, exe = %snap.exe, error = %e, "revert: resume_process failed")
+                    }
+                }
             }
-            Err(e) => {
-                warn!(pid = snap.pid, exe = %snap.exe, error = %e, "revert: resume_process failed")
+            ResumeCheck::SkipExited => {
+                debug!(
+                    pid = snap.pid,
+                    exe = %snap.exe,
+                    "revert: suspended PID is gone; nothing to resume"
+                );
+            }
+            ResumeCheck::SkipMismatch { live_exe } => {
+                warn!(
+                    pid = snap.pid,
+                    journaled_exe = %snap.exe,
+                    live_exe = %live_exe,
+                    "revert: PID reassigned to different exe since suspend; skipping resume to avoid touching the wrong process"
+                );
+            }
+            ResumeCheck::SkipUnverified { reason } => {
+                warn!(
+                    pid = snap.pid,
+                    exe = %snap.exe,
+                    reason = %reason,
+                    "revert: could not verify exe for suspended PID; skipping resume rather than risk wrong-process resume"
+                );
             }
         }
     }
@@ -141,4 +178,146 @@ pub fn revert_all(applied: &AppliedActions, previous: &PreviousState) {
     }
 
     let _ = ServiceStatus::Stopped; // silence unused-import on prerelease builds
+}
+
+/// Item 4.10 — decision returned by [`resume_check_for_pid`]. Separates
+/// the "is it safe to resume this PID?" predicate from the actual resume
+/// syscall so the predicate can be unit-tested without standing up real
+/// suspended processes.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum ResumeCheck {
+    /// Live exe matches the journaled exe (case-insensitive). Safe to
+    /// resume.
+    Proceed,
+    /// `exe_for_pid` returned `Ok(None)` — the PID has exited (and
+    /// possibly been reused, but not reused yet). Nothing to do.
+    SkipExited,
+    /// Live exe differs from journaled exe — PID has been reassigned to
+    /// a different process. Resuming would touch the wrong process.
+    SkipMismatch { live_exe: String },
+    /// `exe_for_pid` itself errored. Best-effort skip: we'd rather strand
+    /// a suspended PID (rare; user can reboot) than blindly resume an
+    /// unverified PID.
+    SkipUnverified { reason: String },
+}
+
+/// Item 4.10 — return whether `pid` is still the same process we
+/// journaled as `journaled_exe`, by querying its live image path.
+///
+/// Case-insensitive bare-filename comparison: we suspended by full path
+/// but journaled the basename (matches the engine's storage shape, which
+/// keeps exe names without paths to ride out user reinstalls / portable
+/// app moves).
+pub(crate) fn resume_check_for_pid(pid: u32, journaled_exe: &str) -> ResumeCheck {
+    match super::super::process::exe_for_pid(pid) {
+        Ok(Some(live_path)) => {
+            let live_exe = live_path
+                .rsplit(['\\', '/'])
+                .next()
+                .unwrap_or(&live_path);
+            if live_exe.eq_ignore_ascii_case(journaled_exe) {
+                ResumeCheck::Proceed
+            } else {
+                ResumeCheck::SkipMismatch {
+                    live_exe: live_exe.to_owned(),
+                }
+            }
+        }
+        Ok(None) => ResumeCheck::SkipExited,
+        Err(e) => ResumeCheck::SkipUnverified {
+            reason: format!("{e:#}"),
+        },
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The current test process's own PID + its actual exe name should
+    /// always match — the canonical "safe to proceed" case. Establishes
+    /// that the predicate at least connects to `exe_for_pid` on this
+    /// host.
+    #[test]
+    fn resume_check_proceeds_when_live_exe_matches_journaled() {
+        let pid = std::process::id();
+        let live_path = super::super::super::process::exe_for_pid(pid)
+            .expect("exe_for_pid on self")
+            .expect("self has an exe");
+        let live_exe = live_path
+            .rsplit(['\\', '/'])
+            .next()
+            .unwrap_or(&live_path)
+            .to_owned();
+        assert_eq!(
+            resume_check_for_pid(pid, &live_exe),
+            ResumeCheck::Proceed
+        );
+    }
+
+    /// Item 4.10 load-bearing case: journal says "OneDrive.exe" but the
+    /// live PID is the test runner. Predicate must refuse the resume.
+    /// Without this check, a journal pointing at a stale PID that got
+    /// reassigned to the test runner would have flipped its suspend
+    /// counter under us.
+    #[test]
+    fn resume_check_skips_when_live_exe_does_not_match() {
+        let pid = std::process::id();
+        let result = resume_check_for_pid(pid, "OneDrive.exe");
+        match result {
+            ResumeCheck::SkipMismatch { live_exe } => {
+                assert!(
+                    !live_exe.eq_ignore_ascii_case("OneDrive.exe"),
+                    "live exe should be the test runner, not OneDrive.exe"
+                );
+            }
+            other => panic!(
+                "expected SkipMismatch for test-runner PID with fake journaled exe, got {other:?}"
+            ),
+        }
+    }
+
+    /// A PID that's almost certainly not alive (very large 32-bit
+    /// value). `exe_for_pid` returns `Ok(None)` for non-existent PIDs
+    /// (some kernel paths return errors for "definitely-dead" — we
+    /// accept either as a skip without resume).
+    #[test]
+    fn resume_check_skips_when_pid_is_gone() {
+        // A PID well above what Windows hands out in practice. If by
+        // some accident this PID is live on the test host, the
+        // assertion still passes for any non-Proceed variant.
+        let likely_dead_pid = 0x7FFF_FFFE;
+        let result = resume_check_for_pid(likely_dead_pid, "OneDrive.exe");
+        assert!(
+            matches!(
+                result,
+                ResumeCheck::SkipExited | ResumeCheck::SkipUnverified { .. }
+            ),
+            "expected SkipExited or SkipUnverified for a definitely-dead PID, got {result:?}"
+        );
+    }
+
+    /// Case-insensitivity is load-bearing: the journal stores
+    /// `OneDrive.exe` (canonical case from the planner's seed) but the
+    /// live exe may report as `onedrive.exe` on some filesystems /
+    /// PATH-resolution paths. Predicate must treat the two as a match.
+    #[test]
+    fn resume_check_is_case_insensitive() {
+        let pid = std::process::id();
+        let live_path = super::super::super::process::exe_for_pid(pid)
+            .expect("exe_for_pid on self")
+            .expect("self has an exe");
+        let live_exe = live_path
+            .rsplit(['\\', '/'])
+            .next()
+            .unwrap_or(&live_path);
+        // Build an upper-case variant of the live exe — predicate must
+        // still return Proceed.
+        let mangled = live_exe.to_ascii_uppercase();
+        assert_eq!(
+            resume_check_for_pid(pid, &mangled),
+            ResumeCheck::Proceed,
+            "case-mangled journaled exe should still match live exe"
+        );
+    }
 }
