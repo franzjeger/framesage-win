@@ -486,6 +486,36 @@ async fn handle_client(
                 }
             }
             Request::SetPolicy { policy } => {
+                // Server-side safe-list intersection: reject the entire
+                // SetPolicy if any profile requests stopping a denylisted
+                // service or suspending a denylisted process. Aggression on
+                // non-denylisted entries (BITS, WSearch, ClickToRunSvc,
+                // OneDrive, etc.) is allowed — those are the product's
+                // actual feature surface. Per the product positioning:
+                // outside the denylist, aggression is on the table.
+                let denied = validate_policy_against_safe_list(&policy);
+                if !denied.is_empty() {
+                    warn!(
+                        count = denied.len(),
+                        "SetPolicy rejected: denylisted entries"
+                    );
+                    write_response(
+                        &mut write_half,
+                        &Response::Error {
+                            message: format!(
+                                "SetPolicy rejected: {} denylisted entries — these processes / \
+                                 services are on the framesage safety denylist (kernel-critical, \
+                                 antivirus, anti-cheat) and cannot be touched regardless of \
+                                 profile content:\n  {}",
+                                denied.len(),
+                                denied.join("\n  "),
+                            ),
+                        },
+                    )
+                    .await?;
+                    continue;
+                }
+
                 // Apply in-memory first so subsequent ticks see the change
                 // immediately, then persist to disk so the edit survives
                 // service restart. The FS watcher will fire a redundant
@@ -630,4 +660,245 @@ fn _silence_warnings() {
         std::any::type_name::<AsyncBufReadExt>,
         std::any::type_name::<AsyncWriteExt>,
     );
+}
+
+/// Walk every profile in `policy` and collect human-readable error
+/// strings for any `stop_services` or `suspend_processes` entry that lands
+/// on the bundled safe-list denylist. Returns an empty Vec when the
+/// policy is acceptable.
+///
+/// The denylist is the trust-boundary for kernel-critical / AV /
+/// anti-cheat entries — these are non-overridable by design. Anything
+/// else (BITS / WSearch / ClickToRunSvc / OneDrive / OEM bloat) passes
+/// through because that's exactly the aggression surface the product
+/// promises.
+///
+/// Extracted out of the SetPolicy handler so it's unit-testable without
+/// spinning up the full IPC stack.
+fn validate_policy_against_safe_list(policy: &Policy) -> Vec<String> {
+    let safe_list = framesage_gamemode::safe_list::SafeList::bundled();
+    let mut denied: Vec<String> = Vec::new();
+    for (profile_id, profile) in &policy.profiles {
+        let Some(gm) = profile.game_mode.as_ref() else {
+            continue;
+        };
+        for entry in &gm.stop_services {
+            if let framesage_gamemode::safe_list::ServiceVerdict::Denied(reason) =
+                safe_list.check_service(entry)
+            {
+                denied.push(format!(
+                    "profile '{}': stop_services entry '{}' is on the framesage \
+                     denylist for safety — {}",
+                    profile_id.0, entry, reason
+                ));
+            }
+        }
+        for entry in &gm.suspend_processes {
+            if let framesage_gamemode::safe_list::ProcessVerdict::Denied(reason) =
+                safe_list.check_process(entry)
+            {
+                denied.push(format!(
+                    "profile '{}': suspend_processes entry '{}' is on the framesage \
+                     denylist for safety — {}",
+                    profile_id.0, entry, reason
+                ));
+            }
+        }
+    }
+    denied
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use framesage_core::{game_mode::GameModeActions, profile::Profile, ProfileId};
+    use std::collections::HashMap;
+
+    fn policy_with(profile_id: &str, game_mode: GameModeActions) -> Policy {
+        let mut profiles = HashMap::new();
+        let profile = Profile {
+            id: profile_id.into(),
+            game_mode: Some(game_mode),
+            ..Default::default()
+        };
+        profiles.insert(ProfileId(profile_id.into()), profile);
+        Policy {
+            profiles,
+            rules: vec![],
+            default_profile: ProfileId(profile_id.into()),
+            background_profile: None,
+            tick_ms: 300,
+            probalance: framesage_core::ProBalanceConfig::default(),
+            affinity_rules: Vec::new(),
+        }
+    }
+
+    /// Aggressive defaults (BITS / WSearch / OneDrive / etc.) MUST pass.
+    /// These are the product's actual feature surface. Refusing them
+    /// would defeat the whole point of the product positioning.
+    #[test]
+    fn validate_accepts_aggressive_but_safe_defaults() {
+        let policy = policy_with(
+            "aggressive",
+            GameModeActions {
+                stop_services: vec![
+                    "SysMain".into(),
+                    "WSearch".into(),
+                    "DiagTrack".into(),
+                    "BITS".into(),
+                    "DoSvc".into(),
+                    "WaaSMedicSvc".into(),
+                    "UsoSvc".into(),
+                    "ClickToRunSvc".into(),
+                    "WMPNetworkSvc".into(),
+                    "Fax".into(),
+                ],
+                suspend_processes: vec![
+                    "OneDrive.exe".into(),
+                    "FileCoAuth.exe".into(),
+                    "Dropbox.exe".into(),
+                    "GameBar.exe".into(),
+                    "WidgetService.exe".into(),
+                    "YourPhone.exe".into(),
+                    "lghub_updater.exe".into(),
+                ],
+                ..Default::default()
+            },
+        );
+        let denials = validate_policy_against_safe_list(&policy);
+        assert!(
+            denials.is_empty(),
+            "aggressive defaults must pass; got: {denials:#?}"
+        );
+    }
+
+    /// Denylisted services (AV, anti-cheat, RPC, DNS, DHCP, audio) MUST
+    /// be refused with the rationale string from the JSON.
+    #[test]
+    fn validate_refuses_denylisted_services() {
+        for service in &[
+            "WinDefend",     // Defender
+            "vgc",           // Riot Vanguard
+            "EasyAntiCheat", // EAC
+            "BEService",     // BattlEye
+            "RpcSs",         // RPC
+            "Dhcp",          // DHCP
+            "Dnscache",      // DNS
+            "AudioSrv",      // Audio
+        ] {
+            let policy = policy_with(
+                "bad",
+                GameModeActions {
+                    stop_services: vec![service.to_string()],
+                    ..Default::default()
+                },
+            );
+            let denials = validate_policy_against_safe_list(&policy);
+            assert_eq!(
+                denials.len(),
+                1,
+                "expected refusal for service {service}, got: {denials:#?}"
+            );
+            assert!(
+                denials[0]
+                    .to_ascii_lowercase()
+                    .contains(&service.to_ascii_lowercase()),
+                "denial should name {service}, got: {}",
+                denials[0]
+            );
+            assert!(
+                denials[0].contains("denylist"),
+                "denial should mention denylist, got: {}",
+                denials[0]
+            );
+        }
+    }
+
+    /// Same for processes: critical shell, AV, GPU drivers, kernel /
+    /// session processes.
+    #[test]
+    fn validate_refuses_denylisted_processes() {
+        for exe in &[
+            "csrss.exe",
+            "lsass.exe",
+            "wininit.exe",
+            "dwm.exe",
+            "audiodg.exe",
+            "MsMpEng.exe",
+            "explorer.exe",
+            "nvcontainer.exe",
+        ] {
+            let policy = policy_with(
+                "bad",
+                GameModeActions {
+                    suspend_processes: vec![exe.to_string()],
+                    ..Default::default()
+                },
+            );
+            let denials = validate_policy_against_safe_list(&policy);
+            assert_eq!(
+                denials.len(),
+                1,
+                "expected refusal for process {exe}, got: {denials:#?}"
+            );
+        }
+    }
+
+    /// Surface every denial in a single response, not just the first.
+    /// The user fixes them all at once instead of one save-reject cycle
+    /// per entry. The product contract is "informed refusal."
+    #[test]
+    fn validate_reports_all_denials_at_once() {
+        let policy = policy_with(
+            "many-bad",
+            GameModeActions {
+                stop_services: vec!["WinDefend".into(), "vgc".into(), "Dhcp".into()],
+                suspend_processes: vec!["csrss.exe".into(), "lsass.exe".into()],
+                ..Default::default()
+            },
+        );
+        let denials = validate_policy_against_safe_list(&policy);
+        assert_eq!(
+            denials.len(),
+            5,
+            "must report all 5 denials in one pass; got: {denials:#?}"
+        );
+    }
+
+    /// Profile without a game_mode (eco/perf-style profiles) is trivially
+    /// safe — no services to stop, no processes to suspend.
+    #[test]
+    fn validate_accepts_profile_without_game_mode() {
+        let mut profiles = HashMap::new();
+        profiles.insert(
+            ProfileId("perf".into()),
+            Profile {
+                id: "perf".into(),
+                game_mode: None,
+                ..Default::default()
+            },
+        );
+        let policy = Policy {
+            profiles,
+            rules: vec![],
+            default_profile: ProfileId("perf".into()),
+            background_profile: None,
+            tick_ms: 300,
+            probalance: framesage_core::ProBalanceConfig::default(),
+            affinity_rules: Vec::new(),
+        };
+        assert!(validate_policy_against_safe_list(&policy).is_empty());
+    }
+
+    /// The shipped default policy passes validation. Locks the invariant
+    /// that we never accidentally ship a default that the safety layer
+    /// would then reject.
+    #[test]
+    fn validate_accepts_shipped_default_policy() {
+        let denials = validate_policy_against_safe_list(&Policy::default());
+        assert!(
+            denials.is_empty(),
+            "shipped default policy must validate cleanly; got: {denials:#?}"
+        );
+    }
 }
