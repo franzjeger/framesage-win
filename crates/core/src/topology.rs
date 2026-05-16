@@ -216,7 +216,7 @@ impl CpuTopology {
                     .collect()
             }
             CpuSelector::Mask(mask) => (0..self.count() as u32)
-                .filter(|i| mask & (1u128 << i) != 0)
+                .filter(|i| mask & (1u64 << i) != 0)
                 .collect(),
         }
     }
@@ -246,7 +246,14 @@ pub enum CpuSelector {
     /// Top N cores by CPPC perf rank (with SMT siblings de-prioritised).
     TopRanked(u32),
     /// Explicit bitmask over logical processor indices. Last resort / legacy.
-    Mask(u128),
+    ///
+    /// `u64` matches Windows' `KAFFINITY` width — one bit per logical processor
+    /// in the calling thread's group, up to 64. Multi-group machines use
+    /// `GROUP_AFFINITY` instead and aren't covered by this selector. Sized as
+    /// `u64` (not `u128`) so the wire format JSON can serialize it — serde_json
+    /// rejects 128-bit integers by spec, and that rejection silently broke
+    /// every Custom-mask save through the IPC pipe before this fix.
+    Mask(u64),
 }
 
 #[cfg(test)]
@@ -336,7 +343,7 @@ mod tests {
     fn resolve_mask_picks_only_set_bits() {
         let topo = x3d_dual_ccd();
         // Bits 0, 2, 4, 6 → first four even logical indices.
-        let mask: u128 = 0b0101_0101;
+        let mask: u64 = 0b0101_0101;
         let resolved = topo.resolve(&CpuSelector::Mask(mask));
         assert_eq!(resolved, vec![0, 2, 4, 6]);
     }
