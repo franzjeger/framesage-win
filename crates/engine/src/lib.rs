@@ -210,6 +210,22 @@ struct EngineState {
     /// `probalance::decide` will demote it. Lives outside `decide` so the
     /// state survives across ticks; pruned inside `decide` to live PIDs.
     probalance_hog_streak: HashMap<u32, u32>,
+    /// Item 4.9 — per-PID apply-failure timestamps. After an automatic
+    /// (reconcile / background-scan) `apply_profile` call fails on a
+    /// PID, we record the failure time here and skip subsequent
+    /// automatic re-applies for `APPLY_FAILURE_BACKOFF` (default 30 s).
+    /// Avoids log spam from a process that's refusing
+    /// PROCESS_SET_INFORMATION for the entire run (anti-cheat clients,
+    /// AV, kernel-protected services that slipped through the safe-
+    /// list); without backoff the reconcile + background-scan paths
+    /// would each retry once per second and pollute the activity feed.
+    ///
+    /// Cleared on:
+    ///   * successful apply (the failure was transient)
+    ///   * PID exit (the next PID under this number is a new process)
+    ///   * explicit user actions (`apply_once`, `force_recompute` —
+    ///     the user is staring at the screen; honor their request)
+    apply_failure_backoff: HashMap<u32, Instant>,
     /// Per-PID CPU-time snapshot from the previous call to
     /// `list_process_snapshots`. Independent of `probalance_prev_samples`
     /// because the Processes tab needs CPU% whether or not the user has
@@ -375,6 +391,15 @@ const AC_DETECT_INTERVAL: Duration = Duration::from_secs(5);
 /// `policy.probalance.enabled == false`.
 const PROBALANCE_SAMPLE_INTERVAL: Duration = Duration::from_millis(1000);
 
+/// Item 4.9 — after an automatic apply_profile call fails on a PID, skip
+/// further automatic attempts on that PID for this long. Cleared on
+/// success, on PID exit, and on explicit user action. 30 s matches
+/// audit M-15's recommendation: long enough to prevent log spam on
+/// genuinely-protected processes, short enough that a transient
+/// permission race resolves itself within a window the user wouldn't
+/// notice.
+const APPLY_FAILURE_BACKOFF: Duration = Duration::from_secs(30);
+
 /// Cached fields from the previous ProBalance sample.
 #[derive(Debug, Clone, Copy)]
 struct ProBalancePrevSample {
@@ -445,6 +470,7 @@ impl Engine {
                 last_persistent_reassert: None,
                 probalance_prev_samples: HashMap::new(),
                 probalance_hog_streak: HashMap::new(),
+                apply_failure_backoff: HashMap::new(),
                 probalance_last_sample_at: None,
                 probalance_restrained: HashMap::new(),
                 list_processes_prev_samples: HashMap::new(),
@@ -719,6 +745,7 @@ impl Engine {
         s.probalance_restrained.remove(&pid);
         s.probalance_prev_samples.remove(&pid);
         s.probalance_hog_streak.remove(&pid);
+        s.apply_failure_backoff.remove(&pid);
         s.list_processes_prev_samples.remove(&pid);
         s.affinity_rule_applied.remove(&pid);
         if s.current_foreground == Some(pid) {
@@ -2388,6 +2415,11 @@ impl Engine {
         let topology = s.topology.clone();
 
         // ─── Drop records for PIDs that exited since last scan ──────────────
+        // Item 4.9 — also reap stale apply_failure_backoff entries so a
+        // PID-number reuse after 30+ s doesn't start its life under a
+        // false backoff. Cheap (`retain` is one pass).
+        s.apply_failure_backoff
+            .retain(|pid, _| live_set.contains(pid));
         let stale: Vec<u32> = s
             .applied
             .keys()
@@ -2492,6 +2524,14 @@ impl Engine {
             if s.applied.contains_key(&pid) {
                 continue;
             }
+            // Item 4.9 — skip PIDs we recently failed to apply to.
+            // Without this the background-scan walks the full live PID
+            // list every 10 s and burns syscalls retrying the same
+            // protected processes (AV / AC / kernel-protected services
+            // that slipped past the static safe-list).
+            if apply_backoff_active(&s.apply_failure_backoff, pid, Instant::now()) {
+                continue;
+            }
 
             // Filter against the safe-list denylist — same denylist that
             // protects suspend_processes, repurposed here so we don't, e.g.,
@@ -2530,6 +2570,8 @@ impl Engine {
 
             match apply_profile(sys, pid, &exe_name, &profile_for_pid, &topology, safe_list) {
                 Ok(record) => {
+                    // Item 4.9 — successful apply clears any prior failure.
+                    s.apply_failure_backoff.remove(&pid);
                     let profile_id_emitted = record.profile_id.clone();
                     let exe_emitted = record.exe_name.clone();
                     s.applied.insert(pid, record);
@@ -2549,7 +2591,14 @@ impl Engine {
                 // the safe-list, so the residue is genuinely "expected
                 // privileged-process refusals" that would drown the
                 // activity feed without informing the user.
-                Err(_) => continue,
+                //
+                // Item 4.9 — record the failure so the next 10-s
+                // background sweep doesn't burn another OpenProcess on
+                // the same protected PID.
+                Err(_) => {
+                    s.apply_failure_backoff.insert(pid, Instant::now());
+                    continue;
+                }
             }
         }
 
@@ -2692,6 +2741,22 @@ impl Engine {
             );
             return Ok(());
         }
+        // Item 4.9 — automatic reconcile path. If we recently failed
+        // to apply to this PID, skip silently rather than retrying once
+        // per second and flooding ActionFailed. The user-initiated
+        // paths (apply_once, force_recompute) bypass this gate.
+        if apply_backoff_active(&s.apply_failure_backoff, fg.pid, Instant::now()) {
+            debug!(
+                pid = fg.pid,
+                exe = %fg.exe_name,
+                "reconcile: skipping apply — recent failure within backoff window"
+            );
+            // Still update foreground state so the rest of the engine
+            // (ProBalance, status snapshots) reflects the new focus.
+            s.current_foreground = Some(fg.pid);
+            s.foreground_snapshot = Some(snapshot.clone());
+            return Ok(());
+        }
         match apply_profile(
             self.sys.as_ref(),
             fg.pid,
@@ -2702,6 +2767,8 @@ impl Engine {
         ) {
             Ok(record) => {
                 info!(pid = fg.pid, exe = %fg.exe_name, profile = %profile_id, "applied");
+                // Item 4.9 — successful apply clears any prior failure.
+                s.apply_failure_backoff.remove(&fg.pid);
                 s.applied.insert(fg.pid, record);
                 s.current_foreground = Some(fg.pid);
                 s.foreground_snapshot = Some(snapshot.clone());
@@ -2724,6 +2791,14 @@ impl Engine {
                     exe_name: Some(fg.exe_name.clone()),
                     details: format!("apply failed: {e:#}"),
                 });
+                // Item 4.9 — record the failure so subsequent automatic
+                // ticks skip this PID for APPLY_FAILURE_BACKOFF. The
+                // foreground-tracking update below already prevented
+                // tight retry, but only at the granularity of "same
+                // foreground PID for many ticks"; the background-scan
+                // path needs its own gate (also wired below), so we
+                // record here for both.
+                s.apply_failure_backoff.insert(fg.pid, Instant::now());
                 // We still update foreground tracking so we don't loop trying
                 // to re-apply on every tick. System mode below uses
                 // active_profile.
@@ -3142,6 +3217,22 @@ fn applied_from_plan(plan: &ActionPlan) -> AppliedActions {
         }
     }
     a
+}
+
+/// Item 4.9 — returns true if a previous failed apply on `pid` is still
+/// within the backoff window. Caller skips the apply attempt silently
+/// when this returns true. Entries past the window stay in the map (the
+/// next successful apply or PID-exit reaping clears them); checking is
+/// O(1).
+fn apply_backoff_active(
+    backoff: &HashMap<u32, Instant>,
+    pid: u32,
+    now: Instant,
+) -> bool {
+    backoff
+        .get(&pid)
+        .map(|t| now.duration_since(*t) < APPLY_FAILURE_BACKOFF)
+        .unwrap_or(false)
 }
 
 fn apply_profile(
@@ -4109,6 +4200,48 @@ mod tests {
         engine.disable_manual_global_game_mode();
         engine.disable_manual_global_game_mode();
         assert!(engine.status().manual_global_active.is_none());
+    }
+
+    // ─── Item 4.9 — apply-failure backoff ──────────────────────────────────
+
+    /// Predicate: a fresh failure entry (recorded "now") suppresses
+    /// the apply within the window; an entry past the window does not;
+    /// no entry at all does not.
+    #[test]
+    fn apply_backoff_active_window_semantics() {
+        let mut map = HashMap::new();
+        let now = Instant::now();
+        assert!(
+            !apply_backoff_active(&map, 42, now),
+            "no entry → no backoff"
+        );
+
+        // Fresh failure: backoff active.
+        map.insert(42, now);
+        assert!(
+            apply_backoff_active(&map, 42, now),
+            "freshly recorded failure must be inside the window"
+        );
+
+        // Same entry, but observed 31 seconds later: expired.
+        let later = now + Duration::from_secs(31);
+        assert!(
+            !apply_backoff_active(&map, 42, later),
+            "entry past APPLY_FAILURE_BACKOFF must not gate the retry"
+        );
+
+        // A different PID is unaffected by 42's entry.
+        assert!(
+            !apply_backoff_active(&map, 43, now),
+            "backoff entries are per-PID"
+        );
+    }
+
+    /// The window constant is load-bearing for the audit's M-15
+    /// recommendation. Pin it so a future tweak surfaces in code review.
+    #[test]
+    fn apply_failure_backoff_is_thirty_seconds() {
+        assert_eq!(APPLY_FAILURE_BACKOFF, Duration::from_secs(30));
     }
 
     fn test_engine_with_profile(profile: Profile) -> Engine {
