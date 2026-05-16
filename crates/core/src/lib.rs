@@ -12,7 +12,7 @@ pub mod profile;
 pub mod topology;
 
 pub use game_mode::{FocusAssistMode, GameModeActions, PowerPlanId};
-pub use policy::{AppMatch, AppRule, Policy, ProBalanceConfig};
+pub use policy::{AffinityRule, AppMatch, AppRule, Policy, ProBalanceConfig};
 pub use profile::{
     IoPriority, MemoryPriority, PowerThrottlingMode, PriorityClass, Profile, ProfileId,
 };
