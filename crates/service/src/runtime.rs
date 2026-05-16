@@ -625,6 +625,24 @@ async fn handle_client(
                     }
                 }
             }
+            Request::EnableManualGlobalGameMode { profile } => {
+                match engine.enable_manual_global_game_mode(profile) {
+                    Ok(()) => write_response(&mut write_half, &Response::Ok).await?,
+                    Err(e) => {
+                        write_response(
+                            &mut write_half,
+                            &Response::Error {
+                                message: format!("enable_manual_global_game_mode failed: {e:#}"),
+                            },
+                        )
+                        .await?;
+                    }
+                }
+            }
+            Request::DisableManualGlobalGameMode => {
+                engine.disable_manual_global_game_mode();
+                write_response(&mut write_half, &Response::Ok).await?;
+            }
             Request::DeleteAffinityRule { exe_name } => {
                 // Idempotent: delete returns Ok regardless of whether a rule
                 // existed. Still persist on every call so the empty state

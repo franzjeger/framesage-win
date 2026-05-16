@@ -144,6 +144,19 @@ pub enum Request {
     /// Lasso's behavior — clearing a rule for next launch should not
     /// surprise the user by yanking the current session's pin.
     DeleteAffinityRule { exe_name: String },
+    /// Item 2.11 — Manual Global Game Mode. Enter `profile`'s
+    /// `game_mode` actions system-wide regardless of what's
+    /// foregrounded. The profile must have `manual_global_eligible
+    /// = true` or the engine refuses (returns ErrorResponse). The
+    /// session persists across foreground changes until
+    /// `DisableManualGlobalGameMode` arrives; auto-reconcile
+    /// (focus-driven Game Mode transitions) is suspended while
+    /// manual global is active so the user's choice wins.
+    EnableManualGlobalGameMode { profile: ProfileId },
+    /// Item 2.11 — exit Manual Global Game Mode. Reverts the session
+    /// and resumes normal foreground-driven reconcile. Idempotent:
+    /// no-op if manual global wasn't active.
+    DisableManualGlobalGameMode,
 }
 
 impl Request {
@@ -173,7 +186,9 @@ impl Request {
             | Request::SetProcessAffinity { .. }
             | Request::TrimWorkingSet { .. }
             | Request::SetAffinityRule { .. }
-            | Request::DeleteAffinityRule { .. } => false,
+            | Request::DeleteAffinityRule { .. }
+            | Request::EnableManualGlobalGameMode { .. }
+            | Request::DisableManualGlobalGameMode => false,
         }
     }
 
@@ -322,6 +337,16 @@ pub struct StatusSnapshot {
     /// surfaces this with a banner + "Disable manual mode" button.
     #[serde(default)]
     pub manual_override: Option<ProfileId>,
+    /// Item 2.11. When `Some`, the engine is in Manual Global Game
+    /// Mode: the named profile's `game_mode` actions are applied
+    /// system-wide and auto-reconcile (focus-driven Game Mode
+    /// transitions) is suspended. The tray surfaces this with a
+    /// banner + "Exit Manual Game Mode" button. Independent of
+    /// `manual_override` — the two can coexist (the user can pin
+    /// per-PID behavior to one profile while running a different
+    /// profile's environment actions).
+    #[serde(default)]
+    pub manual_global_active: Option<ProfileId>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

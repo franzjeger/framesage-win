@@ -1524,6 +1524,41 @@ impl FramesageApp {
             ui.add_space(10.0);
         }
 
+        // ─── Manual Global Game Mode banner (item 2.11) ─────────────────
+        if let Some(global_id) = &s.manual_global_active {
+            theme::banner(theme::WARNING).show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    ui.colored_label(theme::WARNING, egui::RichText::new("!").strong().size(13.0));
+                    ui.label(
+                        egui::RichText::new("Manual Global Game Mode")
+                            .strong()
+                            .color(theme::TEXT),
+                    );
+                    ui.colored_label(theme::TEXT_MUTED, "·");
+                    ui.label(
+                        egui::RichText::new(display_profile_id(&global_id.0))
+                            .strong()
+                            .color(theme::WARNING),
+                    );
+                    ui.colored_label(
+                        theme::TEXT_MUTED,
+                        "is applied system-wide (auto reconcile paused)",
+                    );
+                    if self.elevated {
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            if ui.button("Exit Manual Game Mode").clicked() {
+                                self.send_admin_request(
+                                    Request::DisableManualGlobalGameMode,
+                                    "disable manual global game mode",
+                                );
+                            }
+                        });
+                    }
+                });
+            });
+            ui.add_space(10.0);
+        }
+
         // ─── Side-by-side: Active profile · Foreground ──────────────────
         ui.columns(2, |cols| {
             theme::card().show(&mut cols[0], |ui| {
@@ -1569,7 +1604,7 @@ impl FramesageApp {
                 .as_ref()
                 .map(|p| p.game_mode.is_some())
                 .unwrap_or(false);
-            self.render_quick_actions(ctx, ui, paused, in_game_mode);
+            self.render_quick_actions(ctx, ui, paused, in_game_mode, s);
             ui.add_space(10.0);
         }
 
@@ -1678,6 +1713,7 @@ impl FramesageApp {
         ui: &mut egui::Ui,
         paused: bool,
         in_game_mode: bool,
+        status: &StatusSnapshot,
     ) {
         if !self.elevated {
             theme::banner(theme::WARNING).show(ui, |ui| {
@@ -1748,6 +1784,62 @@ impl FramesageApp {
                     self.send_admin_request(Request::GameModeOff, "game-mode off");
                 }
             });
+
+            // ─── Manual Global Game Mode launcher (item 2.11) ───────────
+            // Lists every profile marked `manual_global_eligible` so
+            // the user can enter a system-wide quiet-desktop session
+            // independent of foreground. When manual global is
+            // already active, this section collapses to a single
+            // "Exit Manual Game Mode" button so the user has a fast
+            // off-switch without scrolling up to the banner.
+            let eligible: Vec<&framesage_core::Profile> = status
+                .policy
+                .profiles
+                .values()
+                .filter(|p| p.manual_global_eligible)
+                .collect();
+            if !eligible.is_empty() {
+                ui.add_space(6.0);
+                ui.separator();
+                ui.add_space(6.0);
+                ui.label(theme::section_heading("Manual Global Game Mode"));
+                ui.add_space(4.0);
+                if let Some(active) = &status.manual_global_active {
+                    ui.horizontal(|ui| {
+                        ui.colored_label(theme::TEXT_MUTED, "Active:");
+                        ui.colored_label(theme::WARNING, display_profile_id(&active.0));
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            if ui.button("Exit Manual Game Mode").clicked() {
+                                self.send_admin_request(
+                                    Request::DisableManualGlobalGameMode,
+                                    "disable manual global game mode",
+                                );
+                            }
+                        });
+                    });
+                } else {
+                    ui.horizontal_wrapped(|ui| {
+                        ui.colored_label(
+                            theme::TEXT_MUTED,
+                            "Enter a profile's environment actions system-wide:",
+                        );
+                    });
+                    ui.add_space(4.0);
+                    ui.horizontal_wrapped(|ui| {
+                        for profile in &eligible {
+                            let id = profile.id.clone();
+                            let label = format!("Enter {}", display_profile_id(&id.0));
+                            if ui.button(label).clicked() {
+                                self.send_admin_request(
+                                    Request::EnableManualGlobalGameMode { profile: id },
+                                    "enable manual global game mode",
+                                );
+                            }
+                        }
+                    });
+                }
+            }
+
             if let Some(msg) = self.last_action.lock().unwrap().as_ref() {
                 ui.add_space(4.0);
                 ui.small(msg);

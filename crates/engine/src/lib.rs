@@ -188,6 +188,17 @@ struct EngineState {
     /// changes until explicitly cleared via `clear_manual_override` /
     /// `Request::ClearManualOverride`.
     manual_override: Option<ProfileId>,
+    /// Item 2.11 — Manual Global Game Mode. When set, the engine has
+    /// entered `game_mode` actions for this profile system-wide
+    /// regardless of foreground; the auto-reconcile path
+    /// (`reconcile_system_mode_locked`) skips tear-down while this
+    /// is `Some`. Cleared by
+    /// `disable_manual_global_game_mode` /
+    /// `Request::DisableManualGlobalGameMode`, by
+    /// `SystemEvent::Suspend` (matches user's "back to normal on
+    /// resume" expectation), and by
+    /// `SystemEvent::SessionConsoleDisconnect`.
+    manual_global_active: Option<ProfileId>,
     /// Foreground reported by a user-session helper (typically the tray).
     /// `None` means "the user session is idle / on lock screen / no
     /// foreground"; the tick should treat it the same as
@@ -370,6 +381,7 @@ impl Engine {
                 version_info_cache: HashMap::new(),
                 user_cache: HashMap::new(),
                 manual_override: None,
+                manual_global_active: None,
                 reported_foreground: None,
                 foreground_reporter_seen: false,
                 last_foreground_report_at: None,
@@ -726,6 +738,7 @@ impl Engine {
             foreground: s.foreground_snapshot.clone(),
             active_profile,
             manual_override: s.manual_override.clone(),
+            manual_global_active: s.manual_global_active.clone(),
         }
     }
 
@@ -1258,10 +1271,106 @@ impl Engine {
     }
 
     /// Panic button: revert any active system mode regardless of foreground.
-    /// Idempotent — `Ok(())` if no system mode was active.
+    /// Idempotent — `Ok(())` if no system mode was active. Also clears
+    /// Manual Global Game Mode if it was set — the user hit the kill
+    /// switch, they want the desktop fully back.
     pub fn exit_system_mode_now(&self) {
         let mut s = self.state.write();
+        s.manual_global_active = None;
         Self::revert_system_mode_locked(&mut s, &self.journal, &self.events, "manual_exit");
+    }
+
+    /// Item 2.11 — Manual Global Game Mode entry. Applies the named
+    /// profile's `game_mode` actions system-wide regardless of what's
+    /// foregrounded, and pins the system_mode session against
+    /// auto-reconcile tear-down until
+    /// `disable_manual_global_game_mode` arrives.
+    ///
+    /// Refuses (Err) when:
+    ///   * The profile id isn't in the active policy.
+    ///   * The profile is not marked `manual_global_eligible`.
+    ///   * The profile has no `game_mode` actions configured (nothing
+    ///     to apply — a manual global session with zero actions is
+    ///     just confusing).
+    pub fn enable_manual_global_game_mode(&self, profile_id: ProfileId) -> Result<()> {
+        let mut s = self.state.write();
+
+        let profile = s
+            .policy
+            .profile(&profile_id)
+            .ok_or_else(|| anyhow::anyhow!("unknown profile id {profile_id}"))?
+            .clone();
+
+        if !profile.manual_global_eligible {
+            return Err(anyhow::anyhow!(
+                "profile '{profile_id}' is not marked manual_global_eligible — set the flag in \
+                 the policy editor before invoking Manual Global Game Mode"
+            ));
+        }
+
+        let Some(actions) = profile.game_mode.clone() else {
+            return Err(anyhow::anyhow!(
+                "profile '{profile_id}' has no game_mode actions; nothing to apply as a global \
+                 session"
+            ));
+        };
+        if actions == GameModeActions::default() {
+            return Err(anyhow::anyhow!(
+                "profile '{profile_id}' game_mode is empty; nothing to apply"
+            ));
+        }
+
+        info!(
+            profile = %profile_id,
+            "entering Manual Global Game Mode"
+        );
+
+        // Reconcile against the new actions. Important: we must
+        // reconcile BEFORE setting manual_global_active, because
+        // reconcile's own ownership guard uses the flag to decide
+        // whether to honor the request. Setting it first would
+        // cause the new request to be matched against the not-yet-
+        // -set pinned profile and short-circuit.
+        Self::reconcile_system_mode_locked(
+            &mut s,
+            &self.journal,
+            self.safe_list,
+            &profile_id,
+            Some(actions),
+            &self.events,
+            "manual_global_enter",
+        );
+
+        s.manual_global_active = Some(profile_id);
+
+        Ok(())
+    }
+
+    /// Item 2.11 — exit Manual Global Game Mode. Reverts the session
+    /// and resumes auto-reconcile. Idempotent.
+    pub fn disable_manual_global_game_mode(&self) {
+        let mut s = self.state.write();
+        if s.manual_global_active.is_none() {
+            return;
+        }
+        info!(
+            profile = ?s.manual_global_active,
+            "exiting Manual Global Game Mode"
+        );
+        s.manual_global_active = None;
+        Self::revert_system_mode_locked(
+            &mut s,
+            &self.journal,
+            &self.events,
+            "manual_global_exit",
+        );
+        // Force the next reconcile to re-evaluate the current
+        // foreground — without this, if the foreground hasn't
+        // changed since manual global was enabled, reconcile's
+        // "new_pid == current_foreground" fast path would skip the
+        // re-entry. Clearing makes the next tick treat the
+        // foreground as freshly arrived.
+        s.current_foreground = None;
     }
 
     /// Forward an OS-level system event (suspend, resume, session change)
@@ -1296,6 +1405,11 @@ impl Engine {
                 info!("system suspending — exiting Game Mode and pausing engine");
                 {
                     let mut s = self.state.write();
+                    // Clear manual global before revert so the
+                    // revert_system_mode_locked call actually fires
+                    // (it would otherwise skip via the manual-global
+                    // ownership guard).
+                    s.manual_global_active = None;
                     Self::revert_system_mode_locked(
                         &mut s,
                         &self.journal,
@@ -1327,6 +1441,7 @@ impl Engine {
                     "console session disconnected (FUS / RDP off) — exiting Game Mode"
                 );
                 let mut s = self.state.write();
+                s.manual_global_active = None;
                 Self::revert_system_mode_locked(
                     &mut s,
                     &self.journal,
@@ -2302,12 +2417,22 @@ impl Engine {
             }
         }
 
-        // No new foreground? Tear down system mode too — there's nothing to
-        // be in Game Mode "for."
+        // No new foreground? Tear down system mode too — there's nothing
+        // to be in Game Mode "for." Unless Manual Global Game Mode is on:
+        // the user explicitly asked for system_mode regardless of
+        // foreground, so locking the screen / closing every window
+        // doesn't tear it down. (Item 2.11.)
         let Some(fg) = foreground else {
             s.foreground_snapshot = None;
             s.active_profile = None;
-            Self::revert_system_mode_locked(s, &self.journal, &self.events, "foreground_lost");
+            if s.manual_global_active.is_none() {
+                Self::revert_system_mode_locked(
+                    s,
+                    &self.journal,
+                    &self.events,
+                    "foreground_lost",
+                );
+            }
             return Ok(());
         };
 
@@ -2447,6 +2572,25 @@ impl Engine {
         events: &broadcast::Sender<Event>,
         revert_reason: &str,
     ) {
+        // Item 2.11 — Manual Global Game Mode owns system_mode. When
+        // active, the only legitimate caller is the manual global
+        // enter/exit path itself (which passes the manual global
+        // profile as new_profile or clears manual_global_active
+        // before calling). Anything else (force_recompute,
+        // apply_once, foreground-driven reconcile) gets a hard skip
+        // so the user's manual pin can't be silently swapped by an
+        // unrelated profile change.
+        if let Some(pinned) = &s.manual_global_active {
+            if pinned != new_profile {
+                debug!(
+                    pinned = %pinned,
+                    attempted = %new_profile,
+                    "reconcile_system_mode_locked skipped — Manual Global Game Mode owns system mode"
+                );
+                return;
+            }
+        }
+
         // Fast paths.
         match (&s.system_mode, &new_actions) {
             (None, None) => return,
@@ -3514,12 +3658,88 @@ mod tests {
         );
     }
 
+    /// enable_manual_global_game_mode must refuse a profile that
+    /// isn't marked `manual_global_eligible` — the flag exists
+    /// precisely so the picker doesn't fill up with every game
+    /// profile the user has authored.
+    #[test]
+    fn manual_global_refuses_non_eligible_profile() {
+        let engine = test_engine_with_profile(Profile {
+            id: ProfileId("quiet".into()),
+            manual_global_eligible: false,
+            game_mode: Some(GameModeActions {
+                hide_taskbar: true,
+                ..Default::default()
+            }),
+            ..Default::default()
+        });
+        let err = engine
+            .enable_manual_global_game_mode(ProfileId("quiet".into()))
+            .expect_err("non-eligible profile must be refused");
+        assert!(
+            err.to_string().contains("manual_global_eligible"),
+            "error should mention the missing flag: {err}"
+        );
+        assert!(engine.status().manual_global_active.is_none());
+    }
+
+    /// enable_manual_global_game_mode must refuse a profile whose
+    /// `game_mode` is None — entering a manual global session that
+    /// applies zero actions is just confusing.
+    #[test]
+    fn manual_global_refuses_profile_with_no_game_mode() {
+        let engine = test_engine_with_profile(Profile {
+            id: ProfileId("naked".into()),
+            manual_global_eligible: true,
+            game_mode: None,
+            ..Default::default()
+        });
+        let err = engine
+            .enable_manual_global_game_mode(ProfileId("naked".into()))
+            .expect_err("profile with no game_mode must be refused");
+        assert!(err.to_string().contains("no game_mode"));
+    }
+
+    /// disable_manual_global_game_mode must be idempotent — calling
+    /// it when no session is active is a no-op, not an error or
+    /// crash. Mirrors the panic-button (`exit_system_mode_now`)
+    /// semantic.
+    #[test]
+    fn manual_global_disable_is_idempotent() {
+        let engine = test_engine();
+        engine.disable_manual_global_game_mode();
+        engine.disable_manual_global_game_mode();
+        assert!(engine.status().manual_global_active.is_none());
+    }
+
+    fn test_engine_with_profile(profile: Profile) -> Engine {
+        let policy = Policy {
+            default_profile: profile.id.clone(),
+            profiles: {
+                let mut m = std::collections::HashMap::new();
+                m.insert(profile.id.clone(), profile);
+                m
+            },
+            ..Default::default()
+        };
+        Engine::new(EngineDeps {
+            policy,
+            topology: CpuTopology::default(),
+            safe_list: framesage_gamemode::safe_list::SafeList::bundled(),
+            journal: Journal::at_default_path(),
+        })
+    }
+
     fn test_engine() -> Engine {
-        let mut policy = Policy::default();
-        policy.default_profile = ProfileId("default".into());
-        policy
-            .profiles
-            .insert(ProfileId("default".into()), Profile::default());
+        let policy = Policy {
+            default_profile: ProfileId("default".into()),
+            profiles: {
+                let mut m = std::collections::HashMap::new();
+                m.insert(ProfileId("default".into()), Profile::default());
+                m
+            },
+            ..Default::default()
+        };
         Engine::new(EngineDeps {
             policy,
             topology: CpuTopology::default(),

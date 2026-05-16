@@ -76,6 +76,21 @@ enum GameModeCmd {
     Off,
     /// Print the curated safe-list (services + processes) with rationale.
     SafeList,
+    /// Item 2.11 — enter Manual Global Game Mode for `profile`. The
+    /// profile's `game_mode` actions are applied system-wide
+    /// regardless of foreground, and stay until `framesage game-mode
+    /// off-global` (or `off`) is invoked. Profile must be marked
+    /// `manual_global_eligible` in the policy.
+    On {
+        /// Profile id (must have `manual_global_eligible = true`).
+        profile: String,
+    },
+    /// Item 2.11 — exit Manual Global Game Mode. Idempotent. Distinct
+    /// from `off`: `off` is the panic button that clears anything
+    /// active (manual global OR auto session); `off-global` only
+    /// touches manual global so an auto session triggered by the
+    /// foreground keeps running.
+    OffGlobal,
 }
 
 fn main() -> Result<()> {
@@ -103,6 +118,15 @@ fn main() -> Result<()> {
             GameModeCmd::SafeList => {
                 print_safe_list();
                 Ok(())
+            }
+            GameModeCmd::On { profile } => tokio_block(async {
+                send_simple(Request::EnableManualGlobalGameMode {
+                    profile: ProfileId(profile),
+                })
+                .await
+            }),
+            GameModeCmd::OffGlobal => {
+                tokio_block(async { send_simple(Request::DisableManualGlobalGameMode).await })
             }
         },
     }
