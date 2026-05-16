@@ -153,11 +153,31 @@ pub struct ProBalanceConfig {
     /// class on borderline-busy processes.
     pub min_restrain_ms: u64,
 
+    /// Item 4.6 — restrain-side hysteresis. A candidate must read as a hog
+    /// for this many *consecutive* samples before we demote it. 1 is the
+    /// pre-4.6 behavior (instant demote on the first sample over
+    /// threshold); 2 (the new default) requires two ticks in a row, which
+    /// at the default 300 ms tick is ~600 ms of sustained pressure. This
+    /// kills the false-positive demote of processes that briefly spike to
+    /// 100% during a single sample window (Chrome on a tab switch, an
+    /// editor running save-on-blur, etc.) without meaningfully delaying
+    /// restraint of genuine hogs.
+    ///
+    /// Pairs with the existing `min_restrain_ms` dwell on the restore
+    /// side — together they form full hysteresis: slow to demote, slow to
+    /// restore. Audit M-18.
+    #[serde(default = "default_min_restrain_samples")]
+    pub min_restrain_samples: u32,
+
     /// Process names (case-insensitive, no path) that ProBalance never
     /// touches. Beyond the system-critical denylist enforced internally,
     /// this is the user's escape hatch.
     #[serde(default)]
     pub ignore_processes: Vec<String>,
+}
+
+fn default_min_restrain_samples() -> u32 {
+    2
 }
 
 impl Default for ProBalanceConfig {
@@ -167,6 +187,7 @@ impl Default for ProBalanceConfig {
             system_cpu_threshold_percent: 75,
             hog_cpu_threshold_percent: 50,
             min_restrain_ms: 1500,
+            min_restrain_samples: default_min_restrain_samples(),
             ignore_processes: Vec::new(),
         }
     }
