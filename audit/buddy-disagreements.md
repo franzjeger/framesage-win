@@ -314,6 +314,75 @@ When you decide on each, DRAFT v4 applies the chosen resolutions, runs through b
 
 ---
 
+## Entry 3 — 2026-05-17, buddy review of Group A week 2 plan DRAFT v4
+
+### Buddy verdict summary
+
+| Question | Verdict | Notes |
+|---|---|---|
+| (a) Plan matches architecture + schema authority | PASS | No findings |
+| (b) Scope correctness | PASS | No findings |
+| (c) Realistic stop gates + feasibility | PASS-WITH-NOTE | Day 3 carries six artifacts; buddy assesses as "~1.5 days of work" but explicitly NOT blocking — risk is acknowledged in plan §9 risk #3 and Day 3 stop gates fire on overload |
+| (d) Internal consistency | PASS-WITH-MINOR-NOTES | Two micro-findings; see §3.1 below |
+
+**Overall verdict: PROCEED.**
+
+But: this triggers the user's process flag from the v3→v4 instructions:
+
+> "If v4 surfaces same-category issues, STOP and surface to me. Do not iterate to v5 without surfacing. The right intervention may be pair-writing the plan with buddy from scratch rather than continuing to review finished drafts, but that's a decision I need to make, not a default the auditor reaches for."
+
+The v4 findings are in the same category as v3's — both rounds had their substantive issues land in (d) internal consistency. Per the literal flag, primary agent is STOPPING and surfacing this entry to the user rather than iterating to v5 unilaterally (even though buddy recommended PROCEED with inline fold-in).
+
+### 3.1 Buddy's two (d) micro-findings
+
+Direct quotes from buddy:
+
+**Finding 1 (prose-vs-type-block slip):**
+> "Line 596 (§4 Day 3 deliverable prose) writes `Result<EtwSubsystem>` (no generic param) while §3.2 line 173 declares `Result<EtwSubsystem<S>>`. This is the same class of slip v3's d.1 surfaced; v4 fixed the type-block but left a prose shorthand uncorrected. The parameter has a default so it's *technically* readable, but the v4-fix narrative on line 598 explicitly notes the type 'is now consistent with §3.2 per v4 fix d.1' — and then 2 lines earlier writes the bare form. Microscopic."
+
+**Finding 2 (undeclared helper method):**
+> "Line 655 (§4 Day 5) calls `session.into_supervisable_parts()` to extract `(consumer_join, exit_rx)` — this method is never declared in §3.2's `EtwSession` public surface (lines 155-195). It's load-bearing for Day 5 wiring; §3.2 should declare it or §3.6 should specify it."
+
+Primary agent's read: both are real. Finding 1 is a copy-edit slip — `Result<EtwSubsystem>` reads fine because the generic has a default, but the prose-vs-type-block disagreement is the exact class of error the (d) check is for. Finding 2 is closer to a real spec gap than a consistency slip — Day 5's wiring code calls a method that doesn't exist in the type's documented surface. The plan needs to either declare `into_supervisable_parts()` in §3.2's `impl` block or specify it in §3.6 alongside `SupervisorLoop`'s consumption pattern.
+
+### 3.2 Buddy's category-of-issue observation (verbatim)
+
+This is the part that bears most on the user's process-flag decision:
+
+> "**Same category as v3 — but the magnitude and severity dropped roughly an order of magnitude.** v3 had four substantive (d) findings: a mismatched type signature between sections, a stop-gate count mismatch, a Day 3/Day 5 supervisor-lifecycle ambiguity, and a missing `DegradationMode` payload path. v4 has two micro-(d): a single inconsistent prose form in Day 3's deliverable description (`Result<EtwSubsystem>` vs `Result<EtwSubsystem<S>>`), and an undeclared helper method `into_supervisable_parts()` in §3.2.
+>
+> **My read for the user's process decision:** this is NOT structural-rhythm-failure territory. The pattern of v3 findings (substantive type-level disagreements, count mismatches, lifecycle ambiguities) is meaningfully different from v4's residue (one prose shorthand, one missing API declaration in a code sample). The author internalized (d) — they killed every v3 issue and 90% of the new surface they added. The remaining slips are the kind that any human plan-writer leaves: prose drift in a 950-line document, and a helper method that surfaces only when you mentally compile the Day 5 code sample.
+>
+> **Recommendation:** sign off on v4 with a one-line correction request — declare `into_supervisable_parts()` in §3.2 (or §3.6) and tighten line 596's prose to match §3.2's signature. Don't iterate to v5 over only these two; either fold them into a v4.1 patch-commit on the same branch, or push them as Day 3 in-flight corrections."
+
+### 3.3 User's decision required
+
+Three paths I see; user picks one (or proposes Other):
+
+| Option | Action | When Day 1 starts |
+|---|---|---|
+| **α (buddy-recommended)** | Apply the two micro-fixes inline as a v4.1 patch-commit on the same branch. Tiny buddy re-confirmation OK if you want it, otherwise flip header to APPROVED. | Same day |
+| **β (literal-flag intervention)** | Pair-writing intervention. User co-writes the plan with buddy from scratch rather than continuing finished-draft reviews. Discards v4 in favor of a fresh-write process. | After pair-writing complete |
+| **γ (accept as-is)** | Flip v4 to APPROVED with no further edits. The two micro-findings get folded in during Day 3 execution as in-flight corrections (the engineer notices them when mentally compiling the Day 5 code sample and patches §3.2 accordingly). | Same day, with note that v4 ships with two known minor (d) gaps |
+
+**Primary agent's recommendation: option α.** The fixes are mechanical (declare the method, tighten the prose) and surface in well-bounded locations. Pair-writing intervention (β) feels heavier than what the v4 evidence justifies — buddy's "90% reduction" framing is hard to argue with. Option γ leaves a footgun for the Day 3 engineer who may NOT mentally compile the Day 5 code sample and may instead just copy the (broken) snippet.
+
+### 3.4 What primary agent is NOT doing unilaterally
+
+Per the standing rule "Do not resolve disagreements unilaterally — that's what I'm for when I'm back," and the explicit v3→v4 instruction that the same-category trigger is a user-decision moment:
+
+- NOT applying the two micro-fixes to v4. Plan stays at the commit you saw (`9610b9a`).
+- NOT picking among α/β/γ on my own.
+- NOT flipping the header to APPROVED.
+- NOT starting Day 1.
+- NOT running buddy on a v4.1 that I drafted by guessing your preference.
+
+What I AM doing:
+- Surfacing Entry 3 here with buddy's full verdict, buddy's category observation, and my recommendation.
+- Holding execution until you choose.
+
+---
+
 ## How to use this log going forward
 
 Each new buddy review that surfaces a concern gets a new
