@@ -1,6 +1,6 @@
 # v0.7 Group A — Week 2 implementation plan
 
-**Status:** DRAFT v4 — buddy v3 review caught four real (d)-internal-consistency findings; user approved all four with specific implementations (2026-05-17); v4 applies them. Awaiting buddy four-question re-review and user sign-off before execution.
+**Status:** APPROVED 2026-05-17. Execution starts on `feat/group-a-week-2` upon PR #73 merge. (Plan revision history preserved in §11: v1 → v2 buddy-amended → v3 user-five-fix → v4 user-four-fix → v4.1 buddy-two-micro-fix → APPROVED.)
 **Authoritative inputs:**
 - `audit/v0.7-architecture.md` §2.1 (degradation modes, build gate, LocalSystem privilege model) and "Phase 3 acceptance criteria → Group A — ETW foundation"
 - `spike/etw-schemas.md` "Group A weeks 2-7 implementation gates" + "Implementation requirements driven by this document"
@@ -1001,10 +1001,14 @@ cargo build -p framesage-svc --release
 
 ---
 
-## Status: DRAFT v4 — four user-decided fixes applied on top of v3; awaiting buddy four-question re-review and user sign-off
+## Status: APPROVED — 2026-05-17
 
-When buddy approves and the user signs off, this document moves from DRAFT v4 to APPROVED via a small follow-up PR that flips the header. Then execution starts on `feat/group-a-week-2`.
+Execution starts on `feat/group-a-week-2` when PR #73 merges. The architecture-amendment PR for §2.1 mode 5 (per §3.5 #5) lands as a SEPARATE small PR before Day 5's service-wiring code.
 
-The architecture-amendment PR for §2.1 mode 5 (per §3.5 #5) lands as a SEPARATE small PR before Day 5's service-wiring code.
+**Revised watch-signal for future planning rounds** (per user instruction, this round): the same-category STOP trigger fires when
 
-**Process flag for v4 buddy review** (per §11): watch the category of issue buddy finds. Same-category (d) findings means structural problem with the author's plan-writing rhythm — STOP and surface to user rather than iterate to v5.
+(a) count of findings is similar or growing across drafts, OR
+(b) severity of findings is similar or growing across drafts, OR
+(c) the self-administered (d) pass catches nothing while buddy still finds issues — indicating the check isn't being internalized during drafting.
+
+A draft with fewer, smaller findings than the prior round, where the self-pass caught real issues — is convergence, not stagnation. v4 → v4.1 demonstrates this: buddy found 2 micro-(d) issues on v4 (down from v3's 4 substantive findings); v4.1's self-pass caught 4 additional issues before commit (the auditor's internalized-check produced real value).
