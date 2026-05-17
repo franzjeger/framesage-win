@@ -55,3 +55,15 @@ windows = { workspace = true, features = [
 # tests assert on captured tracing output rather than a channel
 # send. Dev-only — does NOT ship in the production binary.
 tracing-test = "0.2"
+# serial_test provides #[serial] for tests that must not run in
+# parallel. Real-Windows finding from the Step 9 batch run:
+# parallel StartTraceW calls from within the same process
+# serialize at the kernel level and return ERROR_ALREADY_EXISTS
+# even with disjoint session names — empirically reproduced in
+# Isolation B (two #[ignore]'d real-ETW tests, unique names,
+# default parallel → both fail with AlreadyExists). The two
+# real-ETW tests are now annotated #[serial_test::serial]; mock
+# tests stay parallel for fast feedback. Production only ever
+# creates one ETW session per service instance so the constraint
+# is invisible in normal operation.
+serial_test = "3"

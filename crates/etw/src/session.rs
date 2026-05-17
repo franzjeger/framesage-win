@@ -1567,6 +1567,28 @@ mod tests {
     }
 
     // ─── #[ignore]'d real-Windows tests (end-of-week batch) ──────────────────
+    //
+    // Step 9 finding (Windows batch, 2026-05-17): parallel
+    // `StartTraceW` calls from within the same process serialize
+    // at the kernel level and return `ERROR_ALREADY_EXISTS` even
+    // when the session names are disjoint. Empirically reproduced
+    // in Isolation B: two real-ETW tests with unique PID-suffixed
+    // names, default parallel test threads → both fail with
+    // AlreadyExists. Cause: undocumented but reproducible
+    // kernel-side behavior of EVENT_TRACE_SYSTEM_LOGGER_MODE
+    // session creation.
+    //
+    // Production impact: zero. Production code only ever creates
+    // one ETW session per service instance.
+    //
+    // Test impact: any future real-Windows test that calls
+    // `EtwSession::start()` (or `EtwSession::start_with_syscalls`
+    // with `RealEtwSysCalls`) MUST be annotated
+    // `#[serial_test::serial]` so the test harness runs it on the
+    // same global serial-test mutex as its siblings. Falling back
+    // to `cargo test ... -- --test-threads=1` also works for
+    // ad-hoc invocation but breaks the parallel-by-default
+    // contract for mock tests.
 
     /// End-of-week batch: full Mode 3 flow via real Windows session.
     /// Starts a real session, generates synthetic drops (or waits for
@@ -1579,6 +1601,7 @@ mod tests {
     /// occur (skip vs fail). Refine during the batch.
     #[cfg(windows)]
     #[test]
+    #[serial_test::serial(real_etw)]
     #[ignore = "deferred to end-of-week Windows runtime batch (real ETW session + drop synthesis)"]
     fn real_etw_session_drop_path_fires_event() {
         use crate::degradation::{DegradationEvent, DegradationMode};
@@ -1623,6 +1646,7 @@ mod tests {
 
     #[cfg(windows)]
     #[test]
+    #[serial_test::serial(real_etw)]
     #[ignore = "deferred to end-of-week Windows runtime batch (real ETW session start/stop)"]
     fn real_etw_session_starts_and_stops_cleanly() {
         // Test isolation: each real-ETW test needs its own session name
