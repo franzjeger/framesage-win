@@ -7,6 +7,7 @@ pub mod io_priority;
 pub mod owned_handle;
 pub mod process;
 pub mod process_actions;
+pub mod services;
 pub mod sys_proc_info;
 pub mod topology;
 pub mod version_info;

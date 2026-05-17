@@ -422,6 +422,11 @@ struct FramesageApp {
     /// by the modal's Close button or by the modal's Apply (which
     /// also fires SetPolicy with the previewed profile).
     preview_modal: Option<PreviewModalState>,
+    /// Item 4.13 — cached service list for the discover-services
+    /// wizard. Populated lazily by a background thread when the
+    /// user clicks Refresh in the editor. Vec is empty until the
+    /// first refresh completes.
+    discover_services_cache: Arc<Mutex<Vec<framesage_ipc::ServiceInfoIpc>>>,
     /// Per-exe icon cache, populated lazily as rows render. Lives outside
     /// `ProcessesView` because the egui textures it holds want to be reused
     /// across tab switches (cheaper than re-extracting on tab return).
@@ -568,6 +573,7 @@ impl FramesageApp {
             },
             settings: SettingsView::default(),
             preview_modal: None,
+            discover_services_cache: Arc::new(Mutex::new(Vec::new())),
             #[cfg(windows)]
             icons: icons::IconCache::new(),
             #[cfg(windows)]
@@ -590,6 +596,7 @@ impl FramesageApp {
                 Ok(Response::Ok)
                 | Ok(Response::Status(_))
                 | Ok(Response::Processes { .. })
+                | Ok(Response::Services { .. })
                 | Ok(Response::UndoResult { .. })
                 | Ok(Response::UndoLog { .. }) => {
                     format!("{label}: ok")
@@ -3511,11 +3518,35 @@ impl FramesageApp {
                         });
                         if is_editing {
                             let mut edited = p.clone();
-                            // Item 4.13 — pass the live process
-                            // snapshot so the editor can render the
-                            // discover-processes section against
-                            // real data.
-                            render_profile_editor(ui, &mut edited, &self.processes.rows);
+                            // Item 4.13 — pass the discover context
+                            // so the editor can render the discover-
+                            // processes and discover-services
+                            // wizards against live data.
+                            let services_snapshot =
+                                self.discover_services_cache.lock().clone();
+                            let mut refresh_services = false;
+                            let mut discover = editors::DiscoverContext {
+                                processes: &self.processes.rows,
+                                services: &services_snapshot,
+                                services_refresh_requested: &mut refresh_services,
+                            };
+                            render_profile_editor(ui, &mut edited, &mut discover);
+                            if refresh_services {
+                                // Fire ListServices in a background
+                                // thread; result populates the cache
+                                // for the next render.
+                                let cache = self.discover_services_cache.clone();
+                                std::thread::spawn(move || {
+                                    if let Ok(framesage_ipc::Response::Services {
+                                        services,
+                                    }) = send_request_blocking(
+                                        framesage_ipc::PIPE_NAME_STATUS,
+                                        &Request::ListServices,
+                                    ) {
+                                        *cache.lock() = services;
+                                    }
+                                });
+                            }
                             if edited != *p {
                                 ops.push(Op::UpdateProfile(id.0.clone(), Box::new(edited)));
                             }

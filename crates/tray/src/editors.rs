@@ -33,10 +33,27 @@ use crate::theme;
 /// Per-profile editor for the simple fields. CpuSelector (cpu_sets,
 /// affinity_mask) and game_mode are shown read-only; their editors land
 /// in a follow-up commit.
+/// Item 4.13 — bundle of live data + flags passed to the profile
+/// editor so the discover-services / discover-processes wizards
+/// have everything they need without ballooning the function
+/// signature. Caller (FramesageApp::render_profiles_tab) populates
+/// per-render.
+pub(crate) struct DiscoverContext<'a> {
+    /// Live process snapshots from the 1-Hz tray poll. Backs the
+    /// discover-processes wizard. Empty = not loaded.
+    pub processes: &'a [framesage_ipc::ProcessSnapshot],
+    /// Cached service list from the last ListServices IPC.
+    /// Empty = not loaded yet (user clicks Refresh to populate).
+    pub services: &'a [framesage_ipc::ServiceInfoIpc],
+    /// Set by the Refresh button to signal the caller it should
+    /// fire a new ListServices IPC. Caller reads + clears.
+    pub services_refresh_requested: &'a mut bool,
+}
+
 pub(crate) fn render_profile_editor(
     ui: &mut egui::Ui,
     p: &mut Profile,
-    discover_processes: &[framesage_ipc::ProcessSnapshot],
+    discover: &mut DiscoverContext<'_>,
 ) {
     ui.group(|ui| {
         ui.heading("Description");
@@ -168,10 +185,20 @@ pub(crate) fn render_profile_editor(
             // when the profile won't suspend anything). The
             // ProcessSnapshot slice comes from the tray's
             // 1-Hz processes poller, so live and free.
-            if !discover_processes.is_empty() {
+            if !discover.processes.is_empty() {
                 ui.add_space(6.0);
-                discover_processes_section(ui, gm, discover_processes);
+                discover_processes_section(ui, gm, discover.processes);
             }
+            // Item 4.13 — Discover services wizard. Always
+            // available; data fetched lazily via ListServices
+            // IPC when the user clicks Refresh.
+            ui.add_space(6.0);
+            discover_services_section(
+                ui,
+                gm,
+                discover.services,
+                discover.services_refresh_requested,
+            );
         }
     });
 }
@@ -341,6 +368,193 @@ fn discover_processes_section(
                 ui.colored_label(
                     theme::TEXT_MUTED,
                     "Tick at least one process to enable Add.",
+                );
+            }
+        });
+    });
+}
+
+/// Item 4.13 — Discover services. Lists every Win32 service the
+/// SCM reported (active + inactive). Filters out:
+///   - Services already on this profile's stop_services
+///   - Denylisted services (visible-but-greyed would be too noisy
+///     when there are dozens of denylisted entries; the editor
+///     just hides them and the denylist-aware editor above
+///     surfaces denial reasons for entries the user types in)
+///
+/// Sorts by display_name (already-sorted from the SCM enum, but
+/// the filter loop preserves order). Each row: name (monospace),
+/// display name, status badge, checkbox. Batch "Add N selected
+/// to stop list" button below.
+///
+/// Data is fetched lazily via the ListServices IPC — the
+/// `services_refresh_requested` out-flag signals the caller to
+/// fire the request next frame. Until the cache populates, the
+/// section shows a "Click Refresh to load services" placeholder.
+fn discover_services_section(
+    ui: &mut egui::Ui,
+    gm: &mut GameModeActions,
+    services: &[framesage_ipc::ServiceInfoIpc],
+    refresh_requested: &mut bool,
+) {
+    use framesage_gamemode::safe_list::{SafeList, ServiceVerdict};
+    let safe_list = SafeList::bundled();
+
+    egui::CollapsingHeader::new(
+        egui::RichText::new("Discover services").strong(),
+    )
+    .default_open(false)
+    .show(ui, |ui| {
+        ui.horizontal(|ui| {
+            if ui
+                .button(if services.is_empty() {
+                    "Load services"
+                } else {
+                    "Refresh"
+                })
+                .on_hover_text(
+                    "Pull the live list of every Win32 service via SCM \
+                     enumeration. Cheap — runs once per click.",
+                )
+                .clicked()
+            {
+                *refresh_requested = true;
+            }
+            ui.colored_label(
+                theme::TEXT_MUTED,
+                if services.is_empty() {
+                    "Click Load services to enumerate every Win32 service.".to_owned()
+                } else {
+                    format!("{} services loaded.", services.len())
+                },
+            );
+        });
+
+        if services.is_empty() {
+            return;
+        }
+
+        let existing_lower: std::collections::HashSet<String> = gm
+            .stop_services
+            .iter()
+            .map(|s| s.to_ascii_lowercase())
+            .collect();
+
+        // Filter: drop already-listed + denylisted.
+        let candidates: Vec<&framesage_ipc::ServiceInfoIpc> = services
+            .iter()
+            .filter(|s| !existing_lower.contains(&s.name.to_ascii_lowercase()))
+            .filter(|s| {
+                !matches!(safe_list.check_service(&s.name), ServiceVerdict::Denied(_))
+            })
+            .collect();
+
+        if candidates.is_empty() {
+            ui.colored_label(
+                theme::TEXT_MUTED,
+                "Every Win32 service is either already on this profile's stop \
+                 list or on the bundled denylist. Nothing to add.",
+            );
+            return;
+        }
+
+        ui.add_space(4.0);
+
+        let sel_id = egui::Id::new(("discover-svcs-sel", gm.stop_services.len()));
+        let mut selected: std::collections::HashSet<String> = ui
+            .data_mut(|d| d.get_temp::<std::collections::HashSet<String>>(sel_id))
+            .unwrap_or_default();
+
+        use egui_extras::{Column, TableBuilder};
+        TableBuilder::new(ui)
+            .striped(true)
+            .column(Column::exact(24.0)) // checkbox
+            .column(Column::initial(170.0).at_least(100.0)) // name
+            .column(Column::initial(240.0).at_least(120.0)) // display name
+            .column(Column::initial(80.0).at_least(60.0)) // status
+            .header(20.0, |mut header| {
+                header.col(|ui| {
+                    ui.label("");
+                });
+                header.col(|ui| {
+                    ui.label("Name");
+                });
+                header.col(|ui| {
+                    ui.label("Display name");
+                });
+                header.col(|ui| {
+                    ui.label("Status");
+                });
+            })
+            .body(|mut body| {
+                for svc in &candidates {
+                    body.row(18.0, |mut row| {
+                        let key = svc.name.to_ascii_lowercase();
+                        let mut picked = selected.contains(&key);
+                        row.col(|ui| {
+                            if ui.checkbox(&mut picked, "").changed() {
+                                if picked {
+                                    selected.insert(key.clone());
+                                } else {
+                                    selected.remove(&key);
+                                }
+                            }
+                        });
+                        row.col(|ui| {
+                            ui.label(egui::RichText::new(&svc.name).monospace());
+                        });
+                        row.col(|ui| {
+                            ui.label(&svc.display_name);
+                        });
+                        row.col(|ui| {
+                            let (color, label) = match svc.status {
+                                framesage_ipc::ServiceStatusKindIpc::Running => {
+                                    (theme::SUCCESS, "Running")
+                                }
+                                framesage_ipc::ServiceStatusKindIpc::Stopped => {
+                                    (theme::TEXT_MUTED, "Stopped")
+                                }
+                                framesage_ipc::ServiceStatusKindIpc::Pending => {
+                                    (theme::WARNING, "Pending")
+                                }
+                            };
+                            ui.colored_label(color, label);
+                        });
+                    });
+                }
+            });
+
+        ui.data_mut(|d| d.insert_temp(sel_id, selected.clone()));
+
+        ui.add_space(6.0);
+        ui.horizontal(|ui| {
+            let n = selected.len();
+            let add_btn = ui.add_enabled(
+                n > 0,
+                egui::Button::new(
+                    egui::RichText::new(format!("Add {} selected to stop list", n))
+                        .strong()
+                        .color(theme::ACCENT),
+                ),
+            );
+            if add_btn.clicked() {
+                let mut added: std::collections::HashSet<String> =
+                    gm.stop_services.iter().cloned().collect();
+                for svc in &candidates {
+                    if selected.contains(&svc.name.to_ascii_lowercase())
+                        && added.insert(svc.name.clone())
+                    {
+                        gm.stop_services.push(svc.name.clone());
+                    }
+                }
+                ui.data_mut(|d| {
+                    d.insert_temp(sel_id, std::collections::HashSet::<String>::new())
+                });
+            }
+            if n == 0 {
+                ui.colored_label(
+                    theme::TEXT_MUTED,
+                    "Tick at least one service to enable Add.",
                 );
             }
         });
