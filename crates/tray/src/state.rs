@@ -245,8 +245,16 @@ mod tests {
     fn session_stats_engine_events_without_game_mode_prefix_dont_count() {
         let now = SystemTime::now();
         let recent = vec![
-            ev(now - Duration::from_secs(60), EventKind::Engine, "engine paused"),
-            ev(now - Duration::from_secs(50), EventKind::Engine, "engine resumed"),
+            ev(
+                now - Duration::from_secs(60),
+                EventKind::Engine,
+                "engine paused",
+            ),
+            ev(
+                now - Duration::from_secs(50),
+                EventKind::Engine,
+                "engine resumed",
+            ),
             ev(
                 now - Duration::from_secs(40),
                 EventKind::Engine,

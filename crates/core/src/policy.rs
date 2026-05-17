@@ -283,8 +283,8 @@ impl Policy {
         }
 
         let ccd_count = topology.ccds().count();
-        let validate_selector = |sel: &CpuSelector, field_path: &str, errors: &mut Vec<String>| {
-            match sel {
+        let validate_selector =
+            |sel: &CpuSelector, field_path: &str, errors: &mut Vec<String>| match sel {
                 CpuSelector::Mask(0) => errors.push(format!(
                     "{field_path}: Mask(0) would leave the process with no CPU; refusing",
                 )),
@@ -299,23 +299,14 @@ impl Policy {
                     ));
                 }
                 _ => {}
-            }
-        };
+            };
 
         for (id, profile) in &self.profiles {
             if let Some(sel) = &profile.cpu_sets {
-                validate_selector(
-                    sel,
-                    &format!("profiles[{id}].cpu_sets"),
-                    &mut errors,
-                );
+                validate_selector(sel, &format!("profiles[{id}].cpu_sets"), &mut errors);
             }
             if let Some(sel) = &profile.affinity_mask {
-                validate_selector(
-                    sel,
-                    &format!("profiles[{id}].affinity_mask"),
-                    &mut errors,
-                );
+                validate_selector(sel, &format!("profiles[{id}].affinity_mask"), &mut errors);
             }
         }
 
@@ -909,7 +900,8 @@ mod tests {
         p.default_profile = ProfileId("missing".into());
         let errs = p.validate_structure(&two_ccd_topology());
         assert!(
-            errs.iter().any(|e| e.contains("default_profile") && e.contains("missing")),
+            errs.iter()
+                .any(|e| e.contains("default_profile") && e.contains("missing")),
             "expected error mentioning default_profile, got: {errs:?}"
         );
     }
@@ -923,7 +915,8 @@ mod tests {
         p.profiles.insert(bad.id.clone(), bad);
         let errs = p.validate_structure(&two_ccd_topology());
         assert!(
-            errs.iter().any(|e| e.contains("Ccd(7)") && e.contains("2 CCDs")),
+            errs.iter()
+                .any(|e| e.contains("Ccd(7)") && e.contains("2 CCDs")),
             "expected out-of-range Ccd error, got: {errs:?}"
         );
     }
@@ -936,7 +929,8 @@ mod tests {
         p.profiles.insert(bad.id.clone(), bad);
         let errs = p.validate_structure(&two_ccd_topology());
         assert!(
-            errs.iter().any(|e| e.contains("Mask(0)") && e.contains("refusing")),
+            errs.iter()
+                .any(|e| e.contains("Mask(0)") && e.contains("refusing")),
             "expected Mask(0) refusal, got: {errs:?}"
         );
     }

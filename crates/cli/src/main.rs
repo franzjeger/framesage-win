@@ -192,9 +192,7 @@ fn main() -> Result<()> {
             .await
         }),
         Cmd::Topology => print_topology(),
-        Cmd::RefreshTopology => {
-            tokio_block(async { send_simple(Request::RefreshTopology).await })
-        }
+        Cmd::RefreshTopology => tokio_block(async { send_simple(Request::RefreshTopology).await }),
         Cmd::GameMode(sub) => match sub {
             GameModeCmd::Status => tokio_block(async { print_game_mode_status().await }),
             GameModeCmd::Off => tokio_block(async { send_simple(Request::GameModeOff).await }),
@@ -219,12 +217,8 @@ fn main() -> Result<()> {
             }
         },
         Cmd::Policy(sub) => match sub {
-            PolicyCmd::Export { path } => {
-                tokio_block(async { policy_export(&path).await })
-            }
-            PolicyCmd::Import { path } => {
-                tokio_block(async { policy_import(&path).await })
-            }
+            PolicyCmd::Export { path } => tokio_block(async { policy_export(&path).await }),
+            PolicyCmd::Import { path } => tokio_block(async { policy_import(&path).await }),
             PolicyCmd::AddRule { exe, profile } => {
                 tokio_block(async { policy_add_rule(&exe, &profile).await })
             }
@@ -237,8 +231,7 @@ fn main() -> Result<()> {
 #[cfg(windows)]
 async fn policy_export(path: &str) -> Result<()> {
     let policy = fetch_live_policy().await?;
-    let body =
-        serde_json::to_string_pretty(&policy).context("serialize policy for export")?;
+    let body = serde_json::to_string_pretty(&policy).context("serialize policy for export")?;
     std::fs::write(path, body).with_context(|| format!("write policy export to {path}"))?;
     println!("exported policy to {path}");
     Ok(())
@@ -255,10 +248,9 @@ async fn policy_export(_path: &str) -> Result<()> {
 /// details surfaced verbatim.
 #[cfg(windows)]
 async fn policy_import(path: &str) -> Result<()> {
-    let body =
-        std::fs::read_to_string(path).with_context(|| format!("read policy file {path}"))?;
-    let policy: framesage_core::Policy = serde_json::from_str(&body)
-        .with_context(|| format!("parse policy file {path} as JSON"))?;
+    let body = std::fs::read_to_string(path).with_context(|| format!("read policy file {path}"))?;
+    let policy: framesage_core::Policy =
+        serde_json::from_str(&body).with_context(|| format!("parse policy file {path} as JSON"))?;
     send_simple(Request::SetPolicy { policy }).await?;
     println!("imported policy from {path}");
     Ok(())
@@ -492,9 +484,7 @@ fn install_service(bin_override: Option<&str>) -> Result<()> {
     let service = manager
         .create_service(
             &info,
-            ServiceAccess::CHANGE_CONFIG
-                | ServiceAccess::QUERY_STATUS
-                | ServiceAccess::START,
+            ServiceAccess::CHANGE_CONFIG | ServiceAccess::QUERY_STATUS | ServiceAccess::START,
         )
         .context("CreateService")?;
 
@@ -1141,10 +1131,7 @@ fn print_undo_log(entries: &[framesage_core::UndoEntry]) {
         println!("undo log is empty");
         return;
     }
-    println!(
-        "{:<6}  {:<19}  description",
-        "id", "timestamp (UTC)"
-    );
+    println!("{:<6}  {:<19}  description", "id", "timestamp (UTC)");
     for e in entries {
         let ts = format_unix_local_or_utc(e.at_unix_secs);
         println!("{:<6}  {:<19}  {}", e.id, ts, e.action.describe());

@@ -246,8 +246,10 @@ mod tests {
         );
 
         // Spot-check: every Windows install has DcomLaunch.
-        let names: std::collections::HashSet<String> =
-            services.iter().map(|s| s.name.to_ascii_lowercase()).collect();
+        let names: std::collections::HashSet<String> = services
+            .iter()
+            .map(|s| s.name.to_ascii_lowercase())
+            .collect();
         assert!(
             names.contains("dcomlaunch"),
             "DcomLaunch should always be present"

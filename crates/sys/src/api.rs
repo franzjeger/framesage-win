@@ -122,12 +122,7 @@ pub trait SysApi: Send + Sync {
     /// Apply every knob in `profile` against `pid`. Returns an opaque
     /// `AppliedState` token the caller stores so `revert` can undo
     /// the changes later.
-    fn apply(
-        &self,
-        pid: u32,
-        profile: &Profile,
-        topology: &CpuTopology,
-    ) -> Result<AppliedState>;
+    fn apply(&self, pid: u32, profile: &Profile, topology: &CpuTopology) -> Result<AppliedState>;
 
     /// Revert per-PID changes captured in `state`.
     fn revert(&self, pid: u32, state: AppliedState) -> Result<()>;
@@ -257,12 +252,7 @@ impl SysApi for RealSysApi {
         crate::foreground::current()
     }
 
-    fn apply(
-        &self,
-        pid: u32,
-        profile: &Profile,
-        topology: &CpuTopology,
-    ) -> Result<AppliedState> {
+    fn apply(&self, pid: u32, profile: &Profile, topology: &CpuTopology) -> Result<AppliedState> {
         crate::apply::apply(pid, profile, topology)
     }
 

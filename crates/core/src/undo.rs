@@ -84,9 +84,7 @@ impl UndoableAction {
                 applied_mask,
                 ..
             } => {
-                format!(
-                    "set affinity of {exe_name} (pid {pid}) to 0x{applied_mask:016x}"
-                )
+                format!("set affinity of {exe_name} (pid {pid}) to 0x{applied_mask:016x}")
             }
             UndoableAction::SuspendProcess { pid, exe_name } => {
                 format!("suspended {exe_name} (pid {pid})")

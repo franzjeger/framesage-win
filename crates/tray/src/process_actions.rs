@@ -191,8 +191,7 @@ pub(crate) fn render_process_detail(
                         // drawing just the background tray.
                         if !cpu_history.is_empty() {
                             let desired = egui::vec2(180.0, 22.0);
-                            let (rect, _) =
-                                ui.allocate_exact_size(desired, egui::Sense::hover());
+                            let (rect, _) = ui.allocate_exact_size(desired, egui::Sense::hover());
                             draw_single_sparkline(ui.painter(), rect, cpu_history);
                             ui.add_space(4.0);
                         }

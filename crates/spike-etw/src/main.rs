@@ -53,8 +53,8 @@ use windows::Win32::System::Diagnostics::Etw::{
     EVENT_TRACE_CONTROL_STOP, EVENT_TRACE_FLAG_CSWITCH, EVENT_TRACE_FLAG_DISK_IO,
     EVENT_TRACE_FLAG_DPC, EVENT_TRACE_FLAG_INTERRUPT, EVENT_TRACE_FLAG_MEMORY_HARD_FAULTS,
     EVENT_TRACE_LOGFILEW, EVENT_TRACE_PROPERTIES, EVENT_TRACE_REAL_TIME_MODE,
-    EVENT_TRACE_SYSTEM_LOGGER_MODE, PROCESS_TRACE_MODE_EVENT_RECORD, PROCESS_TRACE_MODE_REAL_TIME,
-    PROCESSTRACE_HANDLE, WNODE_FLAG_TRACED_GUID,
+    EVENT_TRACE_SYSTEM_LOGGER_MODE, PROCESSTRACE_HANDLE, PROCESS_TRACE_MODE_EVENT_RECORD,
+    PROCESS_TRACE_MODE_REAL_TIME, WNODE_FLAG_TRACED_GUID,
 };
 
 // ─── Constants ────────────────────────────────────────────────────────────────
@@ -233,9 +233,8 @@ impl EtwSessionPropertiesBuffer {
         buf.base.LogFileMode = EVENT_TRACE_REAL_TIME_MODE | EVENT_TRACE_SYSTEM_LOGGER_MODE;
 
         // Kernel flags — the actual "what events do you want".
-        buf.base.EnableFlags = windows::Win32::System::Diagnostics::Etw::EVENT_TRACE_FLAG(
-            enable_flags,
-        );
+        buf.base.EnableFlags =
+            windows::Win32::System::Diagnostics::Etw::EVENT_TRACE_FLAG(enable_flags);
 
         // Buffer tuning. Defaults (64 KiB buffers, 20-64 of them)
         // are usually fine; we can crank these via flags later.
@@ -253,10 +252,8 @@ impl EtwSessionPropertiesBuffer {
 
         // Offsets within the buffer. ETW uses these to locate the
         // name strings without us passing them separately.
-        buf.base.LoggerNameOffset =
-            (size_of::<EVENT_TRACE_PROPERTIES>()) as u32;
-        buf.base.LogFileNameOffset =
-            buf.base.LoggerNameOffset + (size_of::<[u16; 128]>() as u32);
+        buf.base.LoggerNameOffset = (size_of::<EVENT_TRACE_PROPERTIES>()) as u32;
+        buf.base.LogFileNameOffset = buf.base.LoggerNameOffset + (size_of::<[u16; 128]>() as u32);
 
         buf
     }
@@ -404,7 +401,10 @@ fn main() -> Result<()> {
 
     // Start the session.
     let session_handle = start_session(cli.buffer_mult)?;
-    println!("[etw] session started (handle 0x{:x})", session_handle.Value);
+    println!(
+        "[etw] session started (handle 0x{:x})",
+        session_handle.Value
+    );
 
     // Open the trace for consumption + spawn the consumer thread.
     // The consumer's main job is to call `ProcessTrace` and let it
@@ -515,10 +515,8 @@ fn start_session(buffer_mult: f64) -> Result<CONTROLTRACE_HANDLE> {
             | EVENT_TRACE_FLAG_MEMORY_HARD_FAULTS.0,
     );
     // Apply the buffer multiplier — the spike compares 1×/2×/4×.
-    props.base.MinimumBuffers =
-        ((props.base.MinimumBuffers as f64) * buffer_mult).round() as u32;
-    props.base.MaximumBuffers =
-        ((props.base.MaximumBuffers as f64) * buffer_mult).round() as u32;
+    props.base.MinimumBuffers = ((props.base.MinimumBuffers as f64) * buffer_mult).round() as u32;
+    props.base.MaximumBuffers = ((props.base.MaximumBuffers as f64) * buffer_mult).round() as u32;
 
     let name_wide: Vec<u16> = SESSION_NAME
         .encode_utf16()
@@ -586,7 +584,9 @@ fn run_consumer(counters: Arc<Counters>) -> Result<()> {
         bail!("OpenTraceW failed (invalid handle returned)");
     }
 
-    let handles = [PROCESSTRACE_HANDLE { Value: handle.Value }];
+    let handles = [PROCESSTRACE_HANDLE {
+        Value: handle.Value,
+    }];
     // SAFETY: handles is a valid array of one handle. ProcessTrace
     // blocks until the session is stopped (or, in non-real-time
     // mode, until the file is fully consumed).
@@ -595,9 +595,7 @@ fn run_consumer(counters: Arc<Counters>) -> Result<()> {
     // from the main thread. Treat as clean exit.
     if rc != ERROR_SUCCESS && rc.0 != /* ERROR_CANCELLED */ 1223 {
         let code = rc.0;
-        bail!(
-            "ProcessTrace returned unexpected error: {code} (0x{code:08x})"
-        );
+        bail!("ProcessTrace returned unexpected error: {code} (0x{code:08x})");
     }
 
     Ok(())
@@ -620,11 +618,7 @@ fn stop_session() -> Result<()> {
         )
     };
     if rc != ERROR_SUCCESS && rc != ERROR_WMI_INSTANCE_NOT_FOUND {
-        bail!(
-            "ControlTraceW(STOP) failed: {} (0x{:08x})",
-            rc.0,
-            rc.0
-        );
+        bail!("ControlTraceW(STOP) failed: {} (0x{:08x})", rc.0, rc.0);
     }
     Ok(())
 }
@@ -679,11 +673,7 @@ fn query_session_stats() -> Result<QueryResult> {
         )
     };
     if rc != ERROR_SUCCESS {
-        bail!(
-            "ControlTraceW(QUERY) failed: {} (0x{:08x})",
-            rc.0,
-            rc.0
-        );
+        bail!("ControlTraceW(QUERY) failed: {} (0x{:08x})", rc.0, rc.0);
     }
     Ok(QueryResult {
         events_lost: props.base.EventsLost,
@@ -751,42 +741,33 @@ fn print_final_summary(counters: &Counters) {
     println!("====================================================");
     println!("  Final summary");
     println!("====================================================");
-    println!(
-        "  Total events received:         {:>12}",
-        s.total
-    );
-    println!(
-        "    Thread (incl. CSwitch):      {:>12}",
-        s.thread
-    );
-    println!(
-        "    PerfInfo (DPC + ISR + ...):  {:>12}",
-        s.perfinfo
-    );
+    println!("  Total events received:         {:>12}", s.total);
+    println!("    Thread (incl. CSwitch):      {:>12}", s.thread);
+    println!("    PerfInfo (DPC + ISR + ...):  {:>12}", s.perfinfo);
     println!("      of which DPC:              {:>12}", s.dpc);
     println!("      of which ISR:              {:>12}", s.isr);
-    println!(
-        "    DiskIo:                      {:>12}",
-        s.diskio
-    );
-    println!(
-        "    PageFault:                   {:>12}",
-        s.pagefault
-    );
+    println!("    DiskIo:                      {:>12}", s.diskio);
+    println!("    PageFault:                   {:>12}", s.pagefault);
     println!("      of which HardFault:        {:>12}", s.hard_fault);
-    println!(
-        "    Other:                       {:>12}",
-        s.other
-    );
+    println!("    Other:                       {:>12}", s.other);
     println!("  Parse failures:                {:>12}", s.parse_failures);
     if let Some(q) = q {
         println!();
         println!("  Session-level buffer stats:");
         println!("    EventsLost:                  {:>12}", q.events_lost);
-        println!("    RealTimeBuffersLost:         {:>12}", q.real_time_buffers_lost);
-        println!("    LogBuffersLost:              {:>12}", q.log_buffers_lost);
+        println!(
+            "    RealTimeBuffersLost:         {:>12}",
+            q.real_time_buffers_lost
+        );
+        println!(
+            "    LogBuffersLost:              {:>12}",
+            q.log_buffers_lost
+        );
         println!("    BuffersWritten:              {:>12}", q.buffers_written);
-        println!("    NumberOfBuffers:             {:>12}", q.number_of_buffers);
+        println!(
+            "    NumberOfBuffers:             {:>12}",
+            q.number_of_buffers
+        );
         println!("    FreeBuffers:                 {:>12}", q.free_buffers);
         let drop_pct = if s.total == 0 {
             0.0
@@ -794,10 +775,7 @@ fn print_final_summary(counters: &Counters) {
             (q.events_lost as f64) / ((s.total + q.events_lost as u64) as f64) * 100.0
         };
         println!();
-        println!(
-            "  Drop rate:                     {:>11.4}%",
-            drop_pct
-        );
+        println!("  Drop rate:                     {:>11.4}%", drop_pct);
     }
     // Provider mix as percent of total — useful for sanity check
     // (e.g. "thread events should be 60-80% of total").

@@ -52,13 +52,13 @@ mod widgets;
 
 use editors::render_profile_editor;
 use icon_assets::{build_tray, build_window_icon};
-use process_actions::{render_process_detail, ProcessAction, PRIORITY_CHOICES};
 use ipc_client::{
     background_loop, foreground_reporter_loop, processes_poll_loop, send_request_blocking,
 };
+use process_actions::{render_process_detail, ProcessAction, PRIORITY_CHOICES};
 use state::{AppState, EventKind, RecentEvent};
 use widgets::{
-    format_local_hms, render_activity_strip, render_active_profile_summary,
+    format_local_hms, render_active_profile_summary, render_activity_strip,
     render_foreground_summary, render_perf_band, render_profile_body, render_readonly_banner,
     render_recent_activity, render_status_bar, render_status_hero,
 };
@@ -465,8 +465,8 @@ impl FramesageApp {
                     let mut s = state.lock();
                     for pe in persisted {
                         let kind = EventKind::from_persist_tag(&pe.kind);
-                        let at = std::time::UNIX_EPOCH
-                            + std::time::Duration::from_secs(pe.at_unix_secs);
+                        let at =
+                            std::time::UNIX_EPOCH + std::time::Duration::from_secs(pe.at_unix_secs);
                         s.recent.push(RecentEvent {
                             at,
                             kind,
@@ -1044,11 +1044,7 @@ impl FramesageApp {
                 ui.add_space(8.0);
 
                 egui::ScrollArea::vertical().show(ui, |ui| {
-                    render_preview_body(
-                        ui,
-                        &preview.profile,
-                        &live_processes,
-                    );
+                    render_preview_body(ui, &preview.profile, &live_processes);
                 });
                 ui.add_space(10.0);
                 ui.horizontal(|ui| {
@@ -1099,10 +1095,7 @@ impl FramesageApp {
                 );
                 #[cfg(windows)]
                 {
-                    self.send_admin_request(
-                        Request::SetPolicy { policy },
-                        "preview commit",
-                    );
+                    self.send_admin_request(Request::SetPolicy { policy }, "preview commit");
                     self.send_admin_request(
                         Request::ApplyOnce {
                             profile: ProfileId(preview.profile_id.clone()),
@@ -1151,8 +1144,7 @@ impl FramesageApp {
                 // user's intent so the wizard doesn't re-fire and
                 // the user can fix the IPC issue separately.
                 if let Err(e) = onboarding::write_marker() {
-                    *self.last_action.lock() =
-                        Some(format!("first-run marker write failed: {e}"));
+                    *self.last_action.lock() = Some(format!("first-run marker write failed: {e}"));
                 }
                 self.onboarding = None;
             }
@@ -1910,11 +1902,7 @@ impl FramesageApp {
     /// Item 4.15 — Session stats card. Four numeric tiles aggregated
     /// from the in-memory activity ring (which is hydrated from
     /// activity.jsonl at startup). 24-hour sliding window.
-    fn render_session_stats_card(
-        &mut self,
-        ui: &mut egui::Ui,
-        stats: &crate::state::SessionStats,
-    ) {
+    fn render_session_stats_card(&mut self, ui: &mut egui::Ui, stats: &crate::state::SessionStats) {
         theme::card().show(ui, |ui| {
             ui.label(theme::section_heading("Session stats (last 24 h)"));
             ui.add_space(6.0);
@@ -1930,7 +1918,12 @@ impl FramesageApp {
                         ui.colored_label(theme::TEXT_MUTED, label);
                     });
                 };
-                tile(ui, stats.profiles_applied, "Profiles applied", theme::ACCENT);
+                tile(
+                    ui,
+                    stats.profiles_applied,
+                    "Profiles applied",
+                    theme::ACCENT,
+                );
                 ui.add_space(24.0);
                 tile(
                     ui,
@@ -2049,11 +2042,7 @@ impl FramesageApp {
     /// tick interval, policy reset, compact-mode toggle. The
     /// ProBalance + tick-ms edits batch into drafts so a slider
     /// drag doesn't spam SetPolicy; Apply commits.
-    fn render_settings_tab(
-        &mut self,
-        ui: &mut egui::Ui,
-        status: &Option<StatusSnapshot>,
-    ) {
+    fn render_settings_tab(&mut self, ui: &mut egui::Ui, status: &Option<StatusSnapshot>) {
         let Some(s) = status else {
             ui.add_space(40.0);
             ui.vertical_centered(|ui| {
@@ -2096,11 +2085,7 @@ impl FramesageApp {
     /// Editable ProBalance thresholds. Mirrors the read-only card on
     /// the Status tab, but the values here are bound to a draft and
     /// Apply commits via SetPolicy.
-    fn render_settings_probalance_card(
-        &mut self,
-        ui: &mut egui::Ui,
-        s: &StatusSnapshot,
-    ) {
+    fn render_settings_probalance_card(&mut self, ui: &mut egui::Ui, s: &StatusSnapshot) {
         theme::card().show(ui, |ui| {
             ui.horizontal(|ui| {
                 ui.label(theme::section_heading("ProBalance"));
@@ -2198,14 +2183,11 @@ impl FramesageApp {
                     let _ = changed;
                     ui.colored_label(theme::TEXT_MUTED, "ProBalance is Windows-only.");
                 }
-                ui.with_layout(
-                    egui::Layout::right_to_left(egui::Align::Center),
-                    |ui| {
-                        if ui.button("Revert").clicked() {
-                            do_revert = true;
-                        }
-                    },
-                );
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if ui.button("Revert").clicked() {
+                        do_revert = true;
+                    }
+                });
             });
 
             #[cfg(windows)]
@@ -2231,21 +2213,14 @@ impl FramesageApp {
     /// Tick interval card. Single slider; Apply commits via
     /// SetPolicy. Lower tick = more reactive foreground reconcile +
     /// more CPU spent in the engine itself.
-    fn render_settings_tick_card(
-        &mut self,
-        ui: &mut egui::Ui,
-        s: &StatusSnapshot,
-    ) {
+    fn render_settings_tick_card(&mut self, ui: &mut egui::Ui, s: &StatusSnapshot) {
         theme::card().show(ui, |ui| {
             ui.label(theme::section_heading("Tick interval"));
             ui.add_space(6.0);
             // Edit in a scoped borrow, then drop before calling
             // self methods (see ProBalance card above for rationale).
             let (changed, draft_val) = {
-                let draft = self
-                    .settings
-                    .tick_ms_draft
-                    .get_or_insert(s.policy.tick_ms);
+                let draft = self.settings.tick_ms_draft.get_or_insert(s.policy.tick_ms);
                 ui.add(
                     egui::Slider::new(draft, 100..=2_000)
                         .text("Tick interval (ms)")
@@ -2288,14 +2263,11 @@ impl FramesageApp {
                     let _ = changed;
                     ui.colored_label(theme::TEXT_MUTED, "Tick interval edit is Windows-only.");
                 }
-                ui.with_layout(
-                    egui::Layout::right_to_left(egui::Align::Center),
-                    |ui| {
-                        if ui.button("Revert").clicked() {
-                            do_revert = true;
-                        }
-                    },
-                );
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if ui.button("Revert").clicked() {
+                        do_revert = true;
+                    }
+                });
             });
 
             #[cfg(windows)]
@@ -2321,11 +2293,7 @@ impl FramesageApp {
     /// Policy actions card. Reset-to-defaults button + pointer at
     /// the CLI verbs for file-based export / import (item 4.3 part 1
     /// already shipped those in PR #56).
-    fn render_settings_policy_card(
-        &mut self,
-        ui: &mut egui::Ui,
-        _s: &StatusSnapshot,
-    ) {
+    fn render_settings_policy_card(&mut self, ui: &mut egui::Ui, _s: &StatusSnapshot) {
         theme::card().show(ui, |ui| {
             ui.label(theme::section_heading("Policy actions"));
             ui.add_space(6.0);
@@ -2363,11 +2331,7 @@ impl FramesageApp {
     /// Confirm modal for the destructive Reset action. Renders only
     /// while `reset_confirm_visible` is true. Esc / Cancel close
     /// without firing; Confirm sends SetPolicy(Policy::default()).
-    fn render_settings_reset_confirm(
-        &mut self,
-        ctx: &egui::Context,
-        _s: &StatusSnapshot,
-    ) {
+    fn render_settings_reset_confirm(&mut self, ctx: &egui::Context, _s: &StatusSnapshot) {
         if !self.settings.reset_confirm_visible {
             return;
         }
@@ -2405,9 +2369,7 @@ impl FramesageApp {
                     ui.add_space(4.0);
                     if ui
                         .add(egui::Button::new(
-                            egui::RichText::new("Reset")
-                                .color(theme::ERROR)
-                                .strong(),
+                            egui::RichText::new("Reset").color(theme::ERROR).strong(),
                         ))
                         .clicked()
                     {
@@ -3522,8 +3484,7 @@ impl FramesageApp {
                             // so the editor can render the discover-
                             // processes and discover-services
                             // wizards against live data.
-                            let services_snapshot =
-                                self.discover_services_cache.lock().clone();
+                            let services_snapshot = self.discover_services_cache.lock().clone();
                             let mut refresh_services = false;
                             let mut discover = editors::DiscoverContext {
                                 processes: &self.processes.rows,
@@ -3537,12 +3498,12 @@ impl FramesageApp {
                                 // for the next render.
                                 let cache = self.discover_services_cache.clone();
                                 std::thread::spawn(move || {
-                                    if let Ok(framesage_ipc::Response::Services {
-                                        services,
-                                    }) = send_request_blocking(
-                                        framesage_ipc::PIPE_NAME_STATUS,
-                                        &Request::ListServices,
-                                    ) {
+                                    if let Ok(framesage_ipc::Response::Services { services }) =
+                                        send_request_blocking(
+                                            framesage_ipc::PIPE_NAME_STATUS,
+                                            &Request::ListServices,
+                                        )
+                                    {
                                         *cache.lock() = services;
                                     }
                                 });
@@ -3652,10 +3613,9 @@ impl FramesageApp {
         // the textbox is focused) clears it. Both are standard
         // search-UI conventions; without them the filter is
         // mouse-only.
-        let ctrl_f_pressed = ui.ctx().input(|i| {
-            i.key_pressed(egui::Key::F)
-                && (i.modifiers.ctrl || i.modifiers.command)
-        });
+        let ctrl_f_pressed = ui
+            .ctx()
+            .input(|i| i.key_pressed(egui::Key::F) && (i.modifiers.ctrl || i.modifiers.command));
 
         ui.horizontal(|ui| {
             ui.label("Filter:");
@@ -3676,9 +3636,7 @@ impl FramesageApp {
             // Item 4.2 — Esc clears the filter ONLY when the textbox
             // has focus. Otherwise Esc is reserved for modal dismiss
             // (item 4.12 / render_terminate_confirm_modal etc.).
-            if filter_resp.has_focus()
-                && ui.ctx().input(|i| i.key_pressed(egui::Key::Escape))
-            {
+            if filter_resp.has_focus() && ui.ctx().input(|i| i.key_pressed(egui::Key::Escape)) {
                 self.processes.filter.clear();
             }
             if ui.button("Clear").clicked() {
@@ -3955,7 +3913,11 @@ impl FramesageApp {
                         // but applying it inside `body.rows` requires more
                         // surgery; row-height alone delivers most of the
                         // win.
-                        let row_h = if self.settings.compact_mode { 14.0 } else { 18.0 };
+                        let row_h = if self.settings.compact_mode {
+                            14.0
+                        } else {
+                            18.0
+                        };
                         body.rows(row_h, visible.len(), |mut row| {
                             let tr = visible[row.index()];
                             let p = &rows[tr.row_index];
@@ -4920,8 +4882,7 @@ impl FramesageApp {
                     // whatever the process happens to be pinned to right now
                     // (which might be the rule's mask or might be drift from
                     // an external change since rule apply).
-                    let topology_cpu_count =
-                        self.state.lock().system.per_core_cpu_percent.len();
+                    let topology_cpu_count = self.state.lock().system.per_core_cpu_percent.len();
                     let existing_rule_mask = self
                         .policy_snapshot_lookup_rule(&exe_name)
                         .map(|rule| selector_to_mask(&rule.selector, topology_cpu_count));
@@ -4997,7 +4958,6 @@ impl FramesageApp {
         }
     }
 }
-
 
 // ─── main ────────────────────────────────────────────────────────────────────
 
@@ -5174,8 +5134,7 @@ fn render_preview_body(
                 "environment actions only, game process untouched",
             framesage_core::AntiCheatProfile::SafeMode =>
                 "environment actions only, game process never touched",
-            framesage_core::AntiCheatProfile::Disabled =>
-                "engine STANDBY, no apply at all",
+            framesage_core::AntiCheatProfile::Disabled => "engine STANDBY, no apply at all",
         }
     ));
     ui.add_space(8.0);
@@ -5201,10 +5160,7 @@ fn render_preview_body(
     }
     if !gm.stop_services.is_empty() {
         ui.add_space(4.0);
-        ui.label(format!(
-            "• Services to stop ({}):",
-            gm.stop_services.len()
-        ));
+        ui.label(format!("• Services to stop ({}):", gm.stop_services.len()));
         for id in &gm.stop_services {
             ui.label(format!("    - {id}"));
         }

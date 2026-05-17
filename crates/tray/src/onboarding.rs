@@ -230,7 +230,9 @@ fn render_page_one(ui: &mut egui::Ui, next: &mut Option<NextAction>) {
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
             if ui
                 .add(egui::Button::new(
-                    egui::RichText::new("Continue").strong().color(theme::ACCENT),
+                    egui::RichText::new("Continue")
+                        .strong()
+                        .color(theme::ACCENT),
                 ))
                 .clicked()
             {
@@ -240,11 +242,7 @@ fn render_page_one(ui: &mut egui::Ui, next: &mut Option<NextAction>) {
     });
 }
 
-fn render_page_two(
-    ui: &mut egui::Ui,
-    state: &mut OnboardingState,
-    next: &mut Option<NextAction>,
-) {
+fn render_page_two(ui: &mut egui::Ui, state: &mut OnboardingState, next: &mut Option<NextAction>) {
     ui.add_space(4.0);
     ui.label(theme::section_heading("Choose your level"));
     ui.add_space(4.0);
@@ -292,7 +290,9 @@ fn render_page_two(
                 .add_enabled(
                     continue_enabled,
                     egui::Button::new(
-                        egui::RichText::new("Continue").strong().color(theme::ACCENT),
+                        egui::RichText::new("Continue")
+                            .strong()
+                            .color(theme::ACCENT),
                     ),
                 )
                 .clicked()
@@ -362,16 +362,14 @@ fn render_page_three(ui: &mut egui::Ui, next: &mut Option<NextAction>) {
     );
     ui.add_space(6.0);
     ui.label(
-        egui::RichText::new("You can also enter Manual Game Mode from:")
-            .color(theme::TEXT_MUTED),
+        egui::RichText::new("You can also enter Manual Game Mode from:").color(theme::TEXT_MUTED),
     );
     ui.label(
         egui::RichText::new("  • the tray menu (right-click → \"Enter Manual Game Mode\")")
             .color(theme::TEXT_MUTED),
     );
     ui.label(
-        egui::RichText::new("  • the Status-tab \"Quick actions\" panel")
-            .color(theme::TEXT_MUTED),
+        egui::RichText::new("  • the Status-tab \"Quick actions\" panel").color(theme::TEXT_MUTED),
     );
     ui.label(
         egui::RichText::new("  • `framesage game-mode on <profile>` (CLI)")
@@ -386,7 +384,9 @@ fn render_page_three(ui: &mut egui::Ui, next: &mut Option<NextAction>) {
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
             if ui
                 .add(egui::Button::new(
-                    egui::RichText::new("Continue").strong().color(theme::ACCENT),
+                    egui::RichText::new("Continue")
+                        .strong()
+                        .color(theme::ACCENT),
                 ))
                 .clicked()
             {
@@ -396,11 +396,7 @@ fn render_page_three(ui: &mut egui::Ui, next: &mut Option<NextAction>) {
     });
 }
 
-fn render_page_four(
-    ui: &mut egui::Ui,
-    state: &OnboardingState,
-    next: &mut Option<NextAction>,
-) {
+fn render_page_four(ui: &mut egui::Ui, state: &OnboardingState, next: &mut Option<NextAction>) {
     ui.add_space(4.0);
     ui.label(theme::section_heading("Ready to go"));
     ui.add_space(8.0);
@@ -421,7 +417,10 @@ fn render_page_four(
         // Safety: render shouldn't reach Page 4 without a choice
         // (Continue is disabled on Page 2 without one). Render a
         // sensible fallback anyway.
-        ui.colored_label(theme::ERROR, "Internal error: reached Page 4 without a choice.");
+        ui.colored_label(
+            theme::ERROR,
+            "Internal error: reached Page 4 without a choice.",
+        );
     }
     ui.add_space(14.0);
     ui.horizontal(|ui| {
