@@ -1,20 +1,23 @@
 # v0.7 Phase 2 — EDR Interaction Report
 
 **Status:** **GAP REPORT — not the final EDR validation.**
+**Approved as the Phase 2 deliverable on 2026-05-17 with Option D
+selected (hybrid).** Group A weeks 2-7 unblock immediately; the
+EDR matrix becomes a v0.7.1 default-on-flip gate, not a v0.7
+ship gate.
 
-**Recommendation: STOP for user decision before Group A
-implementation starts.** This document surfaces what we can and
-cannot test from the current dev environment, per Phase 2
-sign-off Decision 2 ("EDR testing matrix stays in scope, gates
-Group A implementation start").
+This document surfaces what we can and cannot test from the
+current dev environment, records the resolution chosen, and
+locks in the validation criteria for the v0.7.1 flip *before*
+v0.7.1 schedule pressure starts skewing judgment.
 
 The architecture (`audit/v0.7-architecture.md` Section 2.1 →
 "EDR interaction — TESTING IS LOAD-BEARING, NOT OPTIONAL") and
 the ground rule attached to PR #67 both prohibit handwaving on
 this. So rather than fabricate results from a single environment
-we don't even fully control, this report documents the testing
-gap explicitly and asks for a budget / access decision before
-Group A starts.
+we don't even fully control, this report documents the gap
+explicitly, records the user-approved path forward, and
+specifies what evidence will close the gap in v0.7.1.
 
 ---
 
@@ -271,34 +274,264 @@ blocked on this report; it is *policy* blocked, per Decision
 
 ---
 
-## 6. Request for user decision
+## 6. Decision — Option D (hybrid), approved 2026-05-17
 
-Before Group A implementation starts, please choose:
+**Approved path:** Option D — hybrid.
 
-- [ ] **Option A** — pursue community outreach, no budget;
-      Group A starts in parallel with no shipping gate until
-      we hear back.
-- [ ] **Option B** — approve ~$200-300 trial-procurement
-      budget + 3 engineer-days for in-house validation; Group
-      A starts in parallel, ships gated on completed matrix.
-- [ ] **Option C** — ship v0.7 closed-loop default-off; Group
-      A starts now with no EDR matrix requirement for v0.7
-      ship.
-- [ ] **Option D (recommended)** — hybrid: ship default-off
-      per Option C, AND pursue community outreach per Option
-      A; flip default-on in v0.7.1 when matrix has two of three
-      products validated.
-- [ ] **Other** — please describe.
+1. **v0.7 ships with `closed_loop_enabled: false` by default.**
+   This already matches the policy default committed in Phase 2
+   sign-off resolution #4. First-run onboarding page 3 gains
+   one additional line surfacing the EDR-validation gap (see
+   §6.4 below).
+2. **Community outreach starts immediately** under the
+   Option-A scope, with the contact list and evidence
+   requirements tightened — see §7.
+3. **Group A weeks 2-7 unblock now.** The EDR matrix is no
+   longer policy-blocking because closed-loop is default-off in
+   v0.7. The matrix becomes a v0.7.1 gate.
+4. **The v0.7.1 default-on-flip PR cannot ship until the
+   criteria in §6.1 are met.** These are non-negotiable in the
+   v0.7.1 cycle — they exist now, in writing, before schedule
+   pressure tilts judgment.
 
-Whatever the choice, the v0.6 → v0.7 README delta MUST mention
-the EDR-interaction caveat. The architecture's "Closed-loop
-and EDR" README section already commits to this; the EDR
-report should also be cited from the README so readers can
-see exactly what we did and didn't test.
+### 6.1 Validation criteria for the v0.7.1 default-on flip
+
+ALL of the following must hold before the flip ships. "2 of 3
+products validated" is **not** sufficient.
+
+1. **Clean run on each of the three products.** Spike binary
+   (or, where applicable, signed v0.7 binary — see criterion
+   3) runs on a clean Win11 26100+ VM under each of: Defender
+   ATP, CrowdStrike Falcon, SentinelOne Singularity, with
+   **no** EDR UI alerts, **no** quarantine, **no** behavioral
+   flag at suspicious-behavior thresholds, and **no** admin-
+   console / hunting-query telemetry that surfaces FrameSage
+   as suspicious. A "clean run" consists of: install →
+   60-second `--duration` run → 5-minute `--duration` run →
+   session teardown.
+2. **At least one of the three runs is performed under
+   realistic gaming load** — a real game session running
+   concurrently with the ETW session, not idle. This validates
+   that the EDR doesn't flag the *combination* of an ETW
+   kernel session + concurrent game-adjacent process
+   modification (priority bumps, affinity changes). Idle-only
+   validation is insufficient.
+3. **The signed v0.7 binary is the artifact tested**, not the
+   unsigned spike. Group D produces the Authenticode-signed
+   binary on a parallel track; if signing is not ready by
+   v0.7.1, the flip waits. (This criterion also closes the
+   "unsigned vs signed behavior may differ" caveat in §5.)
+4. **Vendor-allow-listed counts as validated.** If an EDR
+   product flags FrameSage but the flag clears once the signing
+   certificate is submitted to the vendor's allow-list /
+   reputation system, that product counts as "validated with
+   vendor remediation pending" — the flip can proceed iff the
+   vendor confirms allow-list grant. If a vendor instead
+   requires *architectural changes* in FrameSage to clear the
+   flag, that is a v0.8 conversation, not a v0.7.1 one.
+
+### 6.2 Escalation paths based on outreach results
+
+Once community outreach completes (day-5 hard cutoff per §7):
+
+| Outcome | Action |
+|---|---|
+| **3 of 3 products come back clean** with evidence-level results | Flip ships in v0.7.1 once criteria §6.1 #2 (gaming-load run) and #3 (signed binary) are also met. |
+| **2 of 3 clean + 1 inconclusive** | Fall back to Option B (paid in-house validation) for the inconclusive product before the flip. Budget approved up to ~$200-300 + 3 engineer-days for that single product. |
+| **1 of 3 clean, or worse** | The flip waits. Re-scope the `closed_loop` architecture for v0.8 with EDR-vendor outreach as a serious engagement, not a side task. v0.7.1 ships without the default-on flip; the closed-loop subsystem remains opt-in indefinitely. |
+
+### 6.3 README + release-notes obligations
+
+Independent of which outcome lands, the v0.6 → v0.7 README
+delta MUST mention the EDR-interaction caveat. The
+architecture's "Closed-loop and EDR" README section already
+commits to this; this report must also be cited from the
+README so readers can see exactly what we did and didn't test.
+The v0.7 release notes must say "closed-loop measurement
+default-off in v0.7 pending EDR validation; see
+`spike/etw-edr-report.md`."
+
+### 6.4 First-run onboarding copy delta
+
+Page 3 of the onboarding wizard (architecture §
+"First-run onboarding — new closed-loop opt-in page") gains
+this line in the disclosure block, above the radio buttons:
+
+> *EDR validation in progress for v0.7.1. Enable if you're on
+> a personal machine; we recommend leaving disabled on
+> work-managed machines until v0.7.1 confirms compatibility.*
+
+This is wired into the Group C acceptance criterion as a
+mandatory string check (reviewer rejects a PR that ships
+page 3 without it). Removed in the v0.7.1 default-on flip PR
+once §6.1 criteria are met.
 
 ---
 
-## 7. Honesty checklist (per Phase 3 ground rule)
+## 7. Community outreach scope (Option D execution)
+
+### Target contacts, in priority order
+
+1. **PerfView maintainers** (Vance Morrison + the GitHub
+   contributor set). PerfView consumes the same
+   SystemTraceProvider API we do, has had every EDR
+   conversation under the sun, and is the most likely source
+   of current data about which products flag ETW consumers.
+   Reach: file an issue on
+   [microsoft/perfview](https://github.com/microsoft/perfview/issues)
+   tagged "discussion" with a pointer to this report; cc
+   Vance via the maintainer list if there's no response in 48
+   hours.
+2. **Sysinternals (Mark Russinovich's team), if any direct
+   contact exists.** Process Explorer / Process Monitor face
+   exactly our EDR problem at much larger scale. The team
+   accepts technical inquiries via the Sysinternals forum and,
+   for established correspondents, via direct email. No
+   guaranteed channel; surface this as a "if any team contact
+   exists" item, not a default expectation.
+3. **Process Hacker / System Informer maintainers.** Same
+   category as FrameSage (kernel-event consumer, native UI,
+   open source), smaller scale, will have current data. Reach:
+   issue on
+   [winsiderss/systeminformer](https://github.com/winsiderss/systeminformer/issues)
+   tagged "question" with the same scope-of-questions doc.
+4. **r/sysadmin and EDR-focused Slack/Discord communities.**
+   The BloodHound community in particular has EDR-savvy folks
+   who routinely run multi-EDR home labs. Reach: a single
+   request post in r/sysadmin (read the wiki rules first to
+   avoid the auto-remove pattern), plus a question in the
+   BloodHound Slack #general (channel rules permitting).
+
+### What each contact receives
+
+Standardized package (drafted as part of the same outreach
+push; lives outside the repo because it gets sent to external
+parties — but the templates are tracked in
+`spike/outreach/`):
+
+- The **unsigned spike binary**, OR build instructions for
+  contacts who reasonably refuse to run an unsigned binary.
+  (Both options offered; the contact picks.)
+- A copy of this report (`spike/etw-edr-report.md`) trimmed
+  to §§1, 3, and 6.1 so the contact sees the scope of
+  questions, the validation criteria they're contributing
+  to, and the env-1 gap that motivated the outreach.
+- A copy of `spike/etw-schemas.md` for technical reviewers
+  who want to validate the ETW behavior is "just a normal
+  ETW consumer" before lending the test box.
+
+### Evidence-level results, not anecdote
+
+Each respondent is asked specifically for:
+
+- **Screenshots** of the EDR console showing FrameSage's
+  process during the run, OR
+- **Exported logs / alerts** from the EDR's admin console
+  (CSV, JSON, whatever the product produces), OR
+- **Hunting-query output** if the product has one
+  (CrowdStrike CSPL, Defender ATP advanced hunting, S1 deep
+  visibility queries) showing what telemetry the product
+  collected about FrameSage.
+
+A response of "I ran it, seemed fine" is **not acceptable**
+as a validation source for §6.1 criterion 1 — that produces
+no archivable evidence and we can't show it to a v0.7.1
+reviewer asking "how do you know?"
+
+### Day-5 hard cutoff
+
+Outreach starts on the day this PR merges. If no
+evidence-level response has landed for a given product by
+**day 5**, that product escalates immediately to Option B
+(paid in-house validation) without further waiting. The day-5
+cutoff exists so that "we're still waiting on the community"
+doesn't become a euphemism for "no one wrote back and we
+haven't done anything about it."
+
+Tracking lives in this report's §10 "Results log" — appended
+to as responses arrive.
+
+### Tracking
+
+Each respondent's package + response is tracked in `§10
+Results log` below. Each row records: respondent identifier
+(handle / org / repo), product covered, date sent, date
+responded, evidence-level result link, and the criterion
+§6.1 #N that the response satisfies.
+
+---
+
+## 8. Process change for future spike reports
+
+Phase 1's "Defender is running" claim was wrong on env-1.
+Phase 2's schema research caught the DPC opcode 0x2E error.
+Both are caught-by-the-rhythm wins, but **two factual errors
+in a row is the point to tighten the rhythm itself.**
+
+### New requirement, effective immediately
+
+Any spike report, environment-attestation document, or
+similar "we observed X" claim in this repo must include the
+**verification commands and their literal output**, not just
+the conclusions drawn from them.
+
+**Forbidden form:**
+
+> Defender is running on env-1.
+
+**Required form:**
+
+> Defender is running on env-1.
+> ```
+> PS> Get-Service WinDefend
+>   Status   Name           DisplayName
+>   ------   ----           -----------
+>   Running  WinDefend      Microsoft Defender Antivirus Service
+> ```
+
+Or for build verification:
+
+> Build 26200 verified.
+> ```
+> PS> [System.Environment]::OSVersion.Version
+>   Major  Minor  Build  Revision
+>   -----  -----  -----  --------
+>   10     0      26200  0
+> ```
+
+### What "literal output" means
+
+- The exact command (with no edits / annotations / paraphrase).
+- The exact output (preserving column formatting, IDs, GUIDs,
+  PIDs, and timestamps as they appeared).
+- Captured at the time the claim was authored, with the date
+  of capture in the surrounding text.
+
+### Scope
+
+This requirement applies to **any** claim that depends on a
+specific machine's state — running services, installed
+products, OS build, ETW session attributes, file paths, etc.
+It does NOT apply to API-shape claims that are derivable from
+public documentation (e.g., "`StartTraceW` returns a `WIN32_ERROR`")
+— those are properly cited from MSDN or SDK headers per the
+existing PR #67 ground rule.
+
+### Where this is enforced
+
+- PR review checklist (Group A acceptance criterion, new bullet).
+- Architecture doc Phase 3 ground rules section (`audit/v0.7-architecture.md`),
+  next to the existing schema-research ground rule.
+- This report itself: §2 already includes the captured
+  PowerShell output for the env-1 Defender state, which is
+  the model future reports follow.
+
+This is a cheap process tightening that catches the class of
+error that surfaced in PR #68.
+
+---
+
+## 9. Honesty checklist (per Phase 3 ground rule)
 
 This report passes the "would you sign your name to this if
 you were the user" check on the following claims:
@@ -328,6 +561,27 @@ Until then, this is the gap document.
 
 ---
 
-**Status:** Phase 2 EDR-testing deliverable produced as a gap
-report. Group A implementation is **POLICY BLOCKED** on user
-decision in §6 above per Phase 2 sign-off Decision 2.
+---
+
+## 10. Results log
+
+Populated as community-outreach responses arrive. Each row is
+**evidence-level** per §7 "Evidence-level results" — anecdotal
+"seemed fine" responses do not get logged here.
+
+| Date sent | Respondent | Product | Date responded | Evidence link | Criterion satisfied | Notes |
+|---|---|---|---|---|---|---|
+| _(none yet — outreach begins on PR #68 merge)_ |  |  |  |  |  |  |
+
+When the table fills to satisfy criteria §6.1 #1 (clean run
+on all three products) + #2 (gaming-load run on at least one)
++ #3 (signed binary) + #4 (vendor allow-list, if any
+remediation was required), the v0.7.1 default-on-flip PR
+becomes shippable.
+
+---
+
+**Status:** Phase 2 EDR-testing deliverable approved as a gap
+report. Option D selected 2026-05-17. Group A weeks 2-7
+**UNBLOCKED**. v0.7 ships closed-loop default-off. The v0.7.1
+flip is gated on §6.1 criteria + §10 results log.
