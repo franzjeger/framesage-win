@@ -208,6 +208,27 @@ impl Policy {
         &self.default_profile
     }
 
+    /// Item 4.15 — variant of `match_foreground` that also returns
+    /// which rule (by index into `self.rules`) produced the match.
+    /// Returns `(None, &default_profile)` when no rule matched.
+    /// The index lets the activity feed link each `ForegroundChanged`
+    /// event back to the specific user-authored rule that fired —
+    /// the answer to "why did THAT profile apply?" without
+    /// re-running the matcher by hand.
+    pub fn match_foreground_indexed(
+        &self,
+        exe_name: &str,
+        path: &str,
+        title: &str,
+    ) -> (Option<usize>, &ProfileId) {
+        for (idx, rule) in self.rules.iter().enumerate() {
+            if rule.r#match.matches(exe_name, path, title) {
+                return (Some(idx), &rule.profile);
+            }
+        }
+        (None, &self.default_profile)
+    }
+
     pub fn profile(&self, id: &ProfileId) -> Option<&Profile> {
         self.profiles.get(id)
     }
