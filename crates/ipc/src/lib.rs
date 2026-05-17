@@ -414,6 +414,16 @@ pub enum Event {
     ForegroundChanged {
         foreground: ForegroundSnapshot,
         profile: ProfileId,
+        /// Item 4.15 — index into `policy.rules` of the rule that
+        /// matched, or `None` when the profile came from
+        /// `default_profile` (no rule matched), a manual override,
+        /// or a Manual Global Game Mode session. Lets the activity
+        /// feed link each ForegroundChanged event back to the
+        /// specific rule the user authored, so debugging
+        /// "why did THAT profile apply?" doesn't require re-running
+        /// the policy match by hand.
+        #[serde(default)]
+        matched_rule_index: Option<usize>,
     },
     Paused,
     Resumed,

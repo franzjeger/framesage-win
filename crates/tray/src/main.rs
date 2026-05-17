@@ -875,8 +875,17 @@ impl eframe::App for FramesageApp {
             // tab whose list scrolled past the initial height (Rules,
             // Profiles). `set_max_width` keeps the vertical layout intact;
             // wide windows just leave empty space on the right.
+            //
+            // Item 4.2 — Processes tab is the one exception: its table
+            // wants every pixel on ultrawides to keep column widths
+            // (especially the description/path columns) readable
+            // without truncation. Other tabs (Status / Rules / Profiles
+            // / Settings) stay capped where the cap improves
+            // line-length comfort.
             const MAX_CONTENT_WIDTH: f32 = 980.0;
-            ui.set_max_width(MAX_CONTENT_WIDTH);
+            if !matches!(self.tab, Tab::Processes) {
+                ui.set_max_width(MAX_CONTENT_WIDTH);
+            }
             self.render_active_tab(ctx, ui, &status_snapshot, &recent_events);
         });
 
@@ -905,6 +914,15 @@ impl FramesageApp {
         // Two output flags so we can drop the borrow before mutating self.
         let mut do_confirm = false;
         let mut do_cancel = false;
+
+        // Item 4.12 — Esc dismisses the modal. Matches the canonical
+        // OS-wide "cancel current operation" binding; without this the
+        // user can't bail out via keyboard at all (terminating a wrong
+        // PID is destructive, so the default Cancel action being
+        // keyboard-reachable matters).
+        if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
+            do_cancel = true;
+        }
 
         let title = "Terminate process?";
         egui::Window::new(title)
@@ -969,6 +987,13 @@ impl FramesageApp {
         let mut do_remove_rule = false;
         let mut new_mask = picker.mask;
         let mut save_as_rule = picker.save_as_rule;
+
+        // Item 4.12 — Esc dismisses the picker without applying any
+        // change. Same rationale as the terminate-confirm modal:
+        // keyboard-driven escape from a non-trivial action.
+        if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
+            do_cancel = true;
+        }
 
         // CPU count: prefer per_core_cpu_percent length (live), fall back
         // to 32 as a sane default.
@@ -1601,10 +1626,72 @@ impl FramesageApp {
             ui.add_space(10.0);
         }
 
+        // ─── Session stats (item 4.15) ──────────────────────────────────
+        // Trailing 24-hour counts of significant events. The
+        // activity log is hydrated into AppState.recent at startup
+        // so the card carries an answer even on a fresh tray launch
+        // (subject to the on-disk log having entries — empty on
+        // first run).
+        let session_stats = {
+            let s = self.state.lock();
+            crate::state::SessionStats::from_recent(&s.recent, std::time::SystemTime::now())
+        };
+        self.render_session_stats_card(ui, &session_stats);
+        ui.add_space(10.0);
+
         // ─── Recent activity ────────────────────────────────────────────
         ui.label(theme::section_heading("Recent activity"));
         ui.add_space(4.0);
         render_recent_activity(ui, recent);
+    }
+
+    /// Item 4.15 — Session stats card. Four numeric tiles aggregated
+    /// from the in-memory activity ring (which is hydrated from
+    /// activity.jsonl at startup). 24-hour sliding window.
+    fn render_session_stats_card(
+        &mut self,
+        ui: &mut egui::Ui,
+        stats: &crate::state::SessionStats,
+    ) {
+        theme::card().show(ui, |ui| {
+            ui.label(theme::section_heading("Session stats (last 24 h)"));
+            ui.add_space(6.0);
+            ui.horizontal(|ui| {
+                let tile = |ui: &mut egui::Ui, value: u32, label: &str, color: egui::Color32| {
+                    ui.vertical(|ui| {
+                        ui.label(
+                            egui::RichText::new(value.to_string())
+                                .strong()
+                                .size(20.0)
+                                .color(color),
+                        );
+                        ui.colored_label(theme::TEXT_MUTED, label);
+                    });
+                };
+                tile(ui, stats.profiles_applied, "Profiles applied", theme::ACCENT);
+                ui.add_space(24.0);
+                tile(
+                    ui,
+                    stats.probalance_demotions,
+                    "ProBalance demotions",
+                    theme::WARNING,
+                );
+                ui.add_space(24.0);
+                tile(
+                    ui,
+                    stats.probalance_restores,
+                    "ProBalance restores",
+                    theme::SUCCESS,
+                );
+                ui.add_space(24.0);
+                tile(
+                    ui,
+                    stats.game_mode_sessions,
+                    "Game Mode sessions",
+                    theme::ACCENT,
+                );
+            });
+        });
     }
 
     /// ProBalance card — Status-tab summary of the dynamic-priority
@@ -2855,13 +2942,39 @@ impl FramesageApp {
             .filter(|p| p.restrained_by_probalance)
             .count();
 
+        // Item 4.2 — Ctrl-F focuses the filter textbox. Esc (only when
+        // the textbox is focused) clears it. Both are standard
+        // search-UI conventions; without them the filter is
+        // mouse-only.
+        let ctrl_f_pressed = ui.ctx().input(|i| {
+            i.key_pressed(egui::Key::F)
+                && (i.modifiers.ctrl || i.modifiers.command)
+        });
+
         ui.horizontal(|ui| {
             ui.label("Filter:");
-            ui.add(
+            let filter_resp = ui.add(
                 egui::TextEdit::singleline(&mut self.processes.filter)
-                    .hint_text("type to filter by exe name")
-                    .desired_width(200.0),
+                    // Item 4.2 — broadened scope: filter searches
+                    // exe_name + Description + Company + User. Hint
+                    // text reflects the new behavior so users
+                    // expecting exe-only aren't confused when a
+                    // "microsoft" search lights up every Microsoft-
+                    // published process.
+                    .hint_text("filter by name, description, company, user")
+                    .desired_width(280.0),
             );
+            if ctrl_f_pressed {
+                filter_resp.request_focus();
+            }
+            // Item 4.2 — Esc clears the filter ONLY when the textbox
+            // has focus. Otherwise Esc is reserved for modal dismiss
+            // (item 4.12 / render_terminate_confirm_modal etc.).
+            if filter_resp.has_focus()
+                && ui.ctx().input(|i| i.key_pressed(egui::Key::Escape))
+            {
+                self.processes.filter.clear();
+            }
             if ui.button("Clear").clicked() {
                 self.processes.filter.clear();
             }
@@ -2937,12 +3050,39 @@ impl FramesageApp {
         let sort_by = self.processes.sort_by;
         let sort_desc = self.processes.sort_desc;
 
+        // Item 4.2 — search across exe_name + description + company +
+        // user. All case-insensitive substring. A process whose
+        // exe_name doesn't match but whose company / description /
+        // user does should still surface — e.g. typing "microsoft"
+        // lights up every Microsoft-published process regardless of
+        // its exe name.
         let mut rows: Vec<framesage_ipc::ProcessSnapshot> = self
             .processes
             .rows
             .iter()
             .filter(|p| {
-                filter_lc.is_empty() || p.exe_name.to_ascii_lowercase().contains(&filter_lc)
+                if filter_lc.is_empty() {
+                    return true;
+                }
+                if p.exe_name.to_ascii_lowercase().contains(&filter_lc) {
+                    return true;
+                }
+                if let Some(d) = &p.description {
+                    if d.to_ascii_lowercase().contains(&filter_lc) {
+                        return true;
+                    }
+                }
+                if let Some(c) = &p.company {
+                    if c.to_ascii_lowercase().contains(&filter_lc) {
+                        return true;
+                    }
+                }
+                if let Some(u) = &p.user {
+                    if u.to_ascii_lowercase().contains(&filter_lc) {
+                        return true;
+                    }
+                }
+                false
             })
             .cloned()
             .collect();

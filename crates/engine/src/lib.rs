@@ -1400,12 +1400,19 @@ impl Engine {
 
         // Resolve the new profile via the same precedence the tick path
         // uses: manual override wins, else first-match rule, else default.
-        let profile_id = match &s.manual_override {
-            Some(ov) => ov.clone(),
-            None => s
-                .policy
-                .match_foreground(&snapshot.exe_name, &snapshot.path, &snapshot.title)
-                .clone(),
+        //
+        // Item 4.15 — capture which rule matched so the
+        // ForegroundChanged event below carries the index.
+        let (matched_rule_index, profile_id) = match &s.manual_override {
+            Some(ov) => (None, ov.clone()),
+            None => {
+                let (idx, id) = s.policy.match_foreground_indexed(
+                    &snapshot.exe_name,
+                    &snapshot.path,
+                    &snapshot.title,
+                );
+                (idx, id.clone())
+            }
         };
         let profile = match s.policy.profile(&profile_id) {
             Some(p) => p.clone(),
@@ -1471,6 +1478,7 @@ impl Engine {
         let _ = self.events.send(Event::ForegroundChanged {
             foreground: snapshot,
             profile: profile_id.clone(),
+            matched_rule_index,
         });
 
         // Reconcile system-wide Game Mode against the new profile.
@@ -1806,6 +1814,10 @@ impl Engine {
         let _ = self.events.send(Event::ForegroundChanged {
             foreground: snapshot,
             profile: profile_id.clone(),
+            // Item 4.15 — `apply_once` bypasses the rule matcher
+            // entirely; the profile came from the user's explicit
+            // choice. No matched rule to attribute.
+            matched_rule_index: None,
         });
 
         // System mode reconcile — handles entering/exiting/swapping
@@ -2689,12 +2701,20 @@ impl Engine {
         // `set_manual_override` / `Request::SetManualOverride` and cleared
         // by the complementary calls. When active, every foreground app
         // gets this profile regardless of what Rules would have matched.
-        let profile_id = match &s.manual_override {
-            Some(ov) => ov.clone(),
-            None => s
-                .policy
-                .match_foreground(&fg.exe_name, &fg.path, &fg.title)
-                .clone(),
+        //
+        // Item 4.15 — also capture which rule (by index) matched.
+        // `None` when the profile came from manual_override or from
+        // `default_profile` (no rule matched). The activity feed
+        // surfaces this so the user can trace each ForegroundChanged
+        // back to its source.
+        let (matched_rule_index, profile_id) = match &s.manual_override {
+            Some(ov) => (None, ov.clone()),
+            None => {
+                let (idx, id) =
+                    s.policy
+                        .match_foreground_indexed(&fg.exe_name, &fg.path, &fg.title);
+                (idx, id.clone())
+            }
         };
 
         let profile = match s.policy.profile(&profile_id) {
@@ -2746,6 +2766,7 @@ impl Engine {
             let _ = self.events.send(Event::ForegroundChanged {
                 foreground: snapshot.clone(),
                 profile: profile_id.clone(),
+                matched_rule_index,
             });
             // Fall through to system-mode reconcile below.
             let new_actions = profile.game_mode.clone();
@@ -2795,6 +2816,7 @@ impl Engine {
                 let _ = self.events.send(Event::ForegroundChanged {
                     foreground: snapshot,
                     profile: profile_id.clone(),
+                    matched_rule_index,
                 });
                 let _ = self.events.send(Event::ProfileApplied {
                     pid: fg.pid,

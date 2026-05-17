@@ -131,12 +131,25 @@ fn try_connect_and_serve(
                 Event::ForegroundChanged {
                     foreground,
                     profile,
+                    matched_rule_index,
                 } => (
                     EventKind::Foreground,
-                    format!(
-                        "{} -> {} (pid {})",
-                        foreground.exe_name, profile, foreground.pid
-                    ),
+                    // Item 4.15 — surface the matched rule index when
+                    // available so the activity feed answers "which
+                    // rule caused this?" at a glance. Suppress when no
+                    // rule matched (default profile path / manual
+                    // override / apply_once).
+                    if let Some(idx) = matched_rule_index {
+                        format!(
+                            "{} -> {} (pid {}, rule #{idx})",
+                            foreground.exe_name, profile, foreground.pid
+                        )
+                    } else {
+                        format!(
+                            "{} -> {} (pid {})",
+                            foreground.exe_name, profile, foreground.pid
+                        )
+                    },
                 ),
                 Event::Paused => (EventKind::Engine, "engine paused".into()),
                 Event::Resumed => (EventKind::Engine, "engine resumed".into()),
