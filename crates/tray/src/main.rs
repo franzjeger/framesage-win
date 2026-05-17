@@ -43,6 +43,7 @@ mod editors;
 mod formatters;
 mod icon_assets;
 mod ipc_client;
+mod onboarding;
 mod process_actions;
 mod state;
 mod theme;
@@ -363,6 +364,12 @@ struct FramesageApp {
     /// context-menu → "Set CPU affinity → Custom…". Apply / Cancel
     /// clear it.
     affinity_picker: Option<AffinityPicker>,
+    /// Item 4.1 — `Some` while the first-run onboarding wizard is
+    /// visible. Initialised to `Some` when the marker file
+    /// (`%LOCALAPPDATA%\framesage\first-run-complete`) doesn't
+    /// exist; cleared after Finish writes the marker + sends the
+    /// committed SetPolicy. None on every subsequent launch.
+    onboarding: Option<onboarding::OnboardingState>,
     /// Per-exe icon cache, populated lazily as rows render. Lives outside
     /// `ProcessesView` because the egui textures it holds want to be reused
     /// across tab switches (cheaper than re-extracting on tab return).
@@ -498,6 +505,15 @@ impl FramesageApp {
             activity: ActivityLogView::default(),
             terminate_confirm: None,
             affinity_picker: None,
+            // Item 4.1 — if the marker file is missing, queue the
+            // onboarding wizard. The wizard re-fires on every
+            // launch until Finish writes the marker, so a user
+            // who dismisses without choosing will see it again.
+            onboarding: if onboarding::should_show() {
+                Some(onboarding::OnboardingState::default())
+            } else {
+                None
+            },
             #[cfg(windows)]
             icons: icons::IconCache::new(),
             #[cfg(windows)]
@@ -896,6 +912,10 @@ impl eframe::App for FramesageApp {
         self.render_terminate_confirm_modal(ctx);
         // Modal: custom-mask affinity picker. Same overlay treatment.
         self.render_affinity_picker_modal(ctx);
+        // Item 4.1 — first-run onboarding wizard. Renders LAST so it
+        // visually sits above any other modal. Only shown when the
+        // marker file is missing.
+        self.render_onboarding(ctx);
     }
 }
 
@@ -904,6 +924,50 @@ impl FramesageApp {
     /// fixed-size window centered on the screen. Cancel closes without
     /// firing the IPC; Confirm fires `Request::TerminateProcess` and the
     /// engine kills the process with exit code 1.
+    /// Item 4.1 — render the first-run onboarding wizard if it's
+    /// queued. On Finish: apply the chosen aggression level to the
+    /// current policy (via SetPolicy IPC), write the marker file,
+    /// clear `self.onboarding` so subsequent frames skip it.
+    fn render_onboarding(&mut self, ctx: &egui::Context) {
+        let Some(state) = self.onboarding.as_mut() else {
+            return;
+        };
+        match onboarding::render(ctx, state) {
+            onboarding::OnboardingResult::StillVisible => {
+                // Keep rendering each frame; nothing to commit yet.
+            }
+            onboarding::OnboardingResult::Finished(level) => {
+                // Apply the chosen level to the live policy. Pull
+                // the current policy off the latest status snapshot
+                // (the tray always has one once connected), mutate
+                // in place, and send SetPolicy.
+                let policy_to_send = {
+                    let s = self.state.lock();
+                    s.status.as_ref().map(|st| {
+                        let mut p = st.policy.clone();
+                        onboarding::apply_choice_to_policy(&mut p, level);
+                        p
+                    })
+                };
+                if let Some(policy) = policy_to_send {
+                    self.send_admin_request(
+                        Request::SetPolicy { policy },
+                        "first-run policy commit",
+                    );
+                }
+                // Write the marker file LAST — even if SetPolicy
+                // failed (no connection / not elevated), record the
+                // user's intent so the wizard doesn't re-fire and
+                // the user can fix the IPC issue separately.
+                if let Err(e) = onboarding::write_marker() {
+                    *self.last_action.lock() =
+                        Some(format!("first-run marker write failed: {e}"));
+                }
+                self.onboarding = None;
+            }
+        }
+    }
+
     fn render_terminate_confirm_modal(&mut self, ctx: &egui::Context) {
         let Some(pending) = &self.terminate_confirm else {
             return;
