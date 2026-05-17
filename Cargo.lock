@@ -1053,6 +1053,7 @@ dependencies = [
  "egui_extras",
  "embed-resource",
  "framesage-core",
+ "framesage-gamemode",
  "framesage-ipc",
  "framesage-sys",
  "ico",
@@ -2957,6 +2958,15 @@ checksum = "3a766e1110788c36f4fa1c2b71b387a7815aa65f88ce0229841826633d93723e"
 dependencies = [
  "libc",
  "windows-sys 0.61.2",
+]
+
+[[package]]
+name = "spike-etw"
+version = "0.5.0"
+dependencies = [
+ "anyhow",
+ "clap",
+ "windows",
 ]
 
 [[package]]
