@@ -86,6 +86,45 @@ enum Cmd {
     /// action; `undo list` shows the recent log.
     #[command(subcommand)]
     Undo(UndoCmd),
+    /// Item 4.3 — policy management verbs. Export the live policy
+    /// to a JSON file, import from a file (committed via SetPolicy
+    /// so the engine sees it immediately + the service persists),
+    /// or add a quick exe-name rule from the shell.
+    #[command(subcommand)]
+    Policy(PolicyCmd),
+}
+
+#[derive(Subcommand, Debug)]
+enum PolicyCmd {
+    /// Save the running service's current policy to a JSON file.
+    /// Uses the same shape as `policy.json` on disk so the file is
+    /// readable by `policy import` round-trip. Exports the live
+    /// in-memory state, which may include unsaved-to-disk edits.
+    Export {
+        /// Destination file path. Will be overwritten if it exists.
+        path: String,
+    },
+    /// Read a policy JSON file and commit it via SetPolicy. The
+    /// usual server-side validation runs (safe-list + structural);
+    /// rejection prints the error and the live policy is unchanged.
+    Import {
+        /// Source file path.
+        path: String,
+    },
+    /// Append a single exe-name → profile rule to the running
+    /// policy and commit via SetPolicy. Idempotent on existing
+    /// rules: if a rule with the same exe-name already exists, it
+    /// is replaced. Convenience for the shell-driven workflow
+    /// ("frameSage policy add-rule notepad.exe perf").
+    AddRule {
+        /// Exe filename (case-insensitive match in the engine —
+        /// e.g. "bf6.exe").
+        exe: String,
+        /// Profile id to bind. Must already exist in the policy;
+        /// the engine rejects unknown profile ids in the SetPolicy
+        /// structural validator.
+        profile: String,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -179,6 +218,122 @@ fn main() -> Result<()> {
                 tokio_block(async { send_simple(Request::UndoLogList { limit }).await })
             }
         },
+        Cmd::Policy(sub) => match sub {
+            PolicyCmd::Export { path } => {
+                tokio_block(async { policy_export(&path).await })
+            }
+            PolicyCmd::Import { path } => {
+                tokio_block(async { policy_import(&path).await })
+            }
+            PolicyCmd::AddRule { exe, profile } => {
+                tokio_block(async { policy_add_rule(&exe, &profile).await })
+            }
+        },
+    }
+}
+
+/// Item 4.3 — export the live policy via Status, write as
+/// pretty-printed JSON to `path`. Overwrites unconditionally.
+#[cfg(windows)]
+async fn policy_export(path: &str) -> Result<()> {
+    let policy = fetch_live_policy().await?;
+    let body =
+        serde_json::to_string_pretty(&policy).context("serialize policy for export")?;
+    std::fs::write(path, body).with_context(|| format!("write policy export to {path}"))?;
+    println!("exported policy to {path}");
+    Ok(())
+}
+
+#[cfg(not(windows))]
+async fn policy_export(_path: &str) -> Result<()> {
+    Err(anyhow!("policy verbs are Windows-only"))
+}
+
+/// Item 4.3 — read policy JSON from disk, commit via SetPolicy.
+/// The server-side safe-list + structural validators run; any
+/// rejection comes back as Response::Error with the offending
+/// details surfaced verbatim.
+#[cfg(windows)]
+async fn policy_import(path: &str) -> Result<()> {
+    let body =
+        std::fs::read_to_string(path).with_context(|| format!("read policy file {path}"))?;
+    let policy: framesage_core::Policy = serde_json::from_str(&body)
+        .with_context(|| format!("parse policy file {path} as JSON"))?;
+    send_simple(Request::SetPolicy { policy }).await?;
+    println!("imported policy from {path}");
+    Ok(())
+}
+
+#[cfg(not(windows))]
+async fn policy_import(_path: &str) -> Result<()> {
+    Err(anyhow!("policy verbs are Windows-only"))
+}
+
+/// Item 4.3 — pull the live policy, upsert an exe-name rule
+/// pointing at `profile`, commit via SetPolicy. Replaces an
+/// existing rule for the same exe (case-insensitive) so repeated
+/// invocations are idempotent. The engine refuses if the profile
+/// id doesn't exist (Response::Error via the structural
+/// validator added in item 4.11).
+#[cfg(windows)]
+async fn policy_add_rule(exe: &str, profile: &str) -> Result<()> {
+    use framesage_core::{AppMatch, AppRule};
+    let mut policy = fetch_live_policy().await?;
+    let new_rule = AppRule {
+        r#match: AppMatch::ExeName(exe.to_string()),
+        profile: ProfileId(profile.to_string()),
+        note: format!("added via `framesage policy add-rule {exe} {profile}`"),
+    };
+    // Idempotent: if a rule already exists for this exe (case-
+    // insensitive), replace it. Otherwise append.
+    let mut replaced = false;
+    for slot in policy.rules.iter_mut() {
+        if let AppMatch::ExeName(existing) = &slot.r#match {
+            if existing.eq_ignore_ascii_case(exe) {
+                *slot = new_rule.clone();
+                replaced = true;
+                break;
+            }
+        }
+    }
+    if !replaced {
+        policy.rules.push(new_rule);
+    }
+    send_simple(Request::SetPolicy { policy }).await?;
+    if replaced {
+        println!("updated existing rule for {exe} -> {profile}");
+    } else {
+        println!("added rule {exe} -> {profile}");
+    }
+    Ok(())
+}
+
+#[cfg(not(windows))]
+async fn policy_add_rule(_exe: &str, _profile: &str) -> Result<()> {
+    Err(anyhow!("policy verbs are Windows-only"))
+}
+
+/// Item 4.3 helper — pull the live policy off the running service
+/// via a Status request. Reused by `policy export` and
+/// `policy add-rule`.
+#[cfg(windows)]
+async fn fetch_live_policy() -> Result<framesage_core::Policy> {
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+    let stream = open_pipe(Request::Status.target_pipe()).await?;
+    let (read_half, mut write_half) = tokio::io::split(stream);
+    let mut reader = BufReader::new(read_half).lines();
+    let mut line = serde_json::to_vec(&Request::Status)?;
+    line.push(b'\n');
+    write_half.write_all(&line).await?;
+    write_half.flush().await?;
+    let Some(resp_line) = reader.next_line().await? else {
+        return Err(anyhow!("service closed pipe without responding"));
+    };
+    let resp: Response = serde_json::from_str(&resp_line)?;
+    match resp {
+        Response::Status(s) => Ok(s.policy.clone()),
+        Response::Error { message } => Err(anyhow!(message)),
+        other => Err(anyhow!("expected Status response, got {other:?}")),
     }
 }
 

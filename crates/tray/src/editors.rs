@@ -104,6 +104,26 @@ pub(crate) fn render_profile_editor(ui: &mut egui::Ui, p: &mut Profile) {
             );
             ui.checkbox(&mut p.trim_working_set, "");
         });
+        // Item 4.3 — persistent flag exposed in the editor. When set,
+        // the per-PID knobs stick for the lifetime of the matching
+        // process (no revert on focus change) AND the engine
+        // re-asserts them every ~2 s to defeat self-modification
+        // (games that call SetProcessAffinityMask on themselves at
+        // startup, etc.). Default for game-x3d profiles; users
+        // editing custom profiles need the explicit toggle.
+        ui.horizontal(|ui| {
+            ui.add_sized(
+                [150.0, 16.0],
+                egui::Label::new(egui::RichText::new("Persistent").weak()),
+            )
+            .on_hover_text(
+                "Per-PID knobs stick for the lifetime of the matching process. \
+                 The engine also re-asserts the apply every ~2s to defeat games \
+                 that overwrite their own affinity at startup. Recommended for \
+                 game profiles; leave off for tools you alt-tab between often.",
+            );
+            ui.checkbox(&mut p.persistent, "");
+        });
     });
 
     ui.add_space(4.0);
