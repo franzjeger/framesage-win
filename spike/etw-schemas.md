@@ -37,42 +37,44 @@ this offset come from?"
 
 ---
 
-## Build coverage gap (acknowledged up front)
+## Build coverage — closed by Phase 2 sign-off Decision 1
 
-**Only Windows 11 build 26200 was empirically tested in this
-research week.** The architecture document's `OPCODE_TABLES`
-plan requires validation on Win10 22H2 (build 19045) and Win11
-23H2 (build 22631) before implementation can begin in Group A
-weeks 2-7.
+**v0.7 supports Windows 11 24H2 (build 26100) and later only.**
+Earlier Windows builds run the v0.6 static-rule engine
+unchanged; the closed-loop subsystem (ETW consumer, PresentMon
+spawn, session recorder) is gated on a build check at service
+startup. See architecture document Section 2.1 "Build-gate
+degradation mode" for the full degradation behavior.
 
-What the lack of multi-build empirical data means for the
-ground-rule trigger:
+**What this means for schema research:**
 
-- **The user's "stop if opcodes differ across builds" rule** is
-  not yet provably-satisfied. It's provably-satisfied if
-  later-build empirical capture matches; it would trigger a
-  re-plan only if Win10 / Win11 23H2 captures show different
-  opcode meanings.
-- **MSDN documentation is build-independent** for the events we
-  parse (CSwitch, DPC, ISR, HardFault) — pages don't carry
-  per-build opcode tables. We rely on this as authority for
-  builds we couldn't empirically test.
-- **PerfView's parser** (commit cited below) handles Win10 and
-  Win11 22H2 using the same opcode constants we're documenting
-  here. That's a strong indirect signal that opcodes haven't
-  shifted, but it isn't first-hand empirical evidence.
+- The original multi-build empirical-validation gate is
+  CLOSED — we don't promise to work on Win10 22H2 or Win11
+  23H2, so we don't need empirical proof that our schema
+  parses correctly there.
+- This document's empirical column covers Win11 26200, which
+  is in the supported range (26100+). For Win11 25H2 and
+  later, the assumption is that opcode values stay stable per
+  the MSDN authority (which doesn't carry per-build opcode
+  tables). If a future Win11 release breaks our parser, the
+  build-gate's "passthrough mode" catches it cleanly via the
+  five degradation modes in architecture Section 2.1.
+- For Win11 builds **below** 26100, the closed-loop subsystem
+  never instantiates and this document's parse rules are
+  irrelevant.
 
-**Path to close this gap (Phase 2 testing scope):**
-- Spin up Hyper-V VMs of Win10 22H2 and Win11 23H2
-- Run the spike's `--histogram --duration 60` mode on each
-- Diff the resulting histograms against this document's
-  empirical column for Win11 26200
-- If any opcode shifts: STOP, file an architecture-revision PR
-  per the ground rule, do not proceed with implementation
+**What v0.8 should revisit:**
 
-Until that gap is closed, this document represents the
-**single-build-empirical + MSDN-documented** state of
-knowledge.
+- User demand for older-build support. If a real fraction of
+  the user base runs Win11 23H2 or earlier, v0.8 could add
+  build-aware schema selection. That's a real engineering
+  cost (~2-3 weeks for the per-build opcode tables + empirical
+  validation matrix) that v0.7 deliberately doesn't pay.
+- Empirical validation on a Hyper-V Win11 25H2 / 26H1 image
+  once Microsoft releases later builds. The build-gate cap is
+  "26100+ inclusive" — every new build past 26100 should be
+  re-confirmed via the spike's `--histogram` mode before being
+  declared supported.
 
 ---
 
@@ -504,7 +506,7 @@ During the 60s primary spike run, **12,347 events were observed
 on the PerfInfo provider at opcode 50 (0x32)** — 37.50% of all
 PerfInfo events, second only to regular DPC at opcode 68.
 
-**Authority search outcome: not documented.**
+**Authority search outcome: MSDN-undocumented.**
 
 - [PerfInfo class MSDN page](https://learn.microsoft.com/en-us/windows/win32/etw/perfinfo)
   consulted 2026-05-17. Its event-types table lists opcodes 46,
@@ -515,30 +517,51 @@ PerfInfo events, second only to regular DPC at opcode 68.
   events under PerfInfo provider GUID, confirmed by the
   histogram (PerfInfo total adds up correctly).
 
-**Interpretation:** PerfInfo has at least one undocumented
-opcode (50) that fires regularly on Win11 26200. Could be a
-SystemCall variant, a sample-profile sub-event, a Pmc counter,
-or an internal kernel event added in a recent Windows release.
+### Disposition (per Phase 2 sign-off Decision 3)
 
-**v0.7 disposition:** NOT in parse scope. v0.7's PerfInfo parser
-matches opcodes {0x42, 0x43, 0x44, 0x45} and discards everything
-else. Discarded events still count toward total event volume
-for buffer-sizing purposes but contribute nothing to the
-closed-loop signals.
+**v0.7 status: observed on Win11 26200, MSDN-undocumented,
+parsed as no-op.**
 
-**v0.8 follow-up:** investigate via PerfView source —
-specifically `microsoft/perfview` repository, file
-`src/TraceEvent/Parsers/KernelTraceEventParser.cs`. PerfView is
-maintained by Microsoft and tracks new opcodes as they appear.
-If PerfView has a name for opcode 50, the v0.8 schema can
-adopt it with a citation.
+The v0.7 PerfInfo parser explicitly matches opcodes
+`{0x42, 0x43, 0x44, 0x45}` and routes everything else — including
+0x32 — to the no-op branch. The branch increments the
+"discarded by classifier" counter (for buffer-sizing
+diagnostics) and returns. Contributes nothing to closed-loop
+signals.
+
+This disposition is the kind the schema-research ground rule
+was designed for: **honest, cited, deferred with a forwarding
+address.** A v0.8 implementer adding closer-loop signals who
+needs to know "what's that 0x32 on PerfInfo" reads this
+section, follows the v0.8 follow-up below.
+
+### v0.8 follow-up forwarding address
+
+Investigation path when (and only when) opcode 0x32 becomes
+load-bearing for v0.8 attribution work:
+
+1. Read `microsoft/perfview` repository, file
+   `src/TraceEvent/Parsers/KernelTraceEventParser.cs`. PerfView
+   is maintained by Microsoft and tracks new kernel opcodes as
+   Microsoft adds them. Pin the commit hash in the v0.8 schema
+   doc update.
+2. If PerfView doesn't name 0x32 either: run `xperf -on
+   PROC_THREAD+LOADER+PROFILE -minbuffers 200 -maxbuffers 400 -f
+   trace.etl` for 60 s under load, then open the .etl in
+   `wpa.exe` and look at the PerfInfo events table. Microsoft's
+   WPA has decoded event names for many events that aren't on
+   MSDN. If WPA has a name, cite the WPA decode + Windows
+   release.
+3. If neither MSDN nor PerfView nor WPA know: the opcode is
+   either undocumented kernel telemetry that Microsoft hasn't
+   exposed, OR Microsoft-internal-only. v0.8 cannot use it
+   without reverse engineering, which violates the project's
+   anti-cheat-clean / documented-API-only posture.
 
 **Acknowledged limitation:** I did NOT directly read PerfView's
-source during this research week (the file is 565KB and
-authoritative confirmation from MSDN was sufficient for the
-v0.7 parse scope). For v0.8 — or if a maintainer reviewing this
-doc disagrees with the "out of scope" call — PerfView's parser
-should be the next authority consulted.
+source during this research week. MSDN authority was sufficient
+for the v0.7 parse scope; PerfView lookup is the next step
+when v0.8 needs it.
 
 ---
 
@@ -606,24 +629,56 @@ research week is at the proposal/v0.7-architecture branch HEAD
 
 ## Group A weeks 2-7 implementation gates
 
-Per the v0.7 architecture's Phase 3 acceptance criteria,
-implementation cannot begin until:
+Per the v0.7 architecture's Phase 3 acceptance criteria + the
+Phase 2 sign-off decisions, implementation cannot begin until:
 
 - [x] **This document exists and cites authority per event.**
       Done in this week.
-- [ ] **Win10 22H2 build 19045 spike --histogram captured and
-      diffed against this document.** Open — needs a VM.
-- [ ] **Win11 23H2 build 22631 spike --histogram captured.**
-      Open — needs a VM.
-- [ ] **Any opcode shift discovered triggers an architecture-
-      revision PR before implementation.** Conditional gate
-      depending on the two prior items.
+- [x] **Multi-build empirical validation NOT REQUIRED.**
+      Closed by Phase 2 sign-off Decision 1: v0.7 supports
+      Windows 11 24H2 (build 26100) and later only. Earlier
+      builds run the v0.6 static-rule engine. See architecture
+      Section 2.1 "Build-gate degradation mode".
 - [ ] **EDR testing matrix** (Defender ATP + CrowdStrike Falcon
-      + SentinelOne Singularity per architecture revision).
+      + SentinelOne Singularity per Phase 2 sign-off Decision
+      2). Output is `/spike/etw-edr-report.md`. Required before
+      implementation can start.
 
-Implementation work in Group A weeks 2-7 is BLOCKED on the open
-gates above. Continuing without filling them risks the very
-issue the ground rule was designed to prevent.
+### Implementation requirements driven by this document
+
+These are not gates (they don't block start) but they ARE
+acceptance criteria for Group A weeks 2-7 — the consumer
+implementation MUST satisfy these to land:
+
+- [ ] **DPC opcodes use MSDN-authoritative values** per Phase 2
+      sign-off Decision 4. Specifically: the consumer matches
+      `0x42` (ThreadDPC), `0x44` (DPC), `0x45` (TimerDPC). The
+      spike's original `0x2E` constant was empirically wrong;
+      production code must NOT carry the bug forward. A unit
+      test asserts the parser recognizes all three documented
+      DPC opcodes and rejects `0x2E` as DPC.
+- [ ] **HardFault opcode uses `0x20` (PageFault_HardFault),
+      not `0x0E` (MM_HPF).** The two coexist on the PageFault
+      provider; we picked `0x20` because it's the richer
+      layout AND because `EVENT_TRACE_FLAG_MEMORY_HARD_FAULTS`
+      (our enabled flag) fires the `0x20` variant. Unit test
+      pins the choice with a comment citing this document's
+      "HardFault" section.
+- [ ] **DiskIo parser reads only stable-prefix fields**
+      (DiskNumber, IrpFlags, TransferSize). Version-dependent
+      fields beyond offset 12 are explicitly skipped. Unit
+      test loads a synthetic Win Server 2003 V0 layout AND a
+      Win 11 V2 layout and asserts identical stable-prefix
+      output from both.
+- [ ] **PerfInfo opcode 0x32 (50) parsed as no-op** per
+      Decision 3. Discarded events increment a counter for
+      buffer-sizing diagnostics, contribute nothing to
+      closed-loop signals. Code comment cites this document's
+      "Out-of-scope observation" section.
+
+Implementation work in Group A weeks 2-7 is BLOCKED on the
+EDR-testing gate above. Continuing without it risks shipping
+v0.7 with a real anti-cheat-compatibility unknown.
 
 ---
 
