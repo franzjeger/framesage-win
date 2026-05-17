@@ -124,6 +124,18 @@ pub struct Policy {
     /// to the X3D CCD" case. See [`AffinityRule`] for matching + precedence.
     #[serde(default)]
     pub affinity_rules: Vec<AffinityRule>,
+
+    /// v0.7 closed-loop ETW kernel-event consumer master switch. When `true`
+    /// AND the running Windows build is ≥ `framesage_etw::MIN_BUILD_FOR_CLOSED_LOOP`
+    /// (currently 26100 = Win11 24H2), the service spawns the ETW consumer +
+    /// supervisor tasks on startup. When `false` (the default) OR the build
+    /// gate fails, the engine runs in v0.6 static-rule mode.
+    ///
+    /// Per `spike/etw-edr-report.md` §6: v0.7 ships closed-loop **default-off**.
+    /// The v0.7.1 default-on flip is gated on the EDR matrix + signed binary
+    /// + vendor-allow-list path acceptable per §6.1.
+    #[serde(default)]
+    pub closed_loop_enabled: bool,
 }
 
 /// Tunables for dynamic priority management. Modeled after Process Lasso's
@@ -635,6 +647,10 @@ impl Default for Policy {
             tick_ms: Self::default_tick_ms(),
             probalance: ProBalanceConfig::default(),
             affinity_rules: Vec::new(),
+            // v0.7 ships closed-loop default-off per etw-edr-report.md §6.
+            // v0.7.1 default-on flip gated on §6.1 (EDR matrix + signed
+            // binary + vendor-allow-list).
+            closed_loop_enabled: false,
         }
     }
 }
@@ -675,6 +691,7 @@ mod tests {
             tick_ms: 250,
             probalance: ProBalanceConfig::default(),
             affinity_rules: Vec::new(),
+            closed_loop_enabled: false,
         }
     }
 

@@ -74,14 +74,17 @@ pub struct SessionStats {
 
 #[cfg(windows)]
 pub use windows_impl::{
-    ConsumerState, EtwSession, EtwSubsystem, EtwSysCalls, RealEtwSysCalls, SessionShutdownHandle,
+    ConsumerState, EtwSession, EtwSubsystem, EtwSysCalls, MonitorHandle, RealEtwSysCalls,
+    SessionShutdownHandle,
 };
 
 #[cfg(all(windows, test))]
 pub use windows_impl::MockEtwSysCalls;
 
 #[cfg(not(windows))]
-pub use stub::{EtwSession, EtwSubsystem, EtwSysCalls, RealEtwSysCalls, SessionShutdownHandle};
+pub use stub::{
+    EtwSession, EtwSubsystem, EtwSysCalls, MonitorHandle, RealEtwSysCalls, SessionShutdownHandle,
+};
 
 // ─── Windows implementation ──────────────────────────────────────────────────
 
@@ -842,6 +845,29 @@ mod windows_impl {
             Ok(stats)
         }
 
+        /// Day 5: decompose with an additional `MonitorHandle` for the
+        /// drop-poll sibling task. Same as `into_supervisable_parts`
+        /// otherwise.
+        pub fn into_supervisable_parts_with_monitor(
+            self,
+        ) -> (
+            JoinHandle<()>,
+            tokio::sync::oneshot::Receiver<crate::supervisor::ConsumerExitReason>,
+            SessionShutdownHandle<S>,
+            MonitorHandle<S>,
+        )
+        where
+            S: Clone,
+        {
+            let monitor = MonitorHandle {
+                syscalls: self.syscalls.clone(),
+                session_name: self.session_name.clone(),
+                state: Arc::clone(&self.state),
+            };
+            let (join, rx, shutdown) = self.into_supervisable_parts();
+            (join, rx, shutdown, monitor)
+        }
+
         /// Decompose the session into the three parts the
         /// `SupervisorLoop` needs: the consumer-thread JoinHandle, the
         /// oneshot Receiver, and a SessionShutdownHandle that owns
@@ -871,6 +897,65 @@ mod windows_impl {
                 syscalls: self.syscalls,
             };
             (consumer_join, exit_rx, shutdown)
+        }
+    }
+
+    // ─── MonitorHandle (Day 5 addition — see Mac-side uncertainties Entry 7) ─
+
+    /// Read-only monitoring handle for periodic stat queries from a
+    /// sibling tokio task. Plan §4 Day 5 says "the drop-rate query
+    /// loop runs concurrently in a sibling task that calls
+    /// EtwSession::query_stats() on a 1-second tokio interval and
+    /// feeds KernelDrops events into the same on_event sink." But the
+    /// pseudo-code only spawns the supervisor task and uses
+    /// into_supervisable_parts which consumes the EtwSession — so the
+    /// sibling task has no way to call query_stats. Day 5 resolves
+    /// this by introducing `into_supervisable_parts_with_monitor`,
+    /// which returns an additional `MonitorHandle` for the drop-poll
+    /// task to use.
+    ///
+    /// Owns a clone of the syscalls impl, the session name, and a
+    /// clone of the Arc<ConsumerState> (for events_seen). Doesn't own
+    /// teardown — that's still on SessionShutdownHandle (held by the
+    /// SupervisorLoop). The monitor is read-only: query_session_stats,
+    /// format the result, fire the on_event callback. It does **not**
+    /// call ControlTraceW(STOP); the supervisor is the only stop path.
+    pub struct MonitorHandle<S: EtwSysCalls = RealEtwSysCalls> {
+        syscalls: S,
+        session_name: String,
+        state: Arc<ConsumerState>,
+    }
+
+    impl<S: EtwSysCalls> std::fmt::Debug for MonitorHandle<S> {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.debug_struct("MonitorHandle")
+                .field("session_name", &self.session_name)
+                .finish()
+        }
+    }
+
+    impl<S: EtwSysCalls> MonitorHandle<S> {
+        /// Drop-rate poll + KernelDrops emission (Mode 3 wire).
+        /// Same body as `EtwSession::poll_drop_stats` but reachable
+        /// from a sibling task after `into_supervisable_parts_with_monitor`.
+        pub fn poll_drop_stats(
+            &self,
+            on_event: impl Fn(crate::degradation::DegradationEvent),
+        ) -> Result<SessionStats> {
+            let q = query_session_stats(&self.syscalls, &self.session_name)?;
+            let stats = SessionStats {
+                events_lost: q.events_lost,
+                real_time_buffers_lost: q.real_time_buffers_lost,
+                buffers_written: q.buffers_written,
+                events_seen: self.state.events_seen.load(Ordering::Relaxed),
+            };
+            if stats.real_time_buffers_lost > 0 {
+                on_event(crate::degradation::DegradationEvent {
+                    mode: DegradationMode::KernelDrops,
+                    detail: format!("real_time_buffers_lost={}", stats.real_time_buffers_lost),
+                });
+            }
+            Ok(stats)
         }
     }
 
@@ -1197,6 +1282,20 @@ mod stub {
     impl<S: EtwSysCalls> SessionShutdownHandle<S> {
         pub fn shutdown(self) -> Result<()> {
             Ok(())
+        }
+    }
+
+    #[derive(Debug)]
+    pub struct MonitorHandle<S: EtwSysCalls = RealEtwSysCalls> {
+        _private: PhantomData<S>,
+    }
+
+    impl<S: EtwSysCalls> MonitorHandle<S> {
+        pub fn poll_drop_stats(
+            &self,
+            _on_event: impl Fn(crate::degradation::DegradationEvent),
+        ) -> Result<SessionStats> {
+            bail!("framesage-etw monitoring requires Windows")
         }
     }
 }

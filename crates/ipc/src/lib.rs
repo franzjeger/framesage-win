@@ -620,6 +620,7 @@ mod tests {
             tick_ms: 300,
             probalance: framesage_core::ProBalanceConfig::default(),
             affinity_rules: Vec::new(),
+            closed_loop_enabled: false,
         }
     }
 

@@ -106,6 +106,7 @@ framesage-core = { path = "crates/core" }
 framesage-sys = { path = "crates/sys" }
 framesage-ipc = { path = "crates/ipc" }
 framesage-engine = { path = "crates/engine" }
+framesage-etw = { path = "crates/etw" }
 framesage-gamemode = { path = "crates/gamemode" }
 
 # UUIDs for journal session ids

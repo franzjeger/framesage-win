@@ -213,3 +213,108 @@ would still work but doesn't actually involve ETW infrastructure).
 If the end-of-week full-flow test reveals the supervisor doesn't
 react correctly to a real panic, that's an Entry-N in
 audit/buddy-disagreements.md.
+
+**Resolved (Day 4):** the Mode 5 full-flow session-level test
+landed via `MockEtwSysCalls::arm_panic_in_process_trace` — see
+`crates/etw/src/session.rs::tests::mode_5_session_level_full_flow_panic`.
+Test exercises the full path: start_with_syscalls → consumer thread
+spawn → mock's process_trace panics → catch_unwind fires → real
+oneshot sends Panicked → SupervisorLoop receives → on_event called
+with ConsumerPanic. Bounded by tokio::time::timeout(5s). The
+Windows-batch run still verifies it works against a real Windows
+host runtime as well.
+
+---
+
+## Entry 7 — Day 5 (2026-05-17): MonitorHandle introduced for drop-poll sibling task
+
+**What was done:** plan §4 Day 5 pseudo-code only spawned the
+supervisor task and used `into_supervisable_parts` which consumes
+the EtwSession. The prose says "the drop-rate query loop runs
+concurrently in a sibling task that calls EtwSession::query_stats()
+on a 1-second tokio interval" — but the sibling task has no way to
+call query_stats once the session is decomposed.
+
+**Resolution (inline — no STOP):** added `MonitorHandle<S>` type +
+`EtwSession::into_supervisable_parts_with_monitor` returning the
+4-tuple `(JoinHandle, oneshot::Receiver, SessionShutdownHandle,
+MonitorHandle)`. The MonitorHandle owns a clone of syscalls +
+session_name + the Arc<ConsumerState>; provides
+`poll_drop_stats(on_event)` for periodic stat queries from a sibling
+tokio task. Read-only — does NOT call ControlTraceW(STOP). The
+supervisor remains the only stop path.
+
+The `into_supervisable_parts` 3-tuple variant stays for the
+supervisor.rs synthetic-panic test (which doesn't need monitoring).
+Service-side wiring uses `..._with_monitor`.
+
+**Hypothesis:** the drop-poll task self-terminates cleanly when the
+session ends (its query_session_stats call fails because the session
+is gone; the task logs at WARN and breaks). The supervisor task and
+the drop-poll task run independently in the tokio runtime; neither
+participates in the v0.6 watchdog select! per architecture §2.1
+mode 5 amendment (PR #77).
+
+**Windows-side verification:** during the end-of-week batch, start
+the service with `closed_loop_enabled: true` on a Win11 24H2+
+elevated host. Verify:
+1. Both supervisor + drop-poll tasks appear in tracing logs (look
+   for "closed-loop ETW session started" + "ETW consumer-supervisor
+   task completed" or "ETW drop-poll task terminating").
+2. Force-stop the session via `logman stop FramesageEtw -ets`;
+   verify both tasks self-terminate (drop-poll logs "session likely
+   closed"; supervisor logs the consumer's exit reason).
+3. Service itself stays up — watchdog doesn't fire because closed-
+   loop tasks are intentionally excluded from the select!.
+
+---
+
+## Entry 8 — Day 5 (2026-05-17): runtime.rs _silence_warnings host-rot fix-forward
+
+**What was done:** while wiring closed_loop into runtime.rs, found
+that `cargo test -p framesage-service` failed on non-Windows hosts
+because the `_silence_warnings` function (a non-Windows-only helper
+that keeps imports referenced) had bit-rotted:
+- `load_policy` was renamed to `load_policy_or_default` in an
+  earlier refactor but the silence list wasn't updated.
+- `type_name::<AsyncBufReadExt>` (bare trait name) became a hard
+  error in newer Rust editions; `dyn` doesn't help here because
+  AsyncBufReadExt's methods return `Self`-bound future types and
+  it's not dyn-compatible.
+
+**Resolution (inline maintenance):** updated to the new function
+name, and switched to a `fn<T: Trait>(&T)` generic-bound pattern
+that exercises the trait without requiring dyn-compatibility.
+
+**Hypothesis:** pure host-side maintenance with no effect on
+Windows-target behavior. The new `_silence_warnings` compiles clean
+on host AND has no Windows-side counterpart (it's
+`#[cfg(not(windows))]`).
+
+**Windows-side verification:** none required — the function never
+runs on Windows.
+
+---
+
+## Entry 9 — Day 5 (2026-05-17): Policy::closed_loop_enabled added
+
+**What was done:** added `closed_loop_enabled: bool` field to
+`framesage_core::Policy`. Defaults to false per `etw-edr-report.md`
+§6 (v0.7 ships closed-loop default-off; v0.7.1 flip gated on §6.1).
+Three `Policy { ... }` literal sites updated to include the field
+(crates/core, crates/ipc, crates/service).
+
+**Hypothesis:** policy.json files written by v0.6 will load
+correctly with the new field defaulting to false (serde's
+`#[serde(default)]` attribute is on the field). New installs get
+the default-off behavior; users opt in by editing policy.json.
+
+**Windows-side verification:** during the end-of-week batch, test
+upgrade scenario:
+1. Start with a v0.6 policy.json (no closed_loop_enabled field).
+2. Load via load_policy_or_default; verify no error.
+3. Verify Policy.closed_loop_enabled = false (default).
+4. Verify start_closed_loop_if_enabled returns OptedOut + logs the
+   structured reason="policy_opt_out" event.
+5. Manually flip the field to true; restart service; verify the
+   build-gate path is taken next.

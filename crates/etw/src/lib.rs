@@ -21,7 +21,7 @@ pub use build_gate::{
 };
 pub use degradation::{DegradationEvent, DegradationMode};
 pub use session::{
-    EtwSession, EtwSubsystem, EtwSysCalls, RealEtwSysCalls, SessionOptions, SessionShutdownHandle,
-    SessionStats,
+    EtwSession, EtwSubsystem, EtwSysCalls, MonitorHandle, RealEtwSysCalls, SessionOptions,
+    SessionShutdownHandle, SessionStats,
 };
 pub use supervisor::{ConsumerExitReason, SupervisorLoop};

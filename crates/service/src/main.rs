@@ -24,6 +24,7 @@ use tracing::info;
 
 #[cfg(windows)]
 mod acl;
+mod closed_loop;
 #[cfg(windows)]
 mod pipe;
 mod runtime;
