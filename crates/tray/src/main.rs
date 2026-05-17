@@ -111,6 +111,32 @@ struct TrayCommands {
     jump_to_tab: Arc<Mutex<Option<Tab>>>,
 }
 
+/// Item 4.3 — Settings-tab view state. ProBalance + tick interval
+/// edits batch into a draft so a slider drag doesn't spam SetPolicy
+/// IPC; Apply commits. Compact mode is a tray-only display
+/// preference (not in policy), so it lives here, not in the Policy
+/// type — flipping it doesn't need an admin pipe or a service
+/// restart.
+#[derive(Debug, Default)]
+struct SettingsView {
+    /// In-flight ProBalance draft. `Some` while the user is editing
+    /// sliders; cleared on Apply (committed) or on Cancel/tab-switch.
+    /// Apply path snapshots `self.state.lock().status.policy`,
+    /// overlays this draft, and sends SetPolicy.
+    probalance_draft: Option<framesage_core::ProBalanceConfig>,
+    /// In-flight tick_ms draft, same semantics as `probalance_draft`.
+    tick_ms_draft: Option<u64>,
+    /// True while the Reset-to-defaults confirm modal is visible.
+    /// User clicks Reset → modal opens; user clicks Confirm →
+    /// SetPolicy(Policy::default()) fires + modal closes.
+    reset_confirm_visible: bool,
+    /// Item 4.2 deferred — compact mode toggle. When true, the
+    /// Processes-tab table renders with 11.5pt body + 16px rows
+    /// (~25% more rows visible per scroll). Tray-only state; does
+    /// not round-trip to policy.json.
+    pub compact_mode: bool,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 enum Tab {
     /// Item 2.10 / audit H-24 partial: Status is the right landing
@@ -126,6 +152,11 @@ enum Tab {
     Activity,
     Rules,
     Profiles,
+    /// Item 4.3 — Settings tab: editable ProBalance thresholds,
+    /// tick interval, policy reset, compact-mode toggle. File-
+    /// based export/import lives in the `framesage policy` CLI
+    /// verbs (item 4.3 part 1).
+    Settings,
 }
 
 /// Live state for the Processes tab. Polled from the engine in the
@@ -370,6 +401,13 @@ struct FramesageApp {
     /// exist; cleared after Finish writes the marker + sends the
     /// committed SetPolicy. None on every subsequent launch.
     onboarding: Option<onboarding::OnboardingState>,
+    /// Item 4.3 — Settings-tab editor state. Holds in-flight drafts
+    /// of ProBalance config + tick interval (Apply commits via
+    /// SetPolicy) and the Reset-to-defaults confirm-modal flag.
+    /// Compact-mode toggle (item 4.2 deferred from PR #53) lives
+    /// here too because the Settings tab is the appropriate home
+    /// for cross-tab display preferences.
+    settings: SettingsView,
     /// Per-exe icon cache, populated lazily as rows render. Lives outside
     /// `ProcessesView` because the egui textures it holds want to be reused
     /// across tab switches (cheaper than re-extracting on tab return).
@@ -514,6 +552,7 @@ impl FramesageApp {
             } else {
                 None
             },
+            settings: SettingsView::default(),
             #[cfg(windows)]
             icons: icons::IconCache::new(),
             #[cfg(windows)]
@@ -1361,6 +1400,7 @@ impl FramesageApp {
                     (Tab::Activity, "Activity"),
                     (Tab::Rules, "Rules"),
                     (Tab::Profiles, "Profiles"),
+                    (Tab::Settings, "Settings"),
                 ];
                 for (t, label) in tabs {
                     let marker = if self.tab == t { "* " } else { "  " };
@@ -1501,7 +1541,7 @@ impl FramesageApp {
             ui.spacing_mut().item_spacing.x = 0.0;
             // Each tab gets a one-line hover-text that names the tab's
             // job, since the labels themselves are deliberately terse.
-            let tabs: [(Tab, &str, &str); 5] = [
+            let tabs: [(Tab, &str, &str); 6] = [
                 (
                     Tab::Processes,
                     "Processes",
@@ -1526,6 +1566,11 @@ impl FramesageApp {
                     Tab::Profiles,
                     "Profiles",
                     "Per-profile editor — CPU sets, throttling, priority, Game Mode actions.",
+                ),
+                (
+                    Tab::Settings,
+                    "Settings",
+                    "ProBalance thresholds, tick interval, policy reset, compact mode.",
                 ),
             ];
             for (t, label, hover) in tabs {
@@ -1552,6 +1597,7 @@ impl FramesageApp {
             Tab::Activity => self.render_activity_tab(ui),
             Tab::Rules => self.render_rules_tab(ui, status),
             Tab::Profiles => self.render_profiles_tab(ui, status),
+            Tab::Settings => self.render_settings_tab(ui, status),
         }
     }
 
@@ -1845,6 +1891,391 @@ impl FramesageApp {
                 );
             }
         });
+    }
+
+    /// Item 4.3 — Settings tab. Editable ProBalance thresholds,
+    /// tick interval, policy reset, compact-mode toggle. The
+    /// ProBalance + tick-ms edits batch into drafts so a slider
+    /// drag doesn't spam SetPolicy; Apply commits.
+    fn render_settings_tab(
+        &mut self,
+        ui: &mut egui::Ui,
+        status: &Option<StatusSnapshot>,
+    ) {
+        let Some(s) = status else {
+            ui.add_space(40.0);
+            ui.vertical_centered(|ui| {
+                ui.colored_label(theme::TEXT_MUTED, "Waiting for the service to respond…");
+            });
+            return;
+        };
+
+        // ─── Display preferences (tray-only, no IPC) ───────────────────
+        theme::card().show(ui, |ui| {
+            ui.label(theme::section_heading("Display"));
+            ui.add_space(6.0);
+            ui.horizontal(|ui| {
+                ui.checkbox(&mut self.settings.compact_mode, "Compact mode")
+                    .on_hover_text(
+                        "Smaller body font + tighter row height in the Processes \
+                         tab — roughly 25% more rows visible per scroll. Tray-only \
+                         display preference; not persisted across launches.",
+                    );
+            });
+        });
+        ui.add_space(10.0);
+
+        // ─── ProBalance editor (admin-gated commit) ───────────────────
+        self.render_settings_probalance_card(ui, s);
+        ui.add_space(10.0);
+
+        // ─── Tick interval (admin-gated commit) ───────────────────────
+        self.render_settings_tick_card(ui, s);
+        ui.add_space(10.0);
+
+        // ─── Policy actions (Reset + CLI pointer) ─────────────────────
+        self.render_settings_policy_card(ui, s);
+        ui.add_space(10.0);
+
+        // ─── Confirm modal for Reset (rendered last so it overlays) ──
+        self.render_settings_reset_confirm(ui.ctx(), s);
+    }
+
+    /// Editable ProBalance thresholds. Mirrors the read-only card on
+    /// the Status tab, but the values here are bound to a draft and
+    /// Apply commits via SetPolicy.
+    fn render_settings_probalance_card(
+        &mut self,
+        ui: &mut egui::Ui,
+        s: &StatusSnapshot,
+    ) {
+        theme::card().show(ui, |ui| {
+            ui.horizontal(|ui| {
+                ui.label(theme::section_heading("ProBalance"));
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    let (color, text) = if s.policy.probalance.enabled {
+                        (theme::SUCCESS, "Enabled")
+                    } else {
+                        (theme::TEXT_MUTED, "Disabled")
+                    };
+                    theme::status_badge(color).show(ui, |ui| {
+                        ui.colored_label(color, text);
+                    });
+                });
+            });
+            ui.add_space(6.0);
+
+            // Lazily clone the live config into the draft on first
+            // edit. Subsequent renders edit the draft in place. We
+            // do the slider edits in a tight borrow scope, then
+            // release the borrow before triggering the apply/revert
+            // self-method calls below — `self.send_admin_request`
+            // needs `&self` and conflicts with the draft &mut.
+            let (changed, apply_payload) = {
+                let draft = self
+                    .settings
+                    .probalance_draft
+                    .get_or_insert_with(|| s.policy.probalance.clone());
+
+                ui.add(
+                    egui::Slider::new(&mut draft.system_cpu_threshold_percent, 30..=95)
+                        .text("System CPU threshold (%)"),
+                )
+                .on_hover_text(
+                    "System-wide CPU% above which the box is considered 'under \
+                     contention' and ProBalance becomes eligible to restrain hogs.",
+                );
+                ui.add(
+                    egui::Slider::new(&mut draft.hog_cpu_threshold_percent, 20..=400)
+                        .text("Hog CPU threshold (% of one core)"),
+                )
+                .on_hover_text(
+                    "Per-process CPU% above which a non-foreground process is \
+                     considered a hog. 100 = one fully busy core.",
+                );
+                ui.add(
+                    egui::Slider::new(&mut draft.min_restrain_ms, 500..=10_000)
+                        .text("Min restrain dwell (ms)")
+                        .step_by(100.0),
+                )
+                .on_hover_text(
+                    "Minimum time a restrained process stays demoted before it can \
+                     be restored. Prevents priority ping-pong.",
+                );
+                ui.add(
+                    egui::Slider::new(&mut draft.min_restrain_samples, 1..=10)
+                        .text("Hysteresis samples"),
+                )
+                .on_hover_text(
+                    "How many consecutive samples a process must read as a hog \
+                     before ProBalance demotes it. Filters out single-tick spikes \
+                     (Chrome tab switch, editor save). At the default 300ms tick, \
+                     2 samples = ~600ms of sustained pressure.",
+                );
+
+                let changed = *draft != s.policy.probalance;
+                (changed, draft.clone())
+            };
+
+            ui.add_space(8.0);
+            let mut do_apply = false;
+            let mut do_revert = false;
+            ui.horizontal(|ui| {
+                #[cfg(windows)]
+                {
+                    let apply_btn = ui.add_enabled(
+                        self.elevated && changed,
+                        egui::Button::new(
+                            egui::RichText::new("Apply").strong().color(theme::ACCENT),
+                        ),
+                    );
+                    if apply_btn.clicked() {
+                        do_apply = true;
+                    }
+                    if !self.elevated {
+                        ui.colored_label(
+                            theme::TEXT_MUTED,
+                            "Relaunch as administrator to edit ProBalance settings.",
+                        );
+                    } else if !changed {
+                        ui.colored_label(theme::TEXT_MUTED, "No changes to apply.");
+                    }
+                }
+                #[cfg(not(windows))]
+                {
+                    let _ = changed;
+                    ui.colored_label(theme::TEXT_MUTED, "ProBalance is Windows-only.");
+                }
+                ui.with_layout(
+                    egui::Layout::right_to_left(egui::Align::Center),
+                    |ui| {
+                        if ui.button("Revert").clicked() {
+                            do_revert = true;
+                        }
+                    },
+                );
+            });
+
+            #[cfg(windows)]
+            if do_apply {
+                let mut new_policy = s.policy.clone();
+                new_policy.probalance = apply_payload;
+                self.send_admin_request(
+                    Request::SetPolicy { policy: new_policy },
+                    "apply probalance settings",
+                );
+                self.settings.probalance_draft = None;
+            }
+            if do_revert {
+                self.settings.probalance_draft = None;
+            }
+            #[cfg(not(windows))]
+            {
+                let _ = (do_apply, apply_payload);
+            }
+        });
+    }
+
+    /// Tick interval card. Single slider; Apply commits via
+    /// SetPolicy. Lower tick = more reactive foreground reconcile +
+    /// more CPU spent in the engine itself.
+    fn render_settings_tick_card(
+        &mut self,
+        ui: &mut egui::Ui,
+        s: &StatusSnapshot,
+    ) {
+        theme::card().show(ui, |ui| {
+            ui.label(theme::section_heading("Tick interval"));
+            ui.add_space(6.0);
+            // Edit in a scoped borrow, then drop before calling
+            // self methods (see ProBalance card above for rationale).
+            let (changed, draft_val) = {
+                let draft = self
+                    .settings
+                    .tick_ms_draft
+                    .get_or_insert(s.policy.tick_ms);
+                ui.add(
+                    egui::Slider::new(draft, 100..=2_000)
+                        .text("Tick interval (ms)")
+                        .step_by(50.0),
+                )
+                .on_hover_text(
+                    "How often the engine re-evaluates the foreground. Lower = more \
+                     reactive, more CPU spent in the engine. 300ms is the default \
+                     and a good balance.",
+                );
+                (*draft != s.policy.tick_ms, *draft)
+            };
+
+            ui.add_space(8.0);
+            let mut do_apply = false;
+            let mut do_revert = false;
+            ui.horizontal(|ui| {
+                #[cfg(windows)]
+                {
+                    let apply_btn = ui.add_enabled(
+                        self.elevated && changed,
+                        egui::Button::new(
+                            egui::RichText::new("Apply").strong().color(theme::ACCENT),
+                        ),
+                    );
+                    if apply_btn.clicked() {
+                        do_apply = true;
+                    }
+                    if !self.elevated {
+                        ui.colored_label(
+                            theme::TEXT_MUTED,
+                            "Relaunch as administrator to edit the tick interval.",
+                        );
+                    } else if !changed {
+                        ui.colored_label(theme::TEXT_MUTED, "No changes to apply.");
+                    }
+                }
+                #[cfg(not(windows))]
+                {
+                    let _ = changed;
+                    ui.colored_label(theme::TEXT_MUTED, "Tick interval edit is Windows-only.");
+                }
+                ui.with_layout(
+                    egui::Layout::right_to_left(egui::Align::Center),
+                    |ui| {
+                        if ui.button("Revert").clicked() {
+                            do_revert = true;
+                        }
+                    },
+                );
+            });
+
+            #[cfg(windows)]
+            if do_apply {
+                let mut new_policy = s.policy.clone();
+                new_policy.tick_ms = draft_val;
+                self.send_admin_request(
+                    Request::SetPolicy { policy: new_policy },
+                    "apply tick interval",
+                );
+                self.settings.tick_ms_draft = None;
+            }
+            if do_revert {
+                self.settings.tick_ms_draft = None;
+            }
+            #[cfg(not(windows))]
+            {
+                let _ = (do_apply, draft_val);
+            }
+        });
+    }
+
+    /// Policy actions card. Reset-to-defaults button + pointer at
+    /// the CLI verbs for file-based export / import (item 4.3 part 1
+    /// already shipped those in PR #56).
+    fn render_settings_policy_card(
+        &mut self,
+        ui: &mut egui::Ui,
+        _s: &StatusSnapshot,
+    ) {
+        theme::card().show(ui, |ui| {
+            ui.label(theme::section_heading("Policy actions"));
+            ui.add_space(6.0);
+            ui.label(
+                "File-based export / import lives in the CLI for now — open a \
+                 PowerShell and run:",
+            );
+            ui.add_space(2.0);
+            ui.colored_label(theme::ACCENT, "  framesage policy export <path>");
+            ui.colored_label(theme::ACCENT, "  framesage policy import <path>");
+            ui.add_space(8.0);
+            #[cfg(windows)]
+            {
+                let reset_btn = ui.add_enabled(
+                    self.elevated,
+                    egui::Button::new(
+                        egui::RichText::new("Reset policy to defaults")
+                            .color(theme::ERROR)
+                            .strong(),
+                    ),
+                );
+                if reset_btn.clicked() {
+                    self.settings.reset_confirm_visible = true;
+                }
+                if !self.elevated {
+                    ui.colored_label(
+                        theme::TEXT_MUTED,
+                        "Relaunch as administrator to reset the policy.",
+                    );
+                }
+            }
+        });
+    }
+
+    /// Confirm modal for the destructive Reset action. Renders only
+    /// while `reset_confirm_visible` is true. Esc / Cancel close
+    /// without firing; Confirm sends SetPolicy(Policy::default()).
+    fn render_settings_reset_confirm(
+        &mut self,
+        ctx: &egui::Context,
+        _s: &StatusSnapshot,
+    ) {
+        if !self.settings.reset_confirm_visible {
+            return;
+        }
+        let mut do_confirm = false;
+        let mut do_cancel = false;
+
+        if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
+            do_cancel = true;
+        }
+
+        egui::Window::new("Reset policy to defaults?")
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+            .default_width(440.0)
+            .show(ctx, |ui| {
+                ui.add_space(4.0);
+                ui.colored_label(
+                    theme::ERROR,
+                    egui::RichText::new("This replaces your entire policy.").strong(),
+                );
+                ui.add_space(2.0);
+                ui.label(
+                    "Your custom rules, custom profiles, edited ProBalance \
+                     thresholds, and any other policy.json changes will be \
+                     overwritten with the bundled defaults. The first-run \
+                     onboarding marker is preserved (this is not a 'restart \
+                     from scratch'). Cannot be undone via the undo log.",
+                );
+                ui.add_space(10.0);
+                ui.horizontal(|ui| {
+                    if ui.button("Cancel").clicked() {
+                        do_cancel = true;
+                    }
+                    ui.add_space(4.0);
+                    if ui
+                        .add(egui::Button::new(
+                            egui::RichText::new("Reset")
+                                .color(theme::ERROR)
+                                .strong(),
+                        ))
+                        .clicked()
+                    {
+                        do_confirm = true;
+                    }
+                });
+            });
+
+        if do_confirm {
+            #[cfg(windows)]
+            self.send_admin_request(
+                Request::SetPolicy {
+                    policy: framesage_core::Policy::default(),
+                },
+                "reset policy to defaults",
+            );
+            self.settings.reset_confirm_visible = false;
+        } else if do_cancel {
+            self.settings.reset_confirm_visible = false;
+        }
     }
 
     /// Quick-actions strip: elevation prompt when not elevated, or
@@ -3305,7 +3736,16 @@ impl FramesageApp {
                         });
                     })
                     .body(|body| {
-                        body.rows(18.0, visible.len(), |mut row| {
+                        // Item 4.2 (deferred from PR #53, landed via the
+                        // Settings tab in PR #57) — Compact-mode toggle
+                        // shrinks the row height from the default 18px to
+                        // 14px. ~25% more rows visible at the same scroll
+                        // position. The font-size reduction would also help
+                        // but applying it inside `body.rows` requires more
+                        // surgery; row-height alone delivers most of the
+                        // win.
+                        let row_h = if self.settings.compact_mode { 14.0 } else { 18.0 };
+                        body.rows(row_h, visible.len(), |mut row| {
                             let tr = visible[row.index()];
                             let p = &rows[tr.row_index];
                             let pid = p.pid;
