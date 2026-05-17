@@ -1,6 +1,6 @@
 # v0.7 Group A — Week 2 implementation plan
 
-**Status:** DRAFT v3 — user pushback on DRAFT v2 with five required fixes applied (see §11). Awaiting buddy re-review with the new four-question format (adds (d) internal consistency) and user sign-off before execution.
+**Status:** DRAFT v4 — buddy v3 review caught four real (d)-internal-consistency findings; user approved all four with specific implementations (2026-05-17); v4 applies them. Awaiting buddy four-question re-review and user sign-off before execution.
 **Authoritative inputs:**
 - `audit/v0.7-architecture.md` §2.1 (degradation modes, build gate, LocalSystem privilege model) and "Phase 3 acceptance criteria → Group A — ETW foundation"
 - `spike/etw-schemas.md` "Group A weeks 2-7 implementation gates" + "Implementation requirements driven by this document"
@@ -37,16 +37,27 @@ crates/etw/                — package name: framesage-etw
 ├── Cargo.toml
 └── src/
     ├── lib.rs           — public API surface (EtwSession, EtwSubsystem,
+    │                      SupervisorLoop, DegradationMode,
     │                      closed_loop_enabled_for_this_build)
     ├── session.rs       — EtwSession lifetime: start / stop / consumer
     │                      thread / drop-rate query loop / stale cleanup
     ├── build_gate.rs    — RtlGetVersion wrapper + the MIN_BUILD_FOR_CLOSED_LOOP
     │                      const + closed_loop_enabled_for_this_build()
-    ├── degradation.rs   — DegradationMode enum + DegradationEvent (sent
-    │                      to the engine for banner UI later in Group C)
-    └── tests/           — unit tests for build_gate + degradation modes
+    ├── degradation.rs   — DegradationMode enum + DegradationEvent struct
+    │                      (sink-fed in week 2; channel wiring deferred to
+    │                      Group C per v3 secondary decision)
+    ├── supervisor.rs    — SupervisorLoop type per §3.5 + §3.6: holds the
+    │                      consumer-thread join handle, the oneshot
+    │                      ConsumerExitReason receiver, and an
+    │                      externally-supplied event sink. Day 3 scaffolds
+    │                      and tests this in isolation; Day 5 instantiates
+    │                      it inside crates/service/ with the production
+    │                      sink (tracing-emit closure) wired.
+    └── tests/           — unit tests for build_gate, degradation modes,
+        │                  and SupervisorLoop
         ├── build_gate_tests.rs
-        └── degradation_tests.rs
+        ├── degradation_tests.rs
+        └── supervisor_tests.rs
 ```
 
 **Naming convention note (per buddy review of this plan):** the
@@ -84,6 +95,20 @@ windows = { workspace = true, features = [
     "Win32_System_SystemInformation",
     "Win32_System_Time",
 ] }
+
+[dev-dependencies]
+# tracing-test provides #[traced_test] attribute + logs_contain
+# assertion for the Mode 5 test in §4 Day 4. Per v3 secondary
+# decision (Option C — defer channel wiring to Group C): the
+# panic event is emitted via tracing::error! in production;
+# tests assert on captured tracing output rather than a channel
+# send. Dev-only — does NOT ship in the production binary.
+tracing-test = "0.2"
+
+# static_assertions provides compile-time assert_impl_all! for
+# the RefUnwindSafe regression guard in §3.5 #4. Also dev-only;
+# the macro expands to an empty const block in release builds.
+static_assertions = "1"
 ```
 
 Workspace `Cargo.toml` gains `"crates/etw"` in `members`, and a new `framesage-etw = { path = "crates/etw" }` entry in `[workspace.dependencies]`.
@@ -123,23 +148,32 @@ pub fn detected_build() -> Option<u32> { /* ... */ }
 **Public surface:**
 
 ```rust
-pub struct EtwSession { /* opaque handle */ }
+/// Generic over the syscall impl (see §3.4). Production code uses
+/// the default type parameter `RealEtwSysCalls`; tests substitute
+/// `MockEtwSysCalls`. The default makes production callers write
+/// `EtwSession::start(opts)` without naming the type.
+pub struct EtwSession<S: EtwSysCalls = RealEtwSysCalls> {
+    /* opaque handle + the syscall impl */
+}
 
 #[derive(Debug)]
-pub enum EtwSubsystem {
+pub enum EtwSubsystem<S: EtwSysCalls = RealEtwSysCalls> {
     /// Session running normally.
-    Running(EtwSession),
+    Running(EtwSession<S>),
     /// Session not instantiated. The variant carries the reason so
     /// the service can surface it in logs + (later, Group C) the UI.
     Disabled(DegradationMode),
 }
 
-impl EtwSession {
+impl<S: EtwSysCalls + Default> EtwSession<S> {
     /// Architecture §2.1: the entry point that short-circuits on
     /// build gate, then attempts session start, then returns the
-    /// appropriate EtwSubsystem variant.
-    pub fn start(opts: SessionOptions) -> Result<EtwSubsystem>;
+    /// appropriate EtwSubsystem variant. Production callers use
+    /// this; `S` defaults to `RealEtwSysCalls`.
+    pub fn start(opts: SessionOptions) -> Result<EtwSubsystem<S>>;
+}
 
+impl<S: EtwSysCalls> EtwSession<S> {
     /// Triggers an orderly shutdown: ControlTraceW(STOP), joins the
     /// consumer thread, verifies the session no longer exists via
     /// a follow-up QUERY.
@@ -150,7 +184,20 @@ impl EtwSession {
     /// loop; can also be called externally for diagnostics.
     pub fn query_stats(&self) -> Result<SessionStats>;
 }
+
+#[cfg(test)]
+impl<S: EtwSysCalls> EtwSession<S> {
+    /// Test-only entry — takes a caller-constructed `S` so the
+    /// test can configure mock-impl state (scripted queues) BEFORE
+    /// the session consumes it. Production code never sees this
+    /// method. See §3.4 for the test pattern.
+    pub fn start_with_syscalls(syscalls: S, opts: SessionOptions) -> Result<EtwSubsystem<S>>;
+}
 ```
+
+**Why generic-with-default (Option A from user decision on v3 finding d.1):** §3.4 specifies the trait-indirection abstraction `EtwSysCalls`. For the abstraction to compose with `EtwSession`, the session type must carry an `S` parameter that picks an impl at compile time. The default `= RealEtwSysCalls` means production callers ignore the parameter entirely (their code reads `EtwSession::start(opts)` unchanged from a hypothetical non-generic version). Tests opt in to the mock impl explicitly.
+
+The generic propagates into `EtwSubsystem<S>` because the `Running(EtwSession<S>)` variant carries the same parameter. Service-crate code on Day 5 destructures `EtwSubsystem::Running(session) => ...` without naming `S` because pattern-matching infers it.
 
 **Where the code comes from:** `crates/spike-etw/src/main.rs` — Phase 1 validated. The lift is mechanical: the spike's `start_session`, `cleanup_stale_session`, `ControlTraceW` query loop, and `ProcessTrace`-spawning consumer thread move to `session.rs`. The spike binary stays in the repo (and on `chore/clippy-baseline` is the version with clippy fixes); week 2's lift is a copy-then-modify, NOT a delete-spike-and-replace.
 
@@ -326,11 +373,31 @@ The `EtwSession` struct's type parameter defaults to `RealEtwSysCalls` so produc
 ```rust
 pub struct EtwSession<S: EtwSysCalls = RealEtwSysCalls> { /* ... */ }
 impl<S: EtwSysCalls + Default> EtwSession<S> {
+    /// Production entry point — constructs an `S` via `Default::default()`
+    /// and starts the session. Default-implementing impl is required so
+    /// the caller doesn't need to pass an instance.
     pub fn start(opts: SessionOptions) -> Result<EtwSubsystem<S>> { /* ... */ }
+}
+
+#[cfg(test)]
+impl<S: EtwSysCalls> EtwSession<S> {
+    /// Test-only entry point — takes a caller-constructed `S` so the
+    /// test can configure the mock's scripted queues BEFORE the
+    /// session uses them. Production code never sees this method
+    /// (it's gated on `#[cfg(test)]`).
+    pub fn start_with_syscalls(syscalls: S, opts: SessionOptions) -> Result<EtwSubsystem<S>> { /* ... */ }
 }
 ```
 
-Tests opt in to the mock with `EtwSession::<MockEtwSysCalls>::start_with_mock(mock, opts)` or equivalent.
+Test pattern:
+
+```rust
+// Test configures mock first, then passes it in via start_with_syscalls:
+let mock = MockEtwSysCalls::new();
+mock.expect_start_trace(ERROR_ACCESS_DENIED);  // Mode 1 scripted
+let subsystem = EtwSession::start_with_syscalls(mock, opts)?;
+assert!(matches!(subsystem, EtwSubsystem::Disabled(DegradationMode::AccessDenied)));
+```
 
 ### 3.5 Consumer-thread panic-channel mechanism
 
@@ -365,8 +432,7 @@ Tests opt in to the mock with `EtwSession::<MockEtwSysCalls>::start_with_mock(mo
    - Polls the drop-rate query loop (1-second interval).
    - Awaits the oneshot for consumer exit.
    - When the oneshot fires with `Panicked { message }`:
-     - Logs at ERROR level with the panic message + a stack trace if available.
-     - Emits `DegradationMode::ConsumerPanic` into the existing `SystemEvent` channel (engine listens; Group C UI surfaces the banner).
+     - Calls `on_event(DegradationEvent { mode: ConsumerPanic, detail: message })` — production `on_event` is `|ev| tracing::error!(?ev, "ETW degradation event")` per §3.6. The error-level log is the wire to the (future) UI banner consumer; the consumer itself is a Group C concern (per v3 secondary decision Option C — channel wiring deferred).
      - Tears down the session cleanly (calls `EtwSession::stop()` on the cached handle).
      - Transitions the `EtwSubsystem` to `Disabled(ConsumerPanic)` in supervisor-local state.
      - **Does NOT exit the service host.** The engine continues running v0.6 static-rule mode.
@@ -384,7 +450,7 @@ Tests opt in to the mock with `EtwSession::<MockEtwSysCalls>::start_with_mock(mo
    The mechanism specified above does NOT exit the service — only the ETW subsystem transitions to `Disabled`, and the engine continues running v0.6 static-rule mode. This is a **deliberate design change** in v3 (per user instruction): a one-time panic in the consumer shouldn't crash the whole service when the rule-engine half can still serve. The behavior is closer to the architecture's other degradation modes (1-4) which already leave the service running.
 
    **Required follow-up:** before Day 5's service-wiring code lands on main, a separate architecture amendment PR updates §2.1 mode 5 to:
-   > "Consumer thread panics → EtwSubsystem transitions to Disabled(ConsumerPanic). Service host stays up; engine continues in v0.6 static-rule mode. Tray surfaces banner via existing degradation-event channel. SCM restart not required."
+   > "Consumer thread panics → EtwSubsystem transitions to Disabled(ConsumerPanic). Service host stays up; engine continues in v0.6 static-rule mode. The panic event is emitted via `tracing::error!` in week 2; Group C wires a channel for the UI banner consumer when that consumer materializes (per v3 secondary decision Option C). SCM restart not required."
 
    This amendment lands as its own small PR. Day 5's code references the amended §2.1.
 
@@ -393,13 +459,117 @@ Tests opt in to the mock with `EtwSession::<MockEtwSysCalls>::start_with_mock(mo
    - The consumer-thread panic path is a separate code path inside the still-running service. FailureActions does NOT fire because the service host doesn't exit.
    - The tick-task watchdog (v0.6 Group 1 item) is independent of the ETW consumer; the engine's tick task runs whether or not the ETW subsystem is alive. If the tick task itself panics, the existing v0.6 behavior applies (service-host exit + SCM restart).
 
-**Day 4 Mode 5 test asserts this concrete mechanism:**
+**Day 4 Mode 5 test asserts this concrete mechanism via the `SupervisorLoop` type in §3.6:**
 
 - Inject a panic into the consumer thread (via `MockEtwSysCalls::process_trace` returning a sentinel that causes the consumer loop to call `panic!("test injection")`, or via a direct `panic!` injection point in the consumer body gated on `#[cfg(test)]`).
 - Assert that the oneshot fires with `ConsumerExitReason::Panicked { message }` where `message.contains("test injection")`.
-- Assert that the supervisor emits `DegradationMode::ConsumerPanic` into the test-mode `SystemEvent` channel.
+- Assert that the `SupervisorLoop`'s `on_event` sink fires with `DegradationEvent` whose `mode == DegradationMode::ConsumerPanic`. **Sink mechanism (per v3 secondary decision Option C — defer channel wiring to Group C):** in production, `on_event` is wired to `|ev| tracing::error!(?ev, "ETW degradation event")`. In the Mode 5 test, `on_event` is the same tracing emission, and the assertion uses `tracing-test`'s `#[traced_test]` attribute + `logs_contain("ConsumerPanic")` to verify the ERROR-level entry was captured. The test does NOT assert against a channel send because the channel doesn't exist yet — Group C adds it when the UI banner consumer materializes.
 - Assert that the service-host process is still alive after the panic (in unit-test scope: the test runner doesn't exit; in integration scope: a follow-up week-3+ test on real Windows).
-- Assert that `CloseTrace` was called on teardown (via mock call-count).
+- Assert that `CloseTrace` was called on teardown (via `MockEtwSysCalls::call_count("close_trace") == 1`).
+
+### 3.6 SupervisorLoop type — Day 3 scaffold, Day 5 instance
+
+**Why this section exists:** v3 finding d.3 surfaced an ambiguity about when the supervisor materializes. User decision (2026-05-17): explicit split — Day 3 scaffolds the `SupervisorLoop` *type* in `crates/etw/src/supervisor.rs` with a unit test that drives it via synthetic panic; Day 5 *instantiates* that type inside the service crate's runtime with the production sink wired. Two artifacts, two layers, two days.
+
+**Type definition (in `crates/etw/src/supervisor.rs`):**
+
+```rust
+use std::thread::JoinHandle;
+use tokio::sync::oneshot;
+use crate::degradation::{DegradationEvent, DegradationMode};
+
+/// Supervises the ETW consumer thread. Lives for the duration of
+/// the EtwSession's `Running` state. On consumer-thread exit
+/// (clean or panic), calls the supplied event sink and tears down
+/// the session.
+///
+/// Generic over the event sink so production wires it to
+/// `tracing::error!` (a closure) while tests wire it to a
+/// captured-event-vec closure — both via the same trait bound,
+/// monomorphized at the call site.
+///
+/// Day 3 scaffolds + unit-tests this type in isolation (no service
+/// crate involvement). Day 5 instantiates it inside the service's
+/// runtime task with the production sink.
+pub struct SupervisorLoop<F>
+where
+    F: Fn(DegradationEvent) + Send + Sync + 'static,
+{
+    consumer_join: JoinHandle<()>,
+    exit_rx: oneshot::Receiver<ConsumerExitReason>,
+    on_event: F,
+}
+
+#[derive(Debug)]
+pub enum ConsumerExitReason {
+    /// Normal completion — session was stopped externally.
+    CleanShutdown,
+    /// Consumer thread panicked. `message` is best-effort
+    /// extracted from the panic payload (see §3.5).
+    Panicked { message: String },
+}
+
+impl<F> SupervisorLoop<F>
+where
+    F: Fn(DegradationEvent) + Send + Sync + 'static,
+{
+    pub fn new(
+        consumer_join: JoinHandle<()>,
+        exit_rx: oneshot::Receiver<ConsumerExitReason>,
+        on_event: F,
+    ) -> Self {
+        Self { consumer_join, exit_rx, on_event }
+    }
+
+    /// Runs the supervisor's select loop. Returns when the
+    /// consumer thread exits (clean or panic). On panic, calls
+    /// `on_event(DegradationEvent { mode: ConsumerPanic, ... })`.
+    /// On clean shutdown, calls `on_event` with `CleanExit`
+    /// (informational; not a degradation).
+    pub async fn run(self) -> ConsumerExitReason {
+        let SupervisorLoop { consumer_join, exit_rx, on_event } = self;
+        let reason = exit_rx.await.unwrap_or(ConsumerExitReason::CleanShutdown);
+        match &reason {
+            ConsumerExitReason::Panicked { message } => {
+                on_event(DegradationEvent {
+                    mode: DegradationMode::ConsumerPanic,
+                    detail: message.clone(),
+                });
+            }
+            ConsumerExitReason::CleanShutdown => {
+                // Informational, not emitted as a degradation event.
+                tracing::info!("ETW consumer thread exited cleanly");
+            }
+        }
+        let _ = consumer_join.join();
+        reason
+    }
+}
+```
+
+**Day 3 unit test (`tests/supervisor_tests.rs`):**
+
+Drives `SupervisorLoop` with a synthetic consumer thread that panics. Asserts the sink received `DegradationEvent { mode: ConsumerPanic, .. }`. The sink is a test-mode closure that pushes into `Arc<Mutex<Vec<DegradationEvent>>>`; the test asserts the vec contains exactly one event with the expected mode after `supervisor.run().await`. This validates the supervisor's select-loop logic in isolation from any service-crate concerns.
+
+**Day 5 instance** (in `crates/service/src/runtime.rs` or similar):
+
+```rust
+// Production wiring — the on_event sink emits via tracing.
+// Channel wiring is deferred to Group C per v3 secondary decision;
+// for now, tracing::error! IS the wire to the (future) UI banner.
+let supervisor = SupervisorLoop::new(
+    consumer_join,
+    exit_rx,
+    |ev| tracing::error!(?ev, "ETW degradation event"),
+);
+let supervisor_task = tokio::spawn(supervisor.run());
+```
+
+The `supervisor_task` joins the existing tokio runtime alongside the tick task + IPC server. On consumer-thread death, the supervisor emits, tears down, and exits — the engine continues in v0.6 static-rule mode per §3.5 #5's amended-architecture disposition.
+
+**Why this split is the right shape:**
+
+The supervisor's *logic* (await oneshot, emit event, join thread) is etw-crate-internal — it doesn't depend on service-crate state. Putting it in `crates/etw/` makes it independently testable (Day 3 unit test). The *instantiation* (constructing the closure that calls into tracing, spawning the task into the service's runtime) is service-crate concern. Splitting along this seam means Day 4's Mode 5 test can drive the same `SupervisorLoop` type that Day 5 wires into production — no parallel test-only supervisor to maintain.
 
 ---
 
@@ -425,17 +595,38 @@ Five working days. Each day ends with a testable deliverable and a stop gate.
 
 **Deliverable:** `degradation.rs` defines `DegradationMode` per §3.3. `EtwSession::start()` returns `Result<EtwSubsystem>` instead of bare `Result<EtwSession>`. The build-gate short-circuit produces `EtwSubsystem::Disabled(DegradationMode::BuildUnsupported { detected_build })` without ever touching ETW APIs. Logged at INFO with the exact line from architecture §2.1.
 
-**Day 3 also scaffolds the mock-injection abstraction per §3.4:** the `EtwSysCalls` trait, the `RealEtwSysCalls` zero-sized production impl, the `#[cfg(test)] MockEtwSysCalls` with per-method scripted queues, and the generic `EtwSession<S: EtwSysCalls = RealEtwSysCalls>` type parameter. Day 3 verifies via `cargo asm` (or equivalent) that `EtwSession::start::<RealEtwSysCalls>` produces identical assembly to a hypothetical direct-call version in release builds — that's the codegen-parity check §3.4 specifies.
+**Day 3 also scaffolds the mock-injection abstraction per §3.4:** the `EtwSysCalls` trait, the `RealEtwSysCalls` zero-sized production impl, the `#[cfg(test)] MockEtwSysCalls` with per-method scripted queues, and the generic `EtwSession<S: EtwSysCalls = RealEtwSysCalls>` type parameter (now consistent with §3.2 per v4 fix d.1).
 
-**Day 3 ALSO scaffolds the consumer-thread panic-channel mechanism per §3.5:** the `tokio::sync::oneshot` channel for `ConsumerExitReason`, the `std::panic::catch_unwind` wrapper around the consumer body (with `AssertUnwindSafe` and the `static_assertions` regression-guard), and the supervisor-side select-loop pattern. The full supervisor task lands on Day 5; Day 3 just lays the consumer-side primitives so Day 4's Mode 5 test has something to assert against.
+**Day 3 codegen-parity verification (per v4 user instruction — don't take monomorphization on faith):**
 
-**Day 3 also opens (NOT lands) the architecture-amendment follow-up PR for §2.1 mode 5** per §3.5 #5 ("Conflict with architecture §2.1 mode 5 — surfaced for follow-up architecture amendment"). The amendment changes the mode 5 disposition from "service exits non-zero, SCM restarts" to "ETW subsystem disabled, service stays up." That amendment PR can land before, during, or after Day 4 — but it MUST land before Day 5's service-wiring code merges to main.
+The deliverable includes capturing `cargo rustc --emit=asm` output for at least one method of `EtwSession<RealEtwSysCalls>` AND for a hypothetical no-trait baseline. The baseline is a sibling test-only function `direct_call_baseline_<method>()` in `crates/etw/src/session.rs` that performs the same operation against the windows-rs API directly without going through the trait. Both compile under the release profile; the engineer diffs the two asm outputs.
+
+Concrete commands:
+
+```powershell
+# Capture asm for the trait-dispatched path:
+cargo rustc -p framesage-etw --release --lib -- --emit=asm -C codegen-units=1
+# Locate the .s file under target/release/deps/.
+
+# Capture asm for the no-trait baseline (gated behind a cfg flag):
+cargo rustc -p framesage-etw --release --lib --features _asm_baseline -- --emit=asm -C codegen-units=1
+```
+
+The Cargo.toml adds an `_asm_baseline` feature (underscore-prefixed — internal use only, never enabled in shipping builds) that toggles a `#[cfg(feature = "_asm_baseline")]` block exposing the no-trait baseline functions. The asm output for `EtwSession::<RealEtwSysCalls>::start_trace_inner` (or equivalent name — TBD during scaffold) must match the baseline's `direct_call_baseline_start_trace` byte-for-byte after stripping symbol names. Both asm files (or their diff) land in `spike/group-a-week-2-report.md` §12.4 as evidence per the literal-output ground rule.
+
+If the asm diff shows non-trivial differences — branch indirection, additional stack frames, or any sign of dyn-dispatch — the abstraction has failed its production-cost contract. Day 3 stop gate fires.
+
+**Day 3 ALSO scaffolds the `SupervisorLoop` type per §3.6:** the `SupervisorLoop<F>` struct, the `ConsumerExitReason` enum, the `tokio::sync::oneshot` plumbing, the `std::panic::catch_unwind` wrapper around the consumer body (with `AssertUnwindSafe` and the `static_assertions` regression-guard), and `tests/supervisor_tests.rs` driving the type with a synthetic-panic consumer and asserting the event-sink fires once with `DegradationMode::ConsumerPanic`.
+
+The supervisor *task instance* (a tokio spawn calling `supervisor.run().await`) is NOT created on Day 3 — that's Day 5. Day 3 produces the type + its standalone unit test; Day 5 wires the instantiation into `crates/service/src/runtime.rs`.
+
+**Day 3 also opens (NOT lands) the architecture-amendment follow-up PR for §2.1 mode 5** per §3.5 #5. The amendment changes the mode 5 disposition from "service exits non-zero, SCM restarts" to "ETW subsystem disabled, service stays up." That amendment PR can land before, during, or after Day 4 — but it MUST land before Day 5's service-wiring code merges to main.
 
 **Stop gates:**
 - If the architecture's intended log line conflicts with the actual `tracing` formatter (rare but possible — line breaks, format-string mismatch), STOP and propose a doc-level fix to the architecture rather than diverging silently.
 - If the trait-indirection abstraction is the wrong shape (e.g. introduces lifetime gymnastics, requires dyn-dispatch on the hot path even in production builds, or leaks `cfg(test)` symbols into the public API), STOP and re-think before Day 4 commits more code on top of it.
-- **If `cargo asm` shows the trait indirection does NOT produce identical release codegen** to a direct-call version, STOP and surface — the `EtwSysCalls` abstraction is either wrong or the compiler isn't monomorphizing as expected (LTO config issue, missing `#[inline]`, etc.).
-- **If the user rejects the architecture §2.1 mode 5 amendment** (i.e. they want the original "service exits + SCM restart" semantics), STOP — the §3.5 design needs reworking to match the architecture's stated behavior before Day 4's Mode 5 test is written.
+- **If the captured `cargo rustc --emit=asm` shows the trait-dispatched path does NOT match the no-trait baseline byte-for-byte** (after symbol-name stripping), STOP and surface — the `EtwSysCalls` abstraction is either wrong or the compiler isn't monomorphizing as expected (LTO config issue, missing `#[inline]`, etc.). Do not proceed without asm-level proof.
+- **If the user rejects the architecture §2.1 mode 5 amendment** (i.e. they want the original "service exits + SCM restart" semantics), STOP — the §3.5/§3.6 design needs reworking to match the architecture's stated behavior before Day 4's Mode 5 test is written.
 
 ### Day 4 — degradation-mode unit tests (against Day-3 scaffold)
 
@@ -444,30 +635,42 @@ Five working days. Each day ends with a testable deliverable and a stop gate.
 - **Mode 2 (AlreadyExists):** mock returns `ERROR_ALREADY_EXISTS` even after `cleanup_stale_session()`. Assert disabled-with-`AlreadyExists`. Verify cleanup was attempted (call count).
 - **Mode 3 (KernelDrops):** `query_stats` mock returns `RealTimeBuffersLost = 5`. Assert that a `DegradationEvent::KernelDrops { rate }` is emitted on the next poll cycle.
 - **Mode 4 (OurDrops):** the ring buffer doesn't exist yet (week 3+), so this test is a placeholder that asserts the mode exists and serializes correctly. The full path test ships with the ring buffer.
-- **Mode 5 (ConsumerPanic):** exercise the mechanism specified in §3.5. Inject a panic into the consumer thread (via the `#[cfg(test)]` injection point gated behind a `MockEtwSysCalls`-returned sentinel, OR via a direct `panic!` injection in the consumer body's test-only branch). Assert (a) the `tokio::sync::oneshot::channel<ConsumerExitReason>` fires with `Panicked { message }` where `message.contains("test injection")`, (b) the supervisor emits `DegradationMode::ConsumerPanic` into the test-mode `SystemEvent` channel, (c) the service-host process is still alive after the panic (unit-test scope: the test runner doesn't exit; in integration scope on real Windows, that's a week-3+ follow-up test), (d) `CloseTrace` was called on teardown (via `MockEtwSysCalls::call_count("close_trace") == 1`).
+- **Mode 5 (ConsumerPanic):** exercise the mechanism specified in §3.5 + §3.6. Inject a panic into the consumer thread (via the `#[cfg(test)]` injection point gated behind a `MockEtwSysCalls`-returned sentinel, OR via a direct `panic!` injection in the consumer body's test-only branch). Test is annotated `#[tracing_test::traced_test]` so all `tracing::error!` calls inside the test are captured. Assert (a) the `tokio::sync::oneshot::channel<ConsumerExitReason>` fires with `Panicked { message }` where `message.contains("test injection")`, (b) **`tracing-test`'s `logs_contain("ConsumerPanic")` returns true** — confirming the `SupervisorLoop`'s `on_event` sink fired with a `DegradationEvent { mode: ConsumerPanic, .. }` payload that reached `tracing::error!` (this is the v3-secondary-decision-Option-C assertion path: no channel, no `SystemEvent` send — tracing IS the wire), (c) the service-host process is still alive after the panic (unit-test scope: the test runner doesn't exit; in integration scope on real Windows, that's a week-3+ follow-up test), (d) `CloseTrace` was called on teardown (via `MockEtwSysCalls::call_count("close_trace") == 1`).
 - **Mode 6 (BuildUnsupported):** build gate returns false (test injection), assert `start()` short-circuits to `Disabled(BuildUnsupported { detected_build: Some(22631) })` and that no ETW APIs were called (call-count assertion against the mock).
 
 **Stop gate:** if any of the six mocks turns out to be impossible to inject without invasive surgery on the session module, STOP and re-think the test approach. The architecture's intent is that all six modes are testable without spinning up a real ETW session or a real EDR; if the production-code structure makes that impossible, the structure needs revisiting BEFORE more code lands on it.
 
-### Day 5 — service wiring + EOD verification
+### Day 5 — service wiring + SupervisorLoop instance + EOD verification
 
 **Deliverable:** `crates/service/` gains a startup hook that, after policy loads, evaluates:
 
 ```rust
-if policy.closed_loop_enabled && build_gate.closed_loop_enabled_for_this_build() {
+if policy.closed_loop_enabled && build_gate::closed_loop_enabled_for_this_build() {
     match EtwSession::start(opts) {
-        Ok(EtwSubsystem::Running(session)) => spawn_consumer_supervisor(session),
+        Ok(EtwSubsystem::Running(session)) => {
+            // Day 5 wires the SupervisorLoop type (Day 3 scaffold) into
+            // a tokio task. The on_event sink emits via tracing —
+            // channel wiring is deferred to Group C per v3 secondary
+            // decision (see §3.5 + §3.6).
+            let (consumer_join, exit_rx) = session.into_supervisable_parts();
+            let supervisor = SupervisorLoop::new(
+                consumer_join,
+                exit_rx,
+                |ev| tracing::error!(?ev, "ETW degradation event"),
+            );
+            tokio::spawn(supervisor.run());
+        }
         Ok(EtwSubsystem::Disabled(mode)) => emit_degradation_log(mode),
         Err(e) => emit_startup_error(e),
     }
 } else {
     // Either user opted out OR build is unsupported. Either way,
     // no ETW session; engine runs in v0.6 static-rule mode.
-    log_static_rule_mode_reason(policy, build_gate);
+    log_static_rule_mode_reason(&policy, build_gate::detected_build());
 }
 ```
 
-The supervisor (its own small task) holds the `EtwSession`, runs the drop-rate query loop on a 1-second tokio interval, and forwards `DegradationEvent`s into the existing system-events channel (`SystemEvent`, see `crates/engine/`). No actual closed-loop signal yet; just the lifecycle.
+The `SupervisorLoop` type itself ships from `crates/etw/` per §3.6 — Day 5 only *instantiates* it inside the service crate's tokio runtime. The drop-rate query loop runs concurrently in a sibling task that calls `EtwSession::query_stats()` on a 1-second tokio interval and feeds `KernelDrops` events into the same `on_event` sink. No actual closed-loop signal is produced yet; just the lifecycle + the consumer-thread supervision.
 
 **EOD verification (per the spike-reports-include-literal-output ground rule):**
 1. Install built service on a Win11 26200 dev box.
@@ -499,15 +702,19 @@ Tests at the **integration** level (real session against real Windows) come in w
 
 ---
 
-## 6. Stop gates within the week (cumulative)
+## 6. Stop gates — index
 
-Each day's stop gate is restated here so they're visible as a single checklist:
+**Stop gates are defined inline in §4 (one or more per day). This section is the index only; the authoritative definitions live in §4. Per v3 finding d.2 + v4 user decision: §6 must not duplicate §4's content because duplication allowed silent drift in v3 (three Day-3 stops in §4 were absent from §6's purported "single checklist").**
 
-- **Day 1 stop:** if `RtlGetVersion` binding doesn't work as expected. Don't fall back to `GetVersionEx`.
-- **Day 2 stop:** if the spike-to-production lift surfaces ANY behavioral delta on the same dev box.
-- **Day 3 stop:** if the architecture's intended INFO log line conflicts with the actual formatter.
-- **Day 4 stop:** if any of the six degradation-mode mocks turns out to be impossible without invasive code surgery — STOP and re-think structure.
-- **Day 5 stop:** if any EOD verification check deviates from expected (especially stale session after shutdown).
+| Day | Topic(s) the stop covers — see §4 for the actual gate text |
+|---|---|
+| 1 | `RtlGetVersion` binding. See §4 Day 1. |
+| 2 | Spike-to-production behavioral delta. See §4 Day 2. |
+| 3 | Four gates: tracing formatter conflict, trait-indirection wrong shape, `cargo rustc --emit=asm` codegen-parity fail, user rejects architecture amendment. See §4 Day 3. |
+| 4 | Mock injection impossible without invasive surgery. See §4 Day 4. |
+| 5 | EOD verification deviation (especially stale session after shutdown). See §4 Day 5. |
+
+**Drift-prevention rule:** any edit to a §4 stop gate must be reflected in this index in the same commit. The index intentionally carries no gate text — only pointers — so an out-of-date §4 vs §6 contradiction is structurally impossible. (If a future reviewer asks "should this gate be in §6 too?", the answer is always "no, just the pointer; §4 is the source.")
 
 Plus the **ground rules** carried from prior phases that remain in force:
 - Spike-style reports include verification commands + literal output (PR #68 ground rule).
@@ -567,7 +774,7 @@ If any of these tempts a "while we're here" diff during week 2 execution, STOP p
 
 3. **Mock injection design for degradation tests.** The six mode tests need to inject failures at different layers of the session module. If the chosen abstraction (likely a trait-object indirection on `StartTraceW`-like functions for test injection) creeps into the production hot path and slows it down, that's a real cost. Mitigation: only inject in `#[cfg(test)]` builds; production code uses the concrete Windows API directly. Day 4's stop gate explicitly checks for this.
 
-4. **Engine integration timing.** The `SystemEvent` channel exists in `crates/engine/` already; week 2 doesn't introduce engine code. But the consumer-supervisor task in `crates/service/` does need to forward `DegradationEvent` into that channel. If the channel's shape isn't a clean match, the temptation will be to broaden `SystemEvent` "while we're here." DON'T. Surface the mismatch and decide explicitly.
+4. **Tracing-as-wire becoming load-bearing in ways it shouldn't.** Per v3 secondary decision Option C, week 2 emits ETW degradation events via `tracing::error!` rather than a structured channel. This is fine as a stopgap until Group C adds the UI banner consumer + the channel that feeds it. The risk: if anyone (Group B, future v0.7 work, the user under deadline pressure) wires another consumer to the tracing output before Group C runs — e.g. a log-parser that greps for "ConsumerPanic" — the tracing format becomes a de-facto API and we're stuck with it. Mitigation: when Group C adds the channel, the tracing emission stays for human-debuggability but the new channel becomes the structured-consumer wire. If a non-tracing consumer materializes earlier than Group C, STOP and surface; do not normalize ad-hoc log-grepping as a substitute for the deferred channel.
 
 5. **Windows build cache size on CI.** Adding a new crate with ETW feature flags will grow the Cargo build cache. If CI's "native build + test (windows)" job starts hitting the runner's disk quota, that's a separate fix-up PR — surface but don't bundle.
 
@@ -622,7 +829,30 @@ User instruction (2026-05-17): the buddy review format gains a fourth question:
 
 > **(d) Internal consistency** — does the plan agree with itself across sections? Are referenced section numbers, file paths, type names, and acceptance-criteria items consistent throughout?
 
-This catches the class of error that produced the §2 directory slip in v2 (buddy passed (a) "plan matches architecture" but didn't check the plan against itself). The four-question format applies retroactively to this planning-phase review (v3 will be re-reviewed with all four questions) and going forward to the implementation-phase reviews (week 2 EOD PR, week 3, etc.).
+This catches the class of error that produced the §2 directory slip in v2 (buddy passed (a) "plan matches architecture" but didn't check the plan against itself). The four-question format applies retroactively to this planning-phase review (v3 was re-reviewed with all four questions) and going forward to the implementation-phase reviews (week 2 EOD PR, week 3, etc.).
+
+### v3 buddy review found four real (d) issues — DRAFT v4 fixes them
+
+Buddy ran the four-question format on DRAFT v3. Verdict: PASS on (a), (b), (c); FAIL on (d). Three internal-consistency findings + one secondary design question. Captured in `audit/buddy-disagreements.md` Entry 2.
+
+User resolved all four (2026-05-17). DRAFT v4 applies the resolutions:
+
+1. **d.1 — generic shape inconsistency between §3.2 and §3.4** → User chose **Option A** (public generic-with-default). v4 propagates `<S: EtwSysCalls = RealEtwSysCalls>` into §3.2's `EtwSession`, `EtwSubsystem`, and `impl EtwSession::start` signature. Production callers write `EtwSession::start(opts)` unchanged from a hypothetical non-generic version because the default makes the parameter invisible. Plus v4 adds an explicit Day 3 verification step: capture `cargo rustc --emit=asm` output on at least one method and demonstrate codegen-parity against a no-trait baseline (a sibling `direct_call_baseline_*` function gated behind an internal `_asm_baseline` Cargo feature). Don't take "monomorphizes cleanly" on faith.
+
+2. **d.2 — §4 Day 3 had 4 stops; §6 restated only 1** → User chose **collapse §6 into a one-line-per-day index** rather than full restatement. v4 §6 lists only "Day N — topic(s); see §4 Day N" rows, with an explicit drift-prevention rule that any §4 stop-gate edit must update this index in the same commit. Eliminates the structural duplication that allowed v3's silent drift.
+
+3. **d.3 — supervisor "created on Day 5" vs "scaffolded on Day 3"** → User chose **explicit split with a concrete typed scaffold.** v4 adds §3.6 specifying `SupervisorLoop<F>` in `crates/etw/src/supervisor.rs` (Day 3 scaffold) — a type taking `(consumer-thread JoinHandle, oneshot::Receiver<ConsumerExitReason>, on_event: F)`. Day 3 unit-tests it in isolation via `tests/supervisor_tests.rs` driving a synthetic-panic consumer. Day 5 instantiates the type inside the service crate with the production sink (a tracing-emit closure) wired. Two artifacts, two layers, two days.
+
+4. **Secondary — `SystemEvent` channel doesn't carry `DegradationMode` payload** → User chose **Option C** (defer channel wiring to Group C). v4 specifies: week 2 emits via `tracing::error!`, and Day 4's Mode 5 test asserts on captured tracing output using the `tracing-test` crate's `#[traced_test]` attribute + `logs_contain` assertion. `tracing-test` and `static_assertions` added to the §2 Cargo.toml `[dev-dependencies]` block. The actual channel wire materializes in Group C when the UI banner consumer exists.
+
+### Process observation logged for the audit trail
+
+User noted (2026-05-17) that v3 was the first deployment of the four-question format, and (d) caught issues that the prior three questions would have missed. The format validated its own purpose on first use.
+
+User also set a process flag for the v4 buddy review: **watch what category of issue buddy finds.**
+
+- If v4 buddy surfaces a *different* category of issue (e.g. genuinely new (a) authority gap, (b) scope-creep, (c) feasibility) — rhythm working as intended; sign off and execute.
+- If v4 buddy surfaces *same-category* (d) issues (more internal-consistency slips) — structural problem with this plan. The author is relying on buddy to catch slips post-hoc rather than internalizing (d) while writing. **In that case, STOP and surface to user. Do not iterate to v5 without explicit user direction.** The intervention might be pair-writing the plan with buddy from scratch rather than continuing to review finished drafts, but that's a user decision, not a default the auditor reaches for.
 
 ---
 
@@ -680,6 +910,7 @@ Repeat the five-step checklist from §4 Day 5 with literal command outputs:
 3. `logman query FramesageEtw -ets` output after `Stop-Service framesage` (session gone, no leftover)
 4. `cargo test -p framesage-etw -- --nocapture` output (already in §12.3 — cross-reference)
 5. INFO-log line showing the build-gate path on a Win11 26200 (build is supported; closed-loop initializes) AND on a synthetically-mocked unsupported build (static-rule fallback log line)
+6. **Day 3 codegen-parity asm capture** (per §4 Day 3): paste the `cargo rustc --emit=asm` output for `EtwSession::<RealEtwSysCalls>::<one_method>` AND for the no-trait baseline. Either inline-include both asm snippets (one per code block) OR include a unified diff of the two. Annotate clearly which is trait-dispatched and which is the baseline. **This is the load-bearing evidence that the `EtwSysCalls` abstraction has zero production cost — without it the abstraction's no-overhead claim is unsupported.**
 
 ### 12.5 Stop-gate trip log
 
@@ -713,8 +944,10 @@ cargo build -p framesage-svc --release
 
 ---
 
-## Status: DRAFT v3 — five user-fix amendments applied; awaiting buddy re-review (4-question format) and user sign-off
+## Status: DRAFT v4 — four user-decided fixes applied on top of v3; awaiting buddy four-question re-review and user sign-off
 
-When buddy approves and the user signs off, this document moves from DRAFT v3 to APPROVED via a small follow-up PR that flips the header. Then execution starts on `feat/group-a-week-2`.
+When buddy approves and the user signs off, this document moves from DRAFT v4 to APPROVED via a small follow-up PR that flips the header. Then execution starts on `feat/group-a-week-2`.
 
 The architecture-amendment PR for §2.1 mode 5 (per §3.5 #5) lands as a SEPARATE small PR before Day 5's service-wiring code.
+
+**Process flag for v4 buddy review** (per §11): watch the category of issue buddy finds. Same-category (d) findings means structural problem with the author's plan-writing rhythm — STOP and surface to user rather than iterate to v5.
