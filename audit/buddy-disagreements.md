@@ -108,6 +108,104 @@ Per the user's instruction "After rustfmt PR merges + outreach sent, START Group
 
 Does Group A week 2 start get gated on the rustfmt-PR resolution, or can it proceed in parallel on a separate branch? The user's stated rationale for gating was "a red CI baseline poisons every signal Group A produces" — that argument is still active (CI will still be red on clippy even if the fmt-PR merges), so the conservative read is: Group A week 2 waits until CI is green or until the user explicitly accepts a known-red baseline.
 
+### Resolution — 2026-05-17 (user jog-return)
+
+User decisions on all three workstreams, recorded for the audit
+trail:
+
+**Workstream (a) — Rustfmt PR path: SPLIT into two PRs.**
+- Reason given: bundling rustfmt with the seven clippy edits
+  would turn "approve the formatter" into "review seven
+  semantic edits inside a 20-file diff," which is the exact
+  failure mode that produced the current baseline.
+- Execution: PR #69 (fmt-only, mechanical) opened first, merged
+  via auto-merge to commit `e097cbf` on main. Clippy follow-up
+  shipped separately as `chore/clippy-baseline` — that PR will
+  reference this Entry's clippy-fix discussion in its
+  description.
+- On the AtomicU64 specifically: user's reading was correct —
+  the `const ZERO: AtomicU64 = AtomicU64::new(0);` pattern is
+  *deliberately* `const` because `[ZERO; 256]` re-evaluates the
+  initializer at each slot, producing 256 distinct atomics. A
+  `static` won't compile (`AtomicU64: !Copy`). The clippy PR
+  uses `#[allow(clippy::declare_interior_mutable_const)]` with
+  an expanded comment, NOT the clippy-suggested
+  `const`→`static` transform. The original code comment
+  ("array repeat with non-Copy types needs the array_repeat
+  workaround") was correct but cryptic; the expanded comment
+  now explicitly answers "why didn't they just do what clippy
+  said?" so future maintainers don't re-derive the analysis.
+
+**Workstream (b) — Outreach authorization, partial:**
+- `01-perfview-issue.md` (PASS) — AUTHORIZED, send via `gh
+  issue create --repo microsoft/perfview` under the user's
+  GitHub identity. Day-5 clock starts at send. Log timestamp
+  in `spike/etw-edr-report.md` §10 results-log.
+- `03-process-hacker-issue.md` (PASS) — AUTHORIZED, send via
+  `gh issue create --repo winsiderss/systeminformer`. Same
+  day-5 clock + §10 logging.
+- `02-sysinternals.md` (FAIL-WITH-FIXES, now FIXED) — HOLDING.
+  User wants to see the recipient-facing body before sending.
+  Primary agent will surface the post-fix body in chat for
+  user review. Send channel is the user's call (likely email
+  to a Sysinternals contact, not public issue).
+- `04-rsysadmin-post.md` (PASS) — user is posting this one
+  manually via their own Reddit account. Not a primary-agent
+  action. Reddit's mod/account-age gating makes
+  `gh`-equivalent posting impractical, and an account-mismatched
+  cross-post would look suspicious.
+
+**Workstream (c) — Group A week 2 gating: WAIT for full CI green.**
+- Rationale carried over from (a): half-green CI poisons Group
+  A's regression signal. Clippy PR is small (7 edits, one
+  file), so the wait is hours-to-a-day at most.
+- Pre-work allowed during the wait:
+  1. Draft the Group A week 2 implementation plan as a
+     standalone document. Same format and rigor as the Phase 1
+     spike report. Run that past buddy before execution.
+  2. Run buddy on the clippy PR using the same three-question
+     format that worked this round. STOP on any new buddy
+     concern; do not shortcut just because confidence is high.
+
+Primary-agent execution order going forward:
+  1. Open fmt-only PR #69. ✓ DONE — merged via auto-merge.
+  2. Read AtomicU64 use sites, form view, show diff to user
+     before opening clippy PR. ✓ DONE — user confirmed in
+     chat 2026-05-17.
+  3. Apply strengthened `#[allow]` comment per user's
+     drafted text, commit on `chore/clippy-baseline`. ✓ DONE.
+  4. Open this docs PR (separate from clippy PR per user's
+     "keep clippy PR isolated" rule).
+  5. Open clippy PR with reference back to this docs PR.
+  6. Run buddy on the clippy PR with the same three-question
+     format.
+  7. After clippy + docs PRs merge and buddy approves:
+     - Send outreach 01 + 03 via `gh issue create`. Log §10.
+     - Show user the 02 recipient-facing body for sign-off.
+     - Draft Group A week 2 implementation plan; run past
+       buddy.
+  8. After clippy merges + buddy approves the implementation
+     plan: START Group A week 2.
+
+**Observation captured for the audit trail (user, 2026-05-17):**
+
+> The AtomicU64 catch is the kind of thing that justifies the
+> entire verification rhythm in one moment. Blind
+> clippy-fix-application would have produced code that didn't
+> compile, you'd have spent twenty minutes debugging it,
+> possibly committed a wrong "fix" before realizing the
+> compile error meant clippy was wrong. Instead the rhythm
+> forced you to read the use sites first, formed the right
+> view, and the wrong path got rejected before it cost any
+> time. The 7-week Group A estimate has dozens of moments
+> like this hiding in it. The discipline you're applying now
+> is what keeps those moments cheap.
+
+Logged here because future maintainers reviewing this audit
+trail will benefit from the explicit articulation of why the
+buddy rhythm exists, not just the mechanical fact that it
+does.
+
 ---
 
 ## How to use this log going forward
