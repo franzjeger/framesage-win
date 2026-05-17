@@ -22,8 +22,8 @@
 use eframe::egui;
 
 use framesage_core::{
-    CoreKind, CpuSelector, GameModeActions, IoPriority, MemoryPriority, PowerPlanId,
-    PowerThrottlingMode, PriorityClass, Profile,
+    AntiCheatProfile, CoreKind, CpuSelector, GameModeActions, IoPriority, MemoryPriority,
+    PowerPlanId, PowerThrottlingMode, PriorityClass, Profile,
 };
 
 use crate::theme;
@@ -42,6 +42,12 @@ pub(crate) fn render_profile_editor(ui: &mut egui::Ui, p: &mut Profile) {
                 .desired_rows(2)
                 .desired_width(f32::INFINITY),
         );
+    });
+
+    ui.add_space(4.0);
+    ui.group(|ui| {
+        ui.heading("Anti-cheat behavior");
+        ac_profile_selector(ui, &mut p.ac_safe_mode_target);
     });
 
     ui.add_space(4.0);
@@ -194,18 +200,30 @@ pub(crate) fn game_mode_editor(ui: &mut egui::Ui, gm: &mut GameModeActions) {
     // policy file as a value that will never be honoured.
     gm.focus_assist = None;
 
-    string_list_edit(
+    // Item 4.13 — replace the bare multiline-text editors with
+    // denylist-aware variants that show per-line "Blocked:
+    // <rationale>" hints inline. The denylist remains
+    // non-overridable; the change is the UX (user sees WHY an
+    // entry is refused at edit time instead of silently dropping
+    // it at apply time).
+    safe_list_aware_list_edit(
         ui,
         "Stop services",
         &mut gm.stop_services,
-        "One service short-name per line (e.g. SysMain, WSearch, DiagTrack).\nSafe-list gate at apply time — unknown ids are logged and skipped.",
+        ListKind::Service,
+        "One service short-name per line (e.g. SysMain, WSearch, DiagTrack).\n\
+         Allowed: any non-denylisted service.\n\
+         Blocked: kernel-critical / AV / anti-cheat services (highlighted inline).",
     );
 
-    string_list_edit(
+    safe_list_aware_list_edit(
         ui,
         "Suspend processes",
         &mut gm.suspend_processes,
-        "One exe name per line (e.g. OneDrive.exe, Dropbox.exe).\nSafe-list gate at apply time — shell/kernel/AV/anti-cheat are denied.",
+        ListKind::Process,
+        "One exe name per line (e.g. OneDrive.exe, Dropbox.exe).\n\
+         Allowed: any non-denylisted process.\n\
+         Blocked: shell / kernel / AV / anti-cheat (highlighted inline).",
     );
 
     power_plan_edit(ui, "Power plan", &mut gm.power_plan);
@@ -220,6 +238,87 @@ pub(crate) fn game_mode_editor(ui: &mut egui::Ui, gm: &mut GameModeActions) {
 }
 
 // ─── Sub-field widgets ───────────────────────────────────────────────────────
+
+/// Item 4.13 — discriminates between "service id" and "process exe"
+/// for the [`safe_list_aware_list_edit`] widget; controls which
+/// SafeList check (`check_service` vs `check_process`) runs against
+/// each entry and what label is shown when an entry is denied.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ListKind {
+    Service,
+    Process,
+}
+
+/// Item 4.13 — denylist-aware `Vec<String>` editor. Wraps
+/// [`string_list_edit`] with a per-entry status table below the
+/// multiline textbox: each non-empty entry is checked against the
+/// bundled SafeList and labelled "Blocked: <rationale>" inline when
+/// it's denylisted, "OK" when allowed, "unknown" when not on either
+/// list (the engine accepts these — user knows their machine).
+///
+/// The denylist is non-overridable. This widget makes the rejection
+/// reason visible at edit time so the user understands why an
+/// attempted entry would be refused at apply time, instead of
+/// silently dropping it (the pre-4.13 behavior).
+pub(crate) fn safe_list_aware_list_edit(
+    ui: &mut egui::Ui,
+    label: &str,
+    items: &mut Vec<String>,
+    kind: ListKind,
+    hint: &str,
+) {
+    use framesage_gamemode::safe_list::{ProcessVerdict, SafeList, ServiceVerdict};
+    let safe_list = SafeList::bundled();
+
+    string_list_edit(ui, label, items, hint);
+
+    if items.is_empty() {
+        return;
+    }
+    ui.add_space(2.0);
+    ui.horizontal(|ui| {
+        ui.add_sized([150.0, 16.0], egui::Label::new(""));
+        ui.vertical(|ui| {
+            for entry in items.iter() {
+                // Skip empty / whitespace-only lines silently — the
+                // textbox can leave trailing blanks while typing.
+                if entry.trim().is_empty() {
+                    continue;
+                }
+                let (color, status) = match kind {
+                    ListKind::Service => match safe_list.check_service(entry) {
+                        ServiceVerdict::Denied(reason) => {
+                            (theme::ERROR, format!("Blocked: {reason}"))
+                        }
+                        ServiceVerdict::Allowed(_) => {
+                            (theme::SUCCESS, "OK (in curated allowlist)".to_owned())
+                        }
+                        ServiceVerdict::Unlisted => (
+                            theme::TEXT_MUTED,
+                            "unknown — accepted, but verify before stopping".to_owned(),
+                        ),
+                    },
+                    ListKind::Process => match safe_list.check_process(entry) {
+                        ProcessVerdict::Denied(reason) => {
+                            (theme::ERROR, format!("Blocked: {reason}"))
+                        }
+                        ProcessVerdict::Allowed(_) => {
+                            (theme::SUCCESS, "OK (in curated allowlist)".to_owned())
+                        }
+                        ProcessVerdict::Unlisted => (
+                            theme::TEXT_MUTED,
+                            "unknown — accepted, but verify before suspending".to_owned(),
+                        ),
+                    },
+                };
+                ui.horizontal(|ui| {
+                    ui.colored_label(theme::TEXT, egui::RichText::new(entry).monospace());
+                    ui.colored_label(color, status);
+                });
+            }
+        });
+    });
+}
 
 /// `Vec<String>` editor: each entry on its own line in a multi-line text
 /// area. Empty lines are filtered out on save so the user can leave a
@@ -250,6 +349,65 @@ pub(crate) fn string_list_edit(
                 .collect();
         }
     });
+}
+
+/// Item 4.13 — `AntiCheatProfile` per-rule selector. Four radios
+/// (Aggressive / Hybrid / SafeMode / Disabled) with hover-text
+/// explaining the trade-offs. Defaults to whatever the profile
+/// currently carries (Aggressive on fresh profiles; the seeded
+/// game / game-x3d / game-x3d-hybrid / game-x3d-safe profiles
+/// ship with explicit values per defaults D-9 + D-10).
+pub(crate) fn ac_profile_selector(ui: &mut egui::Ui, target: &mut AntiCheatProfile) {
+    let options = [
+        (
+            AntiCheatProfile::Aggressive,
+            "Aggressive",
+            "Full sledgehammer. Every knob in the Profile applies, including \
+             direct modifications to the game process (affinity, priority, CPU \
+             sets, I/O priority, power throttling). Recommended for games with \
+             no AC concerns (single-player, EAC-with-no-Javelin titles).",
+        ),
+        (
+            AntiCheatProfile::Hybrid,
+            "Hybrid",
+            "Environment actions at full strength (services / processes / \
+             power / taskbar), but the game process itself is left alone. \
+             Recommended for BF6 + EA Javelin: Javelin actively blocks core \
+             parking / affinity changes on dual-CCD Ryzen during multiplayer \
+             and the press has named Process Lasso as risk-bearing.",
+        ),
+        (
+            AntiCheatProfile::SafeMode,
+            "AC-Safe Mode",
+            "Environment actions still fire; game-process modifications NEVER \
+             fire even if the user-authored profile asks for them. The \
+             defensive choice for Vanguard-protected titles (Valorant). \
+             Mirrors the Hone approach (1M+ Valorant users, zero AC issues).",
+        ),
+        (
+            AntiCheatProfile::Disabled,
+            "Disabled",
+            "Engine enters STANDBY for this profile — no apply, no scans, \
+             no ProBalance. Use when even the environment actions are too \
+             risky (ESEA conflicts, unknown-AC titles you're paranoid about). \
+             You can still manually flip back to a stricter tier later.",
+        ),
+    ];
+
+    for (variant, label, explainer) in options {
+        let selected = *target == variant;
+        ui.horizontal(|ui| {
+            let resp = ui.radio(selected, label);
+            if resp.clicked() {
+                *target = variant;
+            }
+            ui.colored_label(
+                theme::TEXT_MUTED,
+                egui::RichText::new(explainer).size(11.5),
+            )
+            .on_hover_text(format!("Variant: {variant:?}"));
+        });
+    }
 }
 
 /// Option<PowerPlanId> editor. PowerPlanId::Custom carries an arbitrary

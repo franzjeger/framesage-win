@@ -75,10 +75,19 @@ const ALLOWED_EDGES: &[(&str, &[&str])] = &[
             "framesage-sys",
         ],
     ),
-    // Tray is a thin IPC client (no engine, no gamemode).
+    // Tray is a thin IPC client (no engine). Item 4.13 added a
+    // `framesage-gamemode` edge so the tray's profile editor can
+    // surface the bundled SafeList (denylist rationale strings)
+    // inline as the user types — a non-overridable read of static
+    // data, no behavior coupling.
     (
         "framesage-tray",
-        &["framesage-core", "framesage-ipc", "framesage-sys"],
+        &[
+            "framesage-core",
+            "framesage-gamemode",
+            "framesage-ipc",
+            "framesage-sys",
+        ],
     ),
 ];
 

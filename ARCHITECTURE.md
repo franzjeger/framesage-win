@@ -59,7 +59,7 @@ checks the union against the diagram below.
 | `framesage-engine`   | Policy engine (the orchestrator)      | core, ipc, gamemode, sys             |
 | `framesage-service`  | Windows service host (LocalSystem)    | core, engine, gamemode, ipc, sys     |
 | `framesage-cli`      | `framesage.exe` (status, install, …)  | core, gamemode, ipc, sys             |
-| `framesage-tray`     | Tray UI (egui + tray-icon)            | core, ipc, sys                       |
+| `framesage-tray`     | Tray UI (egui + tray-icon)            | core, gamemode, ipc, sys             |
 
 ## Layering invariants
 
@@ -109,6 +109,13 @@ graph grows, a `cargo metadata` walk in CI would automate it.
    `framesage-engine`.** They talk to the engine via IPC.
    `framesage-sim` doesn't depend on engine either; it drives the
    gamemode planner directly with synthetic state.
+
+   `framesage-tray` DOES depend on `framesage-gamemode` (item 4.13):
+   the profile editor consumes the bundled SafeList to surface
+   denylist rationale strings inline as the user types. The
+   coupling is read-only of static JSON data — no behavior is
+   triggered through the dep — so it doesn't move the trust
+   boundary.
 
 7. **Only `framesage-service` depends on `framesage-engine`.** The
    service is the engine's host process. Everything else interacts
