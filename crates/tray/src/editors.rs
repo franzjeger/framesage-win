@@ -33,7 +33,11 @@ use crate::theme;
 /// Per-profile editor for the simple fields. CpuSelector (cpu_sets,
 /// affinity_mask) and game_mode are shown read-only; their editors land
 /// in a follow-up commit.
-pub(crate) fn render_profile_editor(ui: &mut egui::Ui, p: &mut Profile) {
+pub(crate) fn render_profile_editor(
+    ui: &mut egui::Ui,
+    p: &mut Profile,
+    discover_processes: &[framesage_ipc::ProcessSnapshot],
+) {
     ui.group(|ui| {
         ui.heading("Description");
         ui.add(
@@ -157,8 +161,205 @@ pub(crate) fn render_profile_editor(ui: &mut egui::Ui, p: &mut Profile) {
         }
         if let Some(gm) = &mut p.game_mode {
             game_mode_editor(ui, gm);
+
+            // Item 4.13 — Discover background processes wizard.
+            // Renders only when the Game Mode actions block is
+            // active (no point suggesting processes-to-suspend
+            // when the profile won't suspend anything). The
+            // ProcessSnapshot slice comes from the tray's
+            // 1-Hz processes poller, so live and free.
+            if !discover_processes.is_empty() {
+                ui.add_space(6.0);
+                discover_processes_section(ui, gm, discover_processes);
+            }
         }
     });
+}
+
+/// Item 4.13 — Discover background processes. Lists processes that
+/// are NOT already on the profile's `suspend_processes` and NOT on
+/// the bundled denylist, sorted by CPU% descending. User
+/// checkboxes-to-add then clicks "Add selected" to batch-append.
+///
+/// Filters out:
+///   - PID 0 / 4 (System Idle / System)
+///   - Processes already on this profile's suspend list (no point
+///     showing dupes; the user already added them)
+///   - Denylisted processes (the engine refuses them anyway; the
+///     denylist-aware editor above already shows why)
+///   - Tiny CPU% (< 1% — Discover view is about finding hogs)
+fn discover_processes_section(
+    ui: &mut egui::Ui,
+    gm: &mut GameModeActions,
+    snapshots: &[framesage_ipc::ProcessSnapshot],
+) {
+    use framesage_gamemode::safe_list::{ProcessVerdict, SafeList};
+    let safe_list = SafeList::bundled();
+
+    egui::CollapsingHeader::new(
+        egui::RichText::new("Discover background processes (sorted by CPU%)").strong(),
+    )
+    .default_open(false)
+    .show(ui, |ui| {
+        // Stash the user's intended ID for `egui::Id` state in the
+        // table — keyed by profile id so each profile gets its own
+        // checkbox set. Lives in the ui's data store; auto-clears
+        // on tab switch.
+        let existing_lower: std::collections::HashSet<String> = gm
+            .suspend_processes
+            .iter()
+            .map(|s| s.to_ascii_lowercase())
+            .collect();
+
+        let mut candidates: Vec<&framesage_ipc::ProcessSnapshot> = snapshots
+            .iter()
+            .filter(|s| s.pid != 0 && s.pid != 4)
+            .filter(|s| !existing_lower.contains(&s.exe_name.to_ascii_lowercase()))
+            .filter(|s| {
+                !matches!(safe_list.check_process(&s.exe_name), ProcessVerdict::Denied(_))
+            })
+            .filter(|s| s.cpu_percent >= 1)
+            .collect();
+        candidates.sort_by_key(|b| std::cmp::Reverse(b.cpu_percent));
+        candidates.truncate(30);
+
+        if candidates.is_empty() {
+            ui.colored_label(
+                theme::TEXT_MUTED,
+                "No candidate background processes right now. Run a heavy app \
+                 and reopen this view to see hogs.",
+            );
+            return;
+        }
+
+        ui.colored_label(
+            theme::TEXT_MUTED,
+            "Top 30 background processes by CPU%. Tick the ones you want \
+             this profile to suspend during its session, then click Add.",
+        );
+        ui.add_space(4.0);
+
+        // Build a temporary selection set keyed on this section's
+        // unique id. We pull-then-write each render — egui's data
+        // store handles the persistence.
+        let sel_id = egui::Id::new(("discover-procs-sel", gm.stop_services.len()));
+        let mut selected: std::collections::HashSet<String> = ui
+            .data_mut(|d| d.get_temp::<std::collections::HashSet<String>>(sel_id))
+            .unwrap_or_default();
+
+        use egui_extras::{Column, TableBuilder};
+        TableBuilder::new(ui)
+            .striped(true)
+            .column(Column::exact(24.0)) // checkbox
+            .column(Column::initial(180.0).at_least(120.0)) // exe
+            .column(Column::initial(200.0).at_least(120.0)) // description
+            .column(Column::initial(60.0).at_least(50.0)) // CPU%
+            .column(Column::initial(90.0).at_least(60.0)) // memory
+            .header(20.0, |mut header| {
+                header.col(|ui| {
+                    ui.label("");
+                });
+                header.col(|ui| {
+                    ui.label("Process");
+                });
+                header.col(|ui| {
+                    ui.label("Description");
+                });
+                header.col(|ui| {
+                    ui.label("CPU %");
+                });
+                header.col(|ui| {
+                    ui.label("Memory");
+                });
+            })
+            .body(|mut body| {
+                for snap in &candidates {
+                    body.row(18.0, |mut row| {
+                        let key = snap.exe_name.to_ascii_lowercase();
+                        let mut picked = selected.contains(&key);
+                        row.col(|ui| {
+                            if ui.checkbox(&mut picked, "").changed() {
+                                if picked {
+                                    selected.insert(key.clone());
+                                } else {
+                                    selected.remove(&key);
+                                }
+                            }
+                        });
+                        row.col(|ui| {
+                            ui.label(egui::RichText::new(&snap.exe_name).monospace());
+                        });
+                        row.col(|ui| {
+                            ui.label(
+                                snap.description
+                                    .clone()
+                                    .unwrap_or_else(|| "—".to_owned()),
+                            );
+                        });
+                        row.col(|ui| {
+                            ui.label(format!("{}%", snap.cpu_percent));
+                        });
+                        row.col(|ui| {
+                            ui.label(format_bytes_compact(snap.memory_bytes));
+                        });
+                    });
+                }
+            });
+
+        // Persist the updated selection for the next render.
+        ui.data_mut(|d| d.insert_temp(sel_id, selected.clone()));
+
+        ui.add_space(6.0);
+        ui.horizontal(|ui| {
+            let n = selected.len();
+            let add_btn = ui.add_enabled(
+                n > 0,
+                egui::Button::new(
+                    egui::RichText::new(format!("Add {} selected to suspend list", n))
+                        .strong()
+                        .color(theme::ACCENT),
+                ),
+            );
+            if add_btn.clicked() {
+                // Append the chosen exe names (preserving original
+                // casing from the snapshots). Avoid dupes on the
+                // off-chance two snapshots share a key.
+                let mut added: std::collections::HashSet<String> =
+                    gm.suspend_processes.iter().cloned().collect();
+                for snap in &candidates {
+                    if selected.contains(&snap.exe_name.to_ascii_lowercase())
+                        && added.insert(snap.exe_name.clone())
+                    {
+                        gm.suspend_processes.push(snap.exe_name.clone());
+                    }
+                }
+                ui.data_mut(|d| {
+                    d.insert_temp(sel_id, std::collections::HashSet::<String>::new())
+                });
+            }
+            if n == 0 {
+                ui.colored_label(
+                    theme::TEXT_MUTED,
+                    "Tick at least one process to enable Add.",
+                );
+            }
+        });
+    });
+}
+
+fn format_bytes_compact(bytes: u64) -> String {
+    const KIB: u64 = 1024;
+    const MIB: u64 = KIB * 1024;
+    const GIB: u64 = MIB * 1024;
+    if bytes >= GIB {
+        format!("{:.1} GB", bytes as f64 / GIB as f64)
+    } else if bytes >= MIB {
+        format!("{} MB", bytes / MIB)
+    } else if bytes >= KIB {
+        format!("{} KB", bytes / KIB)
+    } else {
+        format!("{} B", bytes)
+    }
 }
 
 // ─── Game Mode actions editor ────────────────────────────────────────────────
