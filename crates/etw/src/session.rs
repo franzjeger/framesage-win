@@ -100,8 +100,8 @@ mod windows_impl {
     use windows::core::{GUID, PCWSTR};
     use windows::Wdk::System::SystemServices::RtlGetVersion;
     use windows::Win32::Foundation::{
-        ERROR_ALREADY_EXISTS, ERROR_SUCCESS, ERROR_WMI_INSTANCE_NOT_FOUND, FILETIME, NTSTATUS,
-        WIN32_ERROR,
+        ERROR_ACCESS_DENIED, ERROR_ALREADY_EXISTS, ERROR_SUCCESS, ERROR_WMI_INSTANCE_NOT_FOUND,
+        FILETIME, NTSTATUS, WIN32_ERROR,
     };
     use windows::Win32::System::Diagnostics::Etw::{
         ControlTraceW, OpenTraceW, ProcessTrace, StartTraceW, CONTROLTRACE_HANDLE, EVENT_RECORD,
@@ -717,7 +717,7 @@ mod windows_impl {
             let rc = unsafe {
                 syscalls.start_trace(&mut handle, PCWSTR(name_wide.as_ptr()), props.as_mut_ptr())
             };
-            if rc == ERROR_ACCESS_DENIED() {
+            if rc == ERROR_ACCESS_DENIED {
                 return Ok(EtwSubsystem::Disabled(DegradationMode::AccessDenied));
             }
             if rc == ERROR_ALREADY_EXISTS {
@@ -1358,18 +1358,13 @@ mod windows_impl {
         state.events_seen.fetch_add(1, Ordering::Relaxed);
     }
 
-    // ─── ERROR_ACCESS_DENIED helper (not exported by windows-rs in 0.58) ────
-
-    /// windows-rs 0.58 doesn't appear to export `ERROR_ACCESS_DENIED`
-    /// as a constant in the standard locations — only `E_ACCESSDENIED`
-    /// HRESULT. The Win32 error code is documented as 5. We construct
-    /// the WIN32_ERROR with the raw value for the Mode 1 mock-test
-    /// match. Verify in the end-of-week Windows batch; if windows-rs
-    /// has it elsewhere, switch to the named constant.
-    #[allow(non_snake_case)]
-    fn ERROR_ACCESS_DENIED() -> WIN32_ERROR {
-        WIN32_ERROR(5)
-    }
+    // (Entry 5 / Step 16 finding: the private `ERROR_ACCESS_DENIED()`
+    // helper previously here is removed. Windows-rs 0.58 DOES export
+    // `ERROR_ACCESS_DENIED: WIN32_ERROR = WIN32_ERROR(5u32)` at the
+    // canonical path `windows::Win32::Foundation::ERROR_ACCESS_DENIED`
+    // — same module as the other constants we already import. The
+    // helper was a Mac-side workaround for a misread of the windows-rs
+    // surface. Now imported alongside ERROR_ALREADY_EXISTS etc.)
 }
 
 // ─── Non-Windows stub ────────────────────────────────────────────────────────

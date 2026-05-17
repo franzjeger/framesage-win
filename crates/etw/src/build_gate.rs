@@ -161,4 +161,42 @@ mod tests {
         assert!(!closed_loop_enabled_for_this_build());
         assert_eq!(detected_build(), None);
     }
+
+    /// Side-channel verification of the real `RtlGetVersion` binding on
+    /// Windows (Windows batch Step 12 / `mac-side-uncertainties.md`
+    /// Entry 1). The synthetic-override tests above exercise the seam
+    /// but never invoke the real probe; this test does, asserts the
+    /// probe succeeded (Some) and the value satisfies the gate's
+    /// contract (>= MIN_BUILD_FOR_CLOSED_LOOP on supported hosts), and
+    /// `eprintln`s the value so a human reviewer can cross-check it
+    /// against `[System.Environment]::OSVersion.Version.Build` on the
+    /// test host.
+    ///
+    /// `#[ignore]`'d so it doesn't run in the default fast-feedback
+    /// loop; invoked explicitly via `cargo test ... -- --include-ignored`
+    /// in the Windows runtime batch.
+    #[cfg(windows)]
+    #[test]
+    #[ignore = "deferred to Windows runtime batch (real RtlGetVersion sanity)"]
+    fn real_rtl_get_version_probe_succeeds_on_supported_host() {
+        // No override -> falls through to real probe. CACHED_BUILD may
+        // already be populated by an earlier test in the same binary
+        // run; that's fine — the cache hit returns the same value the
+        // probe would have produced.
+        let build = detected_build();
+        eprintln!(
+            "real RtlGetVersion: detected_build() = {build:?} (expect Some(>= {})); MIN_BUILD_FOR_CLOSED_LOOP = {MIN_BUILD_FOR_CLOSED_LOOP}",
+            MIN_BUILD_FOR_CLOSED_LOOP
+        );
+        assert!(
+            build.is_some(),
+            "real RtlGetVersion returned None; expected Some(build) on Win11"
+        );
+        let b = build.unwrap();
+        assert!(
+            b >= MIN_BUILD_FOR_CLOSED_LOOP,
+            "real build {b} below MIN_BUILD_FOR_CLOSED_LOOP = {MIN_BUILD_FOR_CLOSED_LOOP}; \
+             this test was designed for supported hosts only"
+        );
+    }
 }
