@@ -111,6 +111,15 @@ struct TrayCommands {
     jump_to_tab: Arc<Mutex<Option<Tab>>>,
 }
 
+/// Item 4.13 — preview-before-save modal state. Carries the profile
+/// being previewed plus its id so the modal can title itself
+/// correctly. Cleared on Close or Apply.
+#[derive(Debug, Clone)]
+struct PreviewModalState {
+    profile_id: String,
+    profile: Profile,
+}
+
 /// Item 4.3 — Settings-tab view state. ProBalance + tick interval
 /// edits batch into a draft so a slider drag doesn't spam SetPolicy
 /// IPC; Apply commits. Compact mode is a tray-only display
@@ -408,6 +417,11 @@ struct FramesageApp {
     /// here too because the Settings tab is the appropriate home
     /// for cross-tab display preferences.
     settings: SettingsView,
+    /// Item 4.13 — `Some` while the preview-before-save modal is
+    /// visible. Set by Op::OpenPreview in the Profiles tab; cleared
+    /// by the modal's Close button or by the modal's Apply (which
+    /// also fires SetPolicy with the previewed profile).
+    preview_modal: Option<PreviewModalState>,
     /// Per-exe icon cache, populated lazily as rows render. Lives outside
     /// `ProcessesView` because the egui textures it holds want to be reused
     /// across tab switches (cheaper than re-extracting on tab return).
@@ -553,6 +567,7 @@ impl FramesageApp {
                 None
             },
             settings: SettingsView::default(),
+            preview_modal: None,
             #[cfg(windows)]
             icons: icons::IconCache::new(),
             #[cfg(windows)]
@@ -951,6 +966,10 @@ impl eframe::App for FramesageApp {
         self.render_terminate_confirm_modal(ctx);
         // Modal: custom-mask affinity picker. Same overlay treatment.
         self.render_affinity_picker_modal(ctx);
+        // Item 4.13 — preview-before-save modal. Render before
+        // onboarding so onboarding stays on top if both happen to be
+        // open (unlikely; onboarding only fires on first launch).
+        self.render_preview_modal(ctx);
         // Item 4.1 — first-run onboarding wizard. Renders LAST so it
         // visually sits above any other modal. Only shown when the
         // marker file is missing.
@@ -963,6 +982,132 @@ impl FramesageApp {
     /// fixed-size window centered on the screen. Cancel closes without
     /// firing the IPC; Confirm fires `Request::TerminateProcess` and the
     /// engine kills the process with exit code 1.
+    /// Item 4.13 — render the preview-before-save modal if it's
+    /// queued. Shows what the profile would do against the current
+    /// foreground (services it'd stop, processes it'd suspend with
+    /// matching live PIDs, power-plan switch, taskbar action, WU
+    /// pause). Apply commits via SetPolicy with the previewed
+    /// profile substituted into the live policy.
+    fn render_preview_modal(&mut self, ctx: &egui::Context) {
+        let Some(preview) = self.preview_modal.clone() else {
+            return;
+        };
+        let mut do_close = false;
+        let mut do_apply = false;
+
+        if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
+            do_close = true;
+        }
+
+        // Snapshot the live state we'll need so we can drop the lock
+        // before rendering (egui closures hold the borrow for the
+        // whole closure body).
+        let (current_foreground, current_policy, live_processes) = {
+            let s = self.state.lock();
+            (
+                s.status.as_ref().and_then(|st| st.foreground.clone()),
+                s.status.as_ref().map(|st| st.policy.clone()),
+                s.processes.clone(),
+            )
+        };
+
+        egui::Window::new(format!("Preview: {}", preview.profile_id))
+            .collapsible(false)
+            .resizable(true)
+            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+            .default_width(620.0)
+            .default_height(540.0)
+            .show(ctx, |ui| {
+                ui.add_space(4.0);
+                if let Some(fg) = &current_foreground {
+                    ui.label(
+                        egui::RichText::new(format!(
+                            "If this profile were applied against {} (pid {}):",
+                            fg.exe_name, fg.pid
+                        ))
+                        .strong(),
+                    );
+                } else {
+                    ui.colored_label(
+                        theme::WARNING,
+                        "No foreground process detected — Apply won't fire \
+                         (Engine's apply_once needs a foreground).",
+                    );
+                }
+                ui.add_space(8.0);
+
+                egui::ScrollArea::vertical().show(ui, |ui| {
+                    render_preview_body(
+                        ui,
+                        &preview.profile,
+                        &live_processes,
+                    );
+                });
+                ui.add_space(10.0);
+                ui.horizontal(|ui| {
+                    if ui.button("Close").clicked() {
+                        do_close = true;
+                    }
+                    ui.add_space(4.0);
+                    #[cfg(windows)]
+                    {
+                        let apply_enabled = self.elevated
+                            && current_foreground.is_some()
+                            && current_policy.is_some();
+                        if ui
+                            .add_enabled(
+                                apply_enabled,
+                                egui::Button::new(
+                                    egui::RichText::new("Apply to foreground")
+                                        .strong()
+                                        .color(theme::ACCENT),
+                                ),
+                            )
+                            .on_hover_text(
+                                "Save THIS profile to the policy (via SetPolicy) AND \
+                                 apply it to the current foreground via ApplyOnce.",
+                            )
+                            .clicked()
+                        {
+                            do_apply = true;
+                        }
+                        if !self.elevated {
+                            ui.colored_label(
+                                theme::TEXT_MUTED,
+                                "Relaunch as administrator to apply.",
+                            );
+                        }
+                    }
+                });
+            });
+
+        if do_close {
+            self.preview_modal = None;
+        }
+        if do_apply {
+            if let Some(mut policy) = current_policy {
+                policy.profiles.insert(
+                    ProfileId(preview.profile_id.clone()),
+                    preview.profile.clone(),
+                );
+                #[cfg(windows)]
+                {
+                    self.send_admin_request(
+                        Request::SetPolicy { policy },
+                        "preview commit",
+                    );
+                    self.send_admin_request(
+                        Request::ApplyOnce {
+                            profile: ProfileId(preview.profile_id.clone()),
+                        },
+                        "preview apply now",
+                    );
+                }
+            }
+            self.preview_modal = None;
+        }
+    }
+
     /// Item 4.1 — render the first-run onboarding wizard if it's
     /// queued. On Finish: apply the chosen aggression level to the
     /// current policy (via SetPolicy IPC), write the marker file,
@@ -3203,6 +3348,10 @@ impl FramesageApp {
             SetManual(String),
             ClearManual,
             DeleteProfile(String),
+            /// Item 4.13 — open the preview modal showing exactly what
+            /// this profile would do against the current foreground.
+            /// Boxed for the same reason as UpdateProfile.
+            OpenPreview(String, Box<Profile>),
         }
         let mut ops: Vec<Op> = Vec::new();
 
@@ -3244,6 +3393,24 @@ impl FramesageApp {
                             }
                             if is_editing && ui.button("Done").clicked() {
                                 ops.push(Op::ExitEdit);
+                            }
+                            // Item 4.13 — Preview button. Only visible
+                            // in edit mode; shows what THIS profile (in
+                            // its current draft state) would do against
+                            // the current foreground app. No commit;
+                            // the modal's Apply still uses the existing
+                            // save flow.
+                            if is_editing
+                                && ui
+                                    .button("Preview")
+                                    .on_hover_text(
+                                        "Show exactly what this profile would do if applied \
+                                         against the current foreground process. No changes \
+                                         are made until you click Apply in the preview modal.",
+                                    )
+                                    .clicked()
+                            {
+                                ops.push(Op::OpenPreview(id.0.clone(), Box::new(p.clone())));
                             }
                             // Apply-now: send ApplyOnce(id) over the admin
                             // pipe. Disabled in edit mode (the user should
@@ -3398,6 +3565,15 @@ impl FramesageApp {
                     draft.profiles.remove(&ProfileId(id));
                     // Stay below the dirty-state checkbox: don't auto-Save;
                     // user confirms by clicking Save changes.
+                }
+                Op::OpenPreview(id, profile) => {
+                    // Item 4.13 — stash the profile + id in
+                    // self.preview_modal. The render loop renders the
+                    // modal next frame.
+                    self.preview_modal = Some(PreviewModalState {
+                        profile_id: id,
+                        profile: *profile,
+                    });
                 }
             }
         }
@@ -4913,5 +5089,140 @@ fn spawn_framesage_subcommand(subcommand: &str) {
     #[cfg(not(windows))]
     {
         let _ = subcommand;
+    }
+}
+
+/// Item 4.13 — render the body of the preview-before-save modal.
+/// Spell out what the profile would do against current live state:
+/// per-process knobs in plain language, Game Mode actions with
+/// per-entry match counts (services we don't query live for status,
+/// processes we cross-reference with live snapshots).
+fn render_preview_body(
+    ui: &mut egui::Ui,
+    profile: &Profile,
+    live_processes: &[framesage_ipc::ProcessSnapshot],
+) {
+    use std::collections::HashMap;
+
+    ui.label(theme::section_heading("Per-process knobs"));
+    ui.add_space(4.0);
+    if let Some(class) = profile.priority_class {
+        ui.label(format!("• Priority class: set to {class}"));
+    }
+    if let Some(mode) = profile.power_throttling {
+        ui.label(format!("• Power throttling: {mode}"));
+    }
+    if let Some(prio) = profile.io_priority {
+        ui.label(format!("• I/O priority: {prio}"));
+    }
+    if let Some(mem) = profile.memory_priority {
+        ui.label(format!("• Memory priority: {mem}"));
+    }
+    if profile.trim_working_set {
+        ui.label("• Working set: trimmed (pages returned to OS free pool)");
+    }
+    if let Some(sel) = &profile.cpu_sets {
+        ui.label(format!("• CPU sets: {sel:?}"));
+    }
+    if let Some(sel) = &profile.affinity_mask {
+        ui.label(format!("• Affinity mask: {sel:?}"));
+    }
+    if profile.persistent {
+        ui.label("• Persistent: knobs stick across alt-tab + re-asserted every ~2s");
+    }
+    ui.add_space(8.0);
+
+    ui.label(theme::section_heading("AC-aware behavior"));
+    ui.add_space(4.0);
+    ui.label(format!(
+        "• Tier: {:?} — {}",
+        profile.ac_safe_mode_target,
+        match profile.ac_safe_mode_target {
+            framesage_core::AntiCheatProfile::Aggressive => "all knobs apply",
+            framesage_core::AntiCheatProfile::Hybrid =>
+                "environment actions only, game process untouched",
+            framesage_core::AntiCheatProfile::SafeMode =>
+                "environment actions only, game process never touched",
+            framesage_core::AntiCheatProfile::Disabled =>
+                "engine STANDBY, no apply at all",
+        }
+    ));
+    ui.add_space(8.0);
+
+    let Some(gm) = &profile.game_mode else {
+        ui.colored_label(
+            theme::TEXT_MUTED,
+            "No system-wide Game Mode actions on this profile.",
+        );
+        return;
+    };
+
+    ui.label(theme::section_heading("System-wide Game Mode actions"));
+    ui.add_space(4.0);
+    if gm.hide_taskbar {
+        ui.label("• Taskbar: hidden (restored on profile exit)");
+    }
+    if gm.pause_windows_update {
+        ui.label("• Windows Update: paused for default window (35 days)");
+    }
+    if let Some(plan) = &gm.power_plan {
+        ui.label(format!("• Power plan: switch to {plan:?}"));
+    }
+    if !gm.stop_services.is_empty() {
+        ui.add_space(4.0);
+        ui.label(format!(
+            "• Services to stop ({}):",
+            gm.stop_services.len()
+        ));
+        for id in &gm.stop_services {
+            ui.label(format!("    - {id}"));
+        }
+    }
+    if !gm.suspend_processes.is_empty() {
+        ui.add_space(4.0);
+        // Cross-reference with live process snapshots: for each
+        // exe-name pattern, count how many live processes match
+        // and their total working set. Gives the user a concrete
+        // sense of what would happen RIGHT NOW.
+        let mut live_count: HashMap<String, (usize, u64)> = HashMap::new();
+        for snap in live_processes {
+            let key = snap.exe_name.to_ascii_lowercase();
+            let entry = live_count.entry(key).or_insert((0, 0));
+            entry.0 += 1;
+            entry.1 += snap.memory_bytes;
+        }
+        ui.label(format!(
+            "• Processes to suspend ({}):",
+            gm.suspend_processes.len()
+        ));
+        for exe in &gm.suspend_processes {
+            let key = exe.to_ascii_lowercase();
+            let (count, mem) = live_count.get(&key).copied().unwrap_or((0, 0));
+            if count > 0 {
+                ui.label(format!(
+                    "    - {} — {} live (frees ~{})",
+                    exe,
+                    count,
+                    format_bytes_compact_preview(mem)
+                ));
+            } else {
+                ui.colored_label(
+                    theme::TEXT_MUTED,
+                    format!("    - {} — none running right now", exe),
+                );
+            }
+        }
+    }
+}
+
+fn format_bytes_compact_preview(bytes: u64) -> String {
+    const MIB: u64 = 1024 * 1024;
+    const GIB: u64 = MIB * 1024;
+    if bytes >= GIB {
+        format!("{:.1} GB", bytes as f64 / GIB as f64)
+    } else if bytes >= MIB {
+        format!("{} MB", bytes / MIB)
+    } else {
+        format!("{} KB", bytes / 1024)
     }
 }
