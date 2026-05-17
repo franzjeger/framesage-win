@@ -181,6 +181,10 @@ pub enum Request {
     /// capped at `limit`. Backs `framesage undo list` and the tray's
     /// undo panel.
     UndoLogList { limit: u32 },
+    /// Item 4.13 — enumerate every Win32 service known to the SCM
+    /// for the tray's discover-services view in the profile editor.
+    /// Returns `Response::Services { services }`.
+    ListServices,
     /// Item 3.7 — manually trigger a CPU topology re-detection.
     /// The engine already refreshes topology automatically on
     /// `SystemEvent::Resume`, but power-plan tweaks (core parking,
@@ -204,6 +208,7 @@ impl Request {
             Request::Status
             | Request::Subscribe
             | Request::ListProcesses
+            | Request::ListServices
             | Request::UndoLogList { .. } => true,
             Request::SetPolicy { .. }
             | Request::ApplyOnce { .. }
@@ -270,6 +275,11 @@ pub enum Response {
     UndoLog {
         entries: Vec<framesage_core::UndoEntry>,
     },
+    /// Item 4.13 — result of `Request::ListServices`. Every Win32
+    /// service the SCM knows about, sorted by display_name.
+    Services {
+        services: Vec<ServiceInfoIpc>,
+    },
     Error {
         message: String,
     },
@@ -294,6 +304,27 @@ pub struct SystemMetrics {
     pub memory_used_bytes: u64,
     /// Physical RAM installed, bytes.
     pub memory_total_bytes: u64,
+}
+
+/// Item 4.13 — IPC mirror of `framesage_sys::services::ServiceInfo`
+/// for the tray's discover-services view. Lives in `framesage-ipc`
+/// (not `framesage-sys`) so the wire type is reachable without a
+/// sys-crate dep at the consumer.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ServiceInfoIpc {
+    pub name: String,
+    pub display_name: String,
+    pub status: ServiceStatusKindIpc,
+    #[serde(default)]
+    pub owning_pid: Option<u32>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ServiceStatusKindIpc {
+    Running,
+    Stopped,
+    Pending,
 }
 
 /// One row of the Processes tab's live view. Sent over IPC, so all fields
@@ -602,6 +633,7 @@ mod tests {
         assert!(Request::Status.is_read_only());
         assert!(Request::Subscribe.is_read_only());
         assert!(Request::ListProcesses.is_read_only());
+        assert!(Request::ListServices.is_read_only());
         assert!(!Request::SetProcessPriority {
             pid: 1,
             class: framesage_core::PriorityClass::Normal,

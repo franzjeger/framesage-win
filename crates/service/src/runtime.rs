@@ -502,6 +502,14 @@ async fn handle_client(
                 let (snapshots, system) = engine.list_process_snapshots();
                 write_response(&mut write_half, &Response::Processes { snapshots, system }).await?;
             }
+            Request::ListServices => {
+                // Item 4.13 — discover-services view. Enumeration
+                // failures bubble up as an empty list (the engine
+                // logs the underlying error); the UI handles
+                // empty gracefully.
+                let services = engine.list_services_for_ipc();
+                write_response(&mut write_half, &Response::Services { services }).await?;
+            }
             Request::SetProcessPriority { pid, class } => {
                 match engine.set_process_priority(pid, class) {
                     Ok(()) => write_response(&mut write_half, &Response::Ok).await?,

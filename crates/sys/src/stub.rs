@@ -226,6 +226,29 @@ pub mod version_info {
     }
 }
 
+pub mod services {
+    use super::*;
+    /// Stub mirror of `inner::services::ServiceInfo` so non-Windows
+    /// callers type-check. Enumeration returns Err — there's no
+    /// SCM to query.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub struct ServiceInfo {
+        pub name: String,
+        pub display_name: String,
+        pub status: ServiceStatusKind,
+        pub owning_pid: Option<u32>,
+    }
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub enum ServiceStatusKind {
+        Running,
+        Stopped,
+        Pending,
+    }
+    pub fn enumerate_services() -> Result<Vec<ServiceInfo>> {
+        Err(anyhow!("framesage-sys: services enumeration is Windows-only"))
+    }
+}
+
 pub mod game_mode {
     //! Non-Windows stubs. Game Mode actions are no-ops on a developer host;
     //! the planner and journal still exercise end-to-end via `framesage-sim`,

@@ -1102,6 +1102,9 @@ async fn send_simple(req: Request) -> Result<()> {
             Response::Ok => println!("ok"),
             Response::Status(_) => println!("ok"),
             Response::Processes { .. } => println!("ok"),
+            Response::Services { services } => {
+                println!("ok ({} services)", services.len())
+            }
             Response::UndoResult { undone } => match undone {
                 Some(summary) => {
                     println!("{}", summary.summary);
@@ -1192,6 +1195,7 @@ async fn print_status() -> Result<()> {
         Response::Status(s) => print_status_snapshot(&s),
         Response::Ok => println!("ok"),
         Response::Processes { .. } => println!("ok"),
+        Response::Services { .. } => println!("ok"),
         Response::UndoResult { .. } | Response::UndoLog { .. } => println!("ok"),
         Response::Error { message } => return Err(anyhow!(message)),
     }

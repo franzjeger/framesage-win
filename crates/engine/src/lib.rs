@@ -547,6 +547,38 @@ impl Engine {
         self.state.read().topology.clone()
     }
 
+    /// Item 4.13 — list every Win32 service the SCM knows about,
+    /// formatted as the IPC wire type so the service handler can
+    /// forward directly. Failure is logged + an empty list is
+    /// returned (the discover-services view degrades gracefully).
+    pub fn list_services_for_ipc(&self) -> Vec<framesage_ipc::ServiceInfoIpc> {
+        match self.sys.enumerate_services() {
+            Ok(services) => services
+                .into_iter()
+                .map(|s| framesage_ipc::ServiceInfoIpc {
+                    name: s.name,
+                    display_name: s.display_name,
+                    status: match s.status {
+                        framesage_sys::services::ServiceStatusKind::Running => {
+                            framesage_ipc::ServiceStatusKindIpc::Running
+                        }
+                        framesage_sys::services::ServiceStatusKind::Stopped => {
+                            framesage_ipc::ServiceStatusKindIpc::Stopped
+                        }
+                        framesage_sys::services::ServiceStatusKind::Pending => {
+                            framesage_ipc::ServiceStatusKindIpc::Pending
+                        }
+                    },
+                    owning_pid: s.owning_pid,
+                })
+                .collect(),
+            Err(e) => {
+                warn!(error = %e, "enumerate_services failed; returning empty list");
+                Vec::new()
+            }
+        }
+    }
+
     pub fn set_policy(&self, policy: Policy) {
         // Refresh the cached user-ignore set whenever policy changes —
         // the ignore list is the only ProBalance-relevant field the user
@@ -4241,6 +4273,11 @@ mod tests {
             ) -> Result<framesage_sys::version_info::VersionInfo> {
                 Ok(framesage_sys::version_info::VersionInfo::default())
             }
+            fn enumerate_services(
+                &self,
+            ) -> Result<Vec<framesage_sys::services::ServiceInfo>> {
+                Ok(Vec::new())
+            }
         }
 
         // Build an engine with a non-empty starting topology so we
@@ -4717,6 +4754,9 @@ mod tests {
             _exe_path: &str,
         ) -> Result<framesage_sys::version_info::VersionInfo> {
             Ok(framesage_sys::version_info::VersionInfo::default())
+        }
+        fn enumerate_services(&self) -> Result<Vec<framesage_sys::services::ServiceInfo>> {
+            Ok(Vec::new())
         }
     }
 

@@ -27,6 +27,7 @@
 use crate::apply::AppliedState;
 use crate::foreground::ForegroundInfo;
 use crate::process::{MemoryInfo, PerCpuTimes, PidSnapshot, ProcessCpuTimes, SystemCpuTimes};
+use crate::services::ServiceInfo;
 use crate::sys_proc_info::SysProcInfo;
 use crate::version_info::VersionInfo;
 
@@ -183,6 +184,14 @@ pub trait SysApi: Send + Sync {
     /// ProductName). All fields are `Option<String>`; an empty
     /// `VersionInfo` means the binary has no resource at all.
     fn read_version_info(&self, exe_path: &str) -> Result<VersionInfo>;
+
+    // ─── Services ──────────────────────────────────────────────────
+
+    /// Item 4.13 — enumerate every Win32 service the SCM knows
+    /// about (active + inactive) for the tray's discover-services
+    /// view. Sorted by display_name (case-insensitive) for stable
+    /// UI ordering.
+    fn enumerate_services(&self) -> Result<Vec<ServiceInfo>>;
 }
 
 /// Production implementation — every method forwards to the existing
@@ -299,5 +308,9 @@ impl SysApi for RealSysApi {
 
     fn read_version_info(&self, exe_path: &str) -> Result<VersionInfo> {
         crate::version_info::read_version_info(exe_path)
+    }
+
+    fn enumerate_services(&self) -> Result<Vec<ServiceInfo>> {
+        crate::services::enumerate_services()
     }
 }
