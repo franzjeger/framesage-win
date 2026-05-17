@@ -632,7 +632,19 @@ mod windows_impl {
         /// into the SessionShutdownHandle without re-cloning the
         /// consumer thread's copy (which lives inside that thread's
         /// closure). Cloned once at consumer-thread spawn time.
-        syscalls: S,
+        ///
+        /// Wrapped in `Option<S>` so the explicit-stop and
+        /// supervisor-decomposition paths can `.take()` ownership,
+        /// leaving `None` so that the `Drop` impl below knows the
+        /// session has already been handed off and skips its
+        /// fallback cleanup. The `Drop` impl runs the cleanup only
+        /// on the "fell out of scope without explicit teardown"
+        /// path — which catches the leak class observed in Windows
+        /// runtime batch Step 9 (test used `drop(sess)` without
+        /// calling `sess.stop()`; the session persisted in the
+        /// kernel past process death). See Drop impl comment for
+        /// the full rationale.
+        syscalls: Option<S>,
         /// Non-generic per Day 3 design finding (see ConsumerState
         /// docstring).
         state: Arc<ConsumerState>,
@@ -779,7 +791,7 @@ mod windows_impl {
             Ok(EtwSubsystem::Running(EtwSession {
                 handle,
                 session_name: opts.session_name,
-                syscalls,
+                syscalls: Some(syscalls),
                 state,
                 consumer_join: Some(consumer_join),
                 exit_rx: Some(exit_rx),
@@ -787,7 +799,15 @@ mod windows_impl {
         }
 
         pub fn stop(mut self) -> Result<()> {
-            stop_session(&self.syscalls, &self.session_name)?;
+            // Take syscalls out so the Drop impl below knows we've
+            // explicitly stopped — Drop sees None and is a no-op.
+            // Prevents double-stop if anyone holds an EtwSession and
+            // both calls stop() and lets it drop.
+            let syscalls = self
+                .syscalls
+                .take()
+                .expect("EtwSession::stop called twice or after decomposition");
+            stop_session(&syscalls, &self.session_name)?;
             if let Some(handle) = self.consumer_join.take() {
                 if let Err(panic_payload) = handle.join() {
                     tracing::warn!(
@@ -796,13 +816,17 @@ mod windows_impl {
                     );
                 }
             }
-            verify_session_gone(&self.syscalls, &self.session_name)?;
+            verify_session_gone(&syscalls, &self.session_name)?;
             tracing::info!(session = %self.session_name, "ETW session stopped cleanly");
             Ok(())
         }
 
         pub fn query_stats(&self) -> Result<SessionStats> {
-            let q = query_session_stats(&self.syscalls, &self.session_name)?;
+            let syscalls = self
+                .syscalls
+                .as_ref()
+                .expect("query_stats called after stop() or decomposition");
+            let q = query_session_stats(syscalls, &self.session_name)?;
             Ok(SessionStats {
                 events_lost: q.events_lost,
                 real_time_buffers_lost: q.real_time_buffers_lost,
@@ -860,7 +884,11 @@ mod windows_impl {
             S: Clone,
         {
             let monitor = MonitorHandle {
-                syscalls: self.syscalls.clone(),
+                syscalls: self
+                    .syscalls
+                    .as_ref()
+                    .expect("session already stopped or decomposed")
+                    .clone(),
                 session_name: self.session_name.clone(),
                 state: Arc::clone(&self.state),
             };
@@ -894,9 +922,74 @@ mod windows_impl {
             let shutdown = SessionShutdownHandle {
                 session_handle: self.handle,
                 session_name: session_name_wide,
-                syscalls: self.syscalls,
+                syscalls: self
+                    .syscalls
+                    .take()
+                    .expect("into_supervisable_parts called twice or after stop()"),
             };
             (consumer_join, exit_rx, shutdown)
+        }
+    }
+
+    // ─── Drop impl: leak-prevention fallback (Step 9 finding #2) ─────────────
+    //
+    // Step 9 finding from the end-of-week Windows runtime batch:
+    // system-trace ETW sessions are kernel-owned and persist past the
+    // creating process's lifetime. A test that called `drop(sess)`
+    // without explicit `sess.stop()` left the session active in the
+    // kernel after the test binary exited. Subsequent test runs hit
+    // `ERROR_ALREADY_EXISTS` because the leaked session was filling
+    // whatever per-process accounting slot the kernel maintains.
+    //
+    // Production code today either calls `sess.stop()` (which takes
+    // ownership and tears down cleanly) or moves the session through
+    // `into_supervisable_parts*` (which hands teardown to a
+    // `SessionShutdownHandle` owned by the `SupervisorLoop`). Both
+    // paths `.take()` `self.syscalls`, leaving `None`. This Drop impl
+    // is a defensive fallback that catches any path that drops the
+    // session without explicit teardown — including panic-unwinds,
+    // `?`-bubbling, and direct `drop(sess)` calls.
+    impl<S: EtwSysCalls> Drop for EtwSession<S> {
+        fn drop(&mut self) {
+            // Idempotent: if stop() or into_supervisable_parts*() has
+            // already run, syscalls is None and there's nothing to do.
+            let Some(syscalls) = self.syscalls.take() else {
+                return;
+            };
+
+            // Best-effort STOP. We're in Drop — cannot panic, cannot
+            // bail. Log at warn on unexpected errors so leaks are
+            // visible in tracing output with a remediation hint.
+            match stop_session(&syscalls, &self.session_name) {
+                Ok(()) => {
+                    tracing::info!(
+                        session = %self.session_name,
+                        "EtwSession::drop: session stopped (fallback path)"
+                    );
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        session = %self.session_name,
+                        error = %e,
+                        "EtwSession::drop: ControlTraceW(STOP) failed; session may be leaked. \
+                         Run `logman stop \"{session_name}\" -ets` (elevated) to clean up.",
+                        session_name = self.session_name,
+                    );
+                }
+            }
+
+            // Join the consumer thread so we don't return from Drop
+            // while the kernel callback is still running (UAF risk if
+            // the callback references state owned by EtwSession).
+            // STOP above causes ProcessTrace in the consumer to
+            // return promptly. If the consumer was already moved out
+            // (via into_supervisable_parts*), this is None and the
+            // supervisor owns the join.
+            if let Some(join) = self.consumer_join.take() {
+                if let Err(panic_payload) = join.join() {
+                    tracing::warn!(?panic_payload, "etw-consumer thread panicked during drop");
+                }
+            }
         }
     }
 
