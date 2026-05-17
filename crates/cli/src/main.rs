@@ -481,8 +481,21 @@ fn install_service(bin_override: Option<&str>) -> Result<()> {
         account_password: None,
     };
 
+    // Grant the returned handle CHANGE_CONFIG + QUERY_STATUS +
+    // START. CHANGE_CONFIG alone is what MSDN documents as the
+    // minimum for `ChangeServiceConfig2(FAILURE_ACTIONS)`, but on
+    // Windows 11 (observed on build 26200) that call returns
+    // ERROR_ACCESS_DENIED unless the handle carries the wider set
+    // — likely because `ChangeServiceConfig2` internally checks
+    // status before applying. We also want START so the caller
+    // can do `framesage start` without reopening the service.
     let service = manager
-        .create_service(&info, ServiceAccess::CHANGE_CONFIG)
+        .create_service(
+            &info,
+            ServiceAccess::CHANGE_CONFIG
+                | ServiceAccess::QUERY_STATUS
+                | ServiceAccess::START,
+        )
         .context("CreateService")?;
 
     service
