@@ -1584,7 +1584,15 @@ mod tests {
         use crate::degradation::{DegradationEvent, DegradationMode};
         use std::sync::{Arc, Mutex};
 
-        let subsystem = EtwSession::<RealEtwSysCalls>::start(SessionOptions::default())
+        // Test isolation: each real-ETW test needs its own session name
+        // so parallel test threads don't race for the same ETW session
+        // (production code uses canonical `FramesageEtw`; tests use a
+        // PID-suffixed unique name per spike-etw's pattern).
+        let opts = SessionOptions {
+            session_name: format!("FramesageEtwTest_drop_path_{}", std::process::id()),
+            ..SessionOptions::default()
+        };
+        let subsystem = EtwSession::<RealEtwSysCalls>::start(opts)
             .expect("start should succeed on Win11 24H2+ elevated");
         let sess = match subsystem {
             EtwSubsystem::Running(s) => s,
@@ -1617,7 +1625,14 @@ mod tests {
     #[test]
     #[ignore = "deferred to end-of-week Windows runtime batch (real ETW session start/stop)"]
     fn real_etw_session_starts_and_stops_cleanly() {
-        let opts = SessionOptions::default();
+        // Test isolation: each real-ETW test needs its own session name
+        // so parallel test threads don't race for the same ETW session
+        // (production code uses canonical `FramesageEtw`; tests use a
+        // PID-suffixed unique name per spike-etw's pattern).
+        let opts = SessionOptions {
+            session_name: format!("FramesageEtwTest_starts_and_stops_{}", std::process::id()),
+            ..SessionOptions::default()
+        };
         let subsystem = EtwSession::<RealEtwSysCalls>::start(opts)
             .expect("start should succeed on Win11 24H2+ elevated");
         match subsystem {
