@@ -1,0 +1,38 @@
+[package]
+name = "spike-etw"
+description = "v0.7 Phase 1 spike — prove the ETW kernel-consumer path before any production code."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+# Not part of the bundled distribution. Build explicitly with:
+#   cargo build --release -p spike-etw
+# The standalone binary lives at target/release/spike-etw.exe.
+publish = false
+
+[[bin]]
+name = "spike-etw"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = { workspace = true }
+clap = { workspace = true }
+
+# Item v0.7 Phase 1 — the windows crate features we need for ETW.
+# Kept tight so the spike's build doesn't pull half the SDK in.
+[target.'cfg(windows)'.dependencies]
+windows = { workspace = true, features = [
+    "Win32_Foundation",
+    "Win32_System_Console",
+    "Win32_System_Diagnostics_Etw",
+    "Win32_System_SystemInformation",
+    "Win32_System_Threading",
+    # OpenTraceW + EVENT_TRACE_LOGFILEW are gated behind
+    # Win32_System_Time in windows-rs 0.58 (the LOGFILE struct
+    # carries a TIME_ZONE_INFORMATION field, which pulls the
+    # whole Time feature in).
+    "Win32_System_Time",
+] }
