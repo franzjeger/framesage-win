@@ -93,6 +93,18 @@ pub fn activity_log_path() -> PathBuf {
     user_data_dir().join(ACTIVITY_LOG_FILE_NAME)
 }
 
+/// Item 4.1 — marker file written when the user completes the
+/// first-run onboarding wizard. Presence of the file gates the
+/// modal: if it exists, skip onboarding. If it doesn't exist (fresh
+/// install or user reset their per-user state), show the wizard.
+///
+/// File contents are unused — the existence-check is all that
+/// matters. Lives in [`user_data_dir`] so it's per-user and an
+/// unprivileged tray can write it without elevation.
+pub fn first_run_marker_path() -> PathBuf {
+    user_data_dir().join("first-run-complete")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
