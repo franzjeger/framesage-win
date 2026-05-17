@@ -37,8 +37,8 @@ crates/etw/                — package name: framesage-etw
 ├── Cargo.toml
 └── src/
     ├── lib.rs           — public API surface (EtwSession, EtwSubsystem,
-    │                      SupervisorLoop, DegradationMode,
-    │                      closed_loop_enabled_for_this_build)
+    │                      SessionShutdownHandle, SupervisorLoop,
+    │                      DegradationMode, closed_loop_enabled_for_this_build)
     ├── session.rs       — EtwSession lifetime: start / stop / consumer
     │                      thread / drop-rate query loop / stale cleanup
     ├── build_gate.rs    — RtlGetVersion wrapper + the MIN_BUILD_FOR_CLOSED_LOOP
@@ -183,6 +183,25 @@ impl<S: EtwSysCalls> EtwSession<S> {
     /// + buffer stats. Called once per second by the drop-rate query
     /// loop; can also be called externally for diagnostics.
     pub fn query_stats(&self) -> Result<SessionStats>;
+
+    /// Decomposes a `Running` session into the three parts the
+    /// `SupervisorLoop` (§3.6) needs to take ownership of: the
+    /// consumer thread's `JoinHandle`, the `oneshot::Receiver` that
+    /// the consumer signals on exit (clean or panic), and a
+    /// `SessionShutdownHandle` that lets the supervisor call
+    /// `ControlTraceW(STOP)` + `CloseTrace` during teardown without
+    /// needing the original `EtwSession` value.
+    ///
+    /// Used by Day 5's service-wiring code to hand the running
+    /// session off to a `SupervisorLoop` task. Day 3 introduces
+    /// this method as part of the §3.2/§3.4 refactor so Day 5's
+    /// wiring code compiles. Not called by tests directly — Mode 5
+    /// test uses the `SupervisorLoop` type via its own constructor.
+    pub fn into_supervisable_parts(self) -> (
+        std::thread::JoinHandle<()>,
+        tokio::sync::oneshot::Receiver<ConsumerExitReason>,
+        SessionShutdownHandle,
+    );
 }
 
 #[cfg(test)]
@@ -192,6 +211,29 @@ impl<S: EtwSysCalls> EtwSession<S> {
     /// the session consumes it. Production code never sees this
     /// method. See §3.4 for the test pattern.
     pub fn start_with_syscalls(syscalls: S, opts: SessionOptions) -> Result<EtwSubsystem<S>>;
+}
+
+/// Returned by `EtwSession::into_supervisable_parts`. Holds the
+/// minimum state the supervisor needs to tear the session down
+/// cleanly (ControlTraceW(STOP) + CloseTrace) AFTER the
+/// `EtwSession` value has been decomposed and its `JoinHandle` +
+/// receiver handed off. Does NOT own the consumer thread or the
+/// callback state — only the session-control side of the API.
+pub struct SessionShutdownHandle<S: EtwSysCalls = RealEtwSysCalls> {
+    session_handle: windows::Win32::System::Diagnostics::Etw::CONTROLTRACE_HANDLE,
+    /// Session name encoded as a NUL-terminated UTF-16 buffer
+    /// (`Vec<u16>` with `0` appended), matching the spike's pattern
+    /// — no new dependency required. `windows::core::PCWSTR(buf.as_ptr())`
+    /// constructs the API-ready pointer at the call site.
+    session_name: Vec<u16>,
+    syscalls: S,
+}
+
+impl<S: EtwSysCalls> SessionShutdownHandle<S> {
+    /// Stops the session and verifies it no longer exists. Called
+    /// by the supervisor's panic-teardown path (§3.5 #3) or on
+    /// clean shutdown.
+    pub fn shutdown(self) -> Result<()>;
 }
 ```
 
@@ -433,7 +475,7 @@ assert!(matches!(subsystem, EtwSubsystem::Disabled(DegradationMode::AccessDenied
    - Awaits the oneshot for consumer exit.
    - When the oneshot fires with `Panicked { message }`:
      - Calls `on_event(DegradationEvent { mode: ConsumerPanic, detail: message })` — production `on_event` is `|ev| tracing::error!(?ev, "ETW degradation event")` per §3.6. The error-level log is the wire to the (future) UI banner consumer; the consumer itself is a Group C concern (per v3 secondary decision Option C — channel wiring deferred).
-     - Tears down the session cleanly (calls `EtwSession::stop()` on the cached handle).
+     - Tears down the session cleanly via `SessionShutdownHandle::shutdown()` (the handle was extracted at `into_supervisable_parts()` time per §3.2; the `EtwSession` value was decomposed at that point so the supervisor holds the shutdown handle, not the full session).
      - Transitions the `EtwSubsystem` to `Disabled(ConsumerPanic)` in supervisor-local state.
      - **Does NOT exit the service host.** The engine continues running v0.6 static-rule mode.
 
@@ -491,12 +533,17 @@ use crate::degradation::{DegradationEvent, DegradationMode};
 /// Day 3 scaffolds + unit-tests this type in isolation (no service
 /// crate involvement). Day 5 instantiates it inside the service's
 /// runtime task with the production sink.
-pub struct SupervisorLoop<F>
+pub struct SupervisorLoop<F, S = RealEtwSysCalls>
 where
     F: Fn(DegradationEvent) + Send + Sync + 'static,
+    S: EtwSysCalls,
 {
     consumer_join: JoinHandle<()>,
     exit_rx: oneshot::Receiver<ConsumerExitReason>,
+    /// Owned by the supervisor so the panic-teardown path can call
+    /// `shutdown()` without needing to reconstruct an `EtwSession`.
+    /// Extracted from `EtwSession::into_supervisable_parts()` (§3.2).
+    shutdown: SessionShutdownHandle<S>,
     on_event: F,
 }
 
@@ -509,25 +556,28 @@ pub enum ConsumerExitReason {
     Panicked { message: String },
 }
 
-impl<F> SupervisorLoop<F>
+impl<F, S> SupervisorLoop<F, S>
 where
     F: Fn(DegradationEvent) + Send + Sync + 'static,
+    S: EtwSysCalls,
 {
     pub fn new(
         consumer_join: JoinHandle<()>,
         exit_rx: oneshot::Receiver<ConsumerExitReason>,
+        shutdown: SessionShutdownHandle<S>,
         on_event: F,
     ) -> Self {
-        Self { consumer_join, exit_rx, on_event }
+        Self { consumer_join, exit_rx, shutdown, on_event }
     }
 
     /// Runs the supervisor's select loop. Returns when the
     /// consumer thread exits (clean or panic). On panic, calls
-    /// `on_event(DegradationEvent { mode: ConsumerPanic, ... })`.
-    /// On clean shutdown, calls `on_event` with `CleanExit`
-    /// (informational; not a degradation).
+    /// `on_event(DegradationEvent { mode: ConsumerPanic, ... })`
+    /// then calls `shutdown.shutdown()` to tear the session down.
+    /// On clean shutdown, the consumer thread has already triggered
+    /// teardown externally; this method only joins the thread.
     pub async fn run(self) -> ConsumerExitReason {
-        let SupervisorLoop { consumer_join, exit_rx, on_event } = self;
+        let SupervisorLoop { consumer_join, exit_rx, shutdown, on_event } = self;
         let reason = exit_rx.await.unwrap_or(ConsumerExitReason::CleanShutdown);
         match &reason {
             ConsumerExitReason::Panicked { message } => {
@@ -535,10 +585,16 @@ where
                     mode: DegradationMode::ConsumerPanic,
                     detail: message.clone(),
                 });
+                if let Err(e) = shutdown.shutdown() {
+                    tracing::warn!(?e, "session shutdown after consumer panic failed");
+                }
             }
             ConsumerExitReason::CleanShutdown => {
                 // Informational, not emitted as a degradation event.
+                // Clean-shutdown path: external teardown has already
+                // called shutdown(); we just drop the handle.
                 tracing::info!("ETW consumer thread exited cleanly");
+                drop(shutdown);
             }
         }
         let _ = consumer_join.join();
@@ -593,7 +649,7 @@ Five working days. Each day ends with a testable deliverable and a stop gate.
 
 ### Day 3 — degradation enum + EtwSubsystem return type + mock-injection scaffold
 
-**Deliverable:** `degradation.rs` defines `DegradationMode` per §3.3. `EtwSession::start()` returns `Result<EtwSubsystem>` instead of bare `Result<EtwSession>`. The build-gate short-circuit produces `EtwSubsystem::Disabled(DegradationMode::BuildUnsupported { detected_build })` without ever touching ETW APIs. Logged at INFO with the exact line from architecture §2.1.
+**Deliverable:** `degradation.rs` defines `DegradationMode` per §3.3. `EtwSession::start()` returns `Result<EtwSubsystem<S>>` (matching §3.2's signature; the default `S = RealEtwSysCalls` means production callers continue to write `EtwSession::start(opts)` without naming the type) instead of bare `Result<EtwSession>`. The build-gate short-circuit produces `EtwSubsystem::Disabled(DegradationMode::BuildUnsupported { detected_build })` without ever touching ETW APIs. Logged at INFO with the exact line from architecture §2.1.
 
 **Day 3 also scaffolds the mock-injection abstraction per §3.4:** the `EtwSysCalls` trait, the `RealEtwSysCalls` zero-sized production impl, the `#[cfg(test)] MockEtwSysCalls` with per-method scripted queues, and the generic `EtwSession<S: EtwSysCalls = RealEtwSysCalls>` type parameter (now consistent with §3.2 per v4 fix d.1).
 
@@ -652,10 +708,11 @@ if policy.closed_loop_enabled && build_gate::closed_loop_enabled_for_this_build(
             // a tokio task. The on_event sink emits via tracing —
             // channel wiring is deferred to Group C per v3 secondary
             // decision (see §3.5 + §3.6).
-            let (consumer_join, exit_rx) = session.into_supervisable_parts();
+            let (consumer_join, exit_rx, shutdown) = session.into_supervisable_parts();
             let supervisor = SupervisorLoop::new(
                 consumer_join,
                 exit_rx,
+                shutdown,
                 |ev| tracing::error!(?ev, "ETW degradation event"),
             );
             tokio::spawn(supervisor.run());
