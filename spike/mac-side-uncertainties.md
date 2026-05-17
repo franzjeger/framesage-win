@@ -47,6 +47,21 @@ cargo test -p framesage-etw -- --nocapture
 # [System.Environment]::OSVersion.Version's build field.
 ```
 
+**Resolved (Windows batch, 2026-05-17, agenda Step 12):** real
+`RtlGetVersion` binding works on Win11 26200. Permanent #[ignore]'d
+regression test `real_rtl_get_version_probe_succeeds_on_supported_host`
+added to `crates/etw/src/build_gate.rs` (commit `98128a5`). Test run
+captured:
+
+```text
+real RtlGetVersion: detected_build() = Some(26200) (expect Some(>= 26100)); MIN_BUILD_FOR_CLOSED_LOOP = 26100
+```
+
+Host cross-check `[System.Environment]::OSVersion.Version.Build = 26200`
+matches the probe result exactly. Day 1's module-path correction to
+`Wdk::System::SystemServices` + `OSVERSIONINFOW` struct verified
+empirically. No further action.
+
 ---
 
 ## Entry 2 — Day 3 (2026-05-17): trait-signature deltas vs windows-rs 0.58
@@ -82,6 +97,15 @@ is a thin wrapper).
 **Windows-side verification:** `cargo test -p framesage-etw -- --nocapture --include-ignored` — runs all mode tests + the
 `real_etw_session_starts_and_stops_cleanly` ignored test. If any test
 fails on signature mismatch, surface as a real bug.
+
+**Resolved (Windows batch, 2026-05-17, agenda Step 9 + Step 13):** all
+20 framesage-etw tests pass under `--include-ignored` on real Windows
+(final state after four rounds of inline fixes — see report §12.3). The
+trait signatures compile + link + execute correctly against windows-rs
+0.58 on the actual Win11 26200 runtime. Five signature deltas
+(start_trace `*mut`, control_trace typed `EVENT_TRACE_CONTROL`,
+process_trace `Option<*const FILETIME>`, rtl_get_version `OSVERSIONINFOW`,
+all methods `unsafe fn`) all validated empirically. No further action.
 
 ---
 
@@ -132,6 +156,19 @@ treat as caller-asserted safe).
 test runs Mode 5 end-to-end. If the test passes, the design fix is
 sound. If it fails, surface for review.
 
+**Resolved (Windows batch, 2026-05-17, agenda Step 9 + Step 14):**
+both supervisor::tests::supervisor_emits_consumer_panic_event_and_calls_shutdown
+AND session::tests::mode_5_session_level_full_flow_panic pass on real
+Windows. catch_unwind + AssertUnwindSafe + oneshot path works correctly
+under the actual Windows thread runtime. ConsumerState design (non-
+generic, S held by EtwSession directly, consumer-thread closure
+captures S by move) is sound. The static_assertions::assert_impl_all!(
+ConsumerState: RefUnwindSafe) compile-time guard caught a real bug
+during Mac-side Day 3 (parking_lot::Mutex was added to ConsumerState
+prematurely, isn't RefUnwindSafe, guard fired immediately); guard
+removal of the offending field resulted in the final clean design. No
+further action.
+
 ---
 
 ## Entry 4 — Day 3 (2026-05-17): MockEtwSysCalls Clone semantics
@@ -159,6 +196,12 @@ on Windows host. If a future test needs shared-state mock clones
 thread), switch MockEtwSysCalls's RefCell → `Arc<Mutex<VecDeque<...>>>`.
 Not blocking; document the gotcha for future test authors.
 
+**Resolved (Windows batch, 2026-05-17, agenda Step 15):** Mode 3 +
+Mode 5 tests all pass on real Windows. Per-clone-state semantics work
+for the current test surface. Documented the gotcha here for future
+test authors (Day 4's `arm_panic_in_process_trace` extension already
+exercises the pattern). No further action.
+
 ---
 
 ## Entry 5 — Day 3 (2026-05-17): ERROR_ACCESS_DENIED not exported in windows-rs 0.58
@@ -182,6 +225,24 @@ asserts `EtwSubsystem::Disabled(DegradationMode::AccessDenied)` when
 `expect_start_trace(WIN32_ERROR(5))` scripts a Mode 1 failure. If the
 match works, the value is correct. Cleanup-as-needed: `grep -rn ERROR_ACCESS_DENIED ~/.cargo/registry/src/index.crates.io-*/windows-0.58.0/`
 to find the right import path.
+
+**Resolved (Windows batch, 2026-05-17, agenda Step 16): hypothesis was
+WRONG. windows-rs 0.58 DOES export ERROR_ACCESS_DENIED at the canonical
+path.** Grep found:
+
+```text
+C:\Users\Frank Andreas Lia\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\windows-0.58.0\src\Windows\Win32\Foundation\mod.rs:1087:
+  pub const ERROR_ACCESS_DENIED: WIN32_ERROR = WIN32_ERROR(5u32);
+```
+
+Same module as the other constants we already import. Refactored inline
+(commit `98128a5`): added `ERROR_ACCESS_DENIED` to the existing
+`use windows::Win32::Foundation::{...}` import block; replaced
+`if rc == ERROR_ACCESS_DENIED()` (private helper call) with
+`if rc == ERROR_ACCESS_DENIED` (canonical constant); removed the
+`fn ERROR_ACCESS_DENIED() -> WIN32_ERROR { ... }` helper at the bottom
+of `mod windows_impl`. Mode 1 test still passes after refactor (`cargo
+test -p framesage-etw -- --include-ignored` 21/21). No further action.
 
 ---
 
@@ -223,6 +284,12 @@ oneshot sends Panicked → SupervisorLoop receives → on_event called
 with ConsumerPanic. Bounded by tokio::time::timeout(5s). The
 Windows-batch run still verifies it works against a real Windows
 host runtime as well.
+
+**Resolved (Windows batch, 2026-05-17, agenda Step 17):** both tests
+(supervisor-isolation + session-level full-flow) pass on real Windows
+host runtime. The mock-driven full-flow test exercises the same path
+through the real Windows thread runtime that production would use.
+Architectural Mode 5 wire validated end-to-end. No further action.
 
 ---
 
@@ -267,6 +334,24 @@ elevated host. Verify:
 3. Service itself stays up — watchdog doesn't fire because closed-
    loop tasks are intentionally excluded from the select!.
 
+**Resolved (Windows batch, 2026-05-17, agenda Steps 18 + 23 + 24 +
+28):** the MonitorHandle pattern works end-to-end on real Windows.
+Verified at:
+- Step 23 (closed-loop enable + restart): supervisor + drop-poll
+  tasks spawned per the `closed-loop ETW session started + supervisor/
+  drop-poll tasks spawned reason="running"` INFO log line.
+- Step 24 (clean Stop-Service): closed-loop tasks cancelled cleanly
+  by tokio runtime shutdown; SessionShutdownHandle::Drop tears down
+  the session (Reading 1 ratified by user — D1 Drop is load-bearing
+  here by design, not defensive).
+- Step 28 (survives-restart): four-transition cycle (Start → force-
+  kill → Start → Stop-Service) completes correctly. Service stays up
+  through clean shutdown; closed-loop tasks don't bring down the
+  service host. Watchdog correctly excludes them per architecture
+  §2.1 mode 5 amendment.
+
+No further action.
+
 ---
 
 ## Entry 8 — Day 5 (2026-05-17): runtime.rs _silence_warnings host-rot fix-forward
@@ -294,6 +379,12 @@ on host AND has no Windows-side counterpart (it's
 **Windows-side verification:** none required — the function never
 runs on Windows.
 
+**Resolved (Windows batch, 2026-05-17, agenda Step 19):** no Windows-
+side action needed; verified by Mac-side `cargo test -p framesage-
+service` (8 tests) passing during Day 5. Windows-side `cargo test -p
+framesage-service` (11 tests including 3 cfg(windows)-gated ACL tests)
+also passing per agenda Step 10. No further action.
+
 ---
 
 ## Entry 9 — Day 5 (2026-05-17): Policy::closed_loop_enabled added
@@ -318,3 +409,44 @@ upgrade scenario:
    structured reason="policy_opt_out" event.
 5. Manually flip the field to true; restart service; verify the
    build-gate path is taken next.
+
+**Resolved (Windows batch, 2026-05-17, agenda Steps 20 + 21 + 22 + 23):
+upgrade scenario PASSED end-to-end.** Used the host's pre-existing v0.6
+`C:\ProgramData\framesage\policy.json` (preserved during Step 20.5
+uninstall) as the actual upgrade-test input — no synthetic setup needed.
+
+Per-sub-step:
+1. **Pre-existing v0.6 policy.json present** (4424 bytes, no
+   `closed_loop_enabled` field). Verified at Step 21 V4: `findstr
+   closed_loop policy.json` → exit 1, no match.
+2. **load_policy_or_default loaded without error.** Service running per
+   Step 21 V1; no startup errors in service log.
+3. **Verified closed_loop_enabled = false (default).** Indirect
+   verification via Step 21 V6: `logman query FramesageEtw -ets` returned
+   "not found" — service did NOT create an ETW session, consistent with
+   `closed_loop_enabled = false` taking the OptedOut branch.
+4. **Verified structured reason="policy_opt_out" event.** Step 22 service
+   log capture:
+   ```text
+   2026-05-17T19:55:03.857489Z  INFO framesage_svc::closed_loop:
+     closed-loop disabled by policy.closed_loop_enabled = false;
+     engine runs in v0.6 static-rule mode
+     reason="policy_opt_out"
+   ```
+5. **Manually flipped to true + restarted; build-gate path taken.** Step
+   23: edited policy.json, Restart-Service, verified ETW session running
+   (`FramesageEtw` Running in kernel with 4 providers), service log
+   showed `reason="running"`.
+
+**Side observation captured during sub-step 1 → 2 transition (~3 min
+after install):** the service rewrote policy.json with
+`"closed_loop_enabled": false` added explicitly (+35 bytes). Cause:
+serde-round-trip on first IPC-triggered policy save (almost certainly
+tray interaction during the diagnostic period). Net effect: policy.json
+self-documents after first save with all current-version fields visible.
+**Benign + arguably desirable** — but worth documenting in v0.7 README
+so the timing of "field appears" isn't surprising. v4.3 amendment
+Section 4 captures the operating-model finding; Section 6 captures the
+README TODO.
+
+No further action.
