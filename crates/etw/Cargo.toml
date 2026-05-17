@@ -1,0 +1,47 @@
+[package]
+name = "framesage-etw"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "v0.7 closed-loop ETW kernel-event consumer for the framesage-svc service host."
+
+[dependencies]
+anyhow = { workspace = true }
+tracing = { workspace = true }
+thiserror = { workspace = true }
+
+[target.'cfg(windows)'.dependencies]
+windows = { workspace = true, features = [
+    "Win32_Foundation",
+    "Win32_System_Console",
+    "Win32_System_Diagnostics_Etw",
+    "Win32_System_SystemInformation",
+    "Win32_System_Time",
+    # Day 1 in-flight correction: plan §3.1 said RtlGetVersion lived
+    # under Win32_System_SystemInformation, but in windows-rs 0.58 it
+    # actually lives in Wdk::System::SystemServices (links ntdll.dll
+    # "system" fn). We enable that feature here. The plan stop gate
+    # ("don't fall back to GetVersionEx") is honored — this is the
+    # documented user-mode binding at a different path, not a kernel
+    # driver or BYOVD. To be folded into a small plan-fix-up amendment
+    # alongside Day 5's EOD report (per user's "fix in code, don't
+    # re-plan" guidance, 2026-05-17).
+    "Wdk_System_SystemServices",
+] }
+
+[dev-dependencies]
+# tracing-test provides #[traced_test] attribute + logs_contain
+# assertion for the Mode 5 test in §4 Day 4. Per v3 secondary
+# decision (Option C — defer channel wiring to Group C): the
+# panic event is emitted via tracing::error! in production;
+# tests assert on captured tracing output rather than a channel
+# send. Dev-only — does NOT ship in the production binary.
+tracing-test = "0.2"
+
+# static_assertions provides compile-time assert_impl_all! for
+# the RefUnwindSafe regression guard in §3.5 #4. Also dev-only;
+# the macro expands to an empty const block in release builds.
+static_assertions = "1"
