@@ -1,5 +1,9 @@
 # Draft: Sysinternals outreach
 
+> **INTERNAL SEND-PREP — NOT FOR THE RECIPIENT.**
+> Everything in this section is guidance for the sender. Only the content under
+> `## RECIPIENT-FACING BODY` below the divider goes to Sysinternals.
+
 **Target:** Sysinternals team (Mark Russinovich and colleagues at Microsoft).
 
 **Reach options, in order of viability:**
@@ -9,15 +13,21 @@
 
 This contact is opportunistic. There's no guaranteed channel; treat as "if any direct contact exists, send it; otherwise skip and rely on PerfView + Process Hacker channels."
 
+**Personalization before send:**
+- Default salutation below is "Hi Sysinternals team," which is the safe generic. If you have a specific contact in mind (a previous correspondent, a named maintainer you've talked to before), personalize the salutation to that person's first name before sending.
+- If you go the public Twitter/X route, the Body section below needs trimming for character count.
+
 ---
 
-## Subject
+## RECIPIENT-FACING BODY
+
+### Subject
 
 EDR detection of native ETW kernel consumers — current data?
 
-## Body
+### Body
 
-Hi {first name},
+Hi Sysinternals team,
 
 I'm working on an open-source Windows tool (FrameSage) that consumes ETW kernel events via SystemTraceProvider — same API surface as Process Explorer's kernel-event tooling, Process Monitor, and the bits of Sysinternals Suite that read ETW for live process telemetry. Architecture and code are at https://github.com/franzjeger/framesage-win for context.
 
