@@ -167,15 +167,36 @@ foreach ($lnkPath in $lnkPaths) {
     Write-Host "  $lnkPath"
 }
 
-# --- Service: uninstall old, install new, start ------------------------------
+# --- Service: unregister old (SCM-only), install new, start ------------------
+#
+# We do the unregister via sc.exe directly, NOT via `framesage uninstall`,
+# because the full `framesage uninstall` is a clean-slate removal — it
+# deletes binaries, shortcuts, and the install dir, which would wipe out
+# the binaries we just staged above. install.ps1 owns the binary lifecycle
+# (we copied them in this run, we'll copy them again next run); the only
+# thing we need from the SCM here is "forget the old service registration
+# so we can register the new one cleanly".
 Write-Host ""
 Write-Host "[install] (re-)registering the framesage service..." -ForegroundColor Cyan
 $cli = Join-Path $installDir "framesage.exe"
 $svc = Get-Service framesage -ErrorAction SilentlyContinue
 if ($null -ne $svc) {
-    Write-Host "  uninstalling existing service"
-    & $cli uninstall
+    Write-Host "  unregistering existing SCM service (stop + delete)"
+    # Stop first — `sc.exe delete` on a running service marks it
+    # "deletion pending" and won't remove the registration until every
+    # handle closes, blocking the re-install. We swallow stop failures
+    # because the service may already be stopped (race with the kill
+    # step at the top of this script).
+    & sc.exe stop framesage | Out-Null
     Start-Sleep -Seconds 1
+    & sc.exe delete framesage | Out-Null
+    # Poll briefly for SCM to actually drop the registration before we
+    # try to create one with the same name.
+    $deadline = (Get-Date).AddSeconds(10)
+    while ((Get-Date) -lt $deadline) {
+        if ($null -eq (Get-Service framesage -ErrorAction SilentlyContinue)) { break }
+        Start-Sleep -Milliseconds 250
+    }
 }
 Write-Host "  installing service (LocalSystem, autostart on boot)"
 & $cli install
