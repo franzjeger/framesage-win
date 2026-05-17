@@ -57,7 +57,8 @@ checks the union against the diagram below.
 | `framesage-sys`      | Win32 wrappers (cfg(windows))         | core, gamemode                       |
 | `framesage-sim`      | Simulator for the gamemode planner    | core, gamemode                       |
 | `framesage-engine`   | Policy engine (the orchestrator)      | core, ipc, gamemode, sys             |
-| `framesage-service`  | Windows service host (LocalSystem)    | core, engine, gamemode, ipc, sys     |
+| `framesage-etw`      | v0.7 closed-loop ETW kernel-event consumer (cfg(windows)) | — (windows + tokio + parking_lot, no framesage deps) |
+| `framesage-service`  | Windows service host (LocalSystem)    | core, engine, etw, gamemode, ipc, sys |
 | `framesage-cli`      | `framesage.exe` (status, install, …)  | core, gamemode, ipc, sys             |
 | `framesage-tray`     | Tray UI (egui + tray-icon)            | core, gamemode, ipc, sys             |
 
@@ -120,6 +121,16 @@ graph grows, a `cargo metadata` walk in CI would automate it.
 7. **Only `framesage-service` depends on `framesage-engine`.** The
    service is the engine's host process. Everything else interacts
    via the named-pipe protocol.
+
+8. **`framesage-etw` is a v0.7-era bottom-of-stack crate with zero
+   framesage deps.** It wraps the Windows ETW API surface
+   (`StartTraceW`, `OpenTraceW`, `ProcessTrace`, etc.) and exposes
+   the closed-loop session lifecycle + supervisor + degradation
+   types. Only `framesage-service` depends on it — the service
+   host spawns the supervisor + drop-poll tasks per Day 5 wiring.
+   The crate is gated `cfg(windows)` and compiles to a stub on
+   non-Windows targets so the workspace stays Mac/Linux-buildable
+   for cross-target verification.
 
 ## Why this shape
 

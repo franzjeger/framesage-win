@@ -30,6 +30,74 @@ use framesage_etw::{
 };
 use tracing::{error, info, warn};
 
+// ─── Test-only build-gate override seam (Step 11 finding #11.1) ──────────────
+//
+// Per Step 11 batch finding: the `build_gate_fallthrough_emits_structured_build_unsupported_event`
+// test on elevated Win11 24H2+ falls through the BuildUnsupported branch
+// (host build passes) and reaches `EtwSession::start()` -> `spawn_closed_loop_tasks`
+// -> `tokio::spawn`, panicking outside a tokio runtime. Solution: same
+// thread_local override pattern as `framesage-etw`'s `build_gate` module
+// (per Day 1's S-A1 inline-tests resolution), but composed at the
+// framesage-service layer so the test doesn't need cross-crate `pub(crate)`
+// visibility into framesage-etw's internals.
+//
+// Production builds compile this seam out entirely (the `#[cfg(test)]`
+// blocks inside the wrappers below collapse to nothing in release).
+
+#[cfg(test)]
+thread_local! {
+    /// Per-test override.
+    /// `Some(Ok(build))`  -> wrappers treat the host as that build.
+    /// `Some(Err(()))`    -> wrappers treat the build probe as failed.
+    /// `None`             -> wrappers fall through to framesage_etw::build_gate.
+    static CLOSED_LOOP_BUILD_OVERRIDE: std::cell::RefCell<Option<Result<u32, ()>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// RAII guard: resets the per-thread override on Drop so a panicking
+/// test can't leak its override into the next test on the same thread.
+#[cfg(test)]
+pub(crate) struct BuildOverrideGuard;
+#[cfg(test)]
+impl BuildOverrideGuard {
+    pub(crate) fn set(v: Option<Result<u32, ()>>) -> Self {
+        CLOSED_LOOP_BUILD_OVERRIDE.with(|c| *c.borrow_mut() = v);
+        Self
+    }
+}
+#[cfg(test)]
+impl Drop for BuildOverrideGuard {
+    fn drop(&mut self) {
+        CLOSED_LOOP_BUILD_OVERRIDE.with(|c| *c.borrow_mut() = None);
+    }
+}
+
+/// Wrapper around `framesage_etw::build_gate::closed_loop_enabled_for_this_build()`.
+/// In tests, consults the thread_local override first; in production,
+/// falls through to the real probe directly (zero overhead — the
+/// `#[cfg(test)]` block compiles out).
+fn build_gate_pass() -> bool {
+    #[cfg(test)]
+    {
+        if let Some(v) = CLOSED_LOOP_BUILD_OVERRIDE.with(|c| *c.borrow()) {
+            return matches!(v, Ok(b) if b >= build_gate::MIN_BUILD_FOR_CLOSED_LOOP);
+        }
+    }
+    build_gate::closed_loop_enabled_for_this_build()
+}
+
+/// Wrapper around `framesage_etw::build_gate::detected_build()`. Same
+/// override pattern as `build_gate_pass`.
+fn build_gate_detected_build() -> Option<u32> {
+    #[cfg(test)]
+    {
+        if let Some(v) = CLOSED_LOOP_BUILD_OVERRIDE.with(|c| *c.borrow()) {
+            return v.ok();
+        }
+    }
+    build_gate::detected_build()
+}
+
 /// Result of evaluating + (conditionally) starting the closed-loop
 /// subsystem at service startup. The variants are mutually exclusive
 /// and exhaust the decision-tree per plan §4 Day 5. Fields are read
@@ -78,8 +146,8 @@ pub fn start_closed_loop_if_enabled(policy: &Policy) -> ClosedLoopStartup {
         return ClosedLoopStartup::OptedOut;
     }
 
-    if !build_gate::closed_loop_enabled_for_this_build() {
-        let detected = build_gate::detected_build();
+    if !build_gate_pass() {
+        let detected = build_gate_detected_build();
         info!(
             reason = "build_unsupported",
             detected_build = ?detected,
@@ -227,42 +295,44 @@ mod tests {
         ));
     }
 
-    /// Build-gate path assertion. On non-Windows the build_gate stub
-    /// returns false (detected_build = None); the test asserts the
-    /// structured reason. On Windows the test still runs but may take
-    /// either path depending on the host build — if it's ≥ 26100 the
-    /// session-start path takes over (and may fail with AccessDenied
-    /// if not elevated). For the assertion we only cover the
-    /// build-unsupported branch; running on Windows with build ≥ 26100
-    /// hits a different branch and the test skips its assertion.
+    /// Build-gate-fallthrough assertion via the test-only override seam
+    /// (per Step 11 finding #11.1). The override forces the
+    /// `BuildUnsupported` branch deterministically on any host — including
+    /// elevated Win11 24H2+ where the real build gate would pass and the
+    /// function would reach `tokio::spawn`, panicking outside a runtime.
+    ///
+    /// `#[tokio::test(flavor = "multi_thread")]` provides a runtime as a
+    /// defensive belt-and-suspenders measure; with the override active the
+    /// function returns before reaching any `tokio::spawn`, but the runtime
+    /// availability protects against future refactors that move the spawn
+    /// earlier in the decision tree.
+    ///
+    /// `tracing-test` integrates with `#[tokio::test]` the same way it does
+    /// with `#[test]` — the attribute order matters: `#[tokio::test]` must
+    /// be the outermost so the runtime is set up before the subscriber.
+    #[tokio::test(flavor = "multi_thread")]
     #[tracing_test::traced_test]
-    #[test]
-    fn build_gate_fallthrough_emits_structured_build_unsupported_event() {
+    async fn build_gate_fallthrough_emits_structured_build_unsupported_event() {
+        // Synthetic build below the threshold (Win11 23H2 = 22631 < 26100).
+        // RAII guard resets the override on Drop so a panicking test can't
+        // poison subsequent tests on the same thread.
+        let _guard = BuildOverrideGuard::set(Some(Ok(22631)));
+
         let policy = Policy {
             closed_loop_enabled: true,
             ..Policy::default()
         };
         let result = start_closed_loop_if_enabled(&policy);
-        // The test covers the BuildUnsupported branch specifically.
-        // On hosts where the build gate passes, the test instead
-        // exercises the session-start path (which on a non-elevated
-        // Windows host returns AccessDenied) — we assert that this
-        // alternative path is not BuildUnsupported, and otherwise skip
-        // the field-format assertion.
-        match result {
-            ClosedLoopStartup::BuildUnsupported { .. } => {
-                assert!(logs_contain("reason=\"build_unsupported\""));
-                assert!(logs_contain("closed-loop disabled"));
-            }
-            other => {
-                // Test host build is ≥ 26100 (or session start
-                // succeeded). Either way, structured logging worked
-                // (test runner saw events) — the path-specific
-                // assertion just doesn't apply on this host.
-                eprintln!(
-                    "build_gate test: host took the {other:?} branch instead of BuildUnsupported; field-format assertion skipped"
-                );
-            }
-        }
+        assert!(
+            matches!(
+                result,
+                ClosedLoopStartup::BuildUnsupported {
+                    detected_build: Some(22631)
+                }
+            ),
+            "override forces BuildUnsupported branch; got {result:?}"
+        );
+        assert!(logs_contain("reason=\"build_unsupported\""));
+        assert!(logs_contain("closed-loop disabled"));
     }
 }

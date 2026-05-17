@@ -54,12 +54,19 @@ const ALLOWED_EDGES: &[(&str, &[&str])] = &[
             "framesage-sys",
         ],
     ),
-    // Only the service depends on engine.
+    // v0.7 Group A: new bottom-of-stack crate for the closed-loop
+    // ETW kernel-event consumer. Zero framesage deps — wraps the
+    // Windows ETW API surface and exposes the consumer-lifecycle
+    // + degradation types. Only `framesage-service` depends on it
+    // (the service host spawns the supervisor task).
+    ("framesage-etw", &[]),
+    // Only the service depends on engine (and on etw, added v0.7).
     (
         "framesage-service",
         &[
             "framesage-core",
             "framesage-engine",
+            "framesage-etw",
             "framesage-gamemode",
             "framesage-ipc",
             "framesage-sys",

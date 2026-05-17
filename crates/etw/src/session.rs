@@ -922,10 +922,11 @@ mod windows_impl {
             let shutdown = SessionShutdownHandle {
                 session_handle: self.handle,
                 session_name: session_name_wide,
-                syscalls: self
-                    .syscalls
-                    .take()
-                    .expect("into_supervisable_parts called twice or after stop()"),
+                syscalls: Some(
+                    self.syscalls
+                        .take()
+                        .expect("into_supervisable_parts called twice or after stop()"),
+                ),
             };
             (consumer_join, exit_rx, shutdown)
         }
@@ -1058,10 +1059,19 @@ mod windows_impl {
     /// syscalls clone. Owned by `SupervisorLoop` after
     /// `into_supervisable_parts()`; called from the supervisor's
     /// panic-teardown path.
+    ///
+    /// `syscalls: Option<S>` mirrors the EtwSession Drop pattern
+    /// (Finding #2 from Step 9 batch + Finding #11.2 from Step 11):
+    /// explicit `shutdown(self)` takes ownership of the syscalls
+    /// impl, leaving `None` so the `Drop` impl below knows the
+    /// session has already been torn down. The `Drop` runs the
+    /// best-effort STOP only on the leak path — e.g. if a
+    /// supervisor task holding the handle is killed (tokio runtime
+    /// shutdown, unwind) before `shutdown()` runs.
     pub struct SessionShutdownHandle<S: EtwSysCalls = RealEtwSysCalls> {
         session_handle: CONTROLTRACE_HANDLE,
         session_name: Vec<u16>,
-        syscalls: S,
+        syscalls: Option<S>,
     }
 
     impl<S: EtwSysCalls> std::fmt::Debug for SessionShutdownHandle<S> {
@@ -1069,6 +1079,7 @@ mod windows_impl {
             f.debug_struct("SessionShutdownHandle")
                 .field("session_handle", &self.session_handle)
                 .field("session_name_len", &self.session_name.len())
+                .field("syscalls_present", &self.syscalls.is_some())
                 .finish()
         }
     }
@@ -1077,7 +1088,11 @@ mod windows_impl {
         /// Stop the session via ControlTraceW(STOP). Best-effort: if
         /// the session is already gone (ERROR_WMI_INSTANCE_NOT_FOUND),
         /// treated as success.
-        pub fn shutdown(self) -> Result<()> {
+        pub fn shutdown(mut self) -> Result<()> {
+            let syscalls = self
+                .syscalls
+                .take()
+                .expect("SessionShutdownHandle::shutdown called twice");
             let mut props_opts = SessionOptions {
                 session_name: String::from_utf16_lossy(
                     &self.session_name[..self.session_name.len().saturating_sub(1)],
@@ -1093,7 +1108,7 @@ mod windows_impl {
             // stale if already stopped — that's the WMI_INSTANCE_NOT_FOUND
             // path we tolerate).
             let rc = unsafe {
-                self.syscalls.control_trace(
+                syscalls.control_trace(
                     CONTROLTRACE_HANDLE::default(),
                     PCWSTR(self.session_name.as_ptr()),
                     props.as_mut_ptr(),
@@ -1111,6 +1126,46 @@ mod windows_impl {
             // for CloseTrace in a future iteration.
             let _ = self.session_handle;
             Ok(())
+        }
+    }
+
+    /// Drop fallback: mirrors `EtwSession`'s Drop. Runs only on the
+    /// leak path — e.g. a supervisor task holding this handle is
+    /// killed (tokio runtime shutdown, unwind) before `shutdown()` is
+    /// called. Best-effort STOP; logs warn on failure.
+    ///
+    /// Finding #11.2 from Windows runtime batch Step 11: same
+    /// leak-class as Finding #2 (kernel-owned sessions persist past
+    /// process exit). Production today calls `shutdown()` on the
+    /// supervisor panic-recovery path; this Drop covers the
+    /// task-killed path that production doesn't reach but tests
+    /// might.
+    impl<S: EtwSysCalls> Drop for SessionShutdownHandle<S> {
+        fn drop(&mut self) {
+            let Some(syscalls) = self.syscalls.take() else {
+                return;
+            };
+            let session_name = String::from_utf16_lossy(
+                &self.session_name[..self.session_name.len().saturating_sub(1)],
+            );
+            match stop_session(&syscalls, &session_name) {
+                Ok(()) => {
+                    tracing::info!(
+                        session = %session_name,
+                        "SessionShutdownHandle::drop: session stopped (fallback path)"
+                    );
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        session = %session_name,
+                        error = %e,
+                        "SessionShutdownHandle::drop: ControlTraceW(STOP) failed; session may be leaked. \
+                         Run `logman stop \"{session_name}\" -ets` (elevated) to clean up.",
+                        session_name = session_name,
+                    );
+                }
+            }
+            let _ = self.session_handle;
         }
     }
 
