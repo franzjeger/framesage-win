@@ -1,6 +1,6 @@
 # v0.7 Group A — Week 2 implementation plan
 
-**Status:** DRAFT — pending buddy review.
+**Status:** DRAFT v2 — buddy-approved (verdict PROCEED) with amendments applied (see §11). Awaiting user sign-off before execution.
 **Authoritative inputs:**
 - `audit/v0.7-architecture.md` §2.1 (degradation modes, build gate, LocalSystem privilege model) and "Phase 3 acceptance criteria → Group A — ETW foundation"
 - `spike/etw-schemas.md` "Group A weeks 2-7 implementation gates" + "Implementation requirements driven by this document"
@@ -18,7 +18,7 @@
 
 Week 2 lays the production bones of the ETW consumer. By end of week:
 
-- A new `crates/framesage-etw/` crate exists in the workspace.
+- A new `crates/etw/` crate exists in the workspace.
 - It contains the session lifecycle code lifted from `crates/spike-etw/` (validated in Phase 1) — `StartTraceW`, `OpenTraceW`, `ProcessTrace`, the drop-rate query loop, clean shutdown, stale-session cleanup.
 - The build-gate check (`MIN_BUILD_FOR_CLOSED_LOOP: u32 = 26100`) is in place and `EtwSession::start()` short-circuits to `Disabled` on unsupported builds.
 - All **six** degradation modes from architecture §2.1's table have unit-test coverage via synthetic return-value mocks. Mode #1 (`ERROR_ACCESS_DENIED` — the EDR-blocked path) is tested via mock per the EDR-matrix-is-v0.7.1-not-Group-A decision.
@@ -30,10 +30,10 @@ The end-of-week deliverable is a service binary that, when installed on a Win11 
 
 ---
 
-## 2. New crate layout: `crates/framesage-etw/`
+## 2. New crate layout: `crates/etw/`
 
 ```
-crates/framesage-etw/
+crates/etw/                — package name: framesage-etw
 ├── Cargo.toml
 └── src/
     ├── lib.rs           — public API surface (EtwSession, EtwSubsystem,
@@ -48,6 +48,15 @@ crates/framesage-etw/
         ├── build_gate_tests.rs
         └── degradation_tests.rs
 ```
+
+**Naming convention note (per buddy review of this plan):** the
+workspace pattern is `crates/X/` with `[package].name =
+"framesage-X"`. Examples: `crates/service/` → `framesage-service`,
+`crates/sys/` → `framesage-sys`, `crates/core/` → `framesage-core`.
+The new crate follows that pattern: directory `crates/etw/`,
+package name `framesage-etw`. The first DRAFT of this plan
+mistakenly wrote `crates/framesage-etw/`; buddy caught it before
+execution.
 
 `Cargo.toml` skeleton:
 
@@ -190,7 +199,7 @@ Five working days. Each day ends with a testable deliverable and a stop gate.
 
 ### Day 1 — crate skeleton + build gate
 
-**Deliverable:** `crates/framesage-etw/` exists in the workspace, builds clean. `build_gate.rs` implements the `MIN_BUILD_FOR_CLOSED_LOOP` const + `RtlGetVersion` wrapper + `closed_loop_enabled_for_this_build()` predicate. Unit tests cover: (a) the predicate returns true on builds ≥ 26100 (mocked via a test-only injection point), (b) the predicate returns false on build 22631 (Win11 23H2) and asserts `detected_build() == Some(22631)`, (c) the predicate returns false on a `RtlGetVersion` failure path (mocked) and asserts `detected_build() == None`.
+**Deliverable:** `crates/etw/` exists in the workspace, builds clean. `build_gate.rs` implements the `MIN_BUILD_FOR_CLOSED_LOOP` const + `RtlGetVersion` wrapper + `closed_loop_enabled_for_this_build()` predicate. Unit tests cover: (a) the predicate returns true on builds ≥ 26100 (mocked via a test-only injection point), (b) the predicate returns false on build 22631 (Win11 23H2) and asserts `detected_build() == Some(22631)`, (c) the predicate returns false on a `RtlGetVersion` failure path (mocked) and asserts `detected_build() == None`.
 
 **Stop gate:** if `RtlGetVersion` binding doesn't work as expected (e.g. linking issue, feature gating different in `windows-rs` 0.58), STOP and investigate. Don't fall back to `GetVersionEx` — the architecture explicitly forbids it.
 
@@ -202,15 +211,19 @@ Five working days. Each day ends with a testable deliverable and a stop gate.
 
 **Verification command:** run the resulting binary elevated for 60 s, capture `logman query FramesageEtw -ets` output before / during / after, paste literal output into the EOD note per the spike-reports-include-literal-output ground rule.
 
-### Day 3 — degradation enum + EtwSubsystem return type
+### Day 3 — degradation enum + EtwSubsystem return type + mock-injection scaffold
 
 **Deliverable:** `degradation.rs` defines `DegradationMode` per §3.3. `EtwSession::start()` returns `Result<EtwSubsystem>` instead of bare `Result<EtwSession>`. The build-gate short-circuit produces `EtwSubsystem::Disabled(DegradationMode::BuildUnsupported { detected_build })` without ever touching ETW APIs. Logged at INFO with the exact line from architecture §2.1.
 
-**Stop gate:** if the architecture's intended log line conflicts with the actual `tracing` formatter (rare but possible — line breaks, format-string mismatch), STOP and propose a doc-level fix to the architecture rather than diverging silently.
+**Day 3 also scaffolds the mock-injection abstraction** (per buddy review of this plan): a `#[cfg(test)]`-gated trait indirection on the `StartTraceW` / `ControlTraceW` / `RtlGetVersion` call sites. Production code uses the concrete Windows API; tests substitute a fake. Doing the scaffolding here (alongside the `EtwSubsystem` refactor that touches the same call sites) keeps Day 4 focused on writing the six test cases against an existing scaffold, not building scaffold + tests in one day. Buddy's catch: building scaffold + 5 real tests in Day 4 risks spilling into Day 5's service-wiring time.
 
-### Day 4 — degradation-mode unit tests (synthetic mocks)
+**Stop gates:**
+- If the architecture's intended log line conflicts with the actual `tracing` formatter (rare but possible — line breaks, format-string mismatch), STOP and propose a doc-level fix to the architecture rather than diverging silently.
+- If the trait-indirection abstraction is the wrong shape (e.g. introduces lifetime gymnastics, requires dyn-dispatch on the hot path even in production builds, or leaks `cfg(test)` symbols into the public API), STOP and re-think before Day 4 commits more code on top of it.
 
-**Deliverable:** `tests/degradation_tests.rs` contains six tests, one per `DegradationMode` variant. Each test injects a synthetic failure at the appropriate layer:
+### Day 4 — degradation-mode unit tests (against Day-3 scaffold)
+
+**Deliverable:** `tests/degradation_tests.rs` contains six tests, one per `DegradationMode` variant. The mock-injection scaffold from Day 3 is the substrate; Day 4 is writing test cases against it, NOT building the scaffold from scratch. Each test injects a synthetic failure at the appropriate layer:
 - **Mode 1 (AccessDenied):** `StartTraceW` mock returns `ERROR_ACCESS_DENIED`. Assert `start()` returns `EtwSubsystem::Disabled(AccessDenied)`. NOT against a real EDR — that's a v0.7.1 gate.
 - **Mode 2 (AlreadyExists):** mock returns `ERROR_ALREADY_EXISTS` even after `cleanup_stale_session()`. Assert disabled-with-`AlreadyExists`. Verify cleanup was attempted (call count).
 - **Mode 3 (KernelDrops):** `query_stats` mock returns `RealTimeBuffersLost = 5`. Assert that a `DegradationEvent::KernelDrops { rate }` is emitted on the next poll cycle.
@@ -292,7 +305,7 @@ Plus the **ground rules** carried from prior phases that remain in force:
 
 These are the explicit pass-conditions for "week 2 is complete":
 
-- [ ] `crates/framesage-etw/` exists, registered in workspace `Cargo.toml`.
+- [ ] `crates/etw/` exists, registered in workspace `Cargo.toml`.
 - [ ] `cargo check --workspace` green.
 - [ ] `cargo fmt --check` green.
 - [ ] `cargo clippy --workspace --all-targets -- -D warnings` green (continuing the discipline from PR #71).
@@ -357,6 +370,23 @@ Each day's work commits incrementally on `feat/group-a-week-2`. End-of-week PR i
 
 ---
 
-## Status: DRAFT — pending buddy review
+## 11. Buddy review record
 
-When buddy approves, this document moves from DRAFT to APPROVED via a small follow-up PR that flips the header. Then execution starts.
+**Reviewed by buddy-system agent on 2026-05-17.** Three-question format (same as PR #71):
+- (a) Plan matches architecture + schema authority: **PASS** — build-gate value, six degradation modes, lifecycle lift scope all cross-checked against `audit/v0.7-architecture.md` §2.1 + `spike/etw-schemas.md` "implementation gates."
+- (b) Scope correctness (no creep, no shrinkage, no substitution): **PASS** — every deliverable cites an authoritative source; the four parser-level criteria are correctly deferred to week 3+; EDR matrix correctly deferred to v0.7.1; ground rules honored.
+- (c) Realistic stop gates + risks + daily feasibility: **PASS-WITH-NOTE** on Day 4 feasibility — see amendment below.
+
+**Overall verdict: PROCEED.**
+
+**Buddy's two notes, both applied as amendments to this DRAFT v2:**
+
+1. **Crate naming.** First draft wrote `crates/framesage-etw/`. Workspace pattern is `crates/X/` → `framesage-X` (verified: `crates/service/` → `framesage-service`, `crates/sys/` → `framesage-sys`, `crates/core/` → `framesage-core`). Corrected to `crates/etw/` with `[package].name = "framesage-etw"` throughout this document.
+
+2. **Day 4 de-risking.** The mock-injection trait indirection used by Day 4's six tests is now scaffolded on Day 3 (alongside the `EtwSubsystem` return-type refactor that touches the same call sites). Day 4 becomes "write test cases against an existing scaffold," not "build scaffold + tests in one day." Reduces the risk that Day 4 spills into Day 5's service-wiring time. Day 3 gains a stop gate for the abstraction being the wrong shape.
+
+---
+
+## Status: DRAFT v2 — buddy-approved with amendments applied; awaiting user sign-off
+
+When the user signs off, this document moves from DRAFT v2 to APPROVED via a small follow-up PR that flips the header. Then execution starts on `feat/group-a-week-2`.
