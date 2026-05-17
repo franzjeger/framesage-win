@@ -1,6 +1,41 @@
 # FrameSage
 
-A better-than-Process-Lasso scheduler supervisor for Windows. Watches the foreground app and applies per-process scheduling policy through documented user-mode Win32 APIs — anti-cheat-clean by construction.
+A scheduler supervisor for Windows. Watches the foreground app and applies per-process scheduling policy through documented user-mode Win32 APIs — anti-cheat-clean by construction.
+
+## Who is this for? (read first)
+
+**FrameSage is for users who want maximum performance during games or focused work sessions.** It will stop background services (Windows Update, Search, telemetry, OEM updaters, cloud sync) and suspend non-essential processes (OneDrive, Dropbox, GameBar, Widgets, RGB tools) during a session. Everything is reversed when the session ends. Every action is journaled and reviewable after the fact.
+
+**If you'd rather a gentle optimizer, this isn't the right tool.** Process Lasso's ProBalance-only mode or Windows' built-in Game Mode are better fits for that.
+
+FrameSage's contract:
+
+- **Aggressive by design.** Default profiles do not tiptoe around BITS, WSearch, or cloud sync. If you'd be unhappy with `taskkill /f /im OneDrive.exe` once an hour during a 2-hour gaming session, this isn't the tool for you.
+- **Transparent about every action.** Every service stop, process suspend, power-plan change, and Game Mode entry/exit lands in `%LOCALAPPDATA%\FrameSage\activity.jsonl` with a timestamp. Status tab → Recent activity surfaces the same data live.
+- **Fully reversible.** Every action has a documented revert path. A crash-safe journal at `%ProgramData%\framesage\game-mode.journal` recovers stranded sessions on service restart. The panic button (`framesage game-mode off`, or right-click → Exit Game Mode) reverts everything immediately.
+
+You opt in eyes-open via the first-run choice (Aggressive / Balanced / Pinning-only).
+
+## What gets stopped / suspended (full disclosure)
+
+When you launch a game with the default **Aggressive** profile, FrameSage will:
+
+**Stop these services for the duration of the session:**
+SysMain, WSearch, DiagTrack, BITS, DoSvc, WaaSMedicSvc, UsoSvc, WpnService, CDPSvc, DPS, WdiServiceHost, WdiSystemHost, WerSvc, PcaSvc, dmwappushservice, ClickToRunSvc, SDRSVC, defragsvc, MapsBroker, AJRouter, WMPNetworkSvc, Fax, RetailDemo, PhoneSvc, RemoteRegistry, icssvc, TrkWks, stisvc.
+
+**Suspend these processes for the duration of the session:**
+OneDrive.exe, FileCoAuth.exe, Dropbox.exe, googledrivesync.exe, GoogleDriveFS.exe, pCloud.exe, MEGAsync.exe, OneDriveStandaloneUpdater.exe, GoogleUpdate.exe, MicrosoftEdgeUpdate.exe, lghub_updater.exe, AdobeARM.exe, GameBar.exe, GameBarFTServer.exe, GameBarPresenceWriter.exe, WidgetService.exe, Widgets.exe, YourPhone.exe, PhoneExperienceHost.exe, NVIDIA Web Helper.exe, DellSupportAssistRemedyService.exe, HPSupportSolutionsFrameworkService.exe, HpToastSourceApp.exe, LenovoVantageService.exe.
+
+**Also:**
+- Switch the Windows power plan to **High Performance** (or **Ultimate Performance** if available).
+- **Hide the taskbar.**
+- **Pause Windows Update** for the duration of the session.
+- **Pin the game** to the AMD X3D / Cache CCD (or top-ranked cores on non-X3D parts).
+- **Bump priority + I/O priority** for the game process.
+
+Everything above is reversed automatically when you exit the game. The journal records each action with timestamps; the Status tab → Recent Sessions card aggregates per-session counts. If FrameSage crashes mid-session, the orphan-journal recovery on next service start reverts everything before doing anything else.
+
+**Cannot be touched (kernel-critical / security):** the bundled denylist is non-overridable and refuses to modify csrss, lsass, wininit, smss, services, dwm, explorer, audiodg, MsMpEng (Defender), NisSrv, SecurityHealthService, vgc (Vanguard), BEService (BattlEye), EasyAntiCheat.exe, FACEIT_AC, ESEAClient, vgk.sys (Vanguard kernel driver), BEDaisy.sys, GPU vendor services (NVIDIA / AMD / Intel), the RPC subsystem (rpcss), DNS resolver (dnscache), and the audio stack. These are protected from suspend, priority changes, affinity changes, and working-set trim regardless of profile content.
 
 > Companion to [process-lasso-linux-rs](https://github.com/franzjeger/process-lasso-linux-rs). The Linux tool can do something Windows architecturally won't permit (truly remove a CPU from the scheduler at runtime). This Windows tool does the next-best thing legally, and tries to do it smarter than the incumbents.
 
@@ -134,6 +169,21 @@ To remove:
 .\framesage.exe uninstall
 ```
 
+### Complete removal (uninstall + state directories)
+
+`framesage.exe uninstall` removes the SCM service, the binaries, and the Start Menu / Desktop shortcuts. If you also want to delete all state — policy.json, the Game Mode journal, the activity log, and any cached version-info — run these afterwards:
+
+```pwsh
+# Service-owned state (requires elevation):
+Remove-Item -Recurse -Force "$env:ProgramData\framesage"
+
+# Per-user state (no elevation needed):
+Remove-Item -Recurse -Force "$env:LOCALAPPDATA\FrameSage"
+Remove-Item -Recurse -Force "$env:LOCALAPPDATA\Programs\FrameSage"
+```
+
+If the uninstall ran while Game Mode was active, the uninstaller automatically detects the orphan journal and runs an offline revert before removing the service — your services / processes / power plan / taskbar are restored either way.
+
 ### Running in console mode (for development)
 
 The service binary can run as a foreground console process for development, bypassing the SCM:
@@ -220,6 +270,26 @@ cargo check --workspace --target x86_64-pc-windows-gnu
 
 - [ ] **"Pure X3D boot mode"** via `bcdedit /set numproc N` + a dedicated boot entry. The actually-invisible-CCD option for benchmark sessions; trades a reboot for a real topology change. Anti-cheat-safe (boot config, not runtime hook).
 - [ ] **MSIX / signed installer.** Distribution polish.
+
+## Known limitations
+
+- **Single processor group only.** Windows splits machines with >64 logical processors into "processor groups" (Threadripper PRO 96-core counts). FrameSage currently flattens group 0; anything beyond is a v0.2 task.
+- **Intel hybrid P/E detection is approximate.** We use CPPC perf-rank + L3 cache differential to identify cluster boundaries. A proper `PROCESSOR_RELATIONSHIP::EfficiencyClass` readout (the canonical Intel signal) is a v0.2 task.
+- **Re-assert is poll-based, not driver-callback.** The engine re-pushes kernel state for every persistent-pinned PID every ~2 seconds to defeat games that override their own affinity at startup. A driver callback would be lower-jitter but lives outside the anti-cheat-safe envelope this project commits to.
+- **Topology hot-plug is reactive, not predictive.** Sleep/resume cycles auto-trigger a topology refresh (so power-plan core parking that landed during sleep is picked up); manual triggers are available via `framesage refresh-topology` for power-plan tweaks that don't fire a resume event.
+- **Some Windows builds require unsigned-driver popups for ETW kernel consumers.** v0.3 ETW work depends on this and may require Authenticode signing on the binaries before it ships.
+
+## SmartScreen / Authenticode
+
+The shipped binaries are **not yet Authenticode-signed**. On first launch you'll see a SmartScreen prompt; click "More info" → "Run anyway" to proceed. If you're verifying against a published SHA-256 hash:
+
+```pwsh
+Get-FileHash .\framesage.exe -Algorithm SHA256
+Get-FileHash .\framesage-svc.exe -Algorithm SHA256
+Get-FileHash .\framesage-tray.exe -Algorithm SHA256
+```
+
+Compare against the hashes posted in the matching GitHub release notes. Signing is on the roadmap (v0.3 prerequisite for the ETW-consumer work).
 
 ## Why not just use Process Lasso / Xbox Game Bar / AMD's 3D V-Cache Optimizer?
 

@@ -3717,6 +3717,38 @@ mod tests {
         }
     }
 
+    /// Item 4.5 / audit M-04 — the trim-working-set path goes through
+    /// the same `check_process_modifiable` gate as suspend / set
+    /// priority / set affinity. MsMpEng (Defender) is protected
+    /// from trim by the bundled denylist already enforced at the
+    /// engine layer (no special-case trim logic needed). Trimming
+    /// Defender's working set forces it to page-fault its signature
+    /// database back in — a disk-I/O storm that defeats the point
+    /// of Game Mode.
+    ///
+    /// This test pins the protection so a future refactor that
+    /// re-routes `Engine::trim_working_set` around the gate will
+    /// fail loudly. The test asserts via the gate function
+    /// directly because the integration path (Engine::trim_working_set)
+    /// also calls `exe_for_pid` against a live PID — which a unit
+    /// test can't supply without spawning Defender, which is both
+    /// platform-specific and rude.
+    #[test]
+    fn check_process_modifiable_refuses_trim_against_msmpeng() {
+        let safe_list = framesage_gamemode::safe_list::SafeList::bundled();
+        let err = check_process_modifiable(safe_list, "MsMpEng.exe", "trim working set")
+            .expect_err("MsMpEng must be denied for trim");
+        let msg = err.to_string();
+        assert!(
+            msg.to_ascii_lowercase().contains("msmpeng"),
+            "error must name the exe, got: {msg}"
+        );
+        assert!(
+            msg.contains("denylist"),
+            "error must surface the denylist rationale, got: {msg}"
+        );
+    }
+
     /// The other direction of the safety bar — non-denylisted exes MUST
     /// pass the gate. These are the product's aggression surface; refusing
     /// them would defeat the point of the product positioning.
