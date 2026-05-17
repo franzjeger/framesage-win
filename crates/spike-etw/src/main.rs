@@ -98,7 +98,6 @@ const PROVIDER_PAGEFAULT: GUID = GUID::from_u128(0x3D6F_A8D3_FE05_11D0_9DDA_00C0
 /// the main thread for periodic snapshots. `Relaxed` because we don't
 /// need cross-counter ordering — each is independent and the totals
 /// only need to be eventually-consistent at snapshot time.
-#[derive(Default)]
 struct Counters {
     // Per-provider event counts.
     thread_events: AtomicU64,
@@ -125,6 +124,39 @@ struct Counters {
     // bucket (counted in `other_events`). Used as the denominator
     // when computing the breakdown.
     total_events: AtomicU64,
+
+    // Group A week 1 schema research — per-(provider, opcode)
+    // histograms. Lock-free arrays so the callback can bump without
+    // synchronization. 256 opcodes × 4 providers × 8 bytes = ~8 KB
+    // total, fits in two cache lines per provider; cheap.
+    histogram_thread: [AtomicU64; 256],
+    histogram_perfinfo: [AtomicU64; 256],
+    histogram_diskio: [AtomicU64; 256],
+    histogram_pagefault: [AtomicU64; 256],
+}
+
+impl Default for Counters {
+    fn default() -> Self {
+        // const fn AtomicU64::new is available but array repeat with
+        // non-Copy types needs the array_repeat workaround.
+        const ZERO: AtomicU64 = AtomicU64::new(0);
+        Self {
+            thread_events: AtomicU64::new(0),
+            perfinfo_events: AtomicU64::new(0),
+            diskio_events: AtomicU64::new(0),
+            pagefault_events: AtomicU64::new(0),
+            other_events: AtomicU64::new(0),
+            dpc_events: AtomicU64::new(0),
+            isr_events: AtomicU64::new(0),
+            hard_fault_events: AtomicU64::new(0),
+            parse_failures: AtomicU64::new(0),
+            total_events: AtomicU64::new(0),
+            histogram_thread: [ZERO; 256],
+            histogram_perfinfo: [ZERO; 256],
+            histogram_diskio: [ZERO; 256],
+            histogram_pagefault: [ZERO; 256],
+        }
+    }
 }
 
 impl Counters {
@@ -279,11 +311,14 @@ unsafe extern "system" fn event_record_callback(event_record: *mut EVENT_RECORD)
 
     if provider == PROVIDER_THREAD {
         counters.thread_events.fetch_add(1, Ordering::Relaxed);
+        counters.histogram_thread[opcode as usize].fetch_add(1, Ordering::Relaxed);
     } else if provider == PROVIDER_PERFINFO {
         counters.perfinfo_events.fetch_add(1, Ordering::Relaxed);
-        // DPC == 0x2E (46), ISR == 0x42-0x43 (66/67). Some PerfInfo
-        // opcodes overlap across Win10 / Win11 builds; this is the
-        // documented set.
+        counters.histogram_perfinfo[opcode as usize].fetch_add(1, Ordering::Relaxed);
+        // (these dpc/isr counts use the SPIKE's empirically-wrong
+        // opcode constants; the schema research week is what
+        // produces the authoritative mapping. Kept for backwards-
+        // compatible output of the spike's summary block.)
         match opcode {
             0x2E => {
                 counters.dpc_events.fetch_add(1, Ordering::Relaxed);
@@ -295,8 +330,10 @@ unsafe extern "system" fn event_record_callback(event_record: *mut EVENT_RECORD)
         }
     } else if provider == PROVIDER_DISKIO {
         counters.diskio_events.fetch_add(1, Ordering::Relaxed);
+        counters.histogram_diskio[opcode as usize].fetch_add(1, Ordering::Relaxed);
     } else if provider == PROVIDER_PAGEFAULT {
         counters.pagefault_events.fetch_add(1, Ordering::Relaxed);
+        counters.histogram_pagefault[opcode as usize].fetch_add(1, Ordering::Relaxed);
         if opcode == 0x20 {
             counters.hard_fault_events.fetch_add(1, Ordering::Relaxed);
         }
@@ -323,6 +360,13 @@ struct Cli {
     /// Print per-second progress lines (verbose).
     #[arg(long)]
     verbose: bool,
+
+    /// Group A week 1 schema research — at end of run, print
+    /// per-(provider, opcode) histograms. These are the empirical
+    /// observations cross-checked against MSDN / SDK / PerfView in
+    /// /spike/etw-schemas.md.
+    #[arg(long)]
+    histogram: bool,
 }
 
 // ─── Main ─────────────────────────────────────────────────────────────────────
@@ -416,10 +460,49 @@ fn main() -> Result<()> {
 
     // Final stats — counters + dropped-event totals.
     print_final_summary(&counters);
+    if cli.histogram {
+        print_histograms(&counters);
+    }
     println!();
     verify_session_gone()?;
 
     Ok(())
+}
+
+fn print_histograms(counters: &Counters) {
+    println!();
+    println!("====================================================");
+    println!("  Per-(provider, opcode) histograms");
+    println!("  (Group A week 1 — empirical schema research)");
+    println!("====================================================");
+
+    let print_one = |label: &str, arr: &[AtomicU64; 256]| {
+        let total: u64 = arr.iter().map(|a| a.load(Ordering::Relaxed)).sum();
+        if total == 0 {
+            return;
+        }
+        println!();
+        println!("  {label}  (total {total} events)");
+        let mut rows: Vec<(usize, u64)> = arr
+            .iter()
+            .enumerate()
+            .map(|(i, a)| (i, a.load(Ordering::Relaxed)))
+            .filter(|(_, c)| *c > 0)
+            .collect();
+        rows.sort_by(|a, b| b.1.cmp(&a.1));
+        for (opcode, count) in &rows {
+            let pct = (*count as f64) / (total as f64) * 100.0;
+            println!(
+                "    opcode 0x{:02X} ({:>3}): {:>10} events  ({:>6.2}%)",
+                opcode, opcode, count, pct
+            );
+        }
+    };
+
+    print_one("Thread", &counters.histogram_thread);
+    print_one("PerfInfo", &counters.histogram_perfinfo);
+    print_one("DiskIo", &counters.histogram_diskio);
+    print_one("PageFault", &counters.histogram_pagefault);
 }
 
 fn start_session(buffer_mult: f64) -> Result<CONTROLTRACE_HANDLE> {
