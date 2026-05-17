@@ -569,11 +569,24 @@ Populated as community-outreach responses arrive. Each row is
 **evidence-level** per §7 "Evidence-level results" — anecdotal
 "seemed fine" responses do not get logged here.
 
+### 10.1 Outreach sent
+
+| Date sent (UTC) | Channel | Issue / link | Day-5 cutoff (UTC) | Day-5 cutoff (local UTC+2) | Status |
+|---|---|---|---|---|---|
+| 2026-05-17 09:18:50 | GitHub issue, `microsoft/perfview` | [#2422](https://github.com/microsoft/perfview/issues/2422) | 2026-05-22 09:18:50 | 2026-05-22 11:18 | awaiting response |
+| 2026-05-17 09:19:13 | GitHub issue, `winsiderss/systeminformer` | [#2916](https://github.com/winsiderss/systeminformer/issues/2916) | 2026-05-22 09:19:13 | 2026-05-22 11:19 | awaiting response |
+| _(02 Sysinternals — held pending user sign-off on recipient-facing body)_ |  |  |  |  |  |
+| _(04 r/sysadmin — user posting manually via own Reddit account)_ |  |  |  |  |  |
+
+Day-5 hard cutoff applies per outreach per `spike/etw-edr-report.md` §7. If no evidence-level response has landed by the listed cutoff, escalate that product (Defender ATP / CrowdStrike Falcon / SentinelOne Singularity) immediately to Option B (paid in-house validation) without further waiting.
+
+### 10.2 Evidence-level responses received
+
 | Date sent | Respondent | Product | Date responded | Evidence link | Criterion satisfied | Notes |
 |---|---|---|---|---|---|---|
-| _(none yet — outreach begins on PR #68 merge)_ |  |  |  |  |  |  |
+| _(none yet)_ |  |  |  |  |  |  |
 
-When the table fills to satisfy criteria §6.1 #1 (clean run
+When this table fills to satisfy criteria §6.1 #1 (clean run
 on all three products) + #2 (gaming-load run on at least one)
 + #3 (signed binary) + #4 (vendor allow-list, if any
 remediation was required), the v0.7.1 default-on-flip PR
