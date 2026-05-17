@@ -3344,7 +3344,11 @@ impl FramesageApp {
                         });
                         if is_editing {
                             let mut edited = p.clone();
-                            render_profile_editor(ui, &mut edited);
+                            // Item 4.13 — pass the live process
+                            // snapshot so the editor can render the
+                            // discover-processes section against
+                            // real data.
+                            render_profile_editor(ui, &mut edited, &self.processes.rows);
                             if edited != *p {
                                 ops.push(Op::UpdateProfile(id.0.clone(), Box::new(edited)));
                             }
