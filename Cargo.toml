@@ -68,6 +68,11 @@ tokio = { version = "1", features = [
 # Sync
 parking_lot = "0.12"
 
+# Compile-time assertions — used by framesage-etw's supervisor module
+# to enforce the ConsumerState: RefUnwindSafe contract per the
+# catch_unwind soundness analysis in v0.7 week-2 plan §3.5 #4.
+static_assertions = "1"
+
 # CLI
 clap = { version = "4", features = ["derive"] }
 

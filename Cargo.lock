@@ -976,8 +976,10 @@ name = "framesage-etw"
 version = "0.5.0"
 dependencies = [
  "anyhow",
+ "parking_lot",
  "static_assertions",
  "thiserror 1.0.69",
+ "tokio",
  "tracing",
  "tracing-test",
  "windows",

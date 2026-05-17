@@ -12,6 +12,21 @@ description = "v0.7 closed-loop ETW kernel-event consumer for the framesage-svc 
 anyhow = { workspace = true }
 tracing = { workspace = true }
 thiserror = { workspace = true }
+# tokio::sync::oneshot for the consumer-thread → supervisor exit
+# signal (per §3.5 + §3.6). We don't need the runtime here — just
+# the sync primitives — but pulling tokio through workspace deps
+# locks the version.
+tokio = { workspace = true }
+# parking_lot::Mutex for ConsumerState.trace_handle (avoids the
+# poison-on-panic semantics of std::sync::Mutex, which would
+# interact with the catch_unwind boundary in unintended ways).
+parking_lot = { workspace = true }
+# static_assertions is promoted from dev-deps to regular deps in v4.2
+# Day 3: the assert_impl_all!(ConsumerState: RefUnwindSafe) guard in
+# supervisor.rs fires at every compile (not just test compile), so
+# the macro must be visible to all builds. The macro expands to a
+# const trait check in release builds — zero runtime cost.
+static_assertions = { workspace = true }
 
 [target.'cfg(windows)'.dependencies]
 windows = { workspace = true, features = [
@@ -40,8 +55,3 @@ windows = { workspace = true, features = [
 # tests assert on captured tracing output rather than a channel
 # send. Dev-only — does NOT ship in the production binary.
 tracing-test = "0.2"
-
-# static_assertions provides compile-time assert_impl_all! for
-# the RefUnwindSafe regression guard in §3.5 #4. Also dev-only;
-# the macro expands to an empty const block in release builds.
-static_assertions = "1"
