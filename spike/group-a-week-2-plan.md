@@ -1,6 +1,6 @@
 # v0.7 Group A — Week 2 implementation plan
 
-**Status:** APPROVED 2026-05-17. Execution starts on `feat/group-a-week-2` upon PR #73 merge. (Plan revision history preserved in §11: v1 → v2 buddy-amended → v3 user-five-fix → v4 user-four-fix → v4.1 buddy-two-micro-fix → APPROVED.)
+**Status:** APPROVED 2026-05-17, v4.2 amendment applied 2026-05-17 (fresh-eyes re-read per the session-handoff document merged via PR #76; resolves once this branch merges to main, at which point handoff §9 line 4 — "Do NOT auto-merge PR #73 without reviewing the APPROVED plan content first" — is co-located with this plan on main). Execution starts on `feat/group-a-week-2` upon PR #73 merge. (Plan revision history preserved in §11: v1 → v2 buddy-amended → v3 user-five-fix → v4 user-four-fix → v4.1 buddy-two-micro-fix → APPROVED → v4.2 fresh-eyes-three-fix → re-APPROVED.)
 **Authoritative inputs:**
 - `audit/v0.7-architecture.md` §2.1 (degradation modes, build gate, LocalSystem privilege model) and "Phase 3 acceptance criteria → Group A — ETW foundation"
 - `spike/etw-schemas.md` "Group A weeks 2-7 implementation gates" + "Implementation requirements driven by this document"
@@ -40,25 +40,28 @@ crates/etw/                — package name: framesage-etw
     │                      SessionShutdownHandle, SupervisorLoop,
     │                      DegradationMode, closed_loop_enabled_for_this_build)
     ├── session.rs       — EtwSession lifetime: start / stop / consumer
-    │                      thread / drop-rate query loop / stale cleanup
+    │                      thread / drop-rate query loop / stale cleanup;
+    │                      inline #[cfg(test)] mod tests for degradation modes
     ├── build_gate.rs    — RtlGetVersion wrapper + the MIN_BUILD_FOR_CLOSED_LOOP
-    │                      const + closed_loop_enabled_for_this_build()
+    │                      const + closed_loop_enabled_for_this_build();
+    │                      inline #[cfg(test)] mod tests for build-gate predicate
     ├── degradation.rs   — DegradationMode enum + DegradationEvent struct
     │                      (sink-fed in week 2; channel wiring deferred to
     │                      Group C per v3 secondary decision)
-    ├── supervisor.rs    — SupervisorLoop type per §3.5 + §3.6: holds the
-    │                      consumer-thread join handle, the oneshot
-    │                      ConsumerExitReason receiver, and an
-    │                      externally-supplied event sink. Day 3 scaffolds
-    │                      and tests this in isolation; Day 5 instantiates
-    │                      it inside crates/service/ with the production
-    │                      sink (tracing-emit closure) wired.
-    └── tests/           — unit tests for build_gate, degradation modes,
-        │                  and SupervisorLoop
-        ├── build_gate_tests.rs
-        ├── degradation_tests.rs
-        └── supervisor_tests.rs
+    └── supervisor.rs    — SupervisorLoop type per §3.5 + §3.6: holds the
+                           consumer-thread join handle, the oneshot
+                           ConsumerExitReason receiver, and an
+                           externally-supplied event sink. Day 3 scaffolds
+                           and tests this in isolation; Day 5 instantiates
+                           it inside crates/service/ with the production
+                           sink (tracing-emit closure) wired. Inline
+                           #[cfg(test)] mod tests for the synthetic-panic
+                           consumer scenario and the
+                           static_assertions::assert_impl_all!(ConsumerState: RefUnwindSafe)
+                           compile-time regression guard.
 ```
+
+**Test location convention (per v4.2 amendment — Self-pass A/D):** all tests live inline as `#[cfg(test)] mod tests` blocks in their owning source module, NOT in a `tests/` directory. Rationale: the session and degradation tests use `#[cfg(test)] pub struct MockEtwSysCalls` (§3.4) and `#[cfg(test)] pub fn start_with_syscalls` (§3.2); the build_gate tests use `pub(crate) set_build_override` (§3.1); the supervisor tests construct a `SessionShutdownHandle` whose only constructor path goes through `start_with_syscalls`. None of those items is visible to integration tests in `crates/etw/tests/` because integration tests link the lib as an external dep and only see `pub` items. Inline `mod tests` runs against the lib with `cfg(test)` set, so all the test-only seams are visible. (Cross-crate integration tests for real-Windows behavior land in week 3+ when there's something to assert against beyond mocks.)
 
 **Naming convention note (per buddy review of this plan):** the
 workspace pattern is `crates/X/` with `[package].name =
@@ -140,6 +143,40 @@ pub fn detected_build() -> Option<u32> { /* ... */ }
 **Implementation notes:**
 - `RtlGetVersion` lives in `ntdll.dll`. Bind via `windows::Win32::System::SystemInformation::OSVERSIONINFOEXW` + `RtlGetVersion`.
 - The first call caches the result behind a `OnceLock<Option<u32>>` so repeated calls are free. Callers can hit `closed_loop_enabled_for_this_build()` from anywhere without worrying about cost.
+
+**Test-only injection (per v4.2 amendment — Finding 1):**
+
+```rust
+#[cfg(test)]
+thread_local! {
+    /// Per-test override. `Some(Ok(build))` makes detected_build()
+    /// return `Some(build)`; `Some(Err(()))` simulates a
+    /// RtlGetVersion failure (detected_build() returns `None`);
+    /// `None` (the default) lets the production path run and hit
+    /// the real RtlGetVersion via the OnceLock cache.
+    ///
+    /// thread_local — not static Mutex — so parallel tests don't
+    /// step on each other. Each test thread gets its own slot.
+    static BUILD_OVERRIDE: std::cell::RefCell<Option<Result<u32, ()>>>
+        = const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+pub(crate) fn set_build_override(v: Option<Result<u32, ()>>) {
+    BUILD_OVERRIDE.with(|cell| *cell.borrow_mut() = v);
+}
+```
+
+`detected_build()`'s `#[cfg(test)]` arm consults `BUILD_OVERRIDE` before falling through to the real `RtlGetVersion` call. Production builds (the `#[cfg(not(test))]` arm) call `RtlGetVersion` directly with no override branch — the test seam compiles out entirely in release builds.
+
+Day 1's three unit tests use this seam:
+- (a) `set_build_override(Some(Ok(26100))); assert!(closed_loop_enabled_for_this_build())`
+- (b) `set_build_override(Some(Ok(22631))); assert!(!closed_loop_enabled_for_this_build()); assert_eq!(detected_build(), Some(22631))`
+- (c) `set_build_override(Some(Err(()))); assert_eq!(detected_build(), None)`
+
+Each test calls `set_build_override(None)` on teardown so a panic mid-test doesn't poison subsequent tests on the same thread. Cleanest pattern: a `BuildOverrideGuard` RAII wrapper that resets on Drop.
+
+**Why a build_gate-local seam, not the §3.4 `EtwSysCalls` trait:** the trait is for the session API surface (start/control/open/process/close/rtl_get_version) — six methods bundled together because EtwSession calls all six. The build gate calls one function, has no session-state coupling, and lands on Day 1 before the trait exists. Two seams for two scopes is intentional. §3.4 makes the same note for symmetry. The `RealEtwSysCalls::rtl_get_version` impl can delegate to `build_gate::detected_build()` so production code has a single call site, but the trait isn't the test-mocking seam for the build gate.
 
 **Rationale:** Architecture §2.1's "Build gate" subsection mandates the predicate-short-circuit pattern at `EtwSession::start()`. Putting the check in its own module makes it independently testable and stops the predicate from leaking into the session code.
 
@@ -283,6 +320,8 @@ pub enum DegradationMode {
 ### 3.4 Mock injection abstraction
 
 **Why this section exists:** DRAFT v2 referenced "a `#[cfg(test)]`-gated trait indirection on the `StartTraceW` / `ControlTraceW` / `RtlGetVersion` call sites" without specifying the surface. User flagged this as a load-bearing gap in v3 instructions. This section is the concrete specification.
+
+**Relationship to build_gate's injection seam (per v4.2 amendment — Finding 1):** the build_gate module uses its own `#[cfg(test)] thread_local!` override (specified in §3.1) rather than this trait. Two seams for two scopes: the trait bundles six session-API calls invoked by `EtwSession`, the build_gate seam wraps one call invoked from anywhere. The trait scaffolds on Day 3; build_gate tests run on Day 1. `RealEtwSysCalls::rtl_get_version` can delegate to `build_gate::detected_build()` so production has one call site for the version probe, but the test substitution lives at each module's own seam.
 
 **Trait surface — `EtwSysCalls`:**
 
@@ -482,7 +521,7 @@ assert!(matches!(subsystem, EtwSubsystem::Disabled(DegradationMode::AccessDenied
 4. **UnwindSafe analysis:**
    - The consumer thread's captured state is `Arc<ConsumerState>` where `ConsumerState` holds (a) atomic counters (`AtomicU64` — `UnwindSafe`), (b) the ETW session handle (`CONTROLTRACE_HANDLE` is a wrapper around a `usize`, `UnwindSafe`), (c) a clone of the syscall impl `S: EtwSysCalls` (`RealEtwSysCalls` is ZST, `UnwindSafe`).
    - **`AssertUnwindSafe` is used at the catch_unwind site** because the closure captures `state: Arc<ConsumerState>` — `Arc<T>` is `UnwindSafe` only if `T: RefUnwindSafe`. `ConsumerState` contains only `AtomicU64` and handles (both `RefUnwindSafe`), so the assert is sound. Documented inline in `session.rs` with the audit ground rule explaining the soundness.
-   - If a future change adds a field to `ConsumerState` that is NOT `RefUnwindSafe` (e.g. a `Cell<T>` or a custom mutex), the assert becomes unsound. A `static_assertions::assert_impl_all!(ConsumerState: RefUnwindSafe)` test in `tests/build_gate_tests.rs` (since it's a compile-time assert, location is arbitrary) catches this regression at the next build.
+   - If a future change adds a field to `ConsumerState` that is NOT `RefUnwindSafe` (e.g. a `Cell<T>` or a custom mutex), the assert becomes unsound. A `static_assertions::assert_impl_all!(ConsumerState: RefUnwindSafe)` declaration lands inline in `src/supervisor.rs` (per v4.2 amendment — Finding 1 cross-section consistency: the guard's natural home is alongside the `ConsumerState` type it guards, not in a build_gate test file). Compile-time assert; catches the regression at the next build.
 
 5. **Conflict with architecture §2.1 mode 5 — surfaced for follow-up architecture amendment:**
 
@@ -603,7 +642,7 @@ where
 }
 ```
 
-**Day 3 unit test (`tests/supervisor_tests.rs`):**
+**Day 3 unit test (inline `#[cfg(test)] mod tests` in `src/supervisor.rs`, per v4.2 test-location convention in §2):**
 
 Drives `SupervisorLoop` with a synthetic consumer thread that panics. Asserts the sink received `DegradationEvent { mode: ConsumerPanic, .. }`. The sink is a test-mode closure that pushes into `Arc<Mutex<Vec<DegradationEvent>>>`; the test asserts the vec contains exactly one event with the expected mode after `supervisor.run().await`. This validates the supervisor's select-loop logic in isolation from any service-crate concerns.
 
@@ -672,7 +711,7 @@ The Cargo.toml adds an `_asm_baseline` feature (underscore-prefixed — internal
 
 If the asm diff shows non-trivial differences — branch indirection, additional stack frames, or any sign of dyn-dispatch — the abstraction has failed its production-cost contract. Day 3 stop gate fires.
 
-**Day 3 ALSO scaffolds the `SupervisorLoop` type per §3.6:** the `SupervisorLoop<F>` struct, the `ConsumerExitReason` enum, the `tokio::sync::oneshot` plumbing, the `std::panic::catch_unwind` wrapper around the consumer body (with `AssertUnwindSafe` and the `static_assertions` regression-guard), and `tests/supervisor_tests.rs` driving the type with a synthetic-panic consumer and asserting the event-sink fires once with `DegradationMode::ConsumerPanic`.
+**Day 3 ALSO scaffolds the `SupervisorLoop` type per §3.6:** the `SupervisorLoop<F>` struct, the `ConsumerExitReason` enum, the `tokio::sync::oneshot` plumbing, the `std::panic::catch_unwind` wrapper around the consumer body (with `AssertUnwindSafe` and the `static_assertions` regression-guard), and the inline `#[cfg(test)] mod tests` in `src/supervisor.rs` driving the type with a synthetic-panic consumer and asserting the event-sink fires once with `DegradationMode::ConsumerPanic`.
 
 The supervisor *task instance* (a tokio spawn calling `supervisor.run().await`) is NOT created on Day 3 — that's Day 5. Day 3 produces the type + its standalone unit test; Day 5 wires the instantiation into `crates/service/src/runtime.rs`.
 
@@ -686,7 +725,7 @@ The supervisor *task instance* (a tokio spawn calling `supervisor.run().await`) 
 
 ### Day 4 — degradation-mode unit tests (against Day-3 scaffold)
 
-**Deliverable:** `tests/degradation_tests.rs` contains six tests, one per `DegradationMode` variant. The mock-injection scaffold from Day 3 is the substrate; Day 4 is writing test cases against it, NOT building the scaffold from scratch. Each test injects a synthetic failure at the appropriate layer:
+**Deliverable:** inline `#[cfg(test)] mod tests` in `src/session.rs` (or `src/degradation.rs` — engineer picks the natural home; v4.2 test-location convention applies) contains six tests, one per `DegradationMode` variant. The mock-injection scaffold from Day 3 is the substrate; Day 4 is writing test cases against it, NOT building the scaffold from scratch. Each test injects a synthetic failure at the appropriate layer:
 - **Mode 1 (AccessDenied):** `StartTraceW` mock returns `ERROR_ACCESS_DENIED`. Assert `start()` returns `EtwSubsystem::Disabled(AccessDenied)`. NOT against a real EDR — that's a v0.7.1 gate.
 - **Mode 2 (AlreadyExists):** mock returns `ERROR_ALREADY_EXISTS` even after `cleanup_stale_session()`. Assert disabled-with-`AlreadyExists`. Verify cleanup was attempted (call count).
 - **Mode 3 (KernelDrops):** `query_stats` mock returns `RealTimeBuffersLost = 5`. Assert that a `DegradationEvent::KernelDrops { rate }` is emitted on the next poll cycle.
@@ -735,10 +774,13 @@ The `SupervisorLoop` type itself ships from `crates/etw/` per §3.6 — Day 5 on
 3. Update policy to `closed_loop_enabled: true`. Restart service. Capture `logman query FramesageEtw -ets` literal output. Confirm session is running.
 4. Stop service via SCM. Capture `logman query FramesageEtw -ets` literal output. Confirm session is gone.
 5. Run all unit tests: `cargo test -p framesage-etw -- --nocapture`. Confirm 6/6 degradation-mode tests pass.
+6. **Survives-service-restart verification (per v4.2 amendment — Finding 2 Option B):** with `closed_loop_enabled: true`, start the service, then **force-kill** the service process (not orderly SCM stop — use `Stop-Process -Force -Id <pid>` so the graceful `ControlTraceW(STOP)` path doesn't run). Immediately capture `logman query FramesageEtw -ets` to confirm the session is leaked (expected: session still present, owned by no process). Then restart via SCM (`Start-Service framesage`). Capture `logman query FramesageEtw -ets` again to confirm the new service start ran `cleanup_stale_session()` AND opened a fresh session (expected: exactly one `FramesageEtw` session present, owned by the new service PID). Finally stop the service cleanly via SCM. Capture `logman query FramesageEtw -ets` one last time to confirm the session is gone. **Four literal `logman query` outputs captured**: post-start, post-force-kill, post-restart, post-clean-stop.
 
 Put all literal command outputs in `spike/group-a-week-2-report.md` (created at EOD as the week's deliverable doc).
 
-**Stop gate:** if any of the EOD checks deviates from expected (especially: a stale session left behind after shutdown — that's a regression against architecture §2.1's "Survives service restarts" promise), STOP and DO NOT mark week 2 complete.
+**Stop gates:**
+- If any of EOD steps 1–5 deviates from expected (especially: a stale session left behind after orderly shutdown — that's a regression against architecture §2.1's "Survives service restarts" promise), STOP and DO NOT mark week 2 complete.
+- **Step 6 stop gate (per v4.2 amendment):** if the post-restart `logman query` shows the leaked session was NOT cleaned up (i.e. the new service start failed to invoke `cleanup_stale_session()` or the cleanup failed silently), this is a Day-2-session.rs-lift regression and architecture §2.1's "survives service restarts" criterion is unsatisfied. **STOP — not a "noted, will fix later."** Day 2's `session.rs` lift is incomplete and needs revision before week 2 can mark complete. The spike binary already implements this path; the lift must preserve it.
 
 ---
 
@@ -746,12 +788,17 @@ Put all literal command outputs in `spike/group-a-week-2-report.md` (created at 
 
 By end of week, the new crate has:
 
-| Test file | Cases | What they verify |
-|---|---|---|
-| `tests/build_gate_tests.rs` | 3 cases | Predicate returns true ≥ 26100, false at 22631, false on `RtlGetVersion` failure. Plus the compile-time `static_assertions::assert_impl_all!(ConsumerState: RefUnwindSafe)` guard from §3.5 #4. |
-| `tests/degradation_tests.rs` | 6 cases | All six modes round-trip through `EtwSession::start()`/`query_stats()` via the `MockEtwSysCalls` substrate from §3.4 |
+All test modules per the test-location convention in §2: inline `#[cfg(test)] mod tests` blocks in the relevant source file. Three patterns of one shape, not three patterns of three shapes.
 
-Total: 9 tests in framesage-etw (3 build-gate + 6 degradation). Service crate gains 1 integration test asserting the build-gate-fallthrough log message format.
+| Source file | Test count | What the tests assert |
+|---|---|---|
+| `src/build_gate.rs` | 3 runtime cases | (a) `closed_loop_enabled_for_this_build()` returns `true` at synthetic build ≥ 26100 via `set_build_override(Some(Ok(26100)))`; (b) returns `false` at synthetic 22631 + `detected_build() == Some(22631)`; (c) returns `false` on synthetic `RtlGetVersion` failure + `detected_build() == None`. |
+| `src/session.rs` (or `src/degradation.rs` — engineer picks the natural home during Day 3 implementation) | 6 runtime cases (one per `DegradationMode` variant) | All six modes round-trip through `EtwSession::start_with_syscalls()` / `query_stats()` via the `MockEtwSysCalls` substrate from §3.4. Mode-specific assertions detailed in §4 Day 4. |
+| `src/supervisor.rs` | 1 runtime case + 1 compile-time guard | Runtime: drives `SupervisorLoop` with a synthetic-panic consumer; asserts the event sink received exactly one `DegradationEvent { mode: ConsumerPanic, .. }` (§4 Day 3 + Mode 5 detail in §4 Day 4). Compile-time: `static_assertions::assert_impl_all!(ConsumerState: RefUnwindSafe)` regression guard (§3.5 #4). |
+
+Total: 10 runtime test cases in `framesage-etw` (3 build-gate + 6 degradation + 1 supervisor) + 1 compile-time assertion. Service crate gains 1 integration test asserting the build-gate-fallthrough log message format.
+
+**Survives-service-restart coverage (per v4.2 amendment — Finding 2 Option B):** architecture §2.1's "Survives service restarts" acceptance criterion (architecture line 1585) is satisfied in week 2 via **Day 5 EOD verification step 6** (manual kill-restart sequence with four literal `logman query` captures), NOT via a new unit/integration test in the inventory above. Rationale: the behavior depends on the real Windows ETW state, the spike code already implements it, and an automated integration test for force-kill semantics would force an integration-test framework decision that hasn't been made for week 2. The EOD verification + STOP-gate-if-it-fails (per §4 Day 5) provides the same guarantee in week-2 scope. An automated test layered on top is a week 3+ candidate once the integration-test approach is settled.
 
 **Cut from DRAFT v2 (per v3 fix #5):** `tests/serialization_tests.rs` (2 cases for `DegradationMode` serde round-trip). Rationale: the crate has no `serde` dependency at this point (the §2 Cargo.toml block doesn't list it), and IPC consumption of `DegradationMode` is a Group C concern — Group C will add the IPC-shape tests when the IPC surface actually consumes the type. Premature testing here would force a `serde` dependency that has no production use yet.
 
@@ -795,6 +842,9 @@ These are the explicit pass-conditions for "week 2 is complete":
 - [ ] `cargo build -p framesage-svc --release` green.
 - [ ] Service binary verified on a Win11 26200 dev box per Day 5 EOD checklist; literal command outputs captured in `spike/group-a-week-2-report.md`.
 - [ ] `EtwSession::start()` short-circuits cleanly on build < 26100 (verified via test, not just compiled).
+- [ ] **Day 5 EOD step 6 (kill-restart sequence) succeeds** with four literal `logman query` outputs captured in `spike/group-a-week-2-report.md` §12.4 step 7. Satisfies architecture §2.1's "Survives service restarts" acceptance criterion (per v4.2 amendment — Finding 2).
+- [ ] **Day 3 codegen-parity asm capture** present in `spike/group-a-week-2-report.md` §12.4 step 6 with both versions extracted to function-body scope (not the whole `.s` file) and the no-dynamic-dispatch criterion visually verified (per v4.2 amendment — Finding 3).
+- [ ] **Test inventory matches v4.2 §5** — `cargo test -p framesage-etw -- --list` shows ≥ 10 test entries matching the patterns `build_gate::tests::*` (3), `session::tests::*` OR `degradation::tests::*` (6), `supervisor::tests::*` (1). The static_assertions compile-time guard is verified by the build succeeding, not by the test list (per v4.2 amendment — Self-pass A: tests are inline; engineer picks session vs degradation for the six-mode home during Day 3 implementation; either location satisfies this criterion).
 - [ ] No new clippy `#[allow]`s introduced (any added must be justified per the PR #71 pattern).
 - [ ] No scope creep against this plan — anything that surfaces mid-week and tempts a "while we're here" diff gets surfaced to the user instead of folded in.
 
@@ -898,7 +948,7 @@ User resolved all four (2026-05-17). DRAFT v4 applies the resolutions:
 
 2. **d.2 — §4 Day 3 had 4 stops; §6 restated only 1** → User chose **collapse §6 into a one-line-per-day index** rather than full restatement. v4 §6 lists only "Day N — topic(s); see §4 Day N" rows, with an explicit drift-prevention rule that any §4 stop-gate edit must update this index in the same commit. Eliminates the structural duplication that allowed v3's silent drift.
 
-3. **d.3 — supervisor "created on Day 5" vs "scaffolded on Day 3"** → User chose **explicit split with a concrete typed scaffold.** v4 adds §3.6 specifying `SupervisorLoop<F>` in `crates/etw/src/supervisor.rs` (Day 3 scaffold) — a type taking `(consumer-thread JoinHandle, oneshot::Receiver<ConsumerExitReason>, on_event: F)`. Day 3 unit-tests it in isolation via `tests/supervisor_tests.rs` driving a synthetic-panic consumer. Day 5 instantiates the type inside the service crate with the production sink (a tracing-emit closure) wired. Two artifacts, two layers, two days.
+3. **d.3 — supervisor "created on Day 5" vs "scaffolded on Day 3"** → User chose **explicit split with a concrete typed scaffold.** v4 adds §3.6 specifying `SupervisorLoop<F>` in `crates/etw/src/supervisor.rs` (Day 3 scaffold) — a type taking `(consumer-thread JoinHandle, oneshot::Receiver<ConsumerExitReason>, on_event: F)`. Day 3 unit-tests it in isolation via inline `#[cfg(test)] mod tests` in `src/supervisor.rs` (per v4.2 test-location convention) driving a synthetic-panic consumer. Day 5 instantiates the type inside the service crate with the production sink (a tracing-emit closure) wired. Two artifacts, two layers, two days.
 
 4. **Secondary — `SystemEvent` channel doesn't carry `DegradationMode` payload** → User chose **Option C** (defer channel wiring to Group C). v4 specifies: week 2 emits via `tracing::error!`, and Day 4's Mode 5 test asserts on captured tracing output using the `tracing-test` crate's `#[traced_test]` attribute + `logs_contain` assertion. `tracing-test` and `static_assertions` added to the §2 Cargo.toml `[dev-dependencies]` block. The actual channel wire materializes in Group C when the UI banner consumer exists.
 
@@ -910,6 +960,20 @@ User also set a process flag for the v4 buddy review: **watch what category of i
 
 - If v4 buddy surfaces a *different* category of issue (e.g. genuinely new (a) authority gap, (b) scope-creep, (c) feasibility) — rhythm working as intended; sign off and execute.
 - If v4 buddy surfaces *same-category* (d) issues (more internal-consistency slips) — structural problem with this plan. The author is relying on buddy to catch slips post-hoc rather than internalizing (d) while writing. **In that case, STOP and surface to user. Do not iterate to v5 without explicit user direction.** The intervention might be pair-writing the plan with buddy from scratch rather than continuing to review finished drafts, but that's a user decision, not a default the auditor reaches for.
+
+### v4.2 amendment — fresh-eyes re-read of APPROVED plan surfaced three gaps
+
+Per the session-handoff document merged via PR #76 (resolves once this branch merges to main); §9 line 4 reads: **"Do NOT auto-merge PR #73 without reviewing the APPROVED plan content first."** The fresh session re-read this plan against a six-bullet checklist; three findings surfaced; user resolved each:
+
+1. **Finding 1 — Day 1 build_gate.rs lacked an injection-seam spec.** The Day 1 unit tests required mocking the build number AND a `RtlGetVersion` failure path, but §3.1 didn't specify a seam (the `EtwSysCalls` trait from §3.4 scaffolds on Day 3, not Day 1). v4.2 adds a `#[cfg(test)] thread_local!<RefCell<Option<Result<u32, ()>>>>` override + `pub(crate) set_build_override()` helper to §3.1. §3.4 gains a one-line note documenting that build_gate uses its own seam (two patterns intentional for two scopes).
+
+2. **Finding 2 — architecture §2.1's "Survives service restarts" acceptance criterion (architecture line 1585) was unsatisfied.** §5 test inventory had no test for it; §4 Day 5 EOD covered shutdown but not crash-leak + cleanup-on-restart; §7 was silent. User chose Option B: §4 Day 5 EOD gains step 6 (manual kill-restart sequence with four literal `logman query` captures); §12.4 mirrors as step 7; §7 acceptance gains the corresponding checkbox. Step 6 carries a STOP gate: if cleanup-on-restart fails, Day 2's session.rs lift is incomplete and week 2 cannot mark complete.
+
+3. **Finding 3 — §12.4 step 6 (asm-codegen-parity) lacked an extraction step.** The plan specified `cargo rustc --emit=asm` commands but no method to extract the relevant function body from a 100s-of-KB `.s` file. v4.2 specifies both `cargo asm` and `awk`-based extraction, plus the visual-verification acceptance criterion ("no `call` through vtable, no indirect `jmp` through register loaded from memory") + literal-output formatting requirements.
+
+**Process observation (applied per user decision — option α):** the planning-phase 4Q question (d) is extended to include cross-document consistency. (d) becomes "does this artifact agree with itself AND with the authoritative documents it references?" Dependency arrows captured in `audit/buddy-format-implementation-phase.md` §X (lands as part of PR #75 patches). Implementation-phase 5Q question (5) inherits the extended scope. The buddy run on this v4.2 amendment uses the extended (d) — first exercise of the extension on itself.
+
+Captured in `audit/buddy-disagreements.md` Entry 5.
 
 ---
 
@@ -960,14 +1024,38 @@ State explicitly whether the 9 framesage-etw cases + 1 service integration test 
 
 ### 12.4 EOD verification checklist (Day 5)
 
-Repeat the five-step checklist from §4 Day 5 with literal command outputs:
+Repeat the six-step checklist from §4 Day 5 with literal command outputs:
 
 1. `Get-Service framesage` output for `closed_loop_enabled: false` (static-rule path)
 2. `logman query FramesageEtw -ets` output for `closed_loop_enabled: true` after restart (session running)
 3. `logman query FramesageEtw -ets` output after `Stop-Service framesage` (session gone, no leftover)
 4. `cargo test -p framesage-etw -- --nocapture` output (already in §12.3 — cross-reference)
 5. INFO-log line showing the build-gate path on a Win11 26200 (build is supported; closed-loop initializes) AND on a synthetically-mocked unsupported build (static-rule fallback log line)
-6. **Day 3 codegen-parity asm capture** (per §4 Day 3): paste the `cargo rustc --emit=asm` output for `EtwSession::<RealEtwSysCalls>::<one_method>` AND for the no-trait baseline. Either inline-include both asm snippets (one per code block) OR include a unified diff of the two. Annotate clearly which is trait-dispatched and which is the baseline. **This is the load-bearing evidence that the `EtwSysCalls` abstraction has zero production cost — without it the abstraction's no-overhead claim is unsupported.**
+6. **Day 3 codegen-parity asm capture** (per §4 Day 3 + v4.2 amendment — Finding 3): the asm capture and its extraction step are both specified here so the EOD-report writer can't paste a 200 KB `.s` file and call it done.
+
+   **Capture commands** (the two `.s` files):
+   ```powershell
+   cargo rustc -p framesage-etw --release --lib -- --emit=asm -C codegen-units=1
+   cargo rustc -p framesage-etw --release --lib --features _asm_baseline -- --emit=asm -C codegen-units=1
+   # .s files land in target\release\deps\framesage_etw-<hash>.s and
+   # target\release\deps\framesage_etw-<hash>.s for the baseline build
+   # (rebuild between runs to disambiguate, or use --target-dir).
+   ```
+
+   **Extraction step** — pull only the relevant function body, not the whole `.s`. Either:
+   - `cargo asm framesage_etw::session::EtwSession::<method-name>` (the `cargo-asm` subcommand emits a named function directly to stdout — install via `cargo install cargo-show-asm` if not present), OR
+   - `awk` extraction by demangled symbol prefix:
+     ```powershell
+     awk '/^_ZN.*framesage_etw.*session.*EtwSession.*<method-name>/,/^$/' target\release\deps\framesage_etw-*.s
+     ```
+   The exact method name is the one Day 3 picks during scaffold — document it inline in §12.4 step 6 of the EOD report before pasting the asm capture.
+
+   **Acceptance criterion (visually verified):** the trait-dispatched function body contains **no `call` instructions through a vtable, no `mov rax, [rsi+0x..]` followed by `call rax` patterns, no indirect `jmp` through a register loaded from memory** — i.e. no signs of dynamic dispatch. Direct `call <symbol>` to the windows-rs functions is expected and correct. The trait-dispatched and no-trait-baseline outputs should be byte-identical after symbol-name stripping; visual diff confirms.
+
+   **Format requirement** (per the spike-reports-include-literal-output ground rule): paste the extracted function asm (both versions) into the EOD report inside ```text``` fences. Include the demangled symbol name and the source-line annotations the compiler emits (`-C codegen-units=1` keeps them readable). If the diff between the two is empty after symbol stripping, state that explicitly in one sentence — don't paste an empty diff and assume the reader knows what it means.
+
+   **This is the load-bearing evidence that the `EtwSysCalls` abstraction has zero production cost — without it the abstraction's no-overhead claim is unsupported.**
+7. **Survives-service-restart capture** (per §4 Day 5 step 6 + v4.2 amendment — Finding 2): paste the four literal `logman query FramesageEtw -ets` outputs from the kill-restart sequence: (a) post-start (session present, owned by the original PID), (b) post-force-kill (session leaked, no owner), (c) post-restart (session present, owned by the new PID — cleanup-and-fresh-start worked), (d) post-clean-stop (session gone). Annotate each output with the corresponding `Get-Process framesage` PID before/after so the ownership transition is unambiguous. If (b) shows the session was cleaned up by the kill itself (unexpected — Windows doesn't auto-reap leaked ETW sessions), surface in §12.6 as a behavioral deviation from architecture §2.1's stated model.
 
 ### 12.5 Stop-gate trip log
 
@@ -1001,7 +1089,7 @@ cargo build -p framesage-svc --release
 
 ---
 
-## Status: APPROVED — 2026-05-17
+## Status: APPROVED — 2026-05-17 (with v4.2 amendment applied 2026-05-17)
 
 Execution starts on `feat/group-a-week-2` when PR #73 merges. The architecture-amendment PR for §2.1 mode 5 (per §3.5 #5) lands as a SEPARATE small PR before Day 5's service-wiring code.
 
@@ -1012,3 +1100,5 @@ Execution starts on `feat/group-a-week-2` when PR #73 merges. The architecture-a
 (c) the self-administered (d) pass catches nothing while buddy still finds issues — indicating the check isn't being internalized during drafting.
 
 A draft with fewer, smaller findings than the prior round, where the self-pass caught real issues — is convergence, not stagnation. v4 → v4.1 demonstrates this: buddy found 2 micro-(d) issues on v4 (down from v3's 4 substantive findings); v4.1's self-pass caught 4 additional issues before commit (the auditor's internalized-check produced real value).
+
+**(d) extension applied in v4.2 (per user instruction):** the planning-phase 4Q question (d) now reads "does this artifact agree with itself AND with the authoritative documents it references?" The cross-document-consistency check would have caught Findings 1 and 2 — Finding 1 is a plan-internal inconsistency between §3.1 (no seam) and §4 Day 1 (requires seam); Finding 2 is plan-vs-architecture inconsistency (plan §5/§7 silent vs architecture line 1585). Dependency arrows captured in `audit/buddy-format-implementation-phase.md` §X. Implementation-phase 5Q question (5) inherits the same extended scope.

@@ -383,6 +383,231 @@ What I AM doing:
 
 ---
 
+## Entry 5 — 2026-05-17, fresh-eyes re-read of APPROVED week-2 plan surfaced two real gaps + one minor
+
+### Context
+
+Per the session-handoff document merged via PR #76 (resolves once
+PR #73 merges to main); §9 line 4 reads: **"Do NOT auto-merge PR
+#73 without reviewing the APPROVED plan content first."** The
+fresh session re-read `spike/group-a-week-2-plan.md` on
+`plan/group-a-week-2` HEAD (`5ca012d`) against a six-bullet
+checklist. Two of the four explicit checks (bullets 5 + 6)
+surfaced real gaps requiring pre-merge resolution; bullet 3
+surfaced a minor inline-fixable gap; bullet 1 passed with notes
+(consistent with plan §9 risk #1).
+
+Why the entry exists despite plan already being APPROVED: the
+iterative v1→v2→v3→v4→v4.1 process smoothed concerns as they
+surfaced; a fresh-eyes pass on the integrated whole catches what
+iteration absorbed. The handoff §9 directive is the institutional
+recognition of this asymmetry.
+
+### Finding 1 — Day 1 build_gate.rs lacked an injection-seam spec (bullet 5)
+
+Plan §3.1 specified `build_gate.rs`'s public surface but no
+injection mechanism. Plan §4 Day 1 unit-test deliverables required
+mocking both the build number (predicate-true at synthetic ≥26100)
+and a `RtlGetVersion` failure path (predicate-false with
+`detected_build() == None`). Plan §3.4's `EtwSysCalls` trait —
+which DOES provide `rtl_get_version` — scaffolds on **Day 3**, not
+Day 1. Day 1 had a chicken-and-egg the plan didn't resolve.
+
+**User decision (2026-05-17): Option A.** Spec a build_gate-local
+`#[cfg(test)]` injection seam: `thread_local!<RefCell<Option<Result<u32, ()>>>>`
+override + `pub(crate) set_build_override()` helper. Production
+path unchanged in release builds; test parallelism safe via
+`thread_local`. §3.1 gains the spec paragraph; §3.4 gains a
+one-line note documenting that build_gate uses its own injection
+independent of `EtwSysCalls` (two patterns intentional for two
+different scopes).
+
+Applied in v4.2 amendment.
+
+### Finding 2 — architecture §2.1 "Survives service restarts" unsatisfied (bullet 6)
+
+Architecture §2.1 line 120 + acceptance criteria checklist line 1585
+("Service restart leaves no stale session") together require:
+startup `cleanup_stale_session()` + graceful shutdown + crash-leak
+caught on next start. Plan §5 test inventory had no test for this;
+§4 Day 5 EOD step 4 covered SHUTDOWN (orderly SCM stop), not
+RESTART-AFTER-CRASH (the kill-then-cleanup path). §7 acceptance
+criteria silent. §8 out-of-scope silent. The behavior is presumably
+preserved from the spike code (lifted in Day 2's session.rs) but
+the plan never asserted it.
+
+**User decision (2026-05-17): Option B with structural note.**
+§4 Day 5 EOD gains step 6: install, start, force-kill (not orderly
+SCM stop — use `Stop-Process -Force`), capture `logman query`
+immediately to confirm the session leaked, restart via SCM, capture
+`logman query` again to confirm `cleanup_stale_session()` ran AND
+a fresh session opened. Four literal `logman query` outputs total.
+§12.4 mirrors as step 7. §7 acceptance criteria gains the
+corresponding checkbox.
+
+**STOP-gate structural addition (per user instruction):** if step 6
+shows the leaked session was not cleaned up on restart, this is
+NOT a "noted, will fix later" — Day 2's session.rs lift is
+incomplete and architecture §2.1's "survives service restarts"
+criterion is unsatisfied. Week 2 cannot mark complete until the
+lift preserves the spike's `cleanup_stale_session()` behavior.
+Plan §4 Day 5 explicitly states this STOP condition.
+
+Applied in v4.2 amendment.
+
+### Finding 3 — §12.4 step 6 (asm-codegen-parity) lacked extraction step (bullet 3)
+
+Plan §4 Day 3 specified the `cargo rustc --emit=asm` capture
+command but §12.4 step 6 didn't specify how to extract the relevant
+function body from the resulting 100s-of-KB `.s` file. Failure mode:
+EOD-report writer's interpretation ranges from "paste 200 KB" to
+"paste only the relevant function." Acceptance criterion was prose
+("zero production cost") without a visually-checkable concrete
+form.
+
+**User decision (2026-05-17): inline patch.** §12.4 step 6
+specifies the `cargo rustc --emit=asm` command + a grep extraction
+step (either `cargo asm` subcommand OR `awk` extraction by demangled
+symbol prefix) + the visually-verifiable acceptance criterion ("no
+`call` instructions through vtable, no indirect `jmp` through
+register loaded from memory") + the literal-output formatting
+requirement (extracted function body only, in ```text``` fences,
+with demangled symbol name + source-line annotations preserved).
+
+Applied in v4.2 amendment.
+
+### Process observation (applied per user decision — option α)
+
+The planning-phase 4Q question (d) is extended to include
+cross-document consistency. (d) becomes: "does this artifact agree
+with itself **AND with the authoritative documents it references**?"
+
+Dependency arrows (define once, reference forever):
+- Plan documents (e.g., `group-a-week-2-plan.md`) must agree with:
+  `audit/v0.7-architecture.md`, `spike/etw-schemas.md`,
+  `spike/etw-edr-report.md`.
+- Implementation-phase format must agree with: relevant plan +
+  architecture.
+- Spike reports must agree with: prior architecture + prior spike
+  findings if referenced.
+- Architecture amendment PRs must agree with: the architecture
+  sections they amend + any plan that references those sections.
+
+Captured in `audit/buddy-format-implementation-phase.md` §X (lands
+as part of PR #75 patches). Implementation-phase format inherits
+the extended (d) when PR #75 patches land. Finding 1 (plan-internal:
+§3.1 vs §4 Day 1) would have been caught by current-(d);
+Finding 2 (plan-vs-architecture: §5/§7 silent vs architecture line
+1585) is exactly the cross-document case the extension catches.
+
+The buddy run on the v4.2 amendment uses the extended (d) — first
+exercise of the extension on itself.
+
+**Meta-poetic confirmation (per user instruction):** the v4.2
+self-pass with the extended (d) immediately caught one of its own
+consistency violations — Self-pass Finding S-B surfaced that v4.2's
+amendments referenced the session-handoff document via a name
+(`handoff-2026-05-17.md`) that doesn't resolve on this branch,
+because the handoff merged via PR #76 AFTER `plan/group-a-week-2`'s
+HEAD. The extension caught the failure on first round of use; rephrasing
+applied (S-B1 — inline-quote the directive + acknowledge cross-branch
+state). This is the extension doing real work, not adding ceremony.
+A consistency check that fails on its own introduction is the most
+direct possible evidence that the check tracks something real about
+the artifact's correctness.
+
+**Sweep discipline added to self-pass technique (per user decision,
+META 1):** when a (d) check finds an issue class at site X, the
+same class must be checked exhaustively across the document, not
+patched at the single site where it surfaced. Standing instructions
+inherit this from Entry 5.
+
+On-record example: Self-pass A initially treated the `pub(crate)`
+vs `tests/` directory visibility mismatch as build_gate-specific.
+Second self-pass (with sweep-discipline applied retroactively)
+surfaced Finding S-D — same root cause, same bug, two more test
+files (`degradation_tests.rs` + `supervisor_tests.rs` both use
+`#[cfg(test)]` items from the lib via integration-test paths that
+can't see them). Without the sweep, Day 3 + Day 4 would have hit
+compile errors. With it, the v4.2 amendment closes all three sites
+in one round.
+
+Sweep-discipline rule of thumb: when a (d) finding describes a
+mechanism (e.g., visibility-rules-vs-test-location, cross-branch
+cite resolution, type-signature-prose-drift), the next step is
+`grep` / cross-section read to enumerate every site the mechanism
+could apply, NOT a single-site patch.
+
+**Implementation-phase 5Q question (1) broadens (per user decision,
+META 2):** rename from "FFI safety" to "Language-mechanics safety"
+with sub-bullets — `unsafe` blocks need SAFETY justifications;
+visibility modifiers match consumer location (`pub` vs `pub(crate)`
+vs `#[cfg(test)]`); integration tests in `tests/` can only see
+`pub` items (NOT `#[cfg(test)]` or `pub(crate)` items); trait
+bounds match what implementers can satisfy; `Send`/`Sync` where
+threading is involved. Lands as part of the PR #75 patch sequence
+(after PR #73 merges + `plan/implementation-phase-buddy-format`
+rebases). The on-record motivation is the same as META 1: visibility
+mismatches are mechanically detectable but slipped past three rounds
+of planning-phase (d) review because the format didn't name them
+explicitly.
+
+**Process-observation summary (Entry 5 captures three concurrent
+process improvements):**
+
+1. **Extended (d)** — cross-document consistency added to
+   planning-phase 4Q (d) and implementation-phase 5Q (5).
+   Dependency arrows captured in
+   `audit/buddy-format-implementation-phase.md` §X (lands with PR
+   #75 patches).
+2. **Sweep discipline** — when (d) finds an issue class at site X,
+   sweep exhaustively across the document for the same class.
+   Standing instructions inherit from this entry.
+3. **Impl-phase (1) broadens** — Language-mechanics safety with
+   visibility / trait-bound / `Send`/`Sync` sub-bullets. Lands with
+   PR #75 patches.
+
+Three improvements in one entry because they came from one chain of
+self-pass findings, and the rhythm-cost of a separate entry per
+improvement is higher than the audit-trail value of separating them.
+
+### What primary agent is NOT doing unilaterally
+
+- NOT picking among the resolution options on my own — user picked
+  A for Finding 1, B with structural note for Finding 2, inline
+  for Finding 3.
+- NOT merging PR #73 until buddy reviews the v4.2 amendment with
+  the extended (d).
+- NOT starting PR #75 patching work (downstream of PR #73 merge
+  per strict-sequencing decision).
+
+### Lesson for future self-passes (cross-references the Entry that lands with PR #75 patches; references resolve once PR #75 merges following PR #73 per the strict-sequencing decision in §sequencing below)
+
+This Entry's findings include one that the v4.1 self-pass should
+have caught (Finding 1 is plan-internal between §3.1 and §4 Day 1)
+and one that no version of (d) up to v4.1 could have caught (Finding 2
+is cross-document, which is exactly why the (d) extension is being
+added in v4.2). Future self-passes per the new standard documented
+in the Entry that lands with PR #75 patches must include explicit
+verification commands AND their literal output for every positive
+claim — running `grep`/`git show` to verify that referenced sections,
+type names, file paths actually exist in their claimed locations.
+The (d) extension makes this a structural requirement, not an
+aspiration.
+
+### Sequencing
+
+Strict-sequencing decision per user (2026-05-17): PR #73 merges
+first (v4.2 amendment + this Entry 5 land via PR #73 since they
+live on `plan/group-a-week-2`); then `plan/implementation-phase-buddy-format`
+rebases onto new main, picking up Entries 2–5; then PR #75 applies
+its format-doc patches + adds Entry 4 + adds §X to the format doc;
+then buddy + merge. Outcome on main: Entries 1, 2, 3, 4, 5 in
+numerical order, format-doc §X dependency arrows present, all
+references resolve.
+
+---
+
 ## How to use this log going forward
 
 Each new buddy review that surfaces a concern gets a new
