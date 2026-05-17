@@ -142,8 +142,8 @@ fn workspace_layering_invariants_hold() {
         String::from_utf8_lossy(&output.stderr)
     );
 
-    let metadata: CargoMetadata = serde_json::from_slice(&output.stdout)
-        .expect("parse cargo metadata JSON");
+    let metadata: CargoMetadata =
+        serde_json::from_slice(&output.stdout).expect("parse cargo metadata JSON");
 
     // Build an actual-edges map from the cargo metadata output.
     // We only care about framesage-* → framesage-* edges.

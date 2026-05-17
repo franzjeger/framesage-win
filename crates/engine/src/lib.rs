@@ -659,12 +659,15 @@ impl Engine {
         let previous_raw_class = self.sys.get_priority_class_for_pid(pid).ok().flatten();
         self.sys.set_priority_class_for_pid(pid, class)?;
         if let Some(previous_raw_class) = previous_raw_class {
-            self.state.write().undo_log.record(UndoableAction::SetPriority {
-                pid,
-                exe_name: exe,
-                previous_raw_class,
-                applied_class: class,
-            });
+            self.state
+                .write()
+                .undo_log
+                .record(UndoableAction::SetPriority {
+                    pid,
+                    exe_name: exe,
+                    previous_raw_class,
+                    applied_class: class,
+                });
         }
         Ok(())
     }
@@ -681,10 +684,10 @@ impl Engine {
         self.sys.suspend_process(pid)?;
         // Item 3.5 — no prior state to capture; undo reverses by
         // calling resume_process on the same PID.
-        self.state.write().undo_log.record(UndoableAction::SuspendProcess {
-            pid,
-            exe_name: exe,
-        });
+        self.state
+            .write()
+            .undo_log
+            .record(UndoableAction::SuspendProcess { pid, exe_name: exe });
         Ok(())
     }
 
@@ -701,10 +704,10 @@ impl Engine {
         check_process_modifiable(self.safe_list, &exe, "resume")?;
         self.sys.resume_process(pid)?;
         // Item 3.5 — symmetric with suspend_process; undo re-suspends.
-        self.state.write().undo_log.record(UndoableAction::ResumeProcess {
-            pid,
-            exe_name: exe,
-        });
+        self.state
+            .write()
+            .undo_log
+            .record(UndoableAction::ResumeProcess { pid, exe_name: exe });
         Ok(())
     }
 
@@ -768,12 +771,15 @@ impl Engine {
         let previous_mask = self.sys.affinity_mask(pid).ok().flatten();
         self.sys.set_affinity_mask_for_pid(pid, mask)?;
         info!(pid, mask = format!("{:#x}", mask), "set_process_affinity");
-        self.state.write().undo_log.record(UndoableAction::SetAffinity {
-            pid,
-            exe_name: exe,
-            previous_mask,
-            applied_mask: mask,
-        });
+        self.state
+            .write()
+            .undo_log
+            .record(UndoableAction::SetAffinity {
+                pid,
+                exe_name: exe,
+                previous_mask,
+                applied_mask: mask,
+            });
         Ok(())
     }
 
@@ -854,9 +860,7 @@ impl Engine {
             let mut new_marks: Vec<u32> = Vec::new();
             for pid in pids {
                 let live_exe = match self.sys.exe_for_pid(pid) {
-                    Ok(Some(path)) => {
-                        path.rsplit(['\\', '/']).next().unwrap_or(&path).to_owned()
-                    }
+                    Ok(Some(path)) => path.rsplit(['\\', '/']).next().unwrap_or(&path).to_owned(),
                     Ok(None) | Err(_) => continue,
                 };
                 if !live_exe.eq_ignore_ascii_case(&exe_name) {
@@ -1125,12 +1129,7 @@ impl Engine {
                     cached.clone()
                 } else if exe_path_budget > 0 {
                     exe_path_budget -= 1;
-                    let path = self
-                        .sys
-                        .exe_for_pid(pid)
-                        .ok()
-                        .flatten()
-                        .unwrap_or_default();
+                    let path = self.sys.exe_for_pid(pid).ok().flatten().unwrap_or_default();
                     if !path.is_empty() {
                         s.exe_path_cache.insert(pid, path.clone());
                     }
@@ -1247,10 +1246,7 @@ impl Engine {
                     None => {
                         if version_info_budget > 0 {
                             version_info_budget -= 1;
-                            let v = self
-                                .sys
-                                .read_version_info(&exe_path)
-                                .unwrap_or_default();
+                            let v = self.sys.read_version_info(&exe_path).unwrap_or_default();
                             s.version_info_cache.insert(exe_path.clone(), v.clone());
                             v
                         } else {
@@ -1636,12 +1632,7 @@ impl Engine {
             "exiting Manual Global Game Mode"
         );
         s.manual_global_active = None;
-        Self::revert_system_mode_locked(
-            &mut s,
-            &self.journal,
-            &self.events,
-            "manual_global_exit",
-        );
+        Self::revert_system_mode_locked(&mut s, &self.journal, &self.events, "manual_global_exit");
         // Force the next reconcile to re-evaluate the current
         // foreground — without this, if the foreground hasn't
         // changed since manual global was enabled, reconcile's
@@ -1722,9 +1713,7 @@ impl Engine {
                 self.resume();
             }
             SystemEvent::SessionConsoleDisconnect => {
-                info!(
-                    "console session disconnected (FUS / RDP off) — exiting Game Mode"
-                );
+                info!("console session disconnected (FUS / RDP off) — exiting Game Mode");
                 let mut s = self.state.write();
                 s.manual_global_active = None;
                 Self::revert_system_mode_locked(
@@ -2299,10 +2288,7 @@ impl Engine {
     /// Bounded by `PERSISTENT_REASSERT_INTERVAL` (2 s). Each sweep just calls
     /// the per-knob setters; no prev-state capture, no revert plan rewrite —
     /// the original `AppliedRecord` continues to describe what to undo.
-    fn maybe_reassert_persistent_locked(
-        s: &mut EngineState,
-        sys: &dyn framesage_sys::SysApi,
-    ) {
+    fn maybe_reassert_persistent_locked(s: &mut EngineState, sys: &dyn framesage_sys::SysApi) {
         let now = Instant::now();
         if let Some(last) = s.last_persistent_reassert {
             if now.duration_since(last) < PERSISTENT_REASSERT_INTERVAL {
@@ -2388,9 +2374,7 @@ impl Engine {
             let rule_pids: Vec<u32> = s.affinity_rule_applied.iter().copied().collect();
             for pid in rule_pids {
                 let live_exe = match sys.exe_for_pid(pid) {
-                    Ok(Some(path)) => {
-                        path.rsplit(['\\', '/']).next().unwrap_or(&path).to_owned()
-                    }
+                    Ok(Some(path)) => path.rsplit(['\\', '/']).next().unwrap_or(&path).to_owned(),
                     Ok(None) | Err(_) => {
                         stale_rule_pids.push(pid);
                         continue;
@@ -2719,12 +2703,7 @@ impl Engine {
             s.foreground_snapshot = None;
             s.active_profile = None;
             if s.manual_global_active.is_none() {
-                Self::revert_system_mode_locked(
-                    s,
-                    &self.journal,
-                    &self.events,
-                    "foreground_lost",
-                );
+                Self::revert_system_mode_locked(s, &self.journal, &self.events, "foreground_lost");
             }
             return Ok(());
         };
@@ -3359,11 +3338,7 @@ fn applied_from_plan(plan: &ActionPlan) -> AppliedActions {
 /// when this returns true. Entries past the window stay in the map (the
 /// next successful apply or PID-exit reaping clears them); checking is
 /// O(1).
-fn apply_backoff_active(
-    backoff: &HashMap<u32, Instant>,
-    pid: u32,
-    now: Instant,
-) -> bool {
+fn apply_backoff_active(backoff: &HashMap<u32, Instant>, pid: u32, now: Instant) -> bool {
     backoff
         .get(&pid)
         .map(|t| now.duration_since(*t) < APPLY_FAILURE_BACKOFF)
@@ -3443,13 +3418,12 @@ fn apply_profile(
     } else {
         None
     };
-    let applied_affinity_mask = if effective_profile.affinity_mask.is_some()
-        || effective_profile.cpu_sets.is_some()
-    {
-        sys.affinity_mask(pid).ok().flatten()
-    } else {
-        None
-    };
+    let applied_affinity_mask =
+        if effective_profile.affinity_mask.is_some() || effective_profile.cpu_sets.is_some() {
+            sys.affinity_mask(pid).ok().flatten()
+        } else {
+            None
+        };
 
     Ok(AppliedRecord {
         profile_id: profile.id.clone(),
@@ -4074,10 +4048,7 @@ mod tests {
         assert!(engine.status().paused);
 
         engine.handle_system_event(SystemEvent::Resume);
-        assert!(
-            !engine.status().paused,
-            "Resume must un-pause the engine"
-        );
+        assert!(!engine.status().paused, "Resume must un-pause the engine");
     }
 
     /// Item 3.7 — refresh_topology swaps the engine's cached
@@ -4185,10 +4156,7 @@ mod tests {
             ) -> Result<Option<framesage_sys::process::ProcessCpuTimes>> {
                 Ok(None)
             }
-            fn memory_info(
-                &self,
-                _pid: u32,
-            ) -> Result<Option<framesage_sys::process::MemoryInfo>> {
+            fn memory_info(&self, _pid: u32) -> Result<Option<framesage_sys::process::MemoryInfo>> {
                 Ok(None)
             }
             fn affinity_mask(&self, _pid: u32) -> Result<Option<u64>> {
@@ -4220,11 +4188,7 @@ mod tests {
             ) -> Result<framesage_sys::apply::AppliedState> {
                 Err(anyhow::anyhow!("mock: not supported"))
             }
-            fn revert(
-                &self,
-                _pid: u32,
-                _state: framesage_sys::apply::AppliedState,
-            ) -> Result<()> {
+            fn revert(&self, _pid: u32, _state: framesage_sys::apply::AppliedState) -> Result<()> {
                 Ok(())
             }
             fn reassert(
@@ -4245,11 +4209,7 @@ mod tests {
             ) -> Result<()> {
                 Ok(())
             }
-            fn restore_priority_class_for_pid(
-                &self,
-                _pid: u32,
-                _raw_class: u32,
-            ) -> Result<()> {
+            fn restore_priority_class_for_pid(&self, _pid: u32, _raw_class: u32) -> Result<()> {
                 Ok(())
             }
             fn set_affinity_mask_for_pid(&self, _pid: u32, _mask: u64) -> Result<()> {
@@ -4273,9 +4233,7 @@ mod tests {
             ) -> Result<framesage_sys::version_info::VersionInfo> {
                 Ok(framesage_sys::version_info::VersionInfo::default())
             }
-            fn enumerate_services(
-                &self,
-            ) -> Result<Vec<framesage_sys::services::ServiceInfo>> {
+            fn enumerate_services(&self) -> Result<Vec<framesage_sys::services::ServiceInfo>> {
                 Ok(Vec::new())
             }
         }
@@ -4670,10 +4628,7 @@ mod tests {
         fn user_for_pid(&self, _pid: u32) -> Result<Option<String>> {
             Ok(None)
         }
-        fn cpu_times(
-            &self,
-            _pid: u32,
-        ) -> Result<Option<framesage_sys::process::ProcessCpuTimes>> {
+        fn cpu_times(&self, _pid: u32) -> Result<Option<framesage_sys::process::ProcessCpuTimes>> {
             Ok(None)
         }
         fn memory_info(&self, _pid: u32) -> Result<Option<framesage_sys::process::MemoryInfo>> {
@@ -4697,9 +4652,7 @@ mod tests {
         fn memory_status(&self) -> Result<(u64, u64)> {
             Ok((0, 0))
         }
-        fn current_foreground(
-            &self,
-        ) -> Result<Option<framesage_sys::foreground::ForegroundInfo>> {
+        fn current_foreground(&self) -> Result<Option<framesage_sys::foreground::ForegroundInfo>> {
             Ok(None)
         }
         fn apply(
@@ -4713,12 +4666,7 @@ mod tests {
         fn revert(&self, _pid: u32, _state: framesage_sys::apply::AppliedState) -> Result<()> {
             Ok(())
         }
-        fn reassert(
-            &self,
-            _pid: u32,
-            _profile: &Profile,
-            _topology: &CpuTopology,
-        ) -> Result<()> {
+        fn reassert(&self, _pid: u32, _profile: &Profile, _topology: &CpuTopology) -> Result<()> {
             Ok(())
         }
         fn get_priority_class_for_pid(&self, _pid: u32) -> Result<Option<u32>> {
@@ -4865,11 +4813,7 @@ mod tests {
         // Advance just under the interval — still no probe.
         clock.advance(AC_DETECT_INTERVAL - Duration::from_millis(1));
         engine.maybe_refresh_ac_presence();
-        assert_eq!(
-            sys.ac_call_count(),
-            1,
-            "probe must wait the full interval"
-        );
+        assert_eq!(sys.ac_call_count(), 1, "probe must wait the full interval");
 
         // Cross the threshold — probe fires.
         clock.advance(Duration::from_millis(2));

@@ -36,8 +36,8 @@ mod service_main {
 
     use framesage_engine::SystemEvent;
     use windows_service::service::{
-        PowerEventParam, ServiceControl, ServiceControlAccept, ServiceExitCode,
-        SessionChangeReason, ServiceState, ServiceStatus, ServiceType,
+        PowerEventParam, ServiceControl, ServiceControlAccept, ServiceExitCode, ServiceState,
+        ServiceStatus, ServiceType, SessionChangeReason,
     };
     use windows_service::service_control_handler::{self, ServiceControlHandlerResult};
     use windows_service::service_dispatcher;

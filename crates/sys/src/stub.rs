@@ -245,7 +245,9 @@ pub mod services {
         Pending,
     }
     pub fn enumerate_services() -> Result<Vec<ServiceInfo>> {
-        Err(anyhow!("framesage-sys: services enumeration is Windows-only"))
+        Err(anyhow!(
+            "framesage-sys: services enumeration is Windows-only"
+        ))
     }
 }
 

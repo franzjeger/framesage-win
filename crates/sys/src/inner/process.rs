@@ -160,9 +160,9 @@ pub fn exe_for_pid(pid: u32) -> Result<Option<String>> {
         Err(e) => {
             return match classify_open_process_error(&e) {
                 OpenProcessClass::Exited | OpenProcessClass::AccessDenied => Ok(None),
-                OpenProcessClass::Unexpected => {
-                    Err(anyhow!("OpenProcess({pid}) for exe lookup failed unexpectedly: {e}"))
-                }
+                OpenProcessClass::Unexpected => Err(anyhow!(
+                    "OpenProcess({pid}) for exe lookup failed unexpectedly: {e}"
+                )),
             };
         }
     };
@@ -221,9 +221,9 @@ pub fn user_for_pid(pid: u32) -> Result<Option<String>> {
         Err(e) => {
             return match classify_open_process_error(&e) {
                 OpenProcessClass::Exited | OpenProcessClass::AccessDenied => Ok(None),
-                OpenProcessClass::Unexpected => {
-                    Err(anyhow!("OpenProcess({pid}) for user lookup failed unexpectedly: {e}"))
-                }
+                OpenProcessClass::Unexpected => Err(anyhow!(
+                    "OpenProcess({pid}) for user lookup failed unexpectedly: {e}"
+                )),
             };
         }
     };
@@ -388,9 +388,9 @@ pub fn cpu_times(pid: u32) -> Result<Option<ProcessCpuTimes>> {
         Err(e) => {
             return match classify_open_process_error(&e) {
                 OpenProcessClass::Exited | OpenProcessClass::AccessDenied => Ok(None),
-                OpenProcessClass::Unexpected => {
-                    Err(anyhow!("OpenProcess({pid}) for cpu times failed unexpectedly: {e}"))
-                }
+                OpenProcessClass::Unexpected => Err(anyhow!(
+                    "OpenProcess({pid}) for cpu times failed unexpectedly: {e}"
+                )),
             };
         }
     };
@@ -401,7 +401,13 @@ pub fn cpu_times(pid: u32) -> Result<Option<ProcessCpuTimes>> {
     let mut user = FILETIME::default();
     // SAFETY: handle valid; the four FILETIME out-params are valid pointers.
     let result = unsafe {
-        GetProcessTimes(handle.as_raw(), &mut creation, &mut exit, &mut kernel, &mut user)
+        GetProcessTimes(
+            handle.as_raw(),
+            &mut creation,
+            &mut exit,
+            &mut kernel,
+            &mut user,
+        )
     };
     // handle drops at end of scope.
 
@@ -463,9 +469,9 @@ pub fn memory_info(pid: u32) -> Result<Option<MemoryInfo>> {
         Err(e) => {
             return match classify_open_process_error(&e) {
                 OpenProcessClass::Exited | OpenProcessClass::AccessDenied => Ok(None),
-                OpenProcessClass::Unexpected => {
-                    Err(anyhow!("OpenProcess({pid}) for memory info failed unexpectedly: {e}"))
-                }
+                OpenProcessClass::Unexpected => Err(anyhow!(
+                    "OpenProcess({pid}) for memory info failed unexpectedly: {e}"
+                )),
             };
         }
     };
@@ -701,26 +707,24 @@ pub fn affinity_mask(pid: u32) -> Result<Option<u64>> {
         Err(e) => {
             return match classify_open_process_error(&e) {
                 OpenProcessClass::Exited | OpenProcessClass::AccessDenied => Ok(None),
-                OpenProcessClass::Unexpected => {
-                    Err(anyhow!("OpenProcess({pid}) for affinity mask failed unexpectedly: {e}"))
-                }
+                OpenProcessClass::Unexpected => Err(anyhow!(
+                    "OpenProcess({pid}) for affinity mask failed unexpectedly: {e}"
+                )),
             };
         }
     };
     let mut process_mask: usize = 0;
     let mut system_mask: usize = 0;
     // SAFETY: handle valid; both out-params valid.
-    let r = unsafe {
-        GetProcessAffinityMask(handle.as_raw(), &mut process_mask, &mut system_mask)
-    };
+    let r = unsafe { GetProcessAffinityMask(handle.as_raw(), &mut process_mask, &mut system_mask) };
     // handle drops at end of scope.
     match r {
         Ok(()) => Ok(Some(process_mask as u64)),
         Err(e) => match classify_open_process_error(&e) {
             OpenProcessClass::Exited | OpenProcessClass::AccessDenied => Ok(None),
-            OpenProcessClass::Unexpected => {
-                Err(anyhow!("GetProcessAffinityMask({pid}) failed unexpectedly: {e}"))
-            }
+            OpenProcessClass::Unexpected => Err(anyhow!(
+                "GetProcessAffinityMask({pid}) failed unexpectedly: {e}"
+            )),
         },
     }
 }
@@ -777,10 +781,7 @@ mod tests {
         // Real OpenProcess produces these when the PID has exited
         // between snapshot and open; we synthesize one for the unit test.
         let e: windows::core::Error = ERROR_INVALID_PARAMETER.into();
-        assert_eq!(
-            classify_open_process_error(&e),
-            OpenProcessClass::Exited
-        );
+        assert_eq!(classify_open_process_error(&e), OpenProcessClass::Exited);
     }
 
     #[test]

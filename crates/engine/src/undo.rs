@@ -96,12 +96,7 @@ impl UndoLog {
     /// Read-only view ordered newest-first, capped at `limit` entries.
     /// Used by `framesage undo list` and the tray's undo panel.
     pub(crate) fn snapshot_newest_first(&self, limit: usize) -> Vec<UndoEntry> {
-        self.entries
-            .iter()
-            .rev()
-            .take(limit)
-            .cloned()
-            .collect()
+        self.entries.iter().rev().take(limit).cloned().collect()
     }
 }
 

@@ -265,11 +265,7 @@ pub(crate) fn kv_grid_row(ui: &mut egui::Ui, key: &str, value: String) {
 /// readouts (CPU%, Memory) plus a 60-sample sparkline. Designed to compress
 /// to ~28 px of vertical space — enough to read at a glance, not enough to
 /// dominate the tab content below it.
-pub(crate) fn render_perf_band(
-    ui: &mut egui::Ui,
-    metrics: &SystemMetrics,
-    history: &[(u8, u8)],
-) {
+pub(crate) fn render_perf_band(ui: &mut egui::Ui, metrics: &SystemMetrics, history: &[(u8, u8)]) {
     ui.horizontal(|ui| {
         // Left cluster: the live numeric readouts. Color-coded by intensity
         // so the band visually flags contention without the user having to

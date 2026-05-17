@@ -54,8 +54,8 @@ pub(crate) fn background_loop(state: Arc<Mutex<AppState>>) {
     // reconnect attempts (a service restart doesn't lose the writer
     // half). Rotation runs once at startup so we don't carry an
     // unbounded file across launches.
-    let mut activity_log: Option<activity_log::ActivityLog> = match activity_log::ActivityLog::open()
-    {
+    let mut activity_log: Option<activity_log::ActivityLog> = match activity_log::ActivityLog::open(
+    ) {
         Ok(mut log) => {
             if let Err(e) = log.rotate_if_oversized() {
                 tracing::warn!(error = %e, "activity-log rotation failed; continuing");
@@ -358,12 +358,9 @@ pub(crate) fn processes_poll_loop(
                 let new_pids: std::collections::HashSet<u32> =
                     snapshots.iter().map(|p| p.pid).collect();
                 for snap in &snapshots {
-                    let entry = s
-                        .per_pid_cpu_history
-                        .entry(snap.pid)
-                        .or_insert_with(|| {
-                            std::collections::VecDeque::with_capacity(SYSTEM_HISTORY_LEN)
-                        });
+                    let entry = s.per_pid_cpu_history.entry(snap.pid).or_insert_with(|| {
+                        std::collections::VecDeque::with_capacity(SYSTEM_HISTORY_LEN)
+                    });
                     entry.push_back(snap.cpu_percent.min(255) as u8);
                     while entry.len() > SYSTEM_HISTORY_LEN {
                         entry.pop_front();
@@ -372,7 +369,8 @@ pub(crate) fn processes_poll_loop(
                 // Evict PIDs that disappeared this tick — keeps the
                 // map bounded to the live process count instead of
                 // growing forever as PIDs come and go.
-                s.per_pid_cpu_history.retain(|pid, _| new_pids.contains(pid));
+                s.per_pid_cpu_history
+                    .retain(|pid, _| new_pids.contains(pid));
 
                 s.processes = snapshots;
                 s.system = system;
@@ -489,9 +487,9 @@ pub(crate) fn foreground_reporter_loop() {
     use windows::Win32::Foundation::HMODULE;
     use windows::Win32::UI::Accessibility::{SetWinEventHook, UnhookWinEvent};
     use windows::Win32::UI::WindowsAndMessaging::{
-        DispatchMessageW, MsgWaitForMultipleObjectsEx, PeekMessageW, EVENT_SYSTEM_FOREGROUND,
-        MSG, MSG_WAIT_FOR_MULTIPLE_OBJECTS_EX_FLAGS, PM_REMOVE, QS_ALLINPUT,
-        WINEVENT_OUTOFCONTEXT, WINEVENT_SKIPOWNPROCESS,
+        DispatchMessageW, MsgWaitForMultipleObjectsEx, PeekMessageW, EVENT_SYSTEM_FOREGROUND, MSG,
+        MSG_WAIT_FOR_MULTIPLE_OBJECTS_EX_FLAGS, PM_REMOVE, QS_ALLINPUT, WINEVENT_OUTOFCONTEXT,
+        WINEVENT_SKIPOWNPROCESS,
     };
 
     // Item 2.5 / audit L-02 — exponential backoff stays in place; if
@@ -583,8 +581,7 @@ pub(crate) fn foreground_reporter_loop() {
                     current_interval_ms = NORMAL_INTERVAL_MS;
                 }
                 Err(_) => {
-                    current_interval_ms =
-                        current_interval_ms.saturating_mul(2).min(BACKOFF_CAP_MS);
+                    current_interval_ms = current_interval_ms.saturating_mul(2).min(BACKOFF_CAP_MS);
                 }
             }
         }

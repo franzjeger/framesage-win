@@ -105,16 +105,14 @@ pub fn revert_all(applied: &AppliedActions, previous: &PreviousState) {
         // "now twice-not-suspended" state if they happened to be
         // self-suspended.
         match resume_check_for_pid(snap.pid, &snap.exe) {
-            ResumeCheck::Proceed => {
-                match process::resume_process(snap.pid) {
-                    Ok(count) => {
-                        debug!(pid = snap.pid, exe = %snap.exe, resumed_threads = count, "revert: resume_process")
-                    }
-                    Err(e) => {
-                        warn!(pid = snap.pid, exe = %snap.exe, error = %e, "revert: resume_process failed")
-                    }
+            ResumeCheck::Proceed => match process::resume_process(snap.pid) {
+                Ok(count) => {
+                    debug!(pid = snap.pid, exe = %snap.exe, resumed_threads = count, "revert: resume_process")
                 }
-            }
+                Err(e) => {
+                    warn!(pid = snap.pid, exe = %snap.exe, error = %e, "revert: resume_process failed")
+                }
+            },
             ResumeCheck::SkipExited => {
                 debug!(
                     pid = snap.pid,
@@ -211,10 +209,7 @@ pub(crate) enum ResumeCheck {
 pub(crate) fn resume_check_for_pid(pid: u32, journaled_exe: &str) -> ResumeCheck {
     match super::super::process::exe_for_pid(pid) {
         Ok(Some(live_path)) => {
-            let live_exe = live_path
-                .rsplit(['\\', '/'])
-                .next()
-                .unwrap_or(&live_path);
+            let live_exe = live_path.rsplit(['\\', '/']).next().unwrap_or(&live_path);
             if live_exe.eq_ignore_ascii_case(journaled_exe) {
                 ResumeCheck::Proceed
             } else {
@@ -249,10 +244,7 @@ mod tests {
             .next()
             .unwrap_or(&live_path)
             .to_owned();
-        assert_eq!(
-            resume_check_for_pid(pid, &live_exe),
-            ResumeCheck::Proceed
-        );
+        assert_eq!(resume_check_for_pid(pid, &live_exe), ResumeCheck::Proceed);
     }
 
     /// Item 4.10 load-bearing case: journal says "OneDrive.exe" but the
@@ -307,10 +299,7 @@ mod tests {
         let live_path = super::super::super::process::exe_for_pid(pid)
             .expect("exe_for_pid on self")
             .expect("self has an exe");
-        let live_exe = live_path
-            .rsplit(['\\', '/'])
-            .next()
-            .unwrap_or(&live_path);
+        let live_exe = live_path.rsplit(['\\', '/']).next().unwrap_or(&live_path);
         // Build an upper-case variant of the live exe — predicate must
         // still return Proceed.
         let mangled = live_exe.to_ascii_uppercase();
