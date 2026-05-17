@@ -31,6 +31,7 @@
 //! SentinelOne) behavior before we wire the consumer into the
 //! shipped service.
 
+use std::cmp::Reverse;
 use std::collections::HashMap;
 use std::io::Write;
 use std::mem::{size_of, zeroed};
@@ -67,7 +68,7 @@ const SESSION_NAME: &str = "FramesageEtwSpike";
 /// Unique session GUID. Generated once; identifies our session in
 /// `logman` output. Use a NEW guid every release to avoid stale-state
 /// confusion if a previous version left a session behind.
-const SESSION_GUID: GUID = GUID::from_u128(0x4F8B_1A60_9E2D_4F3F_88C2_5B7E1D6F92A4);
+const SESSION_GUID: GUID = GUID::from_u128(0x4F8B_1A60_9E2D_4F3F_88C2_5B7E_1D6F_92A4);
 
 /// Default duration if no `--duration` flag passed.
 const DEFAULT_DURATION_SECS: u64 = 60;
@@ -84,13 +85,13 @@ const POLL_INTERVAL: Duration = Duration::from_secs(1);
 // distinguished by the ProviderId in each event's EventHeader.
 
 /// Thread events — opcodes include CSwitch (36).
-const PROVIDER_THREAD: GUID = GUID::from_u128(0x3D6F_A8D1_FE05_11D0_9DDA_00C04FD7BA7C);
+const PROVIDER_THREAD: GUID = GUID::from_u128(0x3D6F_A8D1_FE05_11D0_9DDA_00C0_4FD7_BA7C);
 /// PerfInfo — DPC (opcode 46), ISR (66/67), SystemCallEnter, etc.
-const PROVIDER_PERFINFO: GUID = GUID::from_u128(0xCE1D_BFB4_137E_4DA6_87B0_3F59AA102CBC);
+const PROVIDER_PERFINFO: GUID = GUID::from_u128(0xCE1D_BFB4_137E_4DA6_87B0_3F59_AA10_2CBC);
 /// DiskIo — Read/Write/Flush (10/11/14).
-const PROVIDER_DISKIO: GUID = GUID::from_u128(0x3D6F_A8D4_FE05_11D0_9DDA_00C04FD7BA7C);
+const PROVIDER_DISKIO: GUID = GUID::from_u128(0x3D6F_A8D4_FE05_11D0_9DDA_00C0_4FD7_BA7C);
 /// PageFault — HardFault (opcode 32), TransitionFault, etc.
-const PROVIDER_PAGEFAULT: GUID = GUID::from_u128(0x3D6F_A8D3_FE05_11D0_9DDA_00C04FD7BA7C);
+const PROVIDER_PAGEFAULT: GUID = GUID::from_u128(0x3D6F_A8D3_FE05_11D0_9DDA_00C0_4FD7_BA7C);
 
 // ─── Shared counters ──────────────────────────────────────────────────────────
 
@@ -137,8 +138,16 @@ struct Counters {
 
 impl Default for Counters {
     fn default() -> Self {
-        // const fn AtomicU64::new is available but array repeat with
-        // non-Copy types needs the array_repeat workaround.
+        // clippy::declare_interior_mutable_const fires because AtomicU64 has
+        // interior mutability, and const re-evaluates the initializer at each
+        // use site. That re-evaluation is exactly what we want: [ZERO; 256]
+        // produces 256 distinct AtomicU64 instances, one per slot. Switching
+        // to `static ZERO` would not compile — AtomicU64 is !Copy, so the
+        // array-repeat syntax can't copy a single static into 256 slots. The
+        // const-with-interior-mutability pattern is the idiomatic Rust
+        // workaround for non-Copy array initialization until
+        // std::array::from_fn stabilizes for const contexts.
+        #[allow(clippy::declare_interior_mutable_const)]
         const ZERO: AtomicU64 = AtomicU64::new(0);
         Self {
             thread_events: AtomicU64::new(0),
@@ -489,7 +498,7 @@ fn print_histograms(counters: &Counters) {
             .map(|(i, a)| (i, a.load(Ordering::Relaxed)))
             .filter(|(_, c)| *c > 0)
             .collect();
-        rows.sort_by(|a, b| b.1.cmp(&a.1));
+        rows.sort_by_key(|b| Reverse(b.1));
         for (opcode, count) in &rows {
             let pct = (*count as f64) / (total as f64) * 100.0;
             println!(
