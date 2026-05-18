@@ -1370,6 +1370,67 @@ Pattern: drifts cluster around moments of high attention (META 1 sweeps, pre-pus
 
 ---
 
+## PR #141 — 2026-05-18 — verdict GO — review-surface: mekanisk P4.9-backfill session 2 (9 findings); multi-step verification applied to diffuse-claim findings per Frank's session-2 guidance
+
+**Source:** M1.13 / issue #127 — P4.9 audit-finding verification backfill, session 2 of ~3.
+
+### Session 2 scope + results
+
+Scope (9 findings): C-004, C-005, D-001, D-002, D-003, D-004, D-006, E-002, E-003.
+
+Results:
+- **VERIFIED OPEN: 9**
+- **CLOSED PRIOR: 0** — no drifts
+- **AMBIGUOUS: 0**
+- **Refinements noted: 2** (text-quality, not drifts):
+  - D-001 Impact-text: "three RefCells inside `control_trace`" — actual code has 2 `borrow_mut()` in cited span. Underlying RefCell-borrow-leak concern unchanged.
+  - E-003 "per E-001" cross-reference partially-stale. E-001 closed via PR #79's mock-based test; E-003's mock-path concern is mock-covered, but E-003's Fix-text asks for CI-runnable real-ETW path — that's the actual remaining gap. Refinement embedded in annotation; recommendation added for Group A week 3 kickoff to land a CI-runnable real-ETW smoke test with elevated-host auto-skip.
+
+### Multi-step verification per Frank's session-2 guidance
+
+Frank's directive: "For E/G/pre-L-axis findings: bruk multi-step verification, ikke bare enkelt grep." Applied to:
+- **E-002**: read source-comment context AT lines 275-300 (acknowledging-comment + `logs_contain` calls) + grep for custom-subscriber patterns. Two-step verification: (a) acknowledging-comment present, (b) custom subscriber absent.
+- **E-003**: two-step verification: (a) mock-path test exists (`mode_5_session_level_full_flow_panic` at session.rs:1720), (b) real-ETW tests exist but `#[ignore]`'d. Refinement note documents the partial overlap with E-001's resolution.
+- **C-005**: two-step verification: (a) function definition (`compute_attribution_summary`) zero matches, (b) any of 5 threshold-substrings zero matches. Both halves of gap confirmed unbuilt.
+- **D-001**: sub-verify of finding's Impact-text claim ("three RefCells") — found 2 in cited span. Inaccuracy noted but doesn't invalidate gap.
+
+### Drift-rate hypothesis test (preliminary)
+
+Pre-session-2 hypothesis: diffuse-claim axes (E "test honesty", G "performance hot path", pre-L "unbuilt deliverables") might drift more than A/B axes (precisely-cited code-structure observations).
+
+Session 2 result on E-axis subset (E-002 + E-003 only): 0 drifts. Sample size too small to confirm or refute. Session 3 covers full E-axis tail (E-004 + E-005) + all G + all pre-L; that's where the hypothesis gets a fairer test.
+
+### Review-surface honesty
+
+**What was actually done:**
+- 9 findings verified using grep + `sed -n 'NM,LMp'` for context-reading on diffuse claims.
+- All 9 annotations follow the format: `**Verified open (M1.13 / P4.9 backfill session 2, 2026-05-18):** <verification command/s> → <output summary>. Gap holds.` (refinement-notes appended where applicable).
+- **No mobile-Claude review** per established cascade-pattern (mechanical work; pre-push grep-verify is the load-bearing defect catch).
+- Self-attestation Q1–Q5 in PR body.
+
+**Defects fanget:** zero. Two refinement-notes (not drifts) captured for future audit-text quality work.
+
+**Verdict:** GO. PR #141 merged as commit `fd0215e`. Session 2 complete.
+
+### Cumulative engagement state
+
+| Phase | Drifts |
+|---|---|
+| PRE-L-006 inline catch (Phase 3 drafting) | 1 |
+| E-001 META 1 sweep catch (W1.5) | 1 |
+| Cascade-2 numbering-conflict (cascade application) | 1 (pre-push) |
+| M1.13 session 1 | 0 |
+| **M1.13 session 2** | **0** |
+| **Total** | **3 in ~70 individual verifications/actions** |
+
+~4.3% drift catch rate; aligns with the ~4.5% base-rate prediction within statistical variance.
+
+### Session pacing
+
+STOP after session 2 per Frank's "Etter session 2 merget: state-rapport per session 1-format". Await Frank's session 3 timing directive.
+
+---
+
 ## How to use this log going forward
 
 Each new buddy review that surfaces a concern gets a new
