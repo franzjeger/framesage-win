@@ -903,6 +903,8 @@ Random 128-bit value; collision odds astronomically low.
 **Effort:** XL (cross-vendor cert + HSM + GitHub Actions wiring + README)
 **Gate:** v0.7.1
 
+**Resolution (2026-05-18, scope revision):** Won't-fix per `audit/v0.7-architecture.md` "Project scope and audience (2026-05-18 revision)" — Authenticode code signing skipped. SmartScreen warning accepted as a known cost of the source-installer distribution model (audience (a): Frank + other self-installers on informed-consent basis). Cert procurement (Sectigo OV / DigiCert EV) not initiated. PR #129 establishes the scope-revision framing; this Resolution applies it. Severity reclassified from BLOCKER-v0.7.1 → won't-fix.
+
 ## I-002 — No MSI installer — PHASE2-PLAN.md punted to a separate engagement; current installer is `install.ps1`
 
 **Severity:** HIGH
@@ -918,6 +920,8 @@ Install/uninstall: per your decision, fix the existing PowerShell installer + CL
 
 **Effort:** XL
 **Gate:** v1.0
+
+**Resolution (2026-05-18, scope revision):** Won't-fix per `audit/v0.7-architecture.md` "Project scope and audience (2026-05-18 revision)" — MSI work skipped. `install.ps1` stays as the distribution channel for audience (a). The Add/Remove Programs entry + script-TOCTOU concerns acknowledged but accepted as known costs of the source-installer model. PR #129 establishes the scope-revision framing. Severity reclassified from HIGH → won't-fix.
 
 ## I-003 — EDR-matrix testing (Defender ATP + CrowdStrike + SentinelOne) is the v0.7.1 default-on-flip gate per architecture §2.1 + `spike/etw-edr-report.md` §6.1
 
@@ -938,6 +942,8 @@ v0.7 ship.
 
 **Effort:** XL (2 engineer-days per architecture estimate; could blow to weeks if findings surface)
 **Gate:** v0.7.1
+
+**Resolution (2026-05-18, scope revision):** Won't-fix per `audit/v0.7-architecture.md` "Project scope and audience (2026-05-18 revision)" — EDR-matrix validation skipped. Frank accepts the risk on his own 9950X3D; self-installers accept the same risk by installing. The v0.7.1 default-on-flip gate is now the dogfood criterion ("Frank used `closed_loop_enabled = true` on his hardware for 2+ weeks without issues") per scope-revision Decision Point #1, NOT external EDR attestation. Architecture §2.1 "EDR interaction — TESTING IS LOAD-BEARING, NOT OPTIONAL" framing is revised-by-reference (testing scoped to Frank's own verification, not external matrix). PR #129 establishes the scope-revision framing. Severity reclassified from BLOCKER-v0.7.1 → won't-fix.
 
 ## I-004 — Service binary path moved to `%ProgramFiles%\FrameSage\` per item 1.6; ACL hardening via `icacls` is implied — verification path needs documenting
 
@@ -966,6 +972,8 @@ v0.7 ship.
 **Effort:** M (drafting + sending); response window is multi-week
 **Gate:** v0.7.1 (must close before default-on flip)
 
+**Resolution (2026-05-18, scope revision):** Won't-fix per `audit/v0.7-architecture.md` "Project scope and audience (2026-05-18 revision)" — AC vendor outreach skipped. **The technical AC-handling stays unchanged** — `AntiCheatProfile::{Aggressive, Hybrid, SafeMode, Disabled}` tiers + STANDBY mode + detection probe at `crates/sys/src/inner/ac_detect.rs` are functional correctness for Frank's own use playing Valorant/BF6, not a trust signal for others. Lack of vendor attestation means Frank relies on his own empirical experience (no Vanguard ban, no BattlEye flag) instead of official sign-off. If Frank gets banned from a game he plays, the tier structure has failed and needs revision; that's the feedback loop replacing vendor outreach. PR #129 establishes the scope-revision framing. Severity reclassified from BLOCKER-v0.7.1 → won't-fix (outreach); technical-AC findings (A-003, the AC matrix invariants at `audit/research/ANTI-CHEAT-MATRIX.md`) remain unaffected.
+
 # AXIS J — Killer features & repositioning
 
 ## J-001 — Marquee differentiator is the closed-loop honesty contract — `audit/v0.7-architecture.md` §2.4 specifies asymmetric +/- bands that surface NEGATIVE attribution prominently. No competitor (LatencyMon, PresentMon, CapFrameX, Process Lasso) does this end-to-end
@@ -988,6 +996,8 @@ harm.
 **Effort:** N/A (strategic)
 **Gate:** v0.7.1
 
+**Resolution (2026-05-18, scope revision):** REFRAMED, not closed. Per `audit/v0.7-architecture.md` "Project scope and audience (2026-05-18 revision)": **the technical content of this finding stays unchanged** (asymmetric +/- bands, honesty contract, negative-attribution surfacing). What changes is the FRAMING: "marquee differentiator" / "no competitor does this" is downgraded to "Frank's personal decision-aid for evaluating whether his rules actually helped." Marketing-positioning is out-of-scope per the scope revision. The honesty-contract unit tests (C-005) + the negative-result-session verification (E-004) remain as v0.7.1 work because they serve Frank's own decision-making, NOT a marketing claim. PR #129 establishes the scope-revision framing.
+
 ## J-002 — Closed-loop disclosure / EDR-implication first-run page is uncoded yet specified — every install of v0.7 that lands without this is a credibility-spent rotation
 
 **Severity:** BLOCKER-v0.7 (cross-ref F-001)
@@ -1005,10 +1015,14 @@ harm.
 **Effort:** S
 **Gate:** Month 1
 
+**Resolution (2026-05-18, scope revision):** REFRAMED, not closed. Per `audit/v0.7-architecture.md` "Project scope and audience (2026-05-18 revision)": **the technical surface stays unchanged** — Manual Global Game Mode (IPC verbs at `crates/service/src/runtime.rs:649-666` + tray-menu wiring + CLI verbs + hotkey infrastructure per PHASE2-PLAN.md item 2.11) remains technically valuable for Frank's own use (video editing, benchmarking, livestreaming with OBS-scene scripting). What changes is the FRAMING: "differentiator vs Process Lasso" is removed per scope-revision marketing-positioning-out-of-scope. The README-doc Fix (M1.11) stays as Month 1 item — Frank uses these verbs himself; documenting them is for Frank's own reference, not adoption-driven positioning. PR #129 establishes the scope-revision framing.
+
 ## J-004 — Closed-loop attribution + Manual Global Game Mode + AC-aware safe profiles are three differentiators NONE of the competitors offer together; the v0.7.1 launch positioning should lean on this trio
 
 **Severity:** N/A — strategic
 **Fix:** Marketing/launch-positioning is out of audit scope. Flagged for the product lead.
+
+**Resolution (2026-05-18, scope revision):** Won't-fix per `audit/v0.7-architecture.md` "Project scope and audience (2026-05-18 revision)" — marketing / launch-positioning is now explicitly out-of-scope. The three technical components individually remain (closed-loop attribution per J-001, Manual Global Game Mode per J-003, AC-aware safe profiles per A-003 / AC matrix). What goes away is the "competitive trio positioning" framing as a v0.7.1 launch lever. PR #129 establishes the scope-revision framing.
 
 # AXIS K — Things to remove / relocate / split
 
@@ -1243,24 +1257,24 @@ The 89-finding SUMMARY.md + 43-item PHASE2-PLAN.md + 5Q/4Q buddy reviews + post-
 
 | Gate | Findings |
 |---|---|
-| **Week 1 (closure)** | A-003 (bf6.exe AC false-positive), A-004 (Arc::as_ptr doc-comment), C-001 (verify_session_gone flake), ~~E-001 (real consumer-thread panic test)~~ — closed prior to audit; see E-001 Resolution block, I-005 kickoff (AC outreach drafts) |
-| **Month 1** | A-001, B-001, B-002, B-003, C-002, C-004, D-001, E-003, **E-005 (catch_unwind &str-branch coverage gap)**, F-003, F-004, I-004, J-003 |
-| **Month 2** | A-002, A-005, A-006 (with G-003), H-004, **K-005 (engine/lib.rs split, XL, HIGH-regression-risk — sequential before K-004)** |
-| **Month 3** | A-007, D-002, D-003, D-004, G-001, K-001, **K-004 (tray/main.rs split, XL, HIGH-regression-risk — spillover from Month 2; slips to v1.0-prep if Group B/C bandwidth tight)** |
+| **Week 1 (closure)** | A-003 (bf6.exe AC false-positive), A-004 (Arc::as_ptr doc-comment), C-001 (verify_session_gone flake), ~~E-001 (real consumer-thread panic test)~~ — closed prior to audit; see E-001 Resolution block, ~~I-005 kickoff (AC outreach drafts)~~ — won't-fix per scope revision (PR #129) |
+| **Month 1** | A-001, B-001, B-002, B-003, C-002, C-004, D-001, E-003, **E-005 (catch_unwind &str-branch coverage gap)**, F-003, F-004, I-004, J-003 (technical doc surface stays; framing reframed per scope revision) |
+| **Month 2** | A-002, A-005, A-006 (with G-003), H-004, **K-005 (engine/lib.rs split, XL, HIGH-regression-risk — sequential before K-004; deferred indefinitely per scope revision)** |
+| **Month 3** | A-007, D-002, D-003, D-004, G-001, K-001, **K-004 (tray/main.rs split, XL, HIGH-regression-risk — deferred indefinitely per scope revision)** |
 | **v0.7 BLOCKER** | F-001 (onboarding page 3), F-002 (Sessions tab — see CONFLICT note) |
-| **v0.7.1 BLOCKER** | C-005 (honesty contract tests), E-004 (negative-session verification), I-001 (signing), I-003 (EDR matrix), I-005 (AC outreach completion) |
-| **v1.0** | I-002 (MSI), K-002 (session GUID rotation) |
+| **v0.7.1 BLOCKER** | C-005 (honesty contract tests), E-004 (negative-session verification), ~~I-001 (signing)~~ — won't-fix per scope revision, ~~I-003 (EDR matrix)~~ — won't-fix per scope revision, ~~I-005 (AC outreach completion)~~ — won't-fix per scope revision. v0.7.1 default-on-flip gate redefined as dogfood-criterion ("Frank used closed_loop_enabled = true on 9950X3D for 2+ weeks") per scope-revision DP #1. |
+| **v1.0** | ~~I-002 (MSI)~~ — won't-fix per scope revision, K-002 (session GUID rotation) |
 
 ---
 
 ## Status
 
 Phase 2 findings file initialized + populated across all 11 axes (A–K + pre-audit L).
-Findings count: **45** (29 actionable open + 1 closed-prior + 6 credits/PASS-after-analysis + 6 pre-audit + 2 strategic + 1 added 2026-05-18). E-001 moved to closed-prior 2026-05-18 per W1.5 (#84) survey — see E-001 Resolution block. E-005 added 2026-05-18 for the catch_unwind `&str`-branch coverage gap surfaced during the same survey.
+Findings count: **45** (23 actionable open + 1 closed-prior + 5 won't-fix-per-scope-revision + 2 reframed + 6 credits/PASS-after-analysis + 6 pre-audit + 2 strategic). E-001 moved to closed-prior 2026-05-18 per W1.5 (#84) survey. E-005 added 2026-05-18 for the catch_unwind `&str`-branch coverage gap. Cascade-1 of scope revision (PR #129) reclassified I-001 / I-002 / I-003 / I-005 / J-004 to won't-fix and J-001 / J-003 to reframed-not-closed; see per-finding Resolution blocks.
 BLOCKER-v0.7: 2 (F-001, F-002 — with conflict-with-audit-position flag on F-002)
-BLOCKER-v0.7.1: 5 (C-005, E-004, I-001, I-003, I-005)
-HIGH: 3 (A-003, C-001, I-002) — E-001 reclassified to "Closed prior" per Resolution
-MEDIUM: 12 (incl. K-004 + K-005, both HIGH-regression-risk; +E-005 added 2026-05-18 per W1.5 survey)
+BLOCKER-v0.7.1: 2 (C-005, E-004) — I-001, I-003, I-005 reclassified to won't-fix per scope revision
+HIGH: 2 (A-003, C-001) — I-002 reclassified to won't-fix per scope revision; E-001 to closed-prior per W1.5
+MEDIUM: 12 (incl. K-004 + K-005, both HIGH-regression-risk, both now indefinitely deferred per scope revision DP #4; +E-005 added 2026-05-18 per W1.5 survey)
 LOW: 13
 N/A (credit/strategic): 10
 
