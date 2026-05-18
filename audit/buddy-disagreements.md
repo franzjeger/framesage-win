@@ -1082,6 +1082,52 @@ Two rounds of mobile-Claude review is the right rhythm for structural architectu
 
 ---
 
+## PR #131 — 2026-05-18 — verdict GO — review-surface: mekanisk anvendelse av merget scope-revision (PR #129); no mobile-Claude review per cascade-1 directive
+
+**Source:** Cascade PR 1 of 5 (+1 future) per PR #129 (scope revision) cascade plan. Applies mechanical Resolution blocks to 7 findings in axes I + J per Frank's 2026-05-18 cascade-rekkefølge directive.
+
+### Review-surface honesty
+
+**What was actually checked:**
+
+- **Mechanical application of merged scope-revision framing.** No new architectural decisions; no new content beyond what PR #129 already authoritative-section established. Each of the 7 Resolution blocks cites PR #129 + the scope-revision section directly.
+- **Per-finding Resolution wording followed Frank's per-finding directive verbatim:**
+  - I-001 / I-002 / I-003 / I-005 / J-004 → won't-fix (5 findings)
+  - J-001 / J-003 → REFRAMED, not closed; technical content unchanged, framing-only revision (2 findings)
+  - J-002 explicitly NOT touched per Frank's directive ("trenger ikke ny Resolution, bare sjekk at eksisterende status er konsistent") — consistency verified: J-002 cross-refs F-001, which closed via W1.6 / PR #119's onboarding-page-3 scaffold.
+- **Index + status-summary updates** applied with strikethrough syntax on the affected v0.7.1 BLOCKER and v1.0 entries (visual rendering of strikethrough in GitHub tables previously validated on PR #126 — fall-back-to-plain-text contingency not needed).
+- **No mobile-Claude review** per Frank's explicit cascade-1 directive: "Mobile-Claude review IKKE nødvendig på cascade-1 — mekanisk anvendelse av allerede-godkjent scope-ramme på 7 finding-blokker."
+- **Self-attestation Q1–Q5** in PR body (markdown-only; build/clippy/fmt confirmed clean).
+- **Verification commands run:**
+  - `cargo build --workspace` — clean (markdown-only)
+  - `cargo fmt --all --check` — clean
+  - `git diff --stat` — 1 file, +24 / -10
+  - `grep -n "^## I-00\|^## J-00"` to locate finding starting positions before editing
+  - Read each finding's body before drafting its Resolution (no surprises)
+
+**Defects fanget:** zero. Mechanical PR with pre-vetted scope frame.
+
+**Verdict:** GO. PR #131 merged as commit `919dca9`. Cascade-1 of 5 (+1) complete.
+
+### Cascade progress
+
+| # | PR | Status |
+|---|---|---|
+| **Cascade PR 1** | **#131** | **✓ MERGED** |
+| Cascade PR 2 | (next) — Roadmap-fil oppdateringer | Pending |
+| Cascade PR 3 | GitHub issues batch-close | Pending |
+| Cascade PR 5 | README scope callout | Pending |
+| Cascade PR 4 | CLI verb for closed-loop toggle | Deferred — tracked as new Month 1 item in cascade-2 |
+| Future scope-revision PR | PresentMon scope decision | Gated on Group A + 2 weeks Frank-usage |
+
+Tempo per Frank's directive: halv-dag-PRer; "mellom hver PR — sjekk at main er stabil og det ikke har vært overraskelser." Next: cascade-2 (roadmap-fil oppdateringer).
+
+### Lesson observation
+
+The "no mobile-Claude review per cascade-1 directive" framing is honest precisely because cascade-1 was purely mechanical. The substantive decisions all happened in PR #129's 2-round review. Cascade work serves only to propagate the decisions into the findings/roadmap/issues files. Future cascade PRs (2, 3, 5) follow the same pattern. **Skipping mobile-Claude review on mechanical-application PRs is the correct discipline** — running review on every PR would dilute the signal of when review actually catches things.
+
+---
+
 ## How to use this log going forward
 
 Each new buddy review that surfaces a concern gets a new
