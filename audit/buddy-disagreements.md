@@ -785,6 +785,373 @@ references resolve.
 
 ---
 
+## Entry 6 — 2026-05-18, buddy review M3.7: Month 3 + v0.7.1 tag (5Q implementation-phase format)
+
+### Context
+
+Issue #116 (roadmap item M3.7) calls for a 5Q implementation-phase
+buddy review against the v0.7.1 tag candidate. The five questions
+are issued by the planning stage of the issue and reproduced
+verbatim here for traceability:
+
+1. Language mechanics — Group B/C code passes `cargo clippy -- -D
+   warnings` + the audit's `[UNVERIFIED]` sweep (P4.8)?
+2. Concurrency — drop-poll + supervisor + recorder + PresentMon
+   subprocess interactions deadlock-free?
+3. Errors — every Win32 path has a documented error mapping?
+4. Test honesty — the five Group C threshold tests assert verbatim
+   substrings (not paraphrased)? The negative-session screenshot is
+   real?
+5. Consistency — architecture §2.4 honesty-contract substrings +
+   onboarding-page-3 required substrings + Sessions tab empty-state
+   substrings all match their spec word-for-word?
+
+**Buddy ran this review against main at `6f972b6` (PR #79 squash —
+Group A week 2 ETW implementation).** Verification commands and
+literal output are included per Phase 3 ground rule (architecture
+§ "New ground rule: spike reports include verification commands +
+literal output").
+
+---
+
+## (1) Language-mechanics safety: FAIL
+
+**Group A (crates/etw + crates/service): PASS on language mechanics.**
+
+Every `unsafe` block in the reviewed code has an adequate `//
+SAFETY:` comment naming preconditions and satisfaction:
+
+- `build_gate.rs:120` — `RtlGetVersion(&mut info)`: SAFETY names the
+  writable-local precondition, size-of population, aliasing
+  impossibility. Adequate.
+- `session.rs` (multiple sites) — `StartTraceW`, `ControlTraceW`,
+  `OpenTraceW`, `ProcessTrace`, `CloseTrace`: each site delegates to
+  "caller contract per trait method docs" and the trait's own `#
+  Safety` doc explains all FFI preconditions. Adequate.
+- `EtwSessionPropertiesBuffer::new` (`zeroed()`): "zero-init gives a
+  valid empty EVENT_TRACE_PROPERTIES." Adequate.
+- `event_record_callback`: two dereferences — pointer non-null check
+  precedes each. Adequate.
+- `MockEtwSysCalls::control_trace` QUERY write-back: "caller passed a
+  valid EVENT_TRACE_PROPERTIES per trait contract." Adequate.
+
+Visibility matches consumer location: all tests are inline
+`#[cfg(test)] mod tests`, not in `crates/etw/tests/`. This is
+correct — the plan §3.4's `pub(crate)` helpers (BuildOverrideGuard,
+MockEtwSysCalls) are only visible from inline tests, and there are no
+integration tests in a `tests/` subdirectory that would fail to see
+them.
+
+Send+Sync bounds: `EtwSession<S: Clone + Send + 'static>` captures
+`S` by move into the consumer-thread closure. `Arc<ConsumerState>` is
+`Send + Sync` because `ConsumerState` contains only `AtomicU64`.
+`static_assertions::assert_impl_all!(ConsumerState: RefUnwindSafe)`
+in supervisor.rs catches future regressions at compile time.
+
+`[UNVERIFIED]` sweep: no `[UNVERIFIED]` markers remain in any
+Group A code or documentation. All eight `mac-side-uncertainties.md`
+entries are marked "Resolved" with literal verification-command
+output. Verification:
+
+```
+$ grep -rn "UNVERIFIED" crates/etw crates/service spike/mac-side-uncertainties.md
+(no output)
+```
+
+**FAIL reason: Group B and Group C code does not exist.**
+
+The question asks about "Group B/C code." Verification:
+
+```
+$ ls crates/
+cli  core  engine  etw  gamemode  ipc  service  sim  spike-etw  sys  tray
+```
+
+There is no `crates/recorder`, `crates/presentmon`, or equivalent.
+
+```
+$ grep -rn "compute_attribution\|attribution_summary\|PresentMon\|presentmon" crates/ \
+    --include="*.rs" | grep -v "target" | grep -v "etw-edr-report"
+crates/service/src/closed_loop.rs:203:    // Group C UI banner consumer.
+crates/etw/src/session.rs:621:        /// service can surface it in logs and (Group C) the UI banner.
+crates/etw/src/degradation.rs:16:/// `EtwSubsystem::Disabled(_)`) and the UI (Group C banner / Status
+```
+
+PresentMon spawn, session recorder, and compute_attribution_summary
+are referenced only in comments describing future Group C wiring.
+None is implemented. The language-mechanics check cannot be performed
+on code that does not exist — and its absence is itself the finding.
+
+---
+
+## (2) Concurrency correctness: PARTIAL — see below
+
+**Drop-poll interval task and supervisor: PASS.**
+
+- `spawn_closed_loop_tasks` in `crates/service/src/closed_loop.rs`
+  spawns two independent tokio tasks. The supervisor task owns
+  `SessionShutdownHandle` (holds `syscalls: Option<S>`); the
+  drop-poll task owns `MonitorHandle` (holds a clone of `syscalls`
+  + a clone of `Arc<ConsumerState>`). These are non-overlapping
+  ownership regions.
+- The drop-poll interval calls `MonitorHandle::poll_drop_stats` which
+  calls `query_session_stats` (→ `ControlTraceW(QUERY)`). The
+  supervisor task calls `shutdown.shutdown()` (→
+  `ControlTraceW(STOP)`) only on the consumer-panic path. Both paths
+  hold their own `syscalls` clone and issue independent Win32 calls.
+  The Win32 session name is the unique ETW session key; concurrent
+  QUERY + STOP on the same session name is explicitly permitted by
+  the ETW API (QUERY is read-only; STOP is idempotent on
+  already-stopped sessions via ERROR_WMI_INSTANCE_NOT_FOUND
+  tolerance).
+- No shared mutable state between the two tasks. No lock required.
+- `ConsumerState::events_seen` is `AtomicU64` with `Ordering::Relaxed`
+  — correct for an independent monotone counter with no cross-counter
+  ordering requirements.
+- `exit_tx` (oneshot Sender) lives exclusively in the consumer-thread
+  closure and is consumed once on exit. No contention possible.
+
+**Recorder + PresentMon subprocess: N/A — not implemented.**
+
+Architecture §2.2 describes PresentMon as a child process managed by
+the session recorder. The recorder does not exist (see Q1). The
+deadlock analysis for recorder ↔ PresentMon process lifecycle
+interactions, I/O drain, and crash-restart logic cannot be performed.
+
+**STOP finding on concurrency:** the v0.7.1 tag requires Group B
+(PresentMon + recorder) per Phase 3 acceptance criteria
+(`audit/v0.7-architecture.md` §1582). Without the recorder and
+PresentMon wiring, concurrency Q2 is unresolvable for the Group B
+scope.
+
+---
+
+## (3) Error handling: PASS (Group A scope)
+
+Win32 paths and their documented error mappings in the reviewed code:
+
+| Call site | Win32 error | Disposition |
+|---|---|---|
+| `start_trace` / `StartTraceW` | `ERROR_ACCESS_DENIED` (5) | `Disabled(AccessDenied)` — explicit match, no bail |
+| `start_trace` / `StartTraceW` | `ERROR_ALREADY_EXISTS` | `Disabled(AlreadyExists)` — explicit match |
+| `start_trace` / `StartTraceW` | any other non-SUCCESS | `bail!` with hex code + human hint |
+| `control_trace` / `ControlTraceW` (STOP path) | `ERROR_WMI_INSTANCE_NOT_FOUND` | treated as success (already gone) |
+| `control_trace` / `ControlTraceW` (STOP path) | any other non-SUCCESS | `bail!` |
+| `control_trace` / `ControlTraceW` (QUERY path) | any non-SUCCESS | `bail!` |
+| `open_trace` / `OpenTraceW` | `handle.Value == u64::MAX` | `bail!` |
+| `process_trace` / `ProcessTrace` | `ERROR_CANCELLED` (1223) | clean-shutdown path (explicit check) |
+| `process_trace` / `ProcessTrace` | any other non-SUCCESS | `bail!` |
+| `close_trace` / `CloseTrace` | non-SUCCESS | `tracing::warn!` (non-fatal — already shutting down) |
+| `RtlGetVersion` | `status.0 < 0` (NTSTATUS) | `Disabled(BuildUnsupported { detected_build: None })` |
+
+No `.ok()` swallows on fallible Win32 calls. No `.unwrap()` in the
+consumer thread outside the `catch_unwind` boundary. The Drop impl
+for `EtwSession` and `SessionShutdownHandle` both emit `WARN` on
+cleanup failure with a `logman stop` remediation hint — appropriate
+severity for a best-effort path.
+
+`tracing_test` subscriber assertions in `crates/service/src/closed_loop.rs`
+correctly assert against structured fields
+(`reason="policy_opt_out"`, `reason="build_unsupported"`) rather than
+free-text substrings. Correct per user's Day 5 guidance.
+
+---
+
+## (4) Test-asserts-what-it-says: FAIL
+
+**Group A tests: PASS.**
+
+Each test name maps cleanly to its assertion:
+
+- `predicate_true_at_synthetic_build_at_or_above_threshold` →
+  asserts `closed_loop_enabled_for_this_build() == true`. ✓
+- `predicate_false_at_synthetic_build_below_threshold` →
+  asserts `!closed_loop_enabled_for_this_build()`. ✓
+- `predicate_false_on_synthetic_rtlgetversion_failure` →
+  asserts `detected_build() == None`. ✓
+- `mode_1_access_denied_returns_disabled` → asserts
+  `matches!(result, EtwSubsystem::Disabled(DegradationMode::AccessDenied))`. ✓
+- `mode_6_build_unsupported_short_circuits_before_any_etw_call` →
+  asserts variant shape + `detected_build == Some(22631)`. ✓
+- `supervisor_emits_consumer_panic_event_and_calls_shutdown` →
+  asserts `events[0].mode == ConsumerPanic` and
+  `events[0].detail.contains("synthetic test panic")`. ✓
+- `mode_5_session_level_full_flow_panic` → full-flow test asserting
+  `Panicked` reason + `ConsumerPanic` event + literal panic payload
+  in detail. ✓
+
+**FAIL: five Group C threshold tests do not exist.**
+
+Architecture §2.4 (line 1164 in `audit/v0.7-architecture.md`) and
+Phase 3 Group C acceptance criteria (line 1631) require:
+
+```
+compute_attribution_summary(session_with_p99_delta(-9%))
+  → rendered string contains "improved your 1% lows"
+compute_attribution_summary(session_with_p99_delta(-6%))
+  → rendered string contains "Modest improvement"
+compute_attribution_summary(session_with_p99_delta(0%))
+  → rendered string contains "No measurable effect"
+compute_attribution_summary(session_with_p99_delta(+4%))
+  → rendered string contains "Slight regression"
+compute_attribution_summary(session_with_p99_delta(+6%))
+  → rendered string contains "**degraded**" verbatim
+```
+
+Verification:
+
+```
+$ grep -rn "compute_attribution\|improved your 1%\|Modest improvement\
+|No measurable effect\|Slight regression\|degraded" \
+    crates/ --include="*.rs" | grep -v "target"
+(no output)
+```
+
+`compute_attribution_summary` does not exist. The five threshold
+tests do not exist. The verbatim-substring requirement for
+`"**degraded**"` (the critical anti-euphemism guard) is unmet.
+
+**FAIL: negative-session screenshot does not exist.**
+
+The Group C acceptance criterion (architecture §1629) requires:
+"Negative-result session intentionally produced (apply a bad profile)
+and verified that the UI shows red attribution banner." No screenshot
+file exists in the repository at any path matching that criterion:
+
+```
+$ find . -name "*.png" -o -name "*.jpg" | grep -i "session\|negative\|bad" | grep -v target
+(no output)
+```
+
+---
+
+## (5) Internal consistency: FAIL
+
+**Architecture §2.4 honesty-contract substrings:** unverifiable
+because `compute_attribution_summary` does not exist. The required
+string table (§2.4 lines 1143–1147) specifies five output strings;
+none is asserted anywhere in the codebase.
+
+**Onboarding page 3 required substrings:**
+
+Architecture §2.1 mode 6 (line 343) and §1354 "First-run
+onboarding — new closed-loop opt-in page" describe a new page 3 (the
+closed-loop opt-in page inserted between current pages 2 and 3).
+Implementation note (§1416): "The 'EDR validation in progress for
+v0.7.1' line is a required substring per Group C acceptance criterion.
+Reviewer rejects a PR that ships page 3 without it."
+
+Current `crates/tray/src/onboarding.rs` has four pages (0–3), not
+five. Page 3 in the current implementation is the "Ready to go"
+confirmation page, not the closed-loop opt-in page. Verification:
+
+```
+$ grep -n "page 3\|page_three\|render_page_three\|Measure whether\
+|EDR validation\|closed.loop.*opt\|ClosedLoopChoice" \
+    crates/tray/src/onboarding.rs
+346:fn render_page_three(ui: &mut egui::Ui, next: &mut Option<NextAction>) {
+348:    ui.label(theme::section_heading("Manual Game Mode"));
+```
+
+`render_page_three` renders the existing "Manual Game Mode" page, not
+the new closed-loop opt-in page. The `ClosedLoopChoice` enum and
+"Measure whether rules helped" heading are absent. The required
+substring "EDR validation in progress for v0.7.1" is absent.
+
+**Sessions tab empty-state substrings:**
+
+Architecture §2.4 specifies two empty-state variants:
+
+1. **Unsupported-build state (build < 26100):** must contain
+   `"requires Windows 11 24H2 or later"` and must NOT contain
+   `"After your first 90-second gaming session"`.
+2. **No-sessions-yet state (build ≥ 26100, `closed_loop_enabled:
+   true`):** must contain `"After your first 90-second gaming
+   session"`.
+
+The Sessions tab does not exist in `crates/tray/src/main.rs`.
+Verification:
+
+```
+$ grep -n "Sessions\|session.*tab\|After your first\
+|requires Windows 11 24H2" crates/tray/src/main.rs
+1944:                    stats.game_mode_sessions,
+1945:                    "Game Mode sessions",
+```
+
+No Sessions tab component. No empty-state strings. No "Enable…"
+button. The architecture §2.4 spec is entirely unimplemented.
+
+---
+
+## Overall verdict
+
+**STOP-ON-MULTIPLE.**
+
+Three independent blocking gaps; none is a documentation/naming slip:
+
+1. **Group B and C implementations missing.** The v0.7.1 tag
+   presupposes Group A (done), Group B (PresentMon + recorder), and
+   Group C (Sessions UI + attribution). Neither Group B nor Group C
+   code exists. The language-mechanics check, the recorder/PresentMon
+   concurrency analysis, the five threshold tests, and the Sessions
+   tab substring verification all block on this.
+
+2. **Onboarding page 3 (closed-loop opt-in) not implemented.**
+   Current `crates/tray/src/onboarding.rs` has 4 pages identical to
+   the v0.6 wizard. The new page 3 ("Measure whether rules helped")
+   with the required `ClosedLoopChoice` enum and the load-bearing
+   substring "EDR validation in progress for v0.7.1" is absent. A
+   v0.7.1 ship without this page launches with `closed_loop_enabled`
+   defaulting to `false` (architecture §1664 resolution) but with no
+   onboarding path to opt in, which breaks the user-facing contract.
+
+3. **Five Group C threshold tests absent.** The verbatim-substring
+   requirement for `compute_attribution_summary` (critical
+   anti-euphemism guard for the `"**degraded**"` case) is the
+   architecture's stated mitigation for the "attribution UI failing
+   the honesty test" risk (§1444). Without these five tests the
+   v0.7.1 merge gate is structurally open to a developer under
+   deadline smoothing a negative delta and passing CI.
+
+**Q3 (error handling) is PASS** for the Group A scope reviewed. No
+swallows, no severity mismatches, all Win32 codes documented.
+
+**Q2 (concurrency) is PASS** for the drop-poll + supervisor
+subsystem reviewed. The recorder + PresentMon interactions cannot be
+verified because the code does not exist.
+
+**Q1 (Group A language mechanics + UNVERIFIED sweep) is PASS** for
+the existing implementation. All SAFETY comments are adequate,
+visibility matches consumer location, Send+Sync bounds are correct,
+no `[UNVERIFIED]` markers remain in code or docs.
+
+---
+
+## Category-of-issue observation
+
+Findings 1–3 are all in the same category: **implementation scope
+gap** — the v0.7.1 tag review arrived before the Phase 3 Group B and
+C deliverables were built. This is distinct from prior entries (which
+were documentation-consistency and API-shape issues within an
+existing deliverable). The watch-signal criteria (count, severity,
+same-category-as-prior-round) do not apply here because this is the
+first 5Q code review; it surfaces a scheduling/scope gap, not a
+quality-regression pattern.
+
+**What the user needs to decide:**
+
+| # | Question | Options |
+|---|---|---|
+| 1 | Group B (PresentMon + recorder) and Group C (Sessions UI + attribution) scope: are these required for the v0.7.1 tag, or does v0.7.1 ship as Group-A-only with the default-on-flip? | (A) v0.7.1 = Group A only; B/C deferred to v0.8. Remove B/C from v0.7.1 acceptance criteria. (B) v0.7.1 requires B+C. Start Group B. |
+| 2 | Onboarding page 3: required for any v0.7.1 candidate regardless of B/C decision? | (A) Yes — any build tagged v0.7.1 must have the opt-in page. (B) Defer to when B/C lands (user can't opt in to something that doesn't record yet anyway). |
+| 3 | Five threshold tests: Group C acceptance criterion per architecture. Required before any Group C code ships. | Not a decision — these block the Group C merge gate by definition. Whoever writes `compute_attribution_summary` also writes the five tests. |
+
+Primary-agent holds execution on all v0.7.1 tag work pending user
+decisions on (1) and (2).
+
+---
+
 ## How to use this log going forward
 
 Each new buddy review that surfaces a concern gets a new
