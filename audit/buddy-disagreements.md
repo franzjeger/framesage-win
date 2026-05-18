@@ -1177,6 +1177,83 @@ This session has now completed cascade-1 + cascade-2 + their buddy-logs. Cascade
 
 ---
 
+## Cascade-3 (no PR, GitHub-state-only) — 2026-05-18 — verdict GO — review-surface: mekanisk anvendelse av merget scope-revision (PR #129) + cascade-1 (#131) + cascade-2 (#133) on GitHub issue state; no mobile-Claude review per cascade-3 directive
+
+**Source:** Cascade step 3 of 4 (+1 future) per PR #129 cascade plan. Applies scope-revision framing to GitHub issue state per Frank's 2026-05-18 cascade-rekkefølge directive. **No PR — direct GitHub mutations only** (8 closes + 1 retitle + 1 new-issue-create).
+
+### Why no PR
+
+Cascade-3 mutates GitHub issue state, not repo files. No source-of-truth file to commit. The audit trail lives in:
+- GitHub's own issue-state log (each closed/retitled/created action timestamped + author-stamped)
+- This buddy-log entry (the project-side narrative)
+- The findings-fil + roadmap-fil edits already merged in cascade-1 (#131) + cascade-2 (#133), which the closure comments cross-reference
+
+This is intentional separation: GitHub state changes have GitHub's audit trail; project-doctrine changes have repo's audit trail. Cascade-3 lives in GitHub-state-land.
+
+### Review-surface honesty
+
+**What was actually done (10 actions via one-shot bash script):**
+
+Closed as won't-fix (6):
+- #80 [W1.1] AC outreach
+- #86 [W1.7] AC outreach cross-ref
+- #87 [W1.8] cert procurement
+- #88 [W1.9] EDR engagement
+- #102 [M2.1] signing closeout
+- #103 [M2.2] EDR matrix closeout
+
+Closed as deferred-indefinitely (2):
+- #108 [M2.7] K-005 engine split — explicit "re-open this issue at that point" language for the un-defer trigger
+- #115 [M3.6] K-004 tray split — same
+
+Housekeeping (2):
+- #101 retitled from [M1.12] → [M1.15] (per cascade-2 renumbering)
+- #135 created as [M1.14] CLI verb (scope-revision DP #2 cascade-item; body cross-refs DP #2 in scope-revision section + M3.5 dogfood-gate dependency)
+
+**Per-issue close-comment template** carried verbatim from Frank's cascade-3 directive ("Closed as [won't-fix | deferred indefinitely] per scope revision merged 2026-05-18 in PR #129 (commit f01c823). ..."), with per-issue rationale appended.
+
+**No mobile-Claude review** per Frank's cascade-3 directive: "Mekanisk anvendelse, ingen mobile-Claude review."
+
+**Verification:**
+- `gh issue list --repo franzjeger/framesage-win --label audit-2026-revision --state open` → 26 open
+- `gh issue list --repo franzjeger/framesage-win --label audit-2026-revision --state closed` → 13 closed
+- Pre-cascade-3 counts (after PR #126 created #127): ~35 open, ~5 closed. Post-cascade-3: 8 issues moved from open → closed; 1 new issue created (#135). Net: open 26, closed 13.
+- #101 title in `gh issue list` confirms retitle to [M1.15].
+- #135 title confirms creation with [M1.14] prefix + correct labels.
+
+**Defects fanget:** zero.
+
+**Verdict:** GO. Cascade-3 complete.
+
+### Cascade progress
+
+| # | Action | Status |
+|---|---|---|
+| Cascade PR 1 | Findings-fil Resolution blocks | ✓ MERGED (#131, `919dca9`) |
+| Cascade PR 2 | Roadmap-fil scope-revision updates | ✓ MERGED (#133, `41f3836`) |
+| **Cascade step 3** | **GitHub issues batch (no PR)** | **✓ COMPLETE** |
+| Cascade PR 5 | README scope callout | Pending Frank's directive (next or future session) |
+| Cascade PR 4 | CLI verb implementation (M1.14 / #135) | Deferred until Month 1 bandwidth permits |
+| Future scope-revision PR | PresentMon scope decision | Gated on Group A + 2 weeks Frank-usage |
+
+### Per Frank's directive: STOP after cascade-3 + report state
+
+Frank's cascade-3 directive: "Etter cascade-3 merget: stopp og rapportér state. Cascade-5 (README) kan vente til neste økt eller gjøres etter en kort pause — Frank's call."
+
+Cascade-3 complete; state reported above + in follow-up chat message. Awaiting Frank's cascade-5 timing directive.
+
+### Pattern observation across 3 cascade steps
+
+| Cascade step | Defects fanget | Self-correction needed |
+|---|---|---|
+| Cascade-1 (#131) | 0 | No |
+| Cascade-2 (#133) | 1 (M1.13 numbering conflict) | Yes (pre-push, grep-verify) |
+| Cascade-3 (no PR) | 0 | No |
+
+Pattern: mechanical-application cascades have low defect rates BUT the one defect that did surface (cascade-2's M1.13 conflict) was caught only because the implementer remembered to grep-verify the corresponding GitHub issue state. **Lesson reinforced:** mechanical work isn't defect-free; the discipline that catches the rare defect is what makes "mechanical" honest framing.
+
+---
+
 ## How to use this log going forward
 
 Each new buddy review that surfaces a concern gets a new
