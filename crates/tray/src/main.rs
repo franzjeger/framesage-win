@@ -46,6 +46,7 @@ mod ipc_client;
 mod onboarding;
 mod process_actions;
 mod state;
+mod tabs;
 mod theme;
 mod tree;
 mod widgets;
@@ -159,6 +160,12 @@ enum Tab {
     Status,
     Processes,
     Activity,
+    /// W1.6 / closes F-002 (Phase 3 roadmap #85). Sessions tab
+    /// position per architecture §2.4: between Activity and Rules.
+    /// Scaffold-only in v0.7 — two empty-state variants (per
+    /// `tabs::sessions`). Full list/detail/attribution rendering
+    /// lands in M3.1 / Group C deliverable (#110).
+    Sessions,
     Rules,
     Profiles,
     /// Item 4.3 — Settings tab: editable ProBalance thresholds,
@@ -1120,16 +1127,23 @@ impl FramesageApp {
             onboarding::OnboardingResult::StillVisible => {
                 // Keep rendering each frame; nothing to commit yet.
             }
-            onboarding::OnboardingResult::Finished(level) => {
-                // Apply the chosen level to the live policy. Pull
-                // the current policy off the latest status snapshot
+            onboarding::OnboardingResult::Finished { level, closed_loop } => {
+                // Apply both choices to the live policy. Pull the
+                // current policy off the latest status snapshot
                 // (the tray always has one once connected), mutate
                 // in place, and send SetPolicy.
+                //
+                // W1.6 — apply_closed_loop_to_policy is the new
+                // mutator; runs back-to-back with the existing
+                // apply_choice_to_policy under the same SetPolicy
+                // commit per architecture §"First-run onboarding"
+                // lines 1411-1412.
                 let policy_to_send = {
                     let s = self.state.lock();
                     s.status.as_ref().map(|st| {
                         let mut p = st.policy.clone();
                         onboarding::apply_choice_to_policy(&mut p, level);
+                        onboarding::apply_closed_loop_to_policy(&mut p, closed_loop);
                         p
                     })
                 };
@@ -1542,6 +1556,7 @@ impl FramesageApp {
                     (Tab::Processes, "Processes"),
                     (Tab::Status, "Status"),
                     (Tab::Activity, "Activity"),
+                    (Tab::Sessions, "Sessions"),
                     (Tab::Rules, "Rules"),
                     (Tab::Profiles, "Profiles"),
                     (Tab::Settings, "Settings"),
@@ -1685,7 +1700,7 @@ impl FramesageApp {
             ui.spacing_mut().item_spacing.x = 0.0;
             // Each tab gets a one-line hover-text that names the tab's
             // job, since the labels themselves are deliberately terse.
-            let tabs: [(Tab, &str, &str); 6] = [
+            let tabs: [(Tab, &str, &str); 7] = [
                 (
                     Tab::Processes,
                     "Processes",
@@ -1700,6 +1715,11 @@ impl FramesageApp {
                     Tab::Activity,
                     "Activity",
                     "Full event log — filter chips + search.",
+                ),
+                (
+                    Tab::Sessions,
+                    "Sessions",
+                    "Closed-loop session history + \"Did it help?\" attribution (v0.7 Group C).",
                 ),
                 (
                     Tab::Rules,
@@ -1739,6 +1759,7 @@ impl FramesageApp {
             Tab::Status => self.render_status_tab(ctx, ui, status, recent),
             Tab::Processes => self.render_processes_tab(ui, status),
             Tab::Activity => self.render_activity_tab(ui),
+            Tab::Sessions => crate::tabs::sessions::render(ui, status.as_ref()),
             Tab::Rules => self.render_rules_tab(ui, status),
             Tab::Profiles => self.render_profiles_tab(ui, status),
             Tab::Settings => self.render_settings_tab(ui, status),
@@ -5041,7 +5062,7 @@ fn open_explorer_select(path: &str) {
 #[cfg(not(windows))]
 fn open_explorer_select(_path: &str) {}
 
-fn open_in_shell(target: &str) {
+pub(crate) fn open_in_shell(target: &str) {
     #[cfg(windows)]
     {
         let _ = std::process::Command::new("cmd")

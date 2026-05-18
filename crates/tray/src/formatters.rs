@@ -321,6 +321,7 @@ mod tests {
             active_profile,
             manual_override: None,
             manual_global_active: None,
+            closed_loop_build_supported: false,
         }
     }
 

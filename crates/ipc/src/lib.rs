@@ -427,6 +427,29 @@ pub struct StatusSnapshot {
     /// profile's environment actions).
     #[serde(default)]
     pub manual_global_active: Option<ProfileId>,
+    /// W1.6 / closes F-002 (Sessions tab scaffold). True iff the
+    /// running Windows build supports the v0.7 closed-loop ETW
+    /// subsystem (≥ build 26100 = Win11 24H2 per architecture §2.1
+    /// "Build gate" + Phase 2 sign-off Decision 1). The tray's
+    /// Sessions tab branches its empty-state rendering on this:
+    /// `false` → unsupported-build empty state ("requires Windows 11
+    /// 24H2 or later"); `true` → no-sessions-yet empty state.
+    ///
+    /// Populated by the service's IPC Status handler from
+    /// `framesage_etw::closed_loop_enabled_for_this_build()` —
+    /// framesage-engine has no etw dep per ARCHITECTURE.md invariant
+    /// #8, so the service is the only crate that can read the
+    /// predicate at status-build time. The value is static for the
+    /// service's lifetime (Windows build doesn't change at runtime),
+    /// so no caching concerns.
+    ///
+    /// `#[serde(default)]` (false) so older clients / fresh JSON
+    /// without this field decode cleanly — the tray then shows the
+    /// unsupported-build empty state, which is the conservative
+    /// fallback ("don't claim closed-loop works if we can't confirm
+    /// the host supports it").
+    #[serde(default)]
+    pub closed_loop_build_supported: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
