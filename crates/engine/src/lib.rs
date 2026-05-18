@@ -2019,6 +2019,13 @@ impl Engine {
             info!(active = new_presence.eac, "AC presence change: EAC");
             emit("eac", new_presence.eac);
         }
+        // NOTE: This transition-detection log line is permanently
+        // dormant after W1.2 / A-003 (Javelin detection deferred
+        // pending dedicated probe). The presence.javelin field never
+        // flips from false until a dedicated probe lands; until then,
+        // this log message never fires. Kept for symmetry with the
+        // other AC variants and to activate automatically when Javelin
+        // detection wires up.
         if old.javelin != new_presence.javelin {
             info!(
                 active = new_presence.javelin,
