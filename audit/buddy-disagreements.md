@@ -950,6 +950,66 @@ The two-round buddy rhythm (diff-plan → raw-diff) has now been demonstrated on
 
 ---
 
+## PR #126 — 2026-05-18 — verdict GO — review-surface: pre-coding 7-point survey caught audit-vs-codebase drift; diff-plan review with 4 user-surfaced fixes; raw-diff fresh-eyes round (per HIGH-severity discipline) + visual strikethrough verification on GitHub-rendered table
+
+**Source:** W1.5 (#84) repurposed from "add the test" to "audit correction" after pre-coding META 1 sweep discovered `mode_5_session_level_full_flow_panic` already existed at `crates/etw/src/session.rs:1718`. Closes E-001 via Resolution block (prior PR #79 resolution), adds E-005 (catch_unwind `&str`-branch coverage gap discovered during the same survey), adds P4.9 (process improvement against future audit-vs-codebase drifts), fixes stale comment at `crates/etw/src/supervisor.rs:254-257`.
+
+### The first audit-tradition self-correction
+
+PR #126 is the audit-tradition's first self-correction. The audit (written 2026-05-18 19:49:56 in PR #117) classified E-001 as open 3h 40m after the test it claimed was missing actually landed in PR #79 (2026-05-18 16:09:37). The drift was caught by Mac-Claude during W1.5 survey (#84), not in a separate audit-sweep. The rhythm caught itself by virtue of the startup procedure requiring code-survey BEFORE diff-plan. **If Mac-Claude had skipped straight to implementation ("roadmap says add test, so add test"), the duplicate test would have landed. Forarbeid > tempo.**
+
+The drift catch motivates P4.9: open-classification is a weaker guarantee than closed-classification. The Phase 2 5/5 spot-check validated CLOSED findings; OPEN findings were assumed honest. Backfill issue M1.13 (#127) tracks the systematic verification work — expected to surface more drifts.
+
+### Review-surface honesty
+
+**What was actually checked:**
+
+- **Pre-coding 7-point survey** (user-requested before diff-plan): arm_panic_in_process_trace infrastructure, existing supervisor-test scope, method-name confirmation (into_supervisable_parts vs _with_monitor), ConsumerExitReason::Panicked shape, catch_unwind RefCell soundness, META 1 sweep for other panic-path tests, trace-event capture decision. The META 1 sweep step is what discovered the audit drift — `git grep -n "arm_panic_in_process_trace\|panic_in_process_trace\|ConsumerExitReason::Panicked\|catch_unwind\|consumer_thread_panic\|consumer_loop.*panic" -- "*.rs"` returned hits at `session.rs:1718` (the existing test). The survey discipline directly prevented duplicate work.
+- **Diff-plan review** (full text of all 5 edits + 7 surface decisions presented): user surfaced 4 fixes — (1) påkrevd: retain raw-diff fresh-eyes round despite comment-only change; (2) påkrevd: soften E-005 fix-suggestion from "Cleanest implementation:" to "Suggested implementation: ... or any equivalent approach" allowing `panic_any` alternative; (3) verify: GitHub strikethrough rendering visually before merge with plain-text fallback; (4) follow-up: separate Month 1 issue for P4.9 backfill (not in this PR scope). All 4 addressed in INITIAL commit.
+- **Raw-diff fresh-eyes round** (per HIGH-severity-shutdown-path discipline, retained even for comment-only change on supervisor.rs per påkrevd #1): user verified the diff matches the plan exactly. **No corrections from this round.**
+- **Visual strikethrough verification** (per påkrevd #3): user opened PR #126's "Files changed" tab on GitHub and confirmed `~~E-001 (...)~~`-syntax renders correctly as gjennomstreket tekst with normal following clause; tabell intakt. No fallback needed.
+- **Self-attestation Q1–Q5** (in PR body): YES. Same LLM-instance as code author.
+- **Independent behavioral verification**: N/A — audit-correction PR; the "behavior" being verified is the audit's own text correctness, which the user reviewed directly.
+- **Verification commands run:**
+  - `cargo build --workspace` — clean
+  - `cargo clippy --workspace --all-targets -- -D warnings` — clean
+  - `cargo fmt --all --check` — clean
+  - `cargo test -p framesage-etw --lib mode_5_session_level_full_flow_panic` — 1 passed (confirms the test the Resolution block points to still works after supervisor.rs comment update)
+  - `cargo test --workspace` — no regressions
+  - `git log --oneline -S "mode_5_session_level_full_flow_panic" -- crates/etw/src/session.rs` — confirmed test landed in commit 6f972b6 (PR #79)
+  - `git show -s --format="%ci"` on PR #79 and PR #117 commits — confirmed 3h 40m timeline drift
+
+**Defects fanget (4 in diff-plan round, 0 in raw-diff round):**
+
+Diff-plan round (pre-coding):
+1. Påkrevd: retain raw-diff fresh-eyes round for supervisor.rs change despite it being comment-only (principle: catch unexpected; not skip-because-known).
+2. Påkrevd: soften E-005 fix-suggestion (don't lock future fixer to mock-API extension).
+3. Verify: strikethrough rendering visually (with fallback plan).
+4. Follow-up: separate Month 1 issue for P4.9 backfill (created post-merge as #127).
+
+Raw-diff round (post-coding, pre-merge):
+- **Zero corrections.** Diff matched the plan exactly. Strikethrough verified visually post-push.
+
+**Verdict:** GO. PR #126 merged as commit `0abfcba`. Issue #84 closed via prior resolution. E-005 added to findings (Month 1, MEDIUM, S effort). P4.9 added to roadmap. M1.13 (#127) created post-merge to track the P4.9 backfill.
+
+### Catch-rate observation update (5 PRs in)
+
+| PR | Diff-plan round adjustments | Raw-diff round adjustments | Note |
+|---|---|---|---|
+| #119 (W1.6) | yes | yes | Two-round catches |
+| #120 (W1.2) | yes (META 1 + diff-plan) | yes | Two-round catches |
+| #122 (W1.3) | yes (1 mikro-fix) | 0 | Diff-plan absorbed all |
+| #124 (W1.4) | yes (3 items) | 0 | Diff-plan absorbed all |
+| #126 (W1.5) | yes (4 items, incl. AUDIT DRIFT catch via META 1 sweep) | 0 | **First audit-tradition self-correction** |
+
+Catch-rate now ~80% on the buddy-rhythm rounds (one or both rounds catches something in 4 of 5 PRs). The pattern: pre-coding survey + diff-plan round absorbs structural / wording / scope-creep concerns; raw-diff round catches the rare unexpected-change. PR #126 was the first to demonstrate that META 1 sweep can also catch audit errors — not just code-side issues.
+
+### Lesson for future PRs
+
+The startup procedure's "code-survey FØR diff-plan" requirement is load-bearing. Without it, PR #126 would have re-implemented an existing test (E-001) instead of correcting the audit. P4.9's Month 1 backfill (#127) will systematically apply that discipline to all remaining open findings — expected to surface 1-3 more drifts based on the 2-of-44 base rate observed so far.
+
+---
+
 ## How to use this log going forward
 
 Each new buddy review that surfaces a concern gets a new
