@@ -785,6 +785,56 @@ references resolve.
 
 ---
 
+## PR #119 — 2026-05-18 — verdict GO — defects: none
+
+**Source:** Buddy review of `feat/w1.6-sessions-tab-onboarding-page3` (PR #119). Closes F-001 + F-002 from `audit/2026-revision-phase2-findings.md`; Phase 3 roadmap item W1.6, Option B (M effort, scaffold-only, no recording/list/detail).
+
+**Format:** 5Q implementation-phase per `audit/buddy-format-implementation-phase.md`. Buddy held back final verdict pending three targeted clarifications; all three were verified in the working tree before GO was issued.
+
+### Q1 — Forward-compat on the new IPC field
+
+Q: Is `#[serde(default)]` present on `StatusSnapshot.closed_loop_build_supported: bool`?
+
+A: **YES.** `crates/ipc/src/lib.rs:451` carries `#[serde(default)]` directly above the field at `:452`. Forward-compat:
+- Old tray + new service → serde drops the unknown field; old tray ignores.
+- New tray + old service → serde defaults to `false` → tray renders the unsupported-build empty state. Conservative fallback (the architecture's preferred failure mode — "don't claim closed-loop works if we can't confirm the host supports it").
+
+### Q2 — VERBATIM constant usage on render paths
+
+Q: Are the load-bearing const strings passed directly to `RichText::new(CONST)`, or is there any `format!()` / `concat()` / interpolation that would pass const-level substring tests but inject extra text into the rendered UI?
+
+A: **VERBATIM throughout.** Grep across all 5 load-bearing constants:
+
+| Constant | Render-site (passed VERBATIM to `RichText::new(...)`) |
+|---|---|
+| `UNSUPPORTED_BUILD_HEADING` | `crates/tray/src/tabs/sessions.rs:126` |
+| `UNSUPPORTED_BUILD_BODY` | `crates/tray/src/tabs/sessions.rs:133` |
+| `NO_SESSIONS_BODY` | `crates/tray/src/tabs/sessions.rs:181` |
+| `NO_SESSIONS_PRIVACY_FOOTER` | `crates/tray/src/tabs/sessions.rs:219` |
+| `CLOSED_LOOP_PAGE_EDR_DISCLOSURE` | `crates/tray/src/onboarding.rs:518` |
+
+The sole `format!()` use referencing these constants is `sessions.rs:262` inside the `unsupported_build_does_not_contain_no_sessions_framing` test — concatenating heading + body to check the negative-half substring constraint. Test-only; not on a render path. Drift between const-level test guarantee and rendered output is therefore impossible without explicitly editing the render call sites.
+
+### Q3 — Continue-button gating: tested or .expect()-loud-panic?
+
+Q: Is the page-2 / page-3 Continue-button gating test-covered, or does it rely on the `.expect()`-loud-panic regression-trip pattern?
+
+A: **`.expect()`-loud-panic pattern (acceptable per project style; explicitly confirmed).**
+
+- Page 2 gate: `onboarding.rs:362` — `let continue_enabled = state.choice.is_some();` + `add_enabled(continue_enabled, ...)` + "Pick a level first." muted label when disabled.
+- Page 3 gate (W1.6 new): `onboarding.rs:553` — identical shape against `state.closed_loop_choice.is_some()` + "Pick one to continue." muted label.
+- Invariant pin at Finish: `:260` + `:263` `.expect("Finish click requires a selection on Page <N>")` — regression in gating surfaces as a loud panic when Finish is clicked without a selection.
+
+No egui-render integration test exercises the gating. Consistent with the pre-W1.6 wizard's test coverage (`aggression_*` tests cover `apply_choice_to_policy` mutation only, not rendering). Full booted-UI integration test deferred to M3.1 / #110 per the W1.6 scaffold-scope contract.
+
+### Verdict + merge
+
+All three clarifications confirm the implementation matches spec. **GO.** Merging PR #119. F-001 + F-002 close on merge.
+
+**No defects fanget.** No CONFLICT-WITH-AUDIT-POSITION entries needed (the Option α resolution was pre-approved before code was written; logged in the PR body for traceability).
+
+---
+
 ## How to use this log going forward
 
 Each new buddy review that surfaces a concern gets a new
