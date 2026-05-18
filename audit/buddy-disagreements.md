@@ -1010,6 +1010,78 @@ The startup procedure's "code-survey FØR diff-plan" requirement is load-bearing
 
 ---
 
+## PR #129 — 2026-05-18 — verdict GO — review-surface: 2-round mobile-Claude 4Q planning-phase review with Frank-decision injected between rounds; zero open items at merge
+
+**Source:** Frank's 2026-05-18 scope revision — FrameSage re-scoped from "potentially broadly distributed Windows scheduler-supervisor product" to **personal power-user tool** (audience (a): Frank + other self-installers welcomed on informed-consent basis). New section "## Project scope and audience (2026-05-18 revision)" added to `audit/v0.7-architecture.md` between Executive Summary and §2.1.
+
+### Why this PR is distinct from the W1.x rhythm
+
+The W1.x PRs (W1.2 / W1.3 / W1.4 / W1.5 / W1.6) executed roadmap items as already-decided work. PR #129 is **the first structural architectural decision since the initial Phase 2 audit** — it changes the ship contract for v0.7+, supersedes prior sections by reference, and triggers a 5-PR cascade. The review discipline scaled accordingly: 2 mobile-Claude rounds + Frank-decision injection between rounds.
+
+### Review-surface honesty
+
+**What was actually checked:**
+
+- **Diff-plan round 1** (pre-coding, full draft text presented): mobile-Claude returned CHANGES_REQUESTED with 3 påkrevde + 1 valgfri.
+  - Q1 påkrevde #1 (Authority concern): Mac-Claude assumed audience-(a) framing without explicit Frank confirmation. Hard-blocked draft finalization. Mac-Claude STOPped and asked Frank via AskUserQuestion: (a) Frank + other self-installers, OR (b) Frank-only-full-stop. Frank chose (a). Difference materially affects scope of cascade work — if (b), onboarding wizard / install.ps1 robustness / error messages would have been lowered priority too.
+  - Q3 påkrevde (Feasibility): Add Decision Point #5 for PresentMon (M3.2) keep-vs-skip — XL-effort, requires Frank's call.
+  - Q4 påkrevde (Consistency): Expand AC-row with empirical-feedback-loop framing (mobile-Claude verbatim text adopted).
+  - Q4 valgfri: Audit-intensity 30-day re-evaluation note. Frank chose: include.
+- **Diff-plan round 2** (revised draft after round 1 fixes): mobile-Claude returned CHANGES_REQUESTED with 1 structural change.
+  - DP #5 (PresentMon) moved from "Decision points still open" to "Cascade work tracked separately" as a SEPARATE future scope-revision PR. Rationale: split decisions from data — Frank can't evaluate PresentMon keep-vs-skip until Group A ETW parsers ship and he's used CPU-only attribution for ~2 weeks. "Decision points still open" section removed entirely (was empty after move). §2.2 "How to consume" line updated to point at cascade-item-#6 mechanism. **Framings-PR closes clean with zero open items.**
+- **Per W1.4 discipline**: markdown-only change, NO raw-diff round needed. Standard 5Q self-attestation in PR body.
+- **Verification commands run:**
+  - `cargo build --workspace` — clean (markdown-only but verified for hygiene)
+  - `cargo fmt --all --check` — clean
+  - No tests changed; existing `closed_loop_page_contains_edr_disclosure_substring` (W1.6) still pinned per DP #3 Option α (keep onboarding copy verbatim through v0.7).
+
+**Defects fanget (4 in round 1, 1 in round 2, 0 in final):**
+
+Round 1:
+1. Påkrevd: Frank-decision needed before draft finalization on audience (a) vs (b). Hard-block.
+2. Påkrevd: Missing Decision Point #5 (PresentMon).
+3. Påkrevd: AC-row needed empirical-feedback-loop framing expansion.
+4. Valgfri: Audit-intensity 30-day re-evaluation note.
+
+Round 2:
+1. Structural: DP #5 placement wrong — should be cascade item, not open decision point.
+
+Final round (post-round-2-fixes): zero corrections; merge.
+
+**Verdict:** GO. PR #129 merged as commit `f01c823`. Scope revision authoritative on main.
+
+### Cascade work — sequencing
+
+Per mobile-Claude round 2 suggestion: ~one week, NOT one session. 5 cascade PRs + 1 future separate scope-revision PR:
+
+1. **Cascade PR 1** — Findings-file Resolution blocks (8 items: I-001 / I-002 / I-003 / I-005 / J-001 / J-002 / J-003 / J-004)
+2. **Cascade PR 2** — Roadmap-file updates (Week 1 won't-fix; Month 2/3 adjusted; K-004/K-005 indefinitely deferred)
+3. **Cascade PR 3** — GitHub issues batch-close (#80 / #86 / #87 / #88 + any others)
+4. **Cascade PR 4** — CLI verb for closed-loop toggle (DP #2 cascade item, M-effort)
+5. **Cascade PR 5** (optional) — README scope callout (Frank's call)
+6. **Future separate scope-revision PR** — PresentMon scope decision (gated on Group A completion + 2 weeks Frank-usage)
+
+**Awaiting Frank's directive on cascade-rekkefølge.** Mac-Claude does NOT open cascade PRs autonomously — each step is a separate decision point.
+
+### Catch-rate observation update (7 PRs in)
+
+| PR | Round 1 (pre-coding) | Round 2 (post-coding / structural) | Note |
+|---|---|---|---|
+| #119 (W1.6) | yes | yes | Two-round catches |
+| #120 (W1.2) | yes | yes | Two-round catches |
+| #122 (W1.3) | yes (1 mikro-fix) | 0 | Diff-plan absorbed all |
+| #124 (W1.4) | yes (3 items) | 0 | Diff-plan absorbed all |
+| #126 (W1.5) | yes (4 items, **AUDIT DRIFT catch**) | 0 | First audit-tradition self-correction |
+| #129 (scope revision) | yes (4 items + Frank-decision injected) | yes (1 structural — DP #5 → cascade) | **First multi-round review with mid-flight Frank decision.** Both rounds load-bearing. |
+
+Pattern: when the PR is **structural** (architecture decision, scope revision), even after a thorough round 1, round 2 catches genuine structural issues. The DP #5 placement was technically correct in round 1 but the framings-PR-should-close-clean principle wasn't applied until round 2. Lesson: structural PRs warrant 2 rounds even if round 1 looks complete.
+
+### Lesson for future structural PRs
+
+Two rounds of mobile-Claude review is the right rhythm for structural architectural decisions. Round 1 catches content / framing / missing-decision-points. Round 2 catches placement / structural-coherence / closing-the-PR-clean issues. The 1-round rhythm that worked for W1.2 / W1.3 / W1.4 / W1.5 is appropriate for execution PRs (already-decided work); it's NOT sufficient for decision-making PRs (new ship contract, new scope, new architectural direction).
+
+---
+
 ## How to use this log going forward
 
 Each new buddy review that surfaces a concern gets a new
