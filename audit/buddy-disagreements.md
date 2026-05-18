@@ -1254,6 +1254,62 @@ Pattern: mechanical-application cascades have low defect rates BUT the one defec
 
 ---
 
+## PR #137 — 2026-05-18 — verdict GO — review-surface: mekanisk anvendelse av merget scope-revision på README; cascade-5 closes the cascade wave
+
+**Source:** Cascade PR 5 of 5 — final cascade-PR in the PR #129 scope-revision cascade plan. Adds 5-sentence "## Project scope" callout to README between the tagline and the existing "## Who is this for?" section.
+
+### Review-surface honesty
+
+**What was actually done:**
+- Single 4-line insertion in `README.md` between tagline (line 3) and the existing `## Who is this for? (read first)` section (line 5).
+- Content matches Frank's cascade-5 directive sentence-by-sentence:
+  1. FrameSage is a personal power-user tool.
+  2. Not a broadly distributed product.
+  3. Self-install via `install.ps1` from source is the expected distribution model.
+  4. Other power-users welcome on informed-consent basis (audience (a)).
+  5. Pointer to `audit/v0.7-architecture.md` §"Project scope and audience (2026-05-18 revision)".
+- Placement chosen: FIRST sub-section after tagline, BEFORE "Who is this for?". Rationale: "Who is this for?" addresses USE CASE; new section addresses AUDIENCE; scope is more fundamental ("should I install this at all"), so it goes first.
+- **No mobile-Claude review** per Frank's cascade-5 directive ("mekanisk anvendelse av allerede-godkjent scope-ramme").
+- Self-attestation Q1–Q5 in PR body.
+
+**Defects fanget:** zero.
+
+**Verdict:** GO. PR #137 merged as commit `fd5b117`. Cascade wave complete.
+
+### Cascade wave summary
+
+| # | Action | Commit | Status |
+|---|---|---|---|
+| Cascade PR 1 (#131) | Findings-fil Resolution-blokker (7 reclassifications + index/summary updates) | `919dca9` | ✓ MERGED |
+| Cascade PR 2 (#133) | Roadmap-fil scope-revision updates (incl. M1.13/M1.14/M1.15 renumbering + summary table) | `41f3836` | ✓ MERGED |
+| Cascade step 3 (no PR) | 8 GitHub issues closed + #101 retitled + #135 new (M1.14 CLI verb) | n/a | ✓ COMPLETE |
+| **Cascade PR 5 (#137)** | **README scope callout** | **`fd5b117`** | **✓ MERGED** |
+| Cascade PR 4 (deferred) | CLI verb implementation (M1.14 / #135) | — | Deferred until Month 1 bandwidth |
+| Future scope-revision PR | PresentMon scope decision | — | Gated on Group A completion + 2 weeks Frank-usage |
+
+### Pattern observation across the full cascade wave (4 cascade steps)
+
+| Step | Type | Defects fanget | Self-correction |
+|---|---|---|---|
+| Cascade-1 (#131) | Findings-fil Resolution-blocks | 0 | N/A |
+| Cascade-2 (#133) | Roadmap-fil updates | 1 (M1.13 numbering conflict) | Yes — pre-push grep-verify |
+| Cascade-3 (GitHub state) | Issues batch-close + housekeeping | 0 | N/A |
+| Cascade-5 (#137) | README callout | 0 | N/A |
+
+**Total defect rate across 4 cascade steps: 1 in ~30 individual actions.** The one defect was caught at the pre-push stage by grep-verify discipline (not by post-merge review). Lesson: mechanical-application cascades have low defect rates, but the rare defect is caught by **the implementer's own pre-push verification**, not by mobile-Claude review. Skipping mobile-Claude review on mechanical PRs is the correct discipline; the verification work that catches defects is grep-verify against source-of-truth state (GitHub issues, existing roadmap structure, current audit-file content).
+
+### Lesson for future cascade waves
+
+When a future scope-revision triggers a cascade wave:
+1. **Mobile-Claude review on the framing-PR** (the architectural decision itself).
+2. **Skip mobile-Claude review on cascade application PRs** (mechanical work).
+3. **Pre-push grep-verify discipline** is the load-bearing defect-catch mechanism for cascade PRs.
+4. **One buddy-log entry per cascade step** (whether PR or GitHub-state-only) so the audit trail captures both the mechanical-application AND the grep-verify-discipline outcomes.
+
+This wave validated the pattern. Future cascade waves can follow the same shape.
+
+---
+
 ## How to use this log going forward
 
 Each new buddy review that surfaces a concern gets a new
