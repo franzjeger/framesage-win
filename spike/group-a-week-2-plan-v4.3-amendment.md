@@ -85,7 +85,7 @@ The `static_assertions::assert_impl_all!(ConsumerState: RefUnwindSafe)` compile-
 
 ### 1.7 — Step 8: `cargo build` package-name correction (Windows batch)
 
-**v4.2 plan §12.8 step 8 said:** `cargo build -p framesage-svc --release`
+**Windows runtime batch agenda (`spike/group-a-week-2-report.md` §12.8 step 8) said:** `cargo build -p framesage-svc --release`
 
 **Reality:** `framesage-svc` is the BINARY name (`[[bin]]` declaration in `crates/service/Cargo.toml`), not the PACKAGE name (`[package].name = "framesage-service"`). cargo rejects with: `error: package ID specification 'framesage-svc' did not match any packages`.
 
@@ -138,13 +138,13 @@ Same module as `ERROR_ALREADY_EXISTS` / `ERROR_SUCCESS` / `ERROR_WMI_INSTANCE_NO
 
 **Disposition:** Refactored inline (commit `98128a5`). Added `ERROR_ACCESS_DENIED` to the existing `use windows::Win32::Foundation::{...}` import block; replaced `if rc == ERROR_ACCESS_DENIED()` (private helper call) with `if rc == ERROR_ACCESS_DENIED` (canonical constant); removed the `fn ERROR_ACCESS_DENIED() -> WIN32_ERROR` helper. Mode 1 test still passes after refactor (21/21).
 
-### 1.12 — `_asm_baseline` Cargo feature: NOT NEEDED (Windows batch — closes v4.2 amendment Finding 3)
+### 1.12 — `_asm_baseline` Cargo feature: NOT NEEDED (Windows batch — closes v4 finding d.1's `_asm_baseline` requirement)
 
-**v4.2 plan §3.4 amendment Finding 3 said:** add a `_asm_baseline` Cargo feature gating a "no-trait" code path for the codegen-parity asm diff. Day 3 chose to defer until the Windows batch.
+**v4 finding d.1 introduced the `_asm_baseline` feature:** "Plus v4 adds an explicit Day 3 verification step: capture `cargo rustc --emit=asm` output on at least one method and demonstrate codegen-parity against a no-trait baseline (a sibling `direct_call_baseline_*` function gated behind an internal `_asm_baseline` Cargo feature). Don't take 'monomorphizes cleanly' on faith." (v4.2 plan line 947.) v4.2 amendment Finding 3 (plan line 972) is a SEPARATE finding about asm extraction methodology (`cargo asm` + `awk`); it doesn't introduce or modify the feature gate. v4.3 §1.12 closes the v4-finding-d.1 feature requirement specifically; v4.2 amendment Finding 3's extraction methodology is also closed by the Step 27 visual-diff approach but that's an incidental consequence.
 
 **Reality (Windows batch Step 27):** the asm capture on the monomorphized `framesage-svc.s` (18MB release binary) shows all 6 windows-rs ETW APIs called via direct `callq *__imp_XXX(%rip)` (the standard Windows PE import-table call), with `RealEtwSysCalls` and `EtwSysCalls` symbols completely absent from the binary (inlined away by monomorphization). The visual diff against "a hypothetical direct-call version" is unambiguous — there's nothing to diff against because both forms reduce to the same instruction stream.
 
-**Disposition:** The `_asm_baseline` Cargo feature is **NOT NEEDED**. v4.3 closes the v4.2 amendment Finding 3 as "verification approach changed: visual diff on monomorphized binary is strictly stronger evidence than a synthetic baseline feature gate would have provided." No code change required; v4.3 just removes the `_asm_baseline` task from any future scope.
+**Disposition:** The `_asm_baseline` Cargo feature is **NOT NEEDED**. v4.3 closes the v4-finding-d.1 `_asm_baseline` requirement as "verification approach changed: visual diff on monomorphized binary is strictly stronger evidence than a synthetic baseline feature gate would have provided." v4.2 amendment Finding 3's extraction methodology (`cargo asm` + `awk`) is also satisfied incidentally — the visual diff IS the extraction. No code change required; v4.3 removes both the `_asm_baseline` feature task AND the cargo-asm + awk extraction step from any future scope.
 
 ---
 
