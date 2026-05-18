@@ -905,6 +905,51 @@ Pre-coding diff-plan review continues to pay dividends: this is the third PR in 
 
 ---
 
+## PR #124 — 2026-05-18 — verdict GO — review-surface: pre-coding 6-point analysis + diff-plan review + raw-diff fresh-eyes review (HIGH-severity-shutdown-path discipline); fresh-eyes round was CONFIRMATION, no corrections beyond diff-plan round
+
+**Source:** W1.4 (#83) — drop `verify_session_gone` from `EtwSession::stop()`. Closes finding C-001 (HIGH) + K-003 (linked). Phase 3 roadmap item W1.4, S effort, HIGH severity because it touches shutdown-path code.
+
+### Review-surface honesty
+
+**What was actually checked:**
+- **Pre-coding 6-point analysis** explicitly requested by user before diff-plan: call-site context, helper-fn definition, `cleanup_stale_session` coverage comparison, K-003 link verification, META 1 sweep for other call-sites, test/Drop-impl impact. All 6 points addressed in writing before any code was drafted.
+- **Pre-coding diff-plan review** (full diff text presented to user before branch creation): user surfaced 1 påkrevd fix (function-name > line-number reference, same durability principle as W1.3) + 1 valgfri (test NOTE — adopted) + 1 PR-body forsterkning (coverage-comparison table included in PR body, not just in chat-history diff-plan). All addressed in INITIAL commit.
+- **Raw-diff fresh-eyes review** (gh pr diff 124 pasted to review channel pre-merge per HIGH-severity-shutdown-path-code discipline): user verified the diff matches the plan exactly. **No corrections from this round.** Items verified:
+  - No unintended changes / scope creep
+  - `query_session_stats` untouched (still used from `EtwSession::query_stats` + `MonitorHandle::poll_drop_stats`)
+  - Drop impls untouched
+  - `bail!` import implicitly still used (build/clippy green excludes dangling import)
+  - NOTE placement relative to test is correct Rust style
+- **Self-attestation Q1–Q5** (in PR body): YES. Same LLM-instance as code author.
+- **Independent behavioral verification on real host**: NO — this is a deletion of a flake-producing post-STOP query; the absence-of-error is the verification. The deleted code was the source of false-positive bails; removing it cannot introduce new flakes by construction.
+- **Verification commands run:**
+  - `cargo build --workspace` — clean
+  - `cargo clippy --workspace --all-targets -- -D warnings` — clean
+  - `cargo fmt --all --check` — clean
+  - `cargo test -p framesage-etw --lib` — 18 passed, 3 ignored (totals unchanged from pre-PR; no test referenced `verify_session_gone`)
+  - `cargo test --workspace` — no regressions
+  - `git grep -n "verify_session_gone" -- '*.rs'` (META 1 pre-coding sweep) — 4 hits classified; 2 removed (etw/session.rs), 2 explicit no-op (spike-etw same-name-different-function).
+
+**Defects fanget (3 in diff-plan round, 0 in raw-diff round):**
+
+Diff-plan round (pre-coding):
+1. Påkrevd: `"(line ~704)"` in the explanatory comment → replaced with `"cleanup_stale_session() at the next start_with_syscalls() call"` per the function-name > line-number durability principle (same as W1.3).
+2. Valgfri: Add NOTE to the `#[ignore]`'d test explaining what it no longer detects post-W1.4 → adopted (forestaller "did this test fail because of W1.4?" investigation if/when un-ignored).
+3. PR-body forsterkning: Include the 5-row coverage-comparison table in the PR body, not just in chat-history diff-plan → adopted (the table IS the safety analysis; future git-history readers should see it in the PR, not have to dig).
+
+Raw-diff round (post-coding, pre-merge):
+- **Zero corrections.** Diff matched the plan exactly. Both verify-points raised in the agent's raw-diff report (error-propagation-paths reduction; `query_session_stats` vs `verify_session_gone` separation) were verified as correctly reasoned by the reviewer.
+
+**Catch-rate observation:** PRs #119 (W1.6), #120 (W1.2), #122 (W1.3) all had at least one user-surfaced adjustment between diff-plan and final commit. PR #124 (W1.4) had three adjustments in the diff-plan round but ZERO in the raw-diff round — i.e., the diff-plan round caught everything before code was written. Across the four PRs: ~75% catch rate on the buddy-rhythm rounds, with the layering working as designed (diff-plan catches structural / wording issues; raw-diff round catches scope-creep / unintended-change-creep / accidental-typo-style issues). Healthy signal.
+
+**Verdict:** GO. PR #124 merged as commit `8c7eec3`. Findings C-001 + K-003 closed.
+
+### Lesson for future PRs
+
+The two-round buddy rhythm (diff-plan → raw-diff) has now been demonstrated on a HIGH-severity shutdown-path PR with the result that the raw-diff round was CONFIRMATION rather than correction. This is the desired outcome: by the time code is written and pushed, the diff-plan round has already absorbed the structural feedback. For future HIGH-severity PRs, retaining the raw-diff round even when no defects are expected is still the right discipline — it's cheap insurance, and the result of "zero corrections" is itself useful audit signal (the diff-plan round was thorough).
+
+---
+
 ## How to use this log going forward
 
 Each new buddy review that surfaces a concern gets a new
