@@ -816,7 +816,17 @@ mod windows_impl {
                     );
                 }
             }
-            verify_session_gone(&syscalls, &self.session_name)?;
+            // W1.4 / closes C-001 + K-003: deliberately NOT
+            // re-querying the session to "verify it's gone."
+            // ControlTraceW(STOP)'s SUCCESS return is the authoritative
+            // signal; the kernel registry-row reclaim happens
+            // asynchronously and a post-STOP QUERY can race the
+            // reclaim, producing false-positive "still registered"
+            // bail-outs (the C-001 flake). The architecture §2.1
+            // "survives service restarts" invariant is upheld by
+            // cleanup_stale_session() at the next
+            // start_with_syscalls() call — see C-001 fix rationale
+            // in audit/2026-revision-phase2-findings.md.
             tracing::info!(session = %self.session_name, "ETW session stopped cleanly");
             Ok(())
         }
@@ -1228,17 +1238,6 @@ mod windows_impl {
             bail!("ControlTraceW(STOP) failed: {} (0x{:08x})", rc.0, rc.0);
         }
         Ok(())
-    }
-
-    fn verify_session_gone<S: EtwSysCalls>(syscalls: &S, session_name: &str) -> Result<()> {
-        match query_session_stats(syscalls, session_name) {
-            Err(_) => Ok(()),
-            Ok(_) => bail!(
-                "session '{}' still registered after STOP — \
-                 architecture §2.1 'survives service restarts' invariant violated",
-                session_name
-            ),
-        }
     }
 
     struct InternalQueryResult {
@@ -1845,6 +1844,12 @@ mod tests {
         drop(sess);
     }
 
+    // NOTE: post-W1.4 / C-001, this test no longer detects
+    // post-STOP kernel registry-row reclaim lingering. That
+    // observable is now covered by cleanup_stale_session() on
+    // the next start_with_syscalls() call rather than by a
+    // verification query in stop(). See C-001 fix rationale
+    // in audit/2026-revision-phase2-findings.md.
     #[cfg(windows)]
     #[test]
     #[serial_test::serial(real_etw)]
