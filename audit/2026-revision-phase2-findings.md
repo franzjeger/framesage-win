@@ -419,6 +419,8 @@ The plan's verification is a manual checklist. The interaction matrix (manual ac
 **Effort:** M
 **Gate:** Month 1
 
+**Verified open (M1.13 / P4.9 backfill session 2, 2026-05-18):** `grep -nE 'fn (manual_global|.*manual_global|enable_manual.*test|disable_manual.*test)' crates/engine/src/lib.rs` → 3 manual_global tests exist at lines 4322, 4346, 4364 (`manual_global_refuses_non_eligible_profile`, `manual_global_refuses_profile_with_no_game_mode`, `manual_global_disable_is_idempotent`). All three are single-path tests; no `report_foreground` × `enable_manual_global` × `disable_manual_global` interaction-matrix test exists. Gap holds.
+
 ## C-005 — Pre-audit: architecture §2.4 "Did FrameSage help?" attribution honesty contract specifies five named threshold tests (`compute_attribution_summary(session_with_p99_delta(-9%))` → "improved your 1% lows", etc.). If Group C ships without these tests, the honesty contract is unenforced
 
 **Severity:** BLOCKER-v0.7.1
@@ -447,6 +449,8 @@ Group C acceptance criterion at `audit/v0.7-architecture.md:1631-1634` requires 
 
 **Effort:** S (per test, once the function exists)
 **Gate:** v0.7.1
+
+**Verified open (M1.13 / P4.9 backfill session 2, 2026-05-18):** Multi-step: (1) `git grep -n 'fn compute_attribution_summary\|compute_attribution_summary' -- '*.rs'` → ZERO matches; function does not exist. (2) `git grep -n 'session_with_p99_delta\|improved your 1% lows\|Modest improvement\|No measurable effect\|Slight regression' -- '*.rs'` → ZERO matches; none of the 5 threshold substrings or helper-fn name exists in source. Honesty-contract function + tests both unbuilt. Aligns with Group C unbuilt status (B-005, F-002). Gap holds; remains BLOCKER-v0.7.1.
 
 # AXIS D — Concurrency (Send/Sync, atomic ordering, catch_unwind, races)
 
@@ -484,6 +488,8 @@ The static_assert covers only `ConsumerState`. The closure additionally captures
 **Effort:** S
 **Gate:** Month 1
 
+**Verified open (M1.13 / P4.9 backfill session 2, 2026-05-18):** `grep -rn 'assert_impl_all' crates/etw/src/` → single match at `supervisor.rs:163` covering only `ConsumerState`. `grep -n 'RealEtwSysCalls.*RefUnwindSafe\|RefUnwindSafe.*RealEtwSysCalls' crates/etw/src/` → zero matches. Static-assert coverage of `RealEtwSysCalls` remains absent. Sub-verify (Impact-text accuracy): finding claims "three RefCells inside `control_trace`" but `sed -n '443,478p' | grep borrow_mut()` shows only 2 `borrow_mut()` calls in that span — minor inaccuracy in Impact-text count (3 → 2), but underlying RefCell-borrow-leak-on-panic concern unchanged. Gap holds.
+
 ## D-002 — `event_record_callback` (`extern "system"`) is `unsafe fn` but lacks an explicit `#[no_mangle]` or `extern "system"` re-check; the ABI-stamp at definition site is correct, but a future refactor that drops to `extern "C"` would silently corrupt the calling convention
 
 **Severity:** LOW (currently correct)
@@ -509,6 +515,8 @@ ABI is `"system"` (correct for ETW callbacks on Windows) [UNVERIFIED — MSDN's 
 **Effort:** S
 **Gate:** Month 3
 
+**Verified open (M1.13 / P4.9 backfill session 2, 2026-05-18):** `grep -B 3 'unsafe extern .system. fn event_record_callback' crates/etw/src/session.rs` → 3 lines preceding the signature are an empty line + the previous function's closing `Ok(())` + a blank — no ABI-stability comment exists. The proposed reviewer-instruction comment ("ABI is 'system' because ETW callbacks are __stdcall ... do not change") is absent. Gap holds.
+
 ## D-003 — Service-side `Subscribe` cap uses `AtomicUsize::fetch_add` + check-then-fetch_sub on cap-exceeded path — small TOCTOU window where N=32 concurrent calls could briefly push the count above the cap before any of them notices
 
 **Severity:** LOW
@@ -528,6 +536,8 @@ If 100 callers each fetch_add concurrently, all 100 see prev≥cap, all fetch_su
 
 **Effort:** S
 **Gate:** Month 3
+
+**Verified open (M1.13 / P4.9 backfill session 2, 2026-05-18):** `sed -n '890,910p' crates/service/src/runtime.rs` confirms `let prev = ACTIVE_SUBSCRIBES.fetch_add(1, Ordering::Relaxed);` followed by `if prev >= MAX_SUBSCRIBES { ACTIVE_SUBSCRIBES.fetch_sub(1, Ordering::Relaxed); }` at lines 903-905. `grep -n 'compare_exchange\|compare_and_swap' crates/service/src/runtime.rs` → zero matches. Neither the compare-exchange-loop hard-cap fix NOR the soft-cap-semantics inline comment exists. Gap holds.
 
 ## D-004 — `consumer_loop`'s `state.events_seen.fetch_add(1, Ordering::Relaxed)` is sound (per-event counter, no read-side ordering dependency) but `query_stats` reads with `Relaxed` and compares to `real_time_buffers_lost` — readers cannot reason about the temporal ordering
 
@@ -555,6 +565,8 @@ pub fn query_stats(&self) -> Result<SessionStats> {
 
 **Effort:** S
 **Gate:** Month 3
+
+**Verified open (M1.13 / P4.9 backfill session 2, 2026-05-18):** `grep -B 3 'events_seen.fetch_add(1, Ordering::Relaxed)' crates/etw/src/session.rs` → 3 preceding lines are the W1.3 Arc-pointer SAFETY block ("ctx was set to Arc::as_ptr(&state)..."), NOT a Relaxed-ordering-correctness comment. The proposed monotone-counter comment is absent. Gap holds.
 
 ## D-005 — `closed_loop.rs::CLOSED_LOOP_BUILD_OVERRIDE` is `thread_local!` and `#[cfg(test)]`-gated; the production path correctly compiles it out, but the `BuildOverrideGuard::set` does NOT reset on panic-from-WITHIN the guard's scope without RAII Drop — Drop is implemented but a panic UNWIND back through `set()` would still leave the override poisoned
 
@@ -596,6 +608,8 @@ impl Drop for BuildOverrideGuard {
 
 **Effort:** M
 **Gate:** Month 1
+
+**Verified open (M1.13 / P4.9 backfill session 2, 2026-05-18):** `grep -nE 'fn.*manual.*tick|fn.*tick.*manual|manual.*disable.*mid' crates/engine/src/lib.rs` → zero matches. No "enable → tick → disable → tick" stress test exists. Same root as C-004's interaction-matrix gap; separate concern (D-006 about mutex/sync lock-ordering; C-004 about user-visible interaction state). Gap holds.
 
 # AXIS E — Testing (coverage, test-asserts-what-it-says, flakiness)
 
@@ -665,6 +679,8 @@ via prior resolution.
 **Effort:** S
 **Gate:** Month 3
 
+**Verified open (M1.13 / P4.9 backfill session 2, 2026-05-18):** `sed -n '275,300p' crates/service/src/closed_loop.rs` confirms acknowledging-comment at lines 275-280 ("for week 2 scope ... is sufficient") plus `assert!(logs_contain("reason=\"policy_opt_out\""));` substring-matching at lines 293-296 still in use. `grep -n 'Subscriber\|with_subscriber\|StructuredAssert' crates/service/src/closed_loop.rs` → zero matches; no custom tracing subscriber added. Gap holds.
+
 ## E-003 — Engine test count (53 per prior context) is strong for the v0.6 surface; the v0.7 ETW crate has supervisor/build_gate/session unit tests but the **full ProcessTrace mock path** is unverified end-to-end (per E-001)
 
 **Severity:** MEDIUM
@@ -680,6 +696,14 @@ via prior resolution.
 
 **Effort:** L
 **Gate:** Group A week 3 kickoff
+
+**Verified open with refinement (M1.13 / P4.9 backfill session 2, 2026-05-18):** Multi-step verification:
+- E-001 (mock-based full-flow panic test) IS closed via PR #79's `mode_5_session_level_full_flow_panic` at session.rs:1720. So the "per E-001" cross-reference in E-003 is partially-outdated — the MOCK path is now covered.
+- However, E-003's load-bearing claim is the **CI-runnable real-ETW path** (per the Fix-text). `grep -rn 'real_etw\|#\[ignore\]' crates/etw/src/` reveals TWO real-ETW tests at session.rs:1806 (`real_etw_session_drop_path_fires_event`) and session.rs:1857 (`real_etw_session_starts_and_stops_cleanly`), both inside `#[ignore]'d real-Windows tests (end-of-week batch)` section (header at line 1769).
+- Both tests exist but are `#[ignore]`'d due to ETW kernel-level parallel-test serialization issues (Step 9 finding). They run manually in the end-of-week Windows batch, not in CI.
+- **Refinement:** E-003's gap remains valid — "at least one CI-runnable real-ETW path on Windows runners." Existence of `#[ignore]`'d real-ETW tests doesn't satisfy the CI-runnable qualifier. The mock-based test (mode_5_session_level_full_flow_panic) closes the "full mock path" half of E-003's headline but NOT the "real-kernel + CI-runnable" half.
+
+Gap holds. Recommend Phase 3 Group A week 3 kickoff add a CI-runnable real-ETW smoke test, perhaps with a guard that auto-skips on hosts without elevated/admin privilege (avoiding the parallel-serialization issue by running solo in CI).
 
 ## E-004 — No "negative result" session has been intentionally produced + verified to surface the YELLOW "**degraded**" banner per architecture §2.4 — Group C acceptance criterion at `v0.7-architecture.md:1631-1634` requires this manually
 
