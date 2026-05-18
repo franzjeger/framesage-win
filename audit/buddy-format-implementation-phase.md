@@ -1,6 +1,6 @@
 # Buddy-system format — implementation phase
 
-**Status:** DRAFT — pending buddy review per user instruction (2026-05-17).
+**Status:** APPROVED 2026-05-18 (DRAFT v1 → v2 errata fixes + META 2 (1) broadening + §X dependency arrows → v2.1 sweep patch → APPROVED). Revision history captured in `audit/buddy-disagreements.md` Entry 4.
 **Authoritative inputs:**
 - `audit/buddy-disagreements.md` — the buddy-system audit trail. Reader consults the current state of the log for the planning-phase format evolution (3Q → 4Q with the (d) internal-consistency question) and the surfaced same-category-finding watch signal.
 - `spike/group-a-week-2-plan.md` — the load-bearing implementation plan whose code reviews this format governs. Section refs throughout this document point at `plan/group-a-week-2` HEAD (now on `main` after PR #73 + PR #78 merge).
@@ -189,6 +189,13 @@ Self-administered (1)-(5) pass on this draft before commit:
 
 ---
 
-## Status: DRAFT — pending buddy review with the planning-phase four-question format
+## Status: APPROVED — 2026-05-18
 
-When buddy approves, this document moves to APPROVED. The first real use is the Group A week-2 EOD PR.
+Buddy 4Q with extended (d) ran on DRAFT v2 (commit `d05c431`),
+returned STOP-ON-(d) with one mechanical sweep-discipline finding;
+v2.1 patch (commit `0997b1e`) applied the fix inline; this APPROVED
+flip is the tiny separate commit per the established rhythm. First
+real use: the Group A week-2 EOD PR (already opened as PR #79 and
+merged via squash to `main` 2026-05-18 at commit `6f972b6`). Future
+week 3+ PRs use this format with the broadened (1) Language-mechanics
+safety scope.
