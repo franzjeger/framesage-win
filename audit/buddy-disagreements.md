@@ -835,6 +835,43 @@ All three clarifications confirm the implementation matches spec. **GO.** Mergin
 
 ---
 
+## PR #120 — 2026-05-18 — verdict GO — review-surface: fresh-eyes diff-description review via separate Claude instance (mobile), CHANGES_REQUESTED on 3 items, addressed in amend before merge
+
+**Source:** Implementation of W1.2 (#81) — remove `bf6.exe` → Javelin AC-detection false-positive marker. Closes finding A-003 (HIGH) per `audit/2026-revision-phase2-findings.md`. Phase 3 roadmap item W1.2, S effort.
+
+### Review-surface honesty (P4.3 — explicitly NOT full buddy-review)
+
+**What was actually checked:**
+- **Pre-coding review of the diff-PLAN** (not yet-written code): user surfaced 3 targeted adjustments to the planned approach (1: split tests rather than rename; 2: explanatory comment + cleaner test naming; 3: pre-coding META 1 `git grep -i bf6 -- '*.rs'` sweep to confirm scope containment). All 3 incorporated before coding began.
+- **Self-attestation Q1–Q5** (PR body): YES, written by the same LLM-instance that wrote the code. Not independent.
+- **Fresh-eyes diff-description review post-coding**: YES — full PR diff pasted back to the review channel; reviewed by a separate Claude instance (mobile interface, no shared context with the implementation instance). Verdict CHANGES_REQUESTED on 3 trivial items:
+  1. Remove `"PR #119's successor"` reference from doc-comment line 17 (PR numbers are short-lived; W1.2/A-003 IDs are the durable references).
+  2. Unify `"Markers fanget"` Norwegian-in-English-message to English — chose `"Offending entries:"` to match the existing line 274 style.
+  3. Add NOTE comment to `engine/lib.rs:2022-2027` explaining the now-permanently-dormant transition-detection log path, with explicit hint that it auto-activates when the dedicated Javelin probe lands.
+- **Independent diff-read of compiled binary or behavioral verification**: NO. Const-list-pin tests verify the marker-list state; no end-to-end run on a real host with synthetic bf6.exe process.
+- **Verification commands run** (by the implementation instance):
+  - `cargo build --workspace` — clean (1 prior `dead_code` warning resolved via `#[allow(dead_code)]` on `AcMarker::Javelin`)
+  - `cargo clippy --workspace --all-targets -- -D warnings` — clean
+  - `cargo fmt --all --check` — clean
+  - `cargo test -p framesage-sys --lib` — 33 passed (including the 3 new ac_detect tests)
+  - `cargo test --workspace` — totals unchanged; no regressions
+  - `git grep -i bf6 -- '*.rs'` (META 1 pre-coding sweep) — 37 hits classified into 4 categories; only Category D (the one marker) touched.
+
+**Defects fanget:**
+- 3 items in fresh-eyes review (all addressed in amend before merge): the PR-#-reference, the Norwegian-in-English message, the missing NOTE on the engine-side dormant log. None semantic; all polish / docs / consistency.
+- Buddy also asked explicit confirmation that the `#[allow(dead_code)]` doc-comment on `AcMarker::Javelin` explicitly explained the allow rationale — it did not. Added the suggested sentence: `` `#[allow(dead_code)]` rationale: kept-but-dormant pending dedicated Javelin probe (W1.2 / A-003). ``
+
+**Force-push trade-off captured for future PRs:**
+- The amend-then-force-push flow required explicit user authorization to bypass the auto-mode classifier's destructive-git block. The classifier also misclassified `git reset --soft origin/<branch>` (a pure HEAD-pointer move, no remote contact) as "force-push" and blocked that too. Going forward: either user pre-authorizes force-pushes for trivial post-review amends, OR follow-up commits become the default (extra commit in PR history but no classifier friction). For W1.2 the user explicitly chose force-push to preserve clean single-commit PR history.
+
+**Verdict:** GO. PR #120 merged as commit `52f7b97`. Finding A-003 closed.
+
+### Lesson for future PRs
+
+The pre-coding diff-plan review caught structural issues (test-split-vs-rename, comment quality, META 1 sweep discipline) BEFORE code was written — saved a round of post-coding diff churn. The post-coding fresh-eyes diff-description review caught polish issues (PR-#-reference, Norwegian-in-English, missing NOTE) that no test would have surfaced. Both review-surfaces are load-bearing in their own way; neither is "full buddy review" (which would require an independent reviewer reading the actual final diff + running their own verification). Logging the surface honestly so the audit doesn't drift to "self-review with extra steps."
+
+---
+
 ## How to use this log going forward
 
 Each new buddy review that surfaces a concern gets a new
