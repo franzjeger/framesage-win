@@ -872,6 +872,39 @@ The pre-coding diff-plan review caught structural issues (test-split-vs-rename, 
 
 ---
 
+## PR #122 — 2026-05-18 — verdict GO — review-surface: pre-coding diff-plan review with 1 mikro-fix surfaced, addressed in initial commit; re-review explicitly waived on pure-docs fix
+
+**Source:** W1.3 (#82) — Arc::as_ptr lifetime doc-comment in `consumer_loop`. Closes finding A-004 (MEDIUM) per `audit/2026-revision-phase2-findings.md`. Phase 3 roadmap item W1.3, S effort, pure-docs change.
+
+### Review-surface honesty
+
+**What was actually checked:**
+- **Pre-coding diff-PLAN review** (full diff text drafted + presented to user BEFORE branch creation): user surfaced 1 mikro-fix on the LIFETIME CONTRACT block point 2's wording — replace brittle `"dropped explicitly at line ~1340"` line-number reference with durable `"It is dropped when consumer_loop returns, after the ProcessTrace call below completes"`. Same principle as preferring finding-IDs (A-004) over PR-#-references (PR #119): line numbers drift with future edits, function names + control-flow descriptions don't. Addressed in the INITIAL commit (no amend needed).
+- **Pre-coding META 1 sweep** (`git grep -in "Arc::as_ptr\|UserContext\|logfile.Context"`): two production-pattern call-sites found. The one this PR documents (`crates/etw/src/session.rs:1309`); spike-etw site at `crates/spike-etw/src/main.rs:585` explicit no-op-confirmed (scheduled for removal at M3.4 / #113). Two false-positives (`crates/sys/src/inner/version_info.rs:114, 146` — different lifecycle pattern).
+- **Spike-citation honesty check** (`grep -n "§12.4\|Step 23\|callback.*never"` in spike report): discovered the spike's Step 23 was about `closed_loop_enabled` toggle, NOT callback timing; Step 24 about Drop teardown; Step 28 about survives-restart. Direct callback-timing instrumentation does NOT exist in the spike. Doc-comment framed honestly as **indirect** evidence (end-to-end teardown ran without crash → no callback fired against dropped Arc, or it would have been observable) rather than claiming direct verification that doesn't exist.
+- **Self-attestation Q1–Q5** (in PR body): YES. Same LLM-instance as code author. Re-review explicitly waived by user on a pure-docs fix.
+- **Independent diff-read of compiled binary or behavioral verification**: N/A — pure-docs change; no behavioral surface to verify.
+- **Verification commands run:**
+  - `cargo build --workspace` — clean
+  - `cargo clippy --workspace --all-targets -- -D warnings` — clean
+  - `cargo fmt --all --check` — clean
+  - `cargo test -p framesage-etw --lib` — 18 passed, 3 ignored (totals unchanged from pre-PR)
+  - `cargo test --workspace` — no regressions
+
+**Defects fanget (1, addressed pre-coding):**
+- LIFETIME CONTRACT block point 2 originally cited `"dropped explicitly at line ~1340"` — brittle line-number reference. User-suggested replacement: `"It is dropped when consumer_loop returns, after the ProcessTrace call below completes."` — durable phrasing tied to function semantics, not source location.
+
+**Convention-locking forward-note (P4.8 kickoff item, NOT changed in this PR):**
+This PR establishes the source-code `[UNVERIFIED]` marker format: `[UNVERIFIED — <reason>. <evidence status>. <how to upgrade>.]` per P4.2 promotion from audit-only to source convention. Locking this format as the standard for `git grep -i "\[UNVERIFIED"` triviality is a P4.8-sweep kickoff agenda item. Forward-noted here so the convention-lock decision lands when the periodic sweep starts, not later as a drift-discovery.
+
+**Verdict:** GO. PR #122 merged as commit `45a0b83`. Finding A-004 closed.
+
+### Lesson for future PRs
+
+Pre-coding diff-plan review continues to pay dividends: this is the third PR in a row (#119 W1.6, #120 W1.2, #122 W1.3) where the user-surfaced adjustment landed in the INITIAL commit rather than as an amend / follow-up commit. Net effect: zero force-pushes for this PR, no classifier friction. Worth keeping the "diff-plan first, code second" rhythm explicit for the remaining Week 1 items.
+
+---
+
 ## How to use this log going forward
 
 Each new buddy review that surfaces a concern gets a new
