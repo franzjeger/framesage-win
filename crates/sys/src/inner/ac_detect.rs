@@ -13,11 +13,18 @@
 //!   * **EAC**: `EasyAntiCheat.exe`, `EasyAntiCheat_EOS.exe`, or
 //!     `easyanticheat.exe` process. Per-session — flips as games come
 //!     and go.
-//!   * **Javelin** (BF6): detected via the EA Javelin service /
-//!     companion process; for v0.6 we surface as a derived "EAC + BF6
-//!     process present" since the dedicated probe needs more reverse
-//!     engineering. Conservative — Hybrid mode for BF6 fires off the
-//!     seeded rule's `ac_safe_mode_target`, not detection.
+//!   * **Javelin** (BF6): **detection deferred pending dedicated probe**
+//!     (W1.2 / finding A-003). Earlier versions used `bf6.exe` as a
+//!     heuristic marker, but the exe name is too generic — unrelated
+//!     tools and games named bf6.exe trivially false-positive,
+//!     silently flipping the Javelin presence bit and suppressing
+//!     per-game-process modifications via the
+//!     `AntiCheatProfile::Hybrid` apply-path at engine/lib.rs:3376-3406.
+//!     `AntiCheatPresence.javelin` remains permanently `false` in v0.7
+//!     until a dedicated probe (Javelin service / driver enumeration)
+//!     wires it. Hybrid mode for BF6 still fires correctly because the
+//!     `ac_safe_mode_target: Hybrid` tier is set statically on the
+//!     seeded BF6 profile, not driven by AC-presence detection.
 //!   * **BattlEye**: `BEService.exe` process.
 //!   * **FACEIT**: `FACEITService.exe`, `FACEIT_AC.exe`, or
 //!     `FACEIT_Start_Protected_Game.exe`.
@@ -45,6 +52,17 @@ use crate::inner::process::{exe_for_pid, iter_pids};
 /// loop is one pass over the live PID list, O(N × M) where N = PID
 /// count (~300) and M = marker count (~10). Single-digit microseconds
 /// in practice.
+///
+/// **`AcMarker::Javelin` is intentionally absent from this list.**
+/// W1.2 / finding A-003 removed the only Javelin marker (`bf6.exe`)
+/// because the exe name is too generic — any unrelated tool, mod, or
+/// renamed binary named `bf6.exe` trivially false-positives via the
+/// case-insensitive match below. The Javelin enum variant + the
+/// `AntiCheatPresence.javelin` field stay so a future dedicated probe
+/// (Javelin service / driver enumeration) can wire them without an
+/// enum-variant addition; until then `presence.javelin` remains
+/// permanently `false`. Inline tests below pin the empty-list state
+/// as a regression guard.
 const AC_PROCESS_MARKERS: &[(AcMarker, &str)] = &[
     // Vanguard
     (AcMarker::Vanguard, "vgc.exe"),
@@ -53,9 +71,7 @@ const AC_PROCESS_MARKERS: &[(AcMarker, &str)] = &[
     (AcMarker::Eac, "EasyAntiCheat.exe"),
     (AcMarker::Eac, "EasyAntiCheat_EOS.exe"),
     (AcMarker::Eac, "easyanticheat.exe"),
-    // BF6 / Javelin process companion (best-effort surface; the actual
-    // Javelin driver detection is deferred).
-    (AcMarker::Javelin, "bf6.exe"),
+    // Javelin — intentionally no markers (W1.2). See doc-comment above.
     // BattlEye
     (AcMarker::Battleye, "BEService.exe"),
     (AcMarker::Battleye, "BEServiceLauncher.exe"),
@@ -72,6 +88,19 @@ const AC_PROCESS_MARKERS: &[(AcMarker, &str)] = &[
 enum AcMarker {
     Vanguard,
     Eac,
+    /// W1.2 / A-003: no markers in AC_PROCESS_MARKERS reference this
+    /// variant (the only candidate `bf6.exe` was too generic). The
+    /// variant + the `AntiCheatPresence.javelin` field stay so a
+    /// future dedicated probe (Javelin service / driver enumeration)
+    /// can wire them without an enum-variant addition. Until then
+    /// `presence.javelin` remains permanently `false`. The match-arm
+    /// at `detect_anti_cheats` line ~112 covers this variant for
+    /// exhaustiveness; the arm is reached only if a future
+    /// AC_PROCESS_MARKERS entry uses `AcMarker::Javelin`.
+    ///
+    /// `#[allow(dead_code)]` rationale: kept-but-dormant pending
+    /// dedicated Javelin probe (W1.2 / A-003).
+    #[allow(dead_code)]
     Javelin,
     Battleye,
     Faceit,
@@ -154,14 +183,18 @@ mod tests {
         let _ = presence.any_present();
     }
 
-    /// AC_PROCESS_MARKERS is non-empty and covers every variant of
-    /// `AcMarker`. Catches the bug-class where someone adds a new
-    /// variant but forgets to wire the marker.
+    /// AC_PROCESS_MARKERS covers every variant of `AcMarker` EXCEPT
+    /// Javelin. Catches the bug-class where someone adds a new
+    /// variant (e.g., a new AC vendor) but forgets to wire the
+    /// marker. Javelin is split out into a separate test below
+    /// because its empty-marker state is INTENTIONAL (W1.2 / A-003)
+    /// and an "except Javelin" framing here would silently pass if
+    /// someone re-introduced a too-generic Javelin marker. The
+    /// explicit-empty test below trips loudly in that case.
     #[test]
-    fn markers_cover_every_ac_variant() {
+    fn markers_cover_every_ac_variant_except_javelin() {
         let mut saw_vanguard = false;
         let mut saw_eac = false;
-        let mut saw_javelin = false;
         let mut saw_battleye = false;
         let mut saw_faceit = false;
         let mut saw_esea = false;
@@ -169,7 +202,12 @@ mod tests {
             match marker {
                 AcMarker::Vanguard => saw_vanguard = true,
                 AcMarker::Eac => saw_eac = true,
-                AcMarker::Javelin => saw_javelin = true,
+                AcMarker::Javelin => {
+                    // Intentional no-op — see
+                    // javelin_marker_list_is_intentionally_empty_pending_dedicated_probe
+                    // below. A Javelin marker existing here is NOT
+                    // a coverage win; it's a regression of W1.2.
+                }
                 AcMarker::Battleye => saw_battleye = true,
                 AcMarker::Faceit => saw_faceit = true,
                 AcMarker::Esea => saw_esea = true,
@@ -177,9 +215,68 @@ mod tests {
         }
         assert!(saw_vanguard, "no Vanguard marker");
         assert!(saw_eac, "no EAC marker");
-        assert!(saw_javelin, "no Javelin marker");
         assert!(saw_battleye, "no BattlEye marker");
         assert!(saw_faceit, "no FACEIT marker");
         assert!(saw_esea, "no ESEA marker");
+    }
+
+    /// W1.2 / finding A-003: the `AcMarker::Javelin` marker list is
+    /// intentionally EMPTY in v0.7 because the only candidate exe
+    /// name (`bf6.exe`) is too generic — unrelated tools, mods, or
+    /// renamed binaries trivially false-positive via the
+    /// case-insensitive match in `detect_anti_cheats`. Re-introducing
+    /// any Javelin marker without a dedicated-probe replacement
+    /// (Javelin service / driver enumeration) fails this test.
+    ///
+    /// `AntiCheatPresence.javelin` remains permanently `false` until
+    /// the dedicated probe lands. Hybrid mode for BF6 is unaffected
+    /// because `ac_safe_mode_target: Hybrid` is set statically on the
+    /// seeded BF6 profile, not driven by AC-presence detection.
+    #[test]
+    fn javelin_marker_list_is_intentionally_empty_pending_dedicated_probe() {
+        let javelin_count = AC_PROCESS_MARKERS
+            .iter()
+            .filter(|(marker, _)| matches!(marker, AcMarker::Javelin))
+            .count();
+        assert_eq!(
+            javelin_count,
+            0,
+            "AcMarker::Javelin must have ZERO markers in v0.7 (W1.2 / \
+             A-003). A re-introduced marker is a regression — see \
+             module docstring + ac_detect.rs's AC_PROCESS_MARKERS \
+             doc-comment for context. Offending entries: {:?}",
+            AC_PROCESS_MARKERS
+                .iter()
+                .filter(|(marker, _)| matches!(marker, AcMarker::Javelin))
+                .map(|(_, exe)| *exe)
+                .collect::<Vec<_>>(),
+        );
+    }
+
+    // Pin at the AC_PROCESS_MARKERS const level rather than via
+    // detect_anti_cheats() output because detect_anti_cheats() calls
+    // real iter_pids() + exe_for_pid() with no mock-injection seam.
+    // Iterator-injection refactor is M-effort and out of scope for
+    // W1.2; const-level pin is sufficient because there is no
+    // transformation between the marker list and what detect_anti_cheats
+    // consumes — a re-introduction of bf6.exe to the marker list
+    // trips this test immediately. See finding A-003 + roadmap W1.2.
+    #[test]
+    fn bf6_exe_not_in_ac_marker_list() {
+        // Collect the matched exe strings (not the marker enum, which
+        // would require Debug on AcMarker). Two motivations matter
+        // identically: prove the list is empty, and surface the
+        // offending entries if not.
+        let bf6_entries: Vec<&str> = AC_PROCESS_MARKERS
+            .iter()
+            .filter(|(_, exe)| exe.eq_ignore_ascii_case("bf6.exe"))
+            .map(|(_, exe)| *exe)
+            .collect();
+        assert!(
+            bf6_entries.is_empty(),
+            "bf6.exe must not appear in AC_PROCESS_MARKERS — the exe \
+             name is too generic for AC detection (W1.2 / A-003). \
+             Offending entries: {bf6_entries:?}",
+        );
     }
 }
