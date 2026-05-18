@@ -1310,6 +1310,66 @@ This wave validated the pattern. Future cascade waves can follow the same shape.
 
 ---
 
+## PR #139 — 2026-05-18 — verdict GO — review-surface: mekanisk P4.9-backfill session 1 (10 findings grep-verified); no mobile-Claude review per established cascade-pattern
+
+**Source:** M1.13 / issue #127 — P4.9 audit-finding verification backfill, session 1 of ~3. Per P4.9: open-classification is a weaker guarantee than closed-classification; backfill applies grep-verify-discipline to every still-open Phase 2 finding to confirm the gap is still in code (or surface drift via Resolution block).
+
+### Session 1 scope + results
+
+Scope (10 findings, all from axes A + B + start of C):
+- A-001, A-002, A-005, A-006, A-007 (full axis-A actionable open set)
+- B-001, B-002, B-003, B-005 (full axis-B actionable open set; B-004 is N/A credit)
+- C-002 (first of axis-C still-open)
+
+Results:
+- **VERIFIED OPEN: 10**
+- **CLOSED PRIOR: 0** — no drifts found in session 1
+- **AMBIGUOUS: 0** — all findings had unambiguous load-bearing claims grep-verify could pin
+
+### Defect-rate observation update
+
+Base-rate prediction (per pre-cascade observation): ~4.5% drift rate (2 drifts in 44 findings).
+Session 1 outcome: 0/10. Within expected variance.
+
+Cumulative drift catch across the engagement so far:
+- PRE-L-006 (caught during Phase 3 roadmap drafting)
+- E-001 (caught during W1.5 META 1 sweep)
+- Session 1 of P4.9 backfill: 0 new drifts
+
+Predicted total for remaining 2 sessions: 1-3 drifts based on mobile-Claude's variance estimate. Even if 0 more drifts surface, the verification work hardens the audit's open-classification confidence — that's the P4.9 contract.
+
+### Review-surface honesty
+
+**What was actually done:**
+- Per finding: load-bearing claim identified → grep command run against current main → result documented in finding-blokk as "Verified open (M1.13 / P4.9 backfill, 2026-05-18)" annotation including verification command + output summary.
+- Annotation format follows P4.9's application of P4.4's SAFETY-VERIFICATION mechanism, retargeted from unsafe-block soundness to finding-existence verification.
+- All 10 verification commands used standard `grep -n` against named file paths the findings cite. No fuzzy / multi-step verifications in session 1.
+- **No mobile-Claude review** per established cascade-pattern (mechanical work; pre-push grep-verify-discipline is the load-bearing defect catch).
+- Self-attestation Q1–Q5 in PR body.
+
+**Defects fanget:** zero.
+
+**Verdict:** GO. PR #139 merged as commit `f4ec21c`. Session 1 complete.
+
+### Session pacing decision
+
+Per Frank's M1.13 directive: 8-10 findings per session, ~3 sessions total. State-rapport after session 1 BEFORE session 2 starts so Frank can decide continue vs pause.
+
+Session 1: 10 findings done in this Mac-Claude turn. **STOP after session 1 + report state.** Await Frank's directive on session 2 timing.
+
+### Pattern observation (4 P4.9 sessions across the engagement)
+
+| Step | Type | Defects fanget |
+|---|---|---|
+| PRE-L-006 catch | Inline during roadmap drafting | 1 |
+| E-001 catch | META 1 sweep during W1.5 | 1 |
+| Cascade-1/2/3/5 | Scope-revision application | 1 (M1.13 numbering, pre-push) |
+| **M1.13 session 1** | **P4.9 backfill, mechanical** | **0** |
+
+Pattern: drifts cluster around moments of high attention (META 1 sweeps, pre-push grep-verifies) rather than uniformly across mechanical work. Session 1's 0-drift result is consistent — A-axis and B-axis findings tend to be precisely-cited code-structure observations (line numbers, function names) that survive longer than diffuse "test missing" / "behavior unspecified" claims. Sessions 2 + 3 likely contain more of the diffuse-claim variety; drift-rate may be higher there.
+
+---
+
 ## How to use this log going forward
 
 Each new buddy review that surfaces a concern gets a new
