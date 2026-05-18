@@ -81,6 +81,8 @@ Four call sites in EtwSession + SessionShutdownHandle use `.expect("…twice…"
 **Effort:** S
 **Gate:** Month 1
 
+**Verified open (M1.13 / P4.9 backfill, 2026-05-18):** `grep -n '\.expect("EtwSession::stop called\|\.expect("query_stats called\|\.expect("into_supervisable_parts called\|\.expect("SessionShutdownHandle::shutdown called' crates/etw/src/session.rs` → 4 matches at lines 809, 838, 938, 1105. Matches the finding's claim of 4 panic sites.
+
 ## A-002 — `EtwSubsystem` enum hides retryability — caller cannot tell `Disabled(AccessDenied)` from `Disabled(AlreadyExists)` without matching on the inner `DegradationMode`
 
 **Severity:** LOW
@@ -101,6 +103,8 @@ The "Disabled" branch carries a `DegradationMode` payload but the type itself is
 
 **Effort:** S
 **Gate:** Month 2
+
+**Verified open (M1.13 / P4.9 backfill, 2026-05-18):** `grep -n 'pub enum EtwSubsystem' crates/etw/src/session.rs` → `EtwSubsystem` defined at line 616 with only `Running(EtwSession<S>)` (line 619) and `Disabled(DegradationMode)` (line 622) variants. No `DisabledRetryable` / `DisabledFatal` split present; retry policy not encoded in typestate.
 
 ## A-003 — `closed_loop.rs::detect_anti_cheats` false-positives on `bf6.exe`
 
@@ -171,6 +175,8 @@ const MAX_SUBSCRIBES: usize = 32;
 **Effort:** S
 **Gate:** Month 2
 
+**Verified open (M1.13 / P4.9 backfill, 2026-05-18):** `grep -n 'GetNamedPipeClientProcessId\|ACTIVE_SUBSCRIBES' crates/service/src/runtime.rs` → `static ACTIVE_SUBSCRIBES: AtomicUsize` at line 900 (process-wide cap of 32); `GetNamedPipeClientProcessId` referenced only in the explanatory comment at line 896 ("would require plumbing GetNamedPipeClientProcessId through every accept"), not actually plumbed.
+
 ## A-006 — `validate_policy_against_safe_list` allocates a fresh `SafeList::bundled()` per call
 
 **Severity:** LOW
@@ -190,6 +196,8 @@ Called on every `SetPolicy` IPC request. `SafeList::bundled()` is presumed cheap
 **Effort:** S
 **Gate:** Month 3
 
+**Verified open (M1.13 / P4.9 backfill, 2026-05-18):** `grep -n 'fn validate_policy_against_safe_list\|SafeList::bundled' crates/service/src/runtime.rs` → `fn validate_policy_against_safe_list(policy: &Policy) -> Vec<String>` at line 1032; first line of body at 1033 is `let safe_list = framesage_gamemode::safe_list::SafeList::bundled();`. Fresh allocation per SetPolicy IPC call.
+
 ## A-007 — `EtwSession<S>` uses `Option<S>` for the `syscalls` field as a sentinel for "already stopped"; correct, but the .take()-on-Drop pattern repeats verbatim across `EtwSession` and `SessionShutdownHandle`
 
 **Severity:** LOW
@@ -203,6 +211,8 @@ Two near-identical Drop impls each take `self.syscalls.take()` as the "already s
 
 **Effort:** M
 **Gate:** Month 3
+
+**Verified open (M1.13 / P4.9 backfill, 2026-05-18):** `grep -n 'let Some(syscalls) = self.syscalls.take() else' crates/etw/src/session.rs` → 2 matches at lines 967 (`EtwSession::Drop`) and 1155 (`SessionShutdownHandle::Drop`). Near-identical pattern across the two Drop impls; not yet extracted to shared helper / `SessionShutdownCore`.
 
 # AXIS B — Architecture (boundaries, layering, resource lifecycle, testability)
 
@@ -223,6 +233,8 @@ let closed_loop_startup = crate::closed_loop::start_closed_loop_if_enabled(&poli
 
 **Effort:** S
 **Gate:** Week 1
+
+**Verified open (M1.13 / P4.9 backfill, 2026-05-18):** `grep -n 'start_closed_loop_if_enabled\|spawn_blocking.*start_closed_loop' crates/service/src/runtime.rs` → single match at line 107 (`let closed_loop_startup = crate::closed_loop::start_closed_loop_if_enabled(&policy);`); no `spawn_blocking` wrapper. Synchronous call on tokio worker thread inside `runtime::run` confirmed.
 
 ## B-002 — Closed-loop tasks deliberately excluded from the v0.6 watchdog `select!` — design correct per architecture §2.1 mode 5 amendment, but the comment trail is the only enforcement
 
@@ -249,6 +261,8 @@ The supervisor + drop-poll tasks are spawned via `tokio::spawn` inside `spawn_cl
 **Effort:** S
 **Gate:** Month 1
 
+**Verified open (M1.13 / P4.9 backfill, 2026-05-18):** `grep -rn 'watchdog.*closed.loop\|closed.loop.*watchdog\|fn.*watchdog' crates/service/src/` → no matches. No automated test exists enforcing the "closed-loop tasks NOT in watchdog" invariant per architecture §2.1 mode 5 amendment; the invariant is enforced only by comments + code structure.
+
 ## B-003 — `framesage-etw` crate is correctly zero-framesage-deps, but the syscall-seam trait pattern is duplicated rather than shared with `framesage-sys`'s `SysApi` trait
 
 **Severity:** LOW
@@ -260,6 +274,8 @@ The supervisor + drop-poll tasks are spawned via `tokio::spawn` inside `spawn_cl
 
 **Effort:** S
 **Gate:** Month 1
+
+**Verified open (M1.13 / P4.9 backfill, 2026-05-18):** `grep -n 'pub trait EtwSysCalls\|pub trait SysApi' crates/etw/src/session.rs crates/sys/src/api.rs` → two independent seam-trait definitions confirmed: `EtwSysCalls` at `crates/etw/src/session.rs:141` (Windows windows_impl module) and `SysApi` at `crates/sys/src/api.rs:46`. Same pattern (mock-injection seam) duplicated; no shared docs / `docs/syscall-seam-pattern.md` exists.
 
 ## B-004 — Engine's `check_process_modifiable` is correctly applied at apply paths (six call sites at lines 652, 683, 704, 725, 746, 798 + line 3366); SafeList is enforced consistently at IPC and policy boundaries
 
@@ -309,6 +325,8 @@ members = [
 
 **Effort:** L (each crate)
 **Gate:** Group B / Group C kickoff
+
+**Verified open (M1.13 / P4.9 backfill, 2026-05-18):** `ls crates/ | grep -E 'recorder|presentmon'` → no matches. Neither `framesage-recorder` nor `framesage-presentmon` crate exists in the workspace. `Cargo.toml` workspace members list (lines 3-22) confirms no new crates added since the v0.7 Group A week 2 batch (PR #79). Scope-revision (PR #129) deferred PresentMon decision (cascade item #6); recorder still expected for Group C (M3.1).
 
 # AXIS C — Correctness & robustness (ETW lifetime, sleep/resume, AC interference)
 
@@ -363,6 +381,8 @@ The supervisor calls `shutdown.shutdown()` synchronously on the panic path (`sup
 
 **Effort:** S
 **Gate:** Month 1
+
+**Verified open (M1.13 / P4.9 backfill, 2026-05-18):** `grep -n 'AtomicBool\|session_torn_down' crates/service/src/closed_loop.rs` → no matches. The `spawn_closed_loop_tasks` function at line 197 spawns supervisor + drop-poll independently; no shared coordination flag exists. Race window described in the finding remains.
 
 ## C-003 — `framesage-etw::session::EtwSession::start` opens the consumer thread BEFORE the supervisor task is wired; if the consumer panics in its first iteration, the panic-reason oneshot fires but no supervisor is listening yet
 
