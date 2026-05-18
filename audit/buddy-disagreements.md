@@ -1128,6 +1128,55 @@ The "no mobile-Claude review per cascade-1 directive" framing is honest precisel
 
 ---
 
+## PR #133 — 2026-05-18 — verdict GO — review-surface: mekanisk anvendelse av merget scope-revision (PR #129) + cascade-1 (PR #131); no mobile-Claude review per cascade-2 directive; one numbering-conflict catch self-corrected before push
+
+**Source:** Cascade PR 2 of 4 (+1 future) per PR #129 cascade plan. Applies scope-revision framing to `audit/2026-revision-phase3-roadmap.md` per Frank's 2026-05-18 cascade-rekkefølge directive.
+
+### Review-surface honesty
+
+**What was actually checked:**
+
+- **Mechanical roadmap-fil application of scope-revision.** No new architectural decisions; per-item reclassifications follow per-finding Resolution blocks landed in PR #131 (cascade-1).
+- **Per-item changes follow Frank's directive verbatim:**
+  - Week 1: W1.1 / W1.7 / W1.8 / W1.9 → won't-fix
+  - Month 2: M2.1 / M2.2 → won't-fix; M2.7 (K-005) → deferred indefinitely
+  - Month 3: M3.5 → REDEFINED (dogfood-gate per DP #1); M3.6 (K-004) → deferred indefinitely
+  - Beyond: I-002 (MSI) → won't-fix
+- **New Month 1 items added per Frank's directive that cascade-2 expands the roadmap:**
+  - M1.13 — P4.9 backfill (mirrors existing issue #127)
+  - M1.14 — CLI verb for closed-loop toggle (scope-revision DP #2 cascade-item, deferred from cascade-PR-4 per Frank)
+  - M1.15 — Month 1 buddy review (renumbered from M1.12)
+- **Roadmap summary table updated:** item counts, cumulative effort per phase, won't-fix annotations.
+- **No mobile-Claude review** per Frank's explicit cascade-2 directive: "Mobile-Claude review IKKE nødvendig. Mekanisk."
+- **Self-attestation Q1–Q5** in PR body (markdown-only; build/clippy/fmt clean).
+
+**Defects fanget (1, self-corrected before push):**
+
+**Numbering-conflict catch:** Initial draft of cascade-2 used `M1.13` for the new CLI-verb roadmap item. Self-caught via `grep -n "M1.13\|P4.9 backfill"` post-Edit — discovered that issue #127 already uses `[M1.13]` tag for P4.9 backfill. Corrected before push: M1.13 = P4.9 backfill (mirrors #127), M1.14 = CLI verb (new), M1.15 = buddy review (renumbered from M1.12). The corrected commit includes an inline "(Was M1.12 pre-scope-revision; renumbered ...)" note so future readers see the renumbering trail.
+
+**Lesson:** Renumbering items in a roadmap that has corresponding GitHub-issue trackers requires grep-verifying issue titles before assigning new IDs. The `[M1.X]` convention in issue titles creates an implicit numbering contract between the roadmap file and GitHub issues. Future cascade work that inserts/removes roadmap items should run a grep-verify step against current issue titles BEFORE landing the roadmap edit.
+
+**Verdict:** GO. PR #133 merged as commit `41f3836`. Cascade-2 of 5 complete.
+
+### Cascade progress
+
+| # | PR | Status |
+|---|---|---|
+| Cascade PR 1 | #131 | ✓ MERGED `919dca9` |
+| **Cascade PR 2** | **#133** | **✓ MERGED `41f3836`** |
+| Cascade PR 3 | (next) — GitHub issues batch-close | Pending |
+| Cascade PR 5 | README scope callout | Pending (after cascade-3) |
+| Cascade PR 4 | CLI verb implementation (M1.14) | Deferred until Month 1 bandwidth permits |
+| Future scope-revision PR | PresentMon scope decision | Gated on Group A + 2 weeks Frank-usage |
+
+### Pacing decision: STOP after cascade-2 per Frank's tempo directive
+
+Frank's cascade-rekkefølge directive: "Tempo: ikke press alle tre i én økt. Halvdag for cascade-1, halvdag for cascade-2, kort økt for cascade-3, så cascade-5 til slutt."
+
+This session has now completed cascade-1 + cascade-2 + their buddy-logs. Cascade-3 (GitHub issues batch-close) is the third — explicitly excluded from "én økt" per Frank's directive. STOP and surface state. Await Frank's directive on cascade-3 timing.
+
+---
+
 ## How to use this log going forward
 
 Each new buddy review that surfaces a concern gets a new
