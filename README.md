@@ -2,6 +2,10 @@
 
 A scheduler supervisor for Windows. Watches the foreground app and applies per-process scheduling policy through documented user-mode Win32 APIs — anti-cheat-clean by construction.
 
+## Project scope
+
+FrameSage is a personal power-user tool. It is not a broadly distributed product. The expected distribution model is self-install from source via `install.ps1` — there is no signed binary, no MSI installer, no marketing. Other power-users who install are welcome on the same informed-consent basis as the maintainer: install means accepting the risks the architecture and this README enumerate. Full scope rationale + decision history: see `audit/v0.7-architecture.md` §"Project scope and audience (2026-05-18 revision)".
+
 ## Who is this for? (read first)
 
 **FrameSage is for users who want maximum performance during games or focused work sessions.** It will stop background services (Windows Update, Search, telemetry, OEM updaters, cloud sync) and suspend non-essential processes (OneDrive, Dropbox, GameBar, Widgets, RGB tools) during a session. Everything is reversed when the session ends. Every action is journaled and reviewable after the fact.
