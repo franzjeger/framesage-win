@@ -22,13 +22,8 @@
 
 Focus: external-clock dependencies + small-risk-large-payoff fixes + the deferred real-mock test.
 
-### W1.1 — Draft + send AC outreach (I-005)
-**Owner:** Engineering lead (you)
-**Deliverable:** Five drafted emails (Vanguard, EA Javelin, BattlEye, FACEIT, internal note on ESEA), sent to vendor support channels with a one-page architecture summary attached.
-**Architecture summary contents:** The AC-aware safe-mode tier scheme (`AntiCheatProfile::Aggressive | Hybrid | SafeMode | Disabled`), the launcher-inheritance pattern for affinity, the explicit "no game-process modifications" invariant under SafeMode, the ten architectural invariants from `audit/research/ANTI-CHEAT-MATRIX.md`, the "we go STANDBY when ESEAClient.exe is detected" decision for ESEA.
-**Success criterion:** Five send-receipts captured. No response is expected in the week; track in `audit/research/ANTI-CHEAT-OUTREACH-LOG.md` (new file).
-**Effort:** M
-**Closes:** I-005 (the outreach launch — not the response gate)
+### ~~W1.1 — Draft + send AC outreach (I-005)~~ — WON'T-FIX per scope revision (PR #129)
+**Resolution (2026-05-18):** Won't-fix. Scope revision (`audit/v0.7-architecture.md` "Project scope and audience (2026-05-18 revision)" + I-005 Resolution block in findings file) skips AC vendor outreach. Technical AC tiers stay; empirical-feedback-loop replaces vendor sign-off. See I-005 Resolution for full rationale.
 
 ### W1.2 — Fix bf6.exe AC false-positive (A-003)
 **Owner:** Engineer
@@ -79,30 +74,14 @@ Focus: external-clock dependencies + small-risk-large-payoff fixes + the deferre
 **Effort:** M (Option B recommended) / S (Option A fallback)
 **Closes:** F-001 + F-002 if Option B selected.
 
-### W1.7 — AC vendor outreach kickoff (I-005)
-**Already in W1.1 — listed for cross-reference. External dependency clock starts on Day 1.**
+### ~~W1.7 — AC vendor outreach kickoff (I-005)~~ — WON'T-FIX per scope revision (PR #129)
+**Resolution (2026-05-18):** Cross-ref of W1.1 above; same won't-fix per scope revision.
 
-### W1.8 — Authenticode signing cert procurement kickoff (I-001)
-**Owner:** You / engineering lead
-**Change:** Kick off Sectigo OV cert procurement on Day 1 (not Month 2). Multi-week response curve:
-- Day 1: Submit OV order with Sectigo (or chosen CA). Identity verification typically takes 3–10 business days.
-- Day 1: Set up Azure subscription for Key Vault HSM (if not already in place). Pre-authorize the storage.
-- Day 1: Open internal ticket for AzureSignTool integration.
-**Why Day 1, not Month 2:** Original M2.1 placement assumed cert procurement starts when engineering work starts. But cert procurement is wall-clock-bound (3+ weeks for OV-to-SmartScreen-reputation, longer for HSM provisioning). Starting Day 1 of Week 1 means the cert is in hand when M2.1's engineering work needs it. Late start = guaranteed v0.7.1 slip.
-**Success criterion:** Cert order submitted with order ID captured in `audit/research/EXTERNAL-DEADLINES.md` (new file per P4.6). Azure Key Vault HSM provisioned.
-**Effort:** S (kickoff only; deliverable lands in M2.1)
-**Closes:** Half of I-001 (kickoff); M2.1 closes the rest
+### ~~W1.8 — Authenticode signing cert procurement kickoff (I-001)~~ — WON'T-FIX per scope revision (PR #129)
+**Resolution (2026-05-18):** Won't-fix. Scope revision skips Authenticode signing (see I-001 Resolution block in findings file). SmartScreen warning accepted as a known cost of the source-installer distribution model for audience (a).
 
-### W1.9 — EDR matrix engagement kickoff (I-003)
-**Owner:** You / engineering lead
-**Change:** Engage SOC team / security researchers for the three-product matrix (Defender ATP, CrowdStrike Falcon, SentinelOne Singularity) on Day 1.
-- Day 1: Reach out to internal SOC (if available) for Defender ATP test environment. Fallback per `spike/etw-edr-report.md` §6: external security researchers via SANS / NCC Group / Trail of Bits engagement.
-- Day 1: Request trial/eval licenses for CrowdStrike Falcon and SentinelOne Singularity on clean Win11 24H2 VMs (~2 weeks lead time for license issuance).
-- Day 1: Set up VM templates (Win11 24H2 clean install + framesage-svc.exe + the test suite).
-**Why Day 1, not Month 2:** Same logic as I-001 — wall-clock-bound. EDR engagement lead time is 2–3 weeks for licenses + ~1 week per product to actually run the test matrix. Starting Month 2 = guaranteed v0.7.1 slip.
-**Success criterion:** All three license/access pathways requested, lead times captured in `audit/research/EXTERNAL-DEADLINES.md`. Test-VM template ready.
-**Effort:** M (kickoff only; deliverable lands in M2.2)
-**Closes:** Half of I-003 (kickoff); M2.2 closes the rest
+### ~~W1.9 — EDR matrix engagement kickoff (I-003)~~ — WON'T-FIX per scope revision (PR #129)
+**Resolution (2026-05-18):** Won't-fix. Scope revision skips EDR matrix (see I-003 Resolution block in findings file). v0.7.1 default-on-flip gate redefined as dogfood-criterion ("Frank used `closed_loop_enabled = true` on 9950X3D for 2+ weeks without issues") per scope-revision DP #1, NOT external EDR attestation.
 
 ### W1.10 — Week 1 buddy review
 **Owner:** You + buddy reviewer
@@ -145,33 +124,34 @@ Grep `crates/tray/src` for residual `std::sync::Mutex`. Close or escalate. Effor
 Manual install on clean VM; capture `icacls` output to `audit/research/install-verification-2026-06.md`. Effort: S.
 
 ### M1.11 — Document Manual Global Game Mode CLI verbs (J-003)
-README "Power-user workflows" section. Effort: S.
+README "Power-user workflows" section. Effort: S. **Note (2026-05-18 scope revision):** J-003 framing reframed (not differentiator-vs-competitors; Frank's own reference). Doc task itself unchanged.
 
-### M1.12 — Month 1 buddy review (4Q format)
+### M1.13 — Backfill audit verification per P4.9 (#127)
+**Source:** P4.9 process improvement (added 2026-05-18 via PR #129 round-1 review). GitHub issue #127 tracks the work.
+**Change:** Backfill verification commands on remaining open Phase 2 findings per P4.9. Each open finding in `audit/2026-revision-phase2-findings.md` should carry an inline verification command demonstrating the gap the finding claims still exists. Any additional drifts surfaced get Resolution blocks per the E-001 / PRE-L-006 pattern.
+**Effort:** M (one-time backfill)
+**Closes:** Tracks via #127; not a Phase 2 audit finding — process work derived from P4.9.
+
+### M1.14 — CLI verb for closed-loop toggle (scope-revision DP #2 cascade)
+**Source:** Scope revision (PR #129) Decision Point #2 cascade-item.
+**Change:** Add `framesage policy set-closed-loop-enabled true|false` CLI verb (or equivalent policy-template mechanism) so Frank can flip `Policy.closed_loop_enabled` without manually editing `policy.json`. Implementation lands when Month 1 bandwidth permits.
+**Note:** This was originally cascade-PR #4 in the scope-revision cascade plan. Per Frank's 2026-05-18 cascade-rekkefølge directive: cascade-4 is real implementation work (not audit-trail work), so it's deferred from the cascade wave and tracked here as a Month 1 item instead.
+**Effort:** M
+**Closes:** Scope-revision DP #2 cascade-item (NOT a Phase 2 audit finding — new work)
+
+### M1.15 — Month 1 buddy review (4Q format)
+
+(Was M1.12 pre-scope-revision; renumbered to M1.15 to make room for M1.13 (P4.9 backfill) and M1.14 (CLI verb cascade-item). The 4Q-format buddy review remains the last item in Month 1.)
 
 ## Month 2 (target completion: 2026-07-18)
 
 Focus: v0.7.1 unblockers (signing-cert + EDR-matrix kickoff) + remaining Quality items.
 
-### M2.1 — Authenticode signing — workflow + verification surface (I-001 closeout)
-**Pre-condition:** Cert procured + Azure Key Vault HSM provisioned during Week 1 (W1.8).
-**Sub-tasks:**
-- GitHub Actions workflow: `cargo build --release` → `AzureSignTool` → `signtool verify`
-- New CLI verb: `framesage --verify-signature` calling `WinVerifyTrust` on every shipped binary
-- `install.ps1` change: `Get-AuthenticodeSignature` check on staged binaries; abort install on `Status -ne 'Valid'` per architecture §2.5
-- README "Verifying the binary" section
-**Effort:** L (cert is already in hand thanks to W1.8 kickoff)
-**Closes:** I-001 (full closeout)
+### ~~M2.1 — Authenticode signing — workflow + verification surface (I-001 closeout)~~ — WON'T-FIX per scope revision (PR #129)
+**Resolution (2026-05-18):** Won't-fix. Scope revision skips Authenticode signing (see I-001 Resolution block in findings file).
 
-### M2.2 — EDR-matrix — execute test runs across three products (I-003 closeout)
-**Pre-condition:** EDR licenses / test access acquired during Week 1 (W1.9).
-**Sub-tasks:**
-- Run framesage closed-loop end-to-end on Defender ATP test environment; capture any alerts triggered. Document in `spike/etw-edr-report.md` §6.1.
-- Run on CrowdStrike Falcon test environment; same.
-- Run on SentinelOne Singularity test environment; same.
-- Produce v0.7.1 default-on-flip attestation per architecture §"NOT a Group A blocker".
-**Effort:** L (licenses in hand from W1.9; the test runs themselves are ~3 engineer-days for the matrix)
-**Closes:** I-003 (full closeout)
+### ~~M2.2 — EDR-matrix — execute test runs across three products (I-003 closeout)~~ — WON'T-FIX per scope revision (PR #129)
+**Resolution (2026-05-18):** Won't-fix. Scope revision skips EDR matrix (see I-003 Resolution block in findings file). v0.7.1 flip-gate now uses dogfood-criterion per scope-revision DP #1.
 
 ### M2.3 — `EtwSubsystem::DisabledRetryable` discriminant (A-002)
 Effort: S.
@@ -185,7 +165,7 @@ Effort: S.
 ### M2.6 — Etw-side build-gate override fold-in (H-004)
 Move thread-local override into `framesage-etw` crate; service-side seam becomes a re-export. Effort: S.
 
-### M2.7 — Engine/lib.rs reviewability split (K-005) — SEQUENTIAL, Month 2 priority
+### M2.7 — Engine/lib.rs reviewability split (K-005) — DEFERRED INDEFINITELY per scope revision (PR #129 DP #4); SEQUENTIAL, Month 2 priority (when un-deferred)
 **Owner:** Engineer (dedicated for the duration)
 **Rationale for sequencing K-005 BEFORE K-004:** 53 inline engine tests provide objective per-sub-PR verification; engineer learns the "split rhythm" on the higher-confidence target. Tray-split (K-004) has no test safety net (eframe render path has no unit coverage — visual screenshot diff is the only verification) and benefits from the rhythm + reviewer pattern established here first.
 **Sub-PRs (sequenced, low-to-high regression risk):**
@@ -198,6 +178,7 @@ Move thread-local override into `framesage-etw` crate; service-side seam becomes
 **Effort:** XL (~2–3 engineer-weeks for the 5 sub-PRs sequentially)
 **Closes:** K-005
 **Regression-risk annotation:** HIGH — lock-ordering across maybe_* + reconcile + apply paths is the load-bearing invariant; any reshuffle that breaks it surfaces as production deadlock or apply-stuck states.
+**Scope-revision (2026-05-18) deferral:** Per PR #129 Decision Point #4, K-004 + K-005 deferred indefinitely. One reader (Frank) means opacity cost is internal-only. Revisit only if contributor count grows or Frank's reviewability pain becomes acute. The technical plan above stays valid; just no scheduled execution.
 
 ### M2.8 — Month 2 buddy review
 
@@ -236,7 +217,7 @@ After Group A week 5+ stabilizes. Effort: S.
 
 **Note:** PRE-L-006 (verify `spike/etw-schemas.md` exists) was resolved inline during Phase 3 roadmap drafting — file exists at 713 LOC with proper provider GUIDs, authority citations, and Win11 26200 empirical observations per the ground rule. No tracking needed; closed.
 
-### M3.6 — Tray/main.rs reviewability split (K-004) — SPILLOVER from Month 2
+### M3.6 — Tray/main.rs reviewability split (K-004) — DEFERRED INDEFINITELY per scope revision (PR #129 DP #4); SPILLOVER from Month 2 (when un-deferred)
 **Owner:** Engineer
 **Pre-condition:** K-005 (M2.7) closed. The split rhythm + reviewer pattern is established.
 **Sub-PRs (sequenced, low-to-high regression risk):**
@@ -255,14 +236,15 @@ After Group A week 5+ stabilizes. Effort: S.
 
 ### M3.7 — Month 3 + v0.7.1 tag buddy review (5Q implementation-phase format)
 
-### M3.5 — v0.7.1 default-on flip — only if I-003 (EDR) and I-005 (AC) both close
-**Sub-task:** Once both EDR matrix attestation is in place AND every AC vendor has responded (positively or with addressable concerns), flip `closed_loop_enabled: false → true` default in `policy.rs:653, 694`. Remove the "EDR validation in progress for v0.7.1" required substring from onboarding page 3 per architecture §"First-run onboarding."
-**Gate:** External dependencies — schedule slips if either I-003 or I-005 slips.
-**Closes:** v0.7.1 ship contract
+### M3.5 — v0.7.1 default-on flip — gate REDEFINED per scope revision (PR #129 DP #1)
+**Sub-task:** Flip `closed_loop_enabled: false → true` default in `policy.rs:653, 694`. Remove the "EDR validation in progress for v0.7.1" required substring from onboarding page 3 per architecture §"First-run onboarding."
+**Gate (revised 2026-05-18):** **Dogfood criterion** — Frank has used `closed_loop_enabled = true` on his 9950X3D for 2+ weeks without issues. NOT external EDR matrix or AC vendor attestation (both reclassified to won't-fix per scope revision; see I-003 and I-005 Resolution blocks). The dogfood gate preserves the audit-trail intent (default-off → verified-stable → default-on) without external dependencies.
+**Pre-condition:** Cascade-PR #4 (M1.14 CLI verb) shipped so Frank can flip the toggle easily during the 2-week dogfood period.
+**Closes:** v0.7.1 ship contract per scope-revision-redefined gate criteria.
 
 ## Beyond Month 3 (v1.0 trajectory)
 
-- I-002 (MSI / WiX installer) — XL
+- ~~I-002 (MSI / WiX installer)~~ — won't-fix per scope revision (PR #129); see I-002 Resolution block
 - K-002 (rotate session GUID for v1.0)
 - Persistent v1.0 prep: signed installer end-to-end, multi-week of dogfood, polish polish polish.
 
@@ -364,11 +346,11 @@ unsafe { syscalls.process_trace(&handles, None, None) }
 
 | Phase | Window | Effort | Deliverables |
 |---|---|---|---|
-| Week 1 | Now → 2026-05-25 | L cumulative | 9 items (W1.1–W1.9) + buddy review. **3 external-clock kickoffs (AC outreach + cert procurement + EDR engagement) fire Day 1.** |
-| Month 1 | 2026-05-25 → 2026-06-18 | L cumulative | 11 items (M1.1–M1.11) + buddy review |
-| Month 2 | 2026-06-18 → 2026-07-18 | XL cumulative | 8 items (M2.1–M2.8). **K-005 (engine split, sequential) takes 2–3 weeks; K-004 slipped to M3.6 because Month 2 with both splits is 7–9 engineer-weeks in 4 calendar weeks.** Cert + EDR deliverables close (kickoffs were Week 1). |
-| Month 3 | 2026-07-18 → 2026-08-18 | XL cumulative | Group B + Group C + v0.7.1 flip + K-004 spillover (or slip-to-v1.0-prep) + buddy review |
-| Beyond | 2026-08+ | XL | MSI installer, v1.0 prep |
+| Week 1 | Now → 2026-05-25 | L cumulative | 5 items (W1.2–W1.6) + buddy review. ~~3 external-clock kickoffs~~ → all won't-fix per scope revision (PR #129). All 5 kodbare items lukket. |
+| Month 1 | 2026-05-25 → 2026-06-18 | L cumulative | 13 items (M1.1–M1.13, M1.14, M1.15-buddy-review). M1.13 = P4.9 backfill (#127); M1.14 = CLI verb for closed-loop toggle (scope-revision DP #2 cascade). |
+| Month 2 | 2026-06-18 → 2026-07-18 | M cumulative (was XL) | 5 items (M2.3–M2.6) + buddy review. ~~M2.1 (signing) + M2.2 (EDR matrix)~~ won't-fix per scope revision. **K-005 (M2.7) deferred indefinitely** per scope-revision DP #4. Quality items only. |
+| Month 3 | 2026-07-18 → 2026-08-18 | L cumulative (was XL) | Group B (M3.2 — gated on future scope-revision PR per PR #129 cascade-item #6) + Group C (M3.1) + v0.7.1 flip (M3.5 dogfood-gate) + buddy review. K-004 (M3.6) deferred indefinitely. |
+| Beyond | 2026-08+ | M | ~~MSI installer~~ won't-fix per scope revision. v1.0 prep + K-002 (session GUID rotation). |
 
 ## Status
 
