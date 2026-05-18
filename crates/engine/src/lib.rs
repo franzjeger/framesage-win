@@ -1008,6 +1008,13 @@ impl Engine {
             active_profile,
             manual_override: s.manual_override.clone(),
             manual_global_active: s.manual_global_active.clone(),
+            // W1.6 — engine has no framesage-etw dep (ARCHITECTURE.md
+            // invariant #8); the service overrides this field with the
+            // real predicate value before sending the snapshot over
+            // IPC. Default false here is the conservative fallback for
+            // any caller that doesn't go through the service-side IPC
+            // path (e.g., unit tests).
+            closed_loop_build_supported: false,
         }
     }
 

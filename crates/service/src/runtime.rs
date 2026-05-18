@@ -508,7 +508,17 @@ async fn handle_client(
 
         match req {
             Request::Status => {
-                let snap = engine.status();
+                // W1.6 / closes F-002 — inject the build-gate predicate
+                // into the snapshot. framesage-engine has no etw dep
+                // (ARCHITECTURE.md invariant #8) so the engine returns
+                // `closed_loop_build_supported: false` by default; the
+                // service overrides here with the real probe result
+                // before sending. The predicate's result is cached
+                // (framesage_etw::build_gate::CACHED_BUILD) so repeated
+                // Status requests don't re-probe RtlGetVersion.
+                let mut snap = engine.status();
+                snap.closed_loop_build_supported =
+                    framesage_etw::build_gate::closed_loop_enabled_for_this_build();
                 write_response(&mut write_half, &Response::Status(Box::new(snap))).await?;
             }
             Request::ListProcesses => {
