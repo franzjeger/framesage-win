@@ -1292,6 +1292,16 @@ mod windows_impl {
     /// ProcessTrace / CloseTrace). Per Day 3 design finding: syscalls
     /// is passed separately so ConsumerState stays non-generic and
     /// trivially RefUnwindSafe.
+    ///
+    /// **Arc-pointer-lifetime contract (W1.3 / A-004):** the
+    /// kernel callback dereferences a raw pointer derived from
+    /// this function's `state` parameter. Memory safety relies on
+    /// three invariants — see the `LIFETIME CONTRACT —
+    /// Arc::as_ptr(&state)` comment block on the `logfile.Context`
+    /// assignment below. **Do NOT move the Arc construction out
+    /// of this local frame** — the compile-time guard in
+    /// `supervisor.rs:158` covers `catch_unwind` soundness but
+    /// does NOT cover this lifetime contract.
     fn consumer_loop<S: EtwSysCalls + Send + 'static>(
         session_name: &str,
         state: Arc<ConsumerState>,
@@ -1306,6 +1316,53 @@ mod windows_impl {
         logfile.Anonymous1.ProcessTraceMode =
             PROCESS_TRACE_MODE_REAL_TIME | PROCESS_TRACE_MODE_EVENT_RECORD;
         logfile.Anonymous2.EventRecordCallback = Some(event_record_callback);
+        // ─── LIFETIME CONTRACT — Arc::as_ptr(&state) ─────────────────────
+        //
+        // W1.3 / closes A-004. The kernel callback `event_record_callback`
+        // (registered above as `logfile.Anonymous2.EventRecordCallback`)
+        // dereferences `EVENT_RECORD::UserContext as *const ConsumerState`
+        // on every kernel event. That raw pointer originates here as
+        // `Arc::as_ptr(&state)`. Three invariants must hold:
+        //
+        //   1. ETW kernel-side guarantees callbacks fire ONLY during
+        //      ProcessTrace's blocking call below. (Documented MSDN
+        //      contract for ProcessTrace's real-time-mode semantics.)
+        //
+        //   2. The `state: Arc<ConsumerState>` parameter is a local
+        //      in this function and lives for the entire function
+        //      scope. It is dropped when `consumer_loop` returns,
+        //      after the ProcessTrace call below completes. Rust's
+        //      ownership model guarantees the pointer is valid for
+        //      the Arc's lifetime; `Arc::as_ptr` does NOT increment
+        //      the strong-count, but the local binding keeps the
+        //      Arc alive.
+        //
+        //   3. After ProcessTrace returns (STOP issued externally via
+        //      ControlTraceW(STOP) on another thread), no further
+        //      callbacks fire. [UNVERIFIED — MSDN documents
+        //      ProcessTrace as synchronous but does not explicitly
+        //      guarantee no in-flight callbacks at return. Indirect
+        //      empirical evidence: spike/group-a-week-2-report.md
+        //      Step 24 + Step 28 end-to-end teardown ran without
+        //      crash, which would have been observable if a callback
+        //      had fired against the dropped Arc. Direct instrumented
+        //      verification deferred to Group A week 3+ parser work.]
+        //
+        // The compile-time guard in `crates/etw/src/supervisor.rs:158`
+        // (`assert_impl_all!(ConsumerState: RefUnwindSafe)`) covers
+        // catch_unwind soundness of the consumer thread — it does
+        // NOT cover this lifetime contract.
+        //
+        // **DO NOT MOVE THE ARC OUT OF THIS LOCAL FRAME.** A future
+        // refactor that hoists the Arc construction into an
+        // enclosing struct field (e.g., `EtwSession.consumer_state`)
+        // opens a use-after-free vector if that struct can be
+        // dropped before ProcessTrace returns. If sharing `state`
+        // differently becomes necessary, take option (b) from
+        // finding A-004: hold the Arc inside a typestate that
+        // statically prevents being dropped before ProcessTrace
+        // returns. See `audit/2026-revision-phase2-findings.md`
+        // A-004 for the design trade-off.
         logfile.Context = Arc::as_ptr(&state) as *mut std::ffi::c_void;
 
         // SAFETY: logfile.LoggerName lives for the OpenTraceW call;
@@ -1317,8 +1374,9 @@ mod windows_impl {
 
         let handles = [handle];
         // SAFETY: handles is a valid array. ProcessTrace blocks until
-        // ControlTraceW(STOP) fires; state Arc keeps ConsumerState
-        // alive across every callback invocation.
+        // ControlTraceW(STOP) fires. The state-Arc lifetime contract
+        // that keeps ConsumerState alive across callback invocations
+        // is documented in the LIFETIME CONTRACT block above.
         let rc = unsafe { syscalls.process_trace(&handles, None, None) };
 
         // CloseTrace fires whether ProcessTrace exited clean or errored
