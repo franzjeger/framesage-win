@@ -16,6 +16,9 @@ members = [
     # not built by default and the v0.6 release scripts never
     # ship it.
     "crates/spike-etw",
+    # v0.7 Group A — ETW kernel-event consumer (Day 1 scaffold).
+    # Production crate the service host wires into on Day 5.
+    "crates/etw",
 ]
 
 [workspace.package]
@@ -65,6 +68,11 @@ tokio = { version = "1", features = [
 # Sync
 parking_lot = "0.12"
 
+# Compile-time assertions — used by framesage-etw's supervisor module
+# to enforce the ConsumerState: RefUnwindSafe contract per the
+# catch_unwind soundness analysis in v0.7 week-2 plan §3.5 #4.
+static_assertions = "1"
+
 # CLI
 clap = { version = "4", features = ["derive"] }
 
@@ -98,6 +106,7 @@ framesage-core = { path = "crates/core" }
 framesage-sys = { path = "crates/sys" }
 framesage-ipc = { path = "crates/ipc" }
 framesage-engine = { path = "crates/engine" }
+framesage-etw = { path = "crates/etw" }
 framesage-gamemode = { path = "crates/gamemode" }
 
 # UUIDs for journal session ids

@@ -26,6 +26,18 @@ tracing-appender = { workspace = true }
 serde_json = { workspace = true }
 notify = { workspace = true }
 
+# Day 5 — v0.7 closed-loop ETW consumer. Conditional on policy.closed_loop_enabled
+# + build_gate predicate. Spawns supervisor + drop-poll tasks at startup
+# when both pass.
+framesage-etw = { workspace = true }
+
+[dev-dependencies]
+# tracing-test for the build-gate-fallthrough integration test
+# (asserts structured tracing event fields, not substring-matching
+# the formatted output, per Mode 5 / build-gate log structure
+# convention).
+tracing-test = "0.2"
+
 [target.'cfg(windows)'.dependencies]
 windows-service = { workspace = true }
 windows = { workspace = true, features = [

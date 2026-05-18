@@ -97,6 +97,19 @@ pub async fn run(inputs: RuntimeInputs) -> Result<()> {
         "framesage engine starting"
     );
 
+    // Day 5 (v0.7 closed-loop): evaluate the policy + build-gate
+    // decision tree and spawn supervisor + drop-poll tasks if enabled.
+    // The closed-loop tasks intentionally do NOT participate in the
+    // v0.6 watchdog select! below — per architecture §2.1 mode 5
+    // amendment (proposal/v0.7-arch-mode5-amendment PR #77), supervisor
+    // exit is not a critical service failure. See closed_loop.rs's
+    // module docstring for the ownership rationale.
+    let closed_loop_startup = crate::closed_loop::start_closed_loop_if_enabled(&policy);
+    info!(
+        startup_result = ?closed_loop_startup,
+        "closed-loop startup decision made"
+    );
+
     let engine = Arc::new(Engine::new(EngineDeps::with_real_sys(
         policy,
         topology,
@@ -947,19 +960,34 @@ where
 }
 
 // Silence warnings about unused imports/items on non-Windows.
+//
+// Day 5 maintenance: the prior implementation had bit-rotted on the
+// non-Windows host build because (a) `load_policy` was renamed to
+// `load_policy_or_default` in an earlier refactor but the silence
+// list wasn't updated, and (b) `type_name::<AsyncBufReadExt>` (bare
+// trait name) became a hard error in newer Rust editions, AND
+// `AsyncBufReadExt` / `AsyncWriteExt` are NOT dyn-compatible (their
+// methods return `Self`-bound future types), so the `dyn` workaround
+// doesn't apply either. Switched to a `PhantomData`-based pattern that
+// works with arbitrary traits without dyn-compatibility requirements.
 #[cfg(not(windows))]
 #[allow(dead_code)]
 fn _silence_warnings() {
-    let _ = (
-        load_policy,
-        std::any::type_name::<Engine>,
-        std::any::type_name::<Request>,
-        std::any::type_name::<Response>,
-        std::any::type_name::<Event>,
-        std::any::type_name::<BufReader<tokio::io::DuplexStream>>,
-        std::any::type_name::<AsyncBufReadExt>,
-        std::any::type_name::<AsyncWriteExt>,
-    );
+    use std::marker::PhantomData;
+    let _: PhantomData<fn() -> Box<dyn std::any::Any>> = PhantomData;
+    let _ = load_policy_or_default;
+    let _ = std::any::type_name::<Engine>;
+    let _ = std::any::type_name::<Request>;
+    let _ = std::any::type_name::<Response>;
+    let _ = std::any::type_name::<Event>;
+    let _ = std::any::type_name::<BufReader<tokio::io::DuplexStream>>;
+    // For not-dyn-compatible traits: take a function pointer to a
+    // method that uses the trait as a bound. The function never
+    // executes — just keeps the import live.
+    fn _uses_async_read<T: AsyncBufReadExt>(_: &T) {}
+    fn _uses_async_write<T: AsyncWriteExt>(_: &T) {}
+    let _ = _uses_async_read::<BufReader<tokio::io::DuplexStream>>;
+    let _ = _uses_async_write::<tokio::io::DuplexStream>;
 }
 
 /// Tag a JoinHandle's result with the task name for the watchdog log
@@ -1046,6 +1074,7 @@ mod tests {
             tick_ms: 300,
             probalance: framesage_core::ProBalanceConfig::default(),
             affinity_rules: Vec::new(),
+            closed_loop_enabled: false,
         }
     }
 
@@ -1202,6 +1231,7 @@ mod tests {
             tick_ms: 300,
             probalance: framesage_core::ProBalanceConfig::default(),
             affinity_rules: Vec::new(),
+            closed_loop_enabled: false,
         };
         assert!(validate_policy_against_safe_list(&policy).is_empty());
     }
