@@ -503,6 +503,61 @@ is code or prose.
   format doc doesn't exist (it lives inline in standing instructions),
   so no edit is required.
 
+### Resolution — 2026-05-18 (buddy 4Q on DRAFT v2; v2.1 patch applied)
+
+Buddy ran planning-phase 4Q (with extended (d) cross-doc) on DRAFT v2
+of the format doc. Verdict: STOP-ON-(d) with one mechanical finding —
+the META 2 Q(1) rename ("FFI safety" → "Language-mechanics safety")
+was applied at the section heading + intro but not swept to two
+downstream sites in the same document:
+
+1. **Line 124** — the output-format template buddy reviewers
+   literally copy into PR reviews: `## (1) FFI safety: PASS|FAIL`.
+   Load-bearing because broken propagation = every buddy review
+   reverts the rename via copy-paste.
+2. **Line 182** — the self-pass meta-section inside this same doc:
+   `**(1) FFI safety** — N/A; this is a process doc, no unsafe.`
+   Marginal — internal consistency only — but the fix is the same
+   two-line edit so doing it together is appropriate.
+
+Watch-signal evaluation per the week-2 plan footer:
+- (a) count similar/growing across drafts: DECREASED (v1: 2 → v2: 1).
+- (b) severity similar/growing: DECREASED. v1's findings were
+  cross-document attribution slips; v2's is a within-document sweep
+  miss on a literal rename.
+- (c) self-pass empty while buddy still finds issues: NOT empty —
+  self-pass made substantive claims that Patch (2) refined. Note: the
+  self-pass at line 182 is itself one of the sites that needed the
+  rename; degenerate case where the self-pass that should catch the
+  sweep miss is also a site of the sweep miss.
+
+**Pattern: CONVERGENCE.** No structural-intervention trigger. Per
+buddy's own recommendation ("apply the two-line fix as a v2.1
+patch-commit on the same branch, no re-buddy required") and the
+2026-05-17 cutoff-the-knot rule, applied as v2.1 patch
+(`audit/buddy-format-implementation-phase.md` lines 124 + 182
+renamed to "Language-mechanics safety").
+
+**Meta-observation (per buddy + user-noted as audit-trail-load-bearing
+in Entry 5 lines 628–639):** the document introducing sweep
+discipline failed its own sweep on its first edit. Specifically: the
+META 2 broadening commit added §X formalizing sweep discipline, but
+the commit itself missed two sites of the same rename it introduced.
+This is the rhythm catching its own introducer mid-introduction —
+not structural failure, but a clean on-record example of why
+self-passes need verification commands + literal output (the
+verification command `grep -n "FFI safety" audit/buddy-format-implementation-phase.md`
+would have output the two missed lines instantly; the self-pass
+without that command read fine and approved itself). Rhythm-
+introduction commits ARE the highest-risk sites for the rhythm
+they introduce — the author is still building the muscle the rhythm
+requires. Documented for future rhythm-introduction commits to plan
+extra verification-command sweep on the day of introduction.
+
+Format doc state: DRAFT v2 → v2.1 (this commit). APPROVED flip +
+PR #75 merge land as follow-up commits per the user's strict-
+sequencing intent.
+
 ---
 
 ## Entry 5 — 2026-05-17, fresh-eyes re-read of APPROVED week-2 plan surfaced two real gaps + one minor

@@ -121,7 +121,7 @@ The (d) check from planning-phase carries over with code-level specificity. Budd
 ## Output format for buddy responses
 
 ```
-## (1) FFI safety: PASS|FAIL
+## (1) Language-mechanics safety: PASS|FAIL
 <list each unsafe block in the diff with its file:line and one-sentence verdict on the SAFETY comment quality>
 
 ## (2) Concurrency correctness: PASS|FAIL
@@ -179,7 +179,7 @@ This format itself is a document. If it gets edited, the edit goes through plann
 
 Self-administered (1)-(5) pass on this draft before commit:
 
-- **(1) FFI safety** — N/A; this is a process doc, no `unsafe`.
+- **(1) Language-mechanics safety** — N/A; this is a process doc, no `unsafe`, no threading, no FFI.
 - **(2) Concurrency** — N/A.
 - **(3) Error handling** — N/A.
 - **(4) Test-asserts-what-it-says** — meta-applies: does the format's stated check actually catch the failure mode it claims to catch? The (1)–(4) checks are themselves grep-able patterns (`unsafe` blocks, `.ok();` swallows, test name vs body alignment) — buddy can verify each in practice.
