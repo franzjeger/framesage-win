@@ -1,9 +1,14 @@
 # Buddy-system format — implementation phase
 
 **Status:** DRAFT — pending buddy review per user instruction (2026-05-17).
-**Authoritative inputs:** `audit/buddy-disagreements.md` Entry 1 (planning-phase 3Q), Entry 2 (planning-phase 4Q + (d)), Entry 3 (v4 review).
+**Authoritative inputs:**
+- `audit/buddy-disagreements.md` — the buddy-system audit trail. Reader consults the current state of the log for the planning-phase format evolution (3Q → 4Q with the (d) internal-consistency question) and the surfaced same-category-finding watch signal.
+- `spike/group-a-week-2-plan.md` — the load-bearing implementation plan whose code reviews this format governs. Section refs throughout this document point at `plan/group-a-week-2` HEAD (now on `main` after PR #73 + PR #78 merge).
+- `audit/v0.7-architecture.md` — architecture proposal. §2.4 (Session History UI + honesty contract) is referenced by question (4) below.
 
-The planning-phase four-question format `(a) authority / (b) scope / (c) feasibility / (d) internal-consistency` is for **documents**. Code review during implementation needs a different format tuned for runtime concerns the planning format can't cover: concurrency, error handling, FFI safety, what tests actually assert.
+The planning-phase four-question format `(a) authority / (b) scope / (c) feasibility / (d) internal-consistency` is for **documents**. Code review during implementation needs a different format tuned for runtime concerns the planning format can't cover: language-mechanics safety, concurrency, error handling, what tests actually assert.
+
+The (d) question carries a cross-document scope (see §X "Cross-document consistency dependencies" below): every artifact must agree with itself AND with the authoritative documents it references. The implementation-phase (5) check inherits the same extended scope at the code level.
 
 This document specifies the implementation-phase format. Applies to:
 - The end-of-week Group A PR (week 2, week 3, etc.).
@@ -19,7 +24,11 @@ Does NOT apply to:
 
 ## The format: five questions
 
-### (1) FFI safety
+### (1) Language-mechanics safety
+
+This question was originally "FFI safety" (DRAFT v1, 2026-05-17). Broadened per **META 2** (decided alongside the v4.2 plan amendment: "the trait surface needs a method that wasn't in §3.4's enumeration → STOP, but mechanical visibility/Send-Sync mismatches kept being mis-classified as 'just compile errors'"). Day 3's Entry 3 finding — `RefCell`-backed mock + `ConsumerState`-holds-`S` + `std::thread::spawn`'s `Sync` bound — escaped three rounds of planning-phase review because no format question explicitly named visibility-vs-consumer-location. (5Q (1) covers it now.)
+
+**Sub-bullet (1a) — `unsafe` SAFETY justifications.**
 
 Every `unsafe` block in the diff has an inline `// SAFETY:` comment justifying the contract. The justification names:
 - What preconditions the call requires (pointer non-null, buffer length, alignment, lifetime).
@@ -36,7 +45,35 @@ Every `unsafe` block in the diff has an inline `// SAFETY:` comment justifying t
 
 Buddy should grep `unsafe` in the diff and verify EVERY block has a justification. If even one lacks it: FAIL.
 
-Also check:
+**Sub-bullet (1b) — visibility matches consumer location.**
+
+`pub` items are reachable from any downstream crate. `pub(crate)` is reachable only from within the lib's own crate (NOT integration tests in `tests/`). `#[cfg(test)]` items exist only when the lib itself is being tested (NOT when downstream integration tests are compiled).
+
+**Specific failure modes to flag:**
+- `pub(crate)` test helper + integration test in `crates/X/tests/foo.rs` → compile error (integration tests link the crate as an external dep; `pub(crate)` is invisible). **Fix:** either inline the test as `#[cfg(test)] mod tests` in the source module, or change the helper to `pub` (gated behind a `_test_seam` Cargo feature if the API surface concern is real).
+- `#[cfg(test)] pub struct MockX` + integration test in `tests/` → same problem (`cfg(test)` isn't set on the lib when the integration test is compiled, so the type is invisible). Same fix.
+- `pub fn xxx(...) -> impl SomeTrait` exposed from a sealed-trait pattern → caller can't name the return type → flag.
+
+This rule traces to Day 3 (week 2, 2026-05-17): the DRAFT plan §3.4 chose `RefCell<VecDeque<T>>` for `MockEtwSysCalls` queues with rationale "tests are single-threaded." But the consumer-thread spawn required `S: Sync` (transitively via `Arc<ConsumerState<S>>: Send`), and `RefCell` isn't `Sync`. The plan didn't anticipate the conflict because no format check explicitly named "do the visibility + trait bounds work for the consumers that will actually use the API?"
+
+**Sub-bullet (1c) — `Send`/`Sync` bounds match usage.**
+
+Types crossing thread boundaries need the right markers:
+- `std::thread::spawn`'s closure → captured types must be `Send + 'static`.
+- `Arc<T>: Send` ⇔ `T: Send + Sync`.
+- `tokio::spawn`'s future → `Future + Send`; captured types must be `Send`.
+- `parking_lot::Mutex<T>: Sync` ⇔ `T: Send`. (Plus: `parking_lot::Mutex<T>` is NOT `RefUnwindSafe` — `static_assertions::assert_impl_all!(MyState: RefUnwindSafe)` will catch this if `MyState` holds a `Mutex` and is captured by a `catch_unwind` wrapper.)
+
+Buddy reads the captured fields and the trait bounds. A `tokio::spawn(async move { ... })` capturing a non-`Send` future receiver is a flag.
+
+**Sub-bullet (1d) — trait bounds match what implementers can satisfy.**
+
+If `impl<S: EtwSysCalls + Clone + Send + 'static> EtwSession<S>` requires `S: Clone`, every impl must be cloneable. If `MockX` uses `RefCell<VecDeque<T>>`, `#[derive(Clone)]` gives per-clone-state semantics — flag if test design assumed shared state.
+
+If a sealed trait (`pub trait Internal: private::Sealed`) is part of the public API, document that downstream crates can't implement it.
+
+**Sub-bullet (1e) — Windows-rs struct layout.**
+
 - `windows::Win32::*` structs with wire-layout requirements (`EVENT_TRACE_PROPERTIES`, `OSVERSIONINFOEXW`, `WNODE_HEADER`): the field-population code matches the documented Microsoft layout. Cross-reference MSDN.
 - `PCWSTR` / `PWSTR` / `PCSTR`: lifetime of the underlying buffer outlives the API call.
 - Raw pointers passed to windows-rs: provenance is documented.
@@ -111,6 +148,23 @@ PROCEED | STOP-ON-(N) | STOP-ON-MULTIPLE
 
 ---
 
+## §X Cross-document consistency dependencies
+
+Per **META 1** (extended (d) decided alongside the v4.2 plan amendment, 2026-05-17): every artifact must agree with itself AND with the authoritative documents it references. The implementation-phase (5) question applies the same rule at the code level — function signatures, type names, and behavior contracts in the diff must agree with the plan and architecture documents they reference.
+
+**Dependency arrows (define once, reference forever):**
+
+- **Plan documents** (e.g., `spike/group-a-week-2-plan.md`) must agree with: `audit/v0.7-architecture.md`, `spike/etw-schemas.md`, `spike/etw-edr-report.md`. Buddy on a plan-document PR checks the cited sections in those files actually exist and say what the plan says they say.
+- **Implementation-phase format** (this document) must agree with: the relevant plan + architecture. Buddy on a code PR using the 5Q format checks the diff's function signatures + type names against the plan's specification.
+- **Spike reports** (e.g., `spike/group-a-week-2-report.md`, `spike/mac-side-uncertainties.md`) must agree with: prior architecture + prior spike findings if referenced. Buddy on a spike-report PR checks cited prior-spike commands + outputs are reproducible.
+- **Architecture amendment PRs** (e.g., `proposal/v0.7-arch-mode5-amendment`) must agree with: the architecture sections they amend + any plan that references those sections. A mode-5 amendment that changes the disposition string requires updating every plan section that quotes the old disposition.
+
+**Sweep discipline** (per META 1 + Entry 5 of `audit/buddy-disagreements.md`): when a (d) check finds an issue class at site X, the same class must be checked exhaustively across the document, not patched at the one site where it surfaced. Example: Day 3's `pub(crate)`-vs-`tests/`-directory visibility mismatch was caught in build_gate first; the sweep surfaced the same pattern in degradation_tests and supervisor_tests. Without sweep, those two would have shipped broken.
+
+**Self-pass technique with verification commands** (per Entry 4 of `audit/buddy-disagreements.md`): self-passes that make positive claims ("section X exists at line Y") must include the literal verification command + its output. `grep -n "^## Entry" audit/buddy-disagreements.md` proves the entries exist; `sed -n '120p' audit/v0.7-architecture.md` proves §2.1's "Survives service restarts" claim. The verification ground rule from `spike/etw-edr-report.md` §8 (literal output for machine-state claims) extends to self-passes: a self-pass that just says "checked, looks fine" is not a self-pass.
+
+---
+
 ## How this format will be exercised in Group A week 2
 
 - **End of Day 5:** the week-2 PR is opened with the full implementation diff + `spike/group-a-week-2-report.md` (the EOD report per week 2 plan §12). Buddy runs the five-question format on that PR.
@@ -129,7 +183,9 @@ Self-administered (1)-(5) pass on this draft before commit:
 - **(2) Concurrency** — N/A.
 - **(3) Error handling** — N/A.
 - **(4) Test-asserts-what-it-says** — meta-applies: does the format's stated check actually catch the failure mode it claims to catch? The (1)–(4) checks are themselves grep-able patterns (`unsafe` blocks, `.ok();` swallows, test name vs body alignment) — buddy can verify each in practice.
-- **(5) Internal consistency** — section references all resolve; cross-references to week 2 plan section numbers (§3.2, §3.4, §3.5, §3.6, §12, §6, §2.4) all point at sections that exist on `plan/group-a-week-2` HEAD.
+- **(5) Internal consistency** — section references resolve in their correct authoritative documents:
+  - Week 2 plan refs (§3.2, §3.4, §3.5, §3.6, §6, §12) → `spike/group-a-week-2-plan.md` on main.
+  - §2.4 (honesty-contract) → `audit/v0.7-architecture.md` on main, NOT the week 2 plan. (The self-pass at the bottom of v4.2's draft bundled §2.4 with the plan-doc refs — Self-pass Finding S-B in v4.2 amendment; that was a doc-pass mistake, not a real cross-doc inconsistency. Lesson captured in `audit/buddy-disagreements.md` Entry 4.)
 
 ---
 

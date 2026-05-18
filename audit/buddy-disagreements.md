@@ -383,6 +383,128 @@ What I AM doing:
 
 ---
 
+## Entry 4 — 2026-05-17, buddy review of implementation-phase format DRAFT v1 + self-pass lesson
+
+### Context
+
+Lands with the PR #75 patch sequence (the implementation-phase
+format doc had been on `plan/implementation-phase-buddy-format` in
+DRAFT since 2026-05-17, deferred behind PR #73's strict-sequencing
+prerequisite). Numbering: Entry 4 here, Entry 5 already exists on
+the rebased branch — non-sequential numbering reflects when entries
+were COMMITTED on each branch, not when they were chronologically
+written. v4.2 amendment Self-pass Finding S-C already documented
+this gap and instructed cross-references to use the phrasing "the
+Entry that lands with PR #75 patches."
+
+### Buddy verdict on DRAFT v1 (2026-05-17, planning-phase 4Q)
+
+| Question | Verdict | Notes |
+|---|---|---|
+| (a) Authority match | PASS | Five questions cover the user's four stated topics (FFI/concurrency/errors/tests); when-to-use gate sensibly scoped |
+| (b) Scope correctness | PASS | Five is right size; (5) consistency is genuinely distinct from planning (d); process surface justified |
+| (c) Realistic feasibility | PASS | Estimated 30-60 min per typical week-EOD PR; explicit enumeration mitigates hand-waving |
+| (d) Internal consistency | **FAIL** | Two cross-reference findings (see below) |
+
+**Overall: STOP-ON-(d).**
+
+### Buddy's two (d) findings
+
+1. **Cross-branch dependency unresolved.** Line 4 of
+   `audit/buddy-format-implementation-phase.md` cited Entries 2 & 3
+   of `audit/buddy-disagreements.md`, but those entries existed only
+   on `plan/group-a-week-2` HEAD. On the format-doc's own branch
+   (`plan/implementation-phase-buddy-format`), the file contained only
+   Entry 1 at the time of buddy review.
+
+2. **§2.4 mis-attribution.** The self-pass at the bottom of the
+   format doc claimed `(§3.2, §3.4, §3.5, §3.6, §12, §6, §2.4) all
+   point at sections that exist on plan/group-a-week-2 HEAD`. Five of
+   six did; §2.4 did NOT. §2.4 lives in `audit/v0.7-architecture.md`,
+   not in `spike/group-a-week-2-plan.md`. The honesty-contract
+   reference at line 72 was correctly to the architecture doc; only
+   the self-pass bundled it wrong.
+
+### Resolution applied via PR #75 patches (this entry's surfacing)
+
+**User decision (2026-05-17): Option α** — apply the two fixes inline
+on the format-doc branch, with the Entry 4 split (per user's
+"closed-loop" instruction surfaced via v4.2 Self-pass S-C: capture the
+process lesson here in a dedicated entry rather than letting it drift
+into the format doc's self-pass section).
+
+**Patch (1):** restructured the "Authoritative inputs" section to
+point at the buddy-disagreements log as a whole (with the explanation
+of the planning-phase format evolution captured in the cite text)
+rather than enumerating specific entries. Removes the cross-branch
+dependency; the doc reads accurately in isolation regardless of which
+branch's `buddy-disagreements.md` the reader has checked out.
+
+**Patch (2):** fixed the self-pass §2.4 attribution by splitting the
+section-existence assertion into "week 2 plan refs (§3.2, §3.4,
+§3.5, §3.6, §6, §12) → plan doc on main" and "§2.4 → architecture
+doc on main, NOT the plan."
+
+**Process improvements landed alongside the format-doc patches:**
+
+- **META 1 (sweep discipline):** when a (d) check finds an issue
+  class at site X, sweep exhaustively across the document for the
+  same class. Now in standing instructions. On-record example: Day 3
+  Self-pass A initially treated `pub(crate)`-vs-`tests/`-directory as
+  build_gate-specific; sweep caught the same pattern in
+  degradation_tests and supervisor_tests.
+
+- **META 2 (5Q (1) broadening):** rename from "FFI safety" to
+  "Language-mechanics safety" with sub-bullets — `unsafe` SAFETY
+  justifications + visibility-vs-consumer-location + integration tests
+  in `tests/` can only see `pub` items + trait bounds match
+  implementers + Send/Sync where threading is involved. Closes the
+  failure mode where Day 3 visibility/Sync gotchas escaped three
+  rounds of planning-phase review because no format question named
+  them explicitly.
+
+- **§X dependency arrows:** `audit/buddy-format-implementation-phase.md`
+  §X "Cross-document consistency dependencies" formalizes the extended
+  (d) at the doc level. Implementation-phase (5) inherits the same
+  cross-document scope.
+
+### Self-pass lesson (the on-record process improvement)
+
+The v4.2 self-pass with the extended (d) caught its own consistency
+violation on first round of use (S-B handoff-cross-branch + S-A
+visibility/Sync + S-D sweep-discipline). The extension is doing real
+work, not adding ceremony. The lesson:
+
+**Self-passes that make positive claims must include the literal
+verification command + its output.** Examples:
+
+- "Section X exists at line Y" → `sed -n 'Yp' path/to/file.md` (output captured inline).
+- "File Z exists on this branch" → `ls path/to/Z 2>&1` (output captured inline).
+- "Cross-doc reference resolves" → `grep -n "expected text" referenced/path.md` (output captured inline).
+
+A self-pass that just says "checked, looks fine" is not a self-pass.
+This rule extends `spike/etw-edr-report.md` §8's literal-output ground
+rule to documentation self-checks: machine-state claims (test passes,
+build succeeds, file exists at path X with content Y) require verifying
+commands and their literal output, regardless of whether the artifact
+is code or prose.
+
+### What primary agent is NOT doing unilaterally
+
+- NOT flipping the format doc to APPROVED without buddy 4Q on the
+  patched version (the meta-rhythm: the document defining the rhythm
+  follows the rhythm).
+- NOT extending META 2's broadening beyond what was specifically
+  decided alongside v4.2 (visibility / trait-bound / Send-Sync
+  sub-bullets — nothing else).
+- NOT modifying the planning-phase 4Q format's wording at the same
+  time — the extended (d) is inherited via standing instructions and
+  via §X in the implementation-phase doc; a separate planning-phase
+  format doc doesn't exist (it lives inline in standing instructions),
+  so no edit is required.
+
+---
+
 ## Entry 5 — 2026-05-17, fresh-eyes re-read of APPROVED week-2 plan surfaced two real gaps + one minor
 
 ### Context
