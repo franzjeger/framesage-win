@@ -348,6 +348,16 @@ unsafe { syscalls.process_trace(&handles, None, None) }
 
 **Effort:** S per sweep.
 
+## P4.9 — Audit-finding verification asymmetry
+
+**Observation:** Phase 2 spot-check 5/5 PASS validated that CLOSED findings were honest. It did NOT validate that OPEN findings were genuinely open. PRE-L-006 (spike/etw-schemas.md already existed) and E-001 (mode_5_session_level_full_flow_panic already landed in PR #79, 3h 40m before E-001 was written) were both audit-vs-codebase drifts where the audit classified resolved items as unresolved.
+
+**Implication:** open-classification is a weaker guarantee than closed-classification. Future audit cycles must grep-verify each finding against current main before classifying as unresolved. The verification commands belong in the audit file itself (per P4.4's SAFETY-VERIFICATION pattern, applied to finding-existence rather than unsafe-block-soundness).
+
+**Action:** future audit-cycle openers run an explicit verification step ("does the code already do what this finding asks for?") before classifying. Phase 3 Month 1 — backfill verification commands on remaining open Phase 2 findings; flag any other drifts.
+
+**Effort:** M (one-time backfill).
+
 ---
 
 ## Roadmap summary table

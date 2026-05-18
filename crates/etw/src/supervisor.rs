@@ -253,8 +253,10 @@ mod tests {
         //
         // This makes the test test the SupervisorLoop's panic-handling
         // path in isolation, not the full consumer-thread → supervisor
-        // flow. The full-flow test runs in the end-of-week Windows
-        // batch (real ETW + real catch_unwind).
+        // flow. The full-flow test (real consumer-thread panic via
+        // mock-armed process_trace → real catch_unwind → real oneshot
+        // → supervisor receives Panicked) lives at
+        // `crates/etw/src/session.rs`'s `mode_5_session_level_full_flow_panic`.
         drop(exit_rx);
         let (synthetic_tx, synthetic_rx) = oneshot::channel();
         synthetic_tx

@@ -607,6 +607,24 @@ The test author's own comment at lines 249-257 acknowledges:
 **Effort:** M
 **Gate:** Week 1 (this is the test that was explicitly deferred and now needs to run)
 
+**Resolution (2026-05-18, W1.5 / #84):** Test already exists at
+`crates/etw/src/session.rs:1718` as `mode_5_session_level_full_flow_panic`
+(landed in PR #79 / Group A week 2 at 2026-05-18 16:09:37; this finding
+was written 3h 40m later at 2026-05-18 19:49:56 in PR #117 without a
+grep-verify against current main). Test passes on Win11 24H2; exercises
+exactly the path E-001 specified — `MockEtwSysCalls::arm_panic_in_process_trace`
+→ real `start_with_syscalls` → `into_supervisable_parts` → real `catch_unwind`
+fires in consumer thread → real oneshot delivers Panicked → SupervisorLoop
+receives + on_event extracts via `DegradationEvent.detail`.
+
+W1.5 (#84) was repurposed from "add the test" to "audit correction":
+(a) this Resolution block, (b) stale-comment fix at `supervisor.rs:254-257`
+pointing at the existing test, (c) new E-005 finding for the
+downcast::<&str>-coverage gap discovered during W1.5 survey, (d) P4.9
+process improvement against future audit-vs-codebase drifts. See
+`audit/buddy-disagreements.md` PR #84-closure entry. Issue #84 closed
+via prior resolution.
+
 ## E-002 — `tracing-test::traced_test` integration tests in `closed_loop.rs` use substring-matching against rendered output, not structured field assertion
 
 **Severity:** LOW (acknowledged in source)
@@ -660,6 +678,53 @@ The test author's own comment at lines 249-257 acknowledges:
 
 **Effort:** M (deliberate-bad-profile build + 1 game session + screenshot)
 **Gate:** v0.7.1
+
+## E-005 — Existing `mode_5_session_level_full_flow_panic` test exercises String-payload catch_unwind extraction branch only; the `downcast_ref::<&str>` branch is uncovered
+
+**Severity:** MEDIUM
+**Evidence:** `crates/etw/src/session.rs:1720-1767` (existing test) uses
+`mock.arm_panic_in_process_trace("synthetic test panic — Day 4 Mode 5")`.
+The mock's `process_trace` at `crates/etw/src/session.rs:500-501` then
+calls `panic!("{}", msg)` (formatted, produces a `String` panic payload
+per Rust's `panic!` macro behavior with format args).
+
+The catch_unwind extraction logic at `crates/etw/src/session.rs:775-783`
+has TWO branches:
+
+```rust
+let msg = payload
+    .downcast_ref::<&str>()        // Branch 1: tested only by &'static str panics
+    .copied()
+    .map(str::to_owned)
+    .or_else(|| payload.downcast_ref::<String>().cloned())  // Branch 2: covered by existing test
+    .unwrap_or_else(|| "(panic payload not a string)".to_string());
+```
+
+Branch 1 (raw `&'static str` payload from `panic!("static literal")` with
+no format args) is uncovered.
+
+**Impact:** A regression in the `downcast_ref::<&str>` branch (e.g., a
+future refactor that drops the `.copied().map(str::to_owned)` chain)
+would not be caught by any test. Production consumers can panic with
+either payload shape; the catch_unwind extraction must handle both.
+
+**Fix:** Add a second test alongside `mode_5_session_level_full_flow_panic`
+that exercises the &'static str path. Suggested implementation: add an
+`arm_direct_panic_in_process_trace(&self, message: &'static str)`
+companion method on MockEtwSysCalls that arms a direct `panic!(msg)`
+(no format args, payload stays as &'static str) — or any equivalent
+approach that exercises the &str-payload extraction path (e.g.,
+`std::panic::panic_any` with a `&'static str` payload). ~30 LOC: one
+new arm method (or equivalent) + one new test mirroring
+`mode_5_session_level_full_flow_panic`.
+
+**Effort:** S
+**Gate:** Month 1
+**Discovered:** 2026-05-18 during W1.5 (#84) survey — found via
+re-reading the catch_unwind extraction logic at session.rs:775-783
+while drafting the E-001 resolution. Cross-references: E-001 Resolution
+above; `audit/buddy-disagreements.md` PR #84-closure entry; P4.9
+process note.
 
 # AXIS F — UX/UI (first-run, config discoverability, error messages)
 
@@ -1178,8 +1243,8 @@ The 89-finding SUMMARY.md + 43-item PHASE2-PLAN.md + 5Q/4Q buddy reviews + post-
 
 | Gate | Findings |
 |---|---|
-| **Week 1 (closure)** | A-003 (bf6.exe AC false-positive), A-004 (Arc::as_ptr doc-comment), C-001 (verify_session_gone flake), E-001 (real consumer-thread panic test), I-005 kickoff (AC outreach drafts) |
-| **Month 1** | A-001, B-001, B-002, B-003, C-002, C-004, D-001, E-003, F-003, F-004, I-004, J-003 |
+| **Week 1 (closure)** | A-003 (bf6.exe AC false-positive), A-004 (Arc::as_ptr doc-comment), C-001 (verify_session_gone flake), ~~E-001 (real consumer-thread panic test)~~ — closed prior to audit; see E-001 Resolution block, I-005 kickoff (AC outreach drafts) |
+| **Month 1** | A-001, B-001, B-002, B-003, C-002, C-004, D-001, E-003, **E-005 (catch_unwind &str-branch coverage gap)**, F-003, F-004, I-004, J-003 |
 | **Month 2** | A-002, A-005, A-006 (with G-003), H-004, **K-005 (engine/lib.rs split, XL, HIGH-regression-risk — sequential before K-004)** |
 | **Month 3** | A-007, D-002, D-003, D-004, G-001, K-001, **K-004 (tray/main.rs split, XL, HIGH-regression-risk — spillover from Month 2; slips to v1.0-prep if Group B/C bandwidth tight)** |
 | **v0.7 BLOCKER** | F-001 (onboarding page 3), F-002 (Sessions tab — see CONFLICT note) |
@@ -1191,11 +1256,11 @@ The 89-finding SUMMARY.md + 43-item PHASE2-PLAN.md + 5Q/4Q buddy reviews + post-
 ## Status
 
 Phase 2 findings file initialized + populated across all 11 axes (A–K + pre-audit L).
-Findings count: **44** (30 actionable + 6 credits/PASS-after-analysis + 6 pre-audit + 2 strategic).
+Findings count: **45** (29 actionable open + 1 closed-prior + 6 credits/PASS-after-analysis + 6 pre-audit + 2 strategic + 1 added 2026-05-18). E-001 moved to closed-prior 2026-05-18 per W1.5 (#84) survey — see E-001 Resolution block. E-005 added 2026-05-18 for the catch_unwind `&str`-branch coverage gap surfaced during the same survey.
 BLOCKER-v0.7: 2 (F-001, F-002 — with conflict-with-audit-position flag on F-002)
 BLOCKER-v0.7.1: 5 (C-005, E-004, I-001, I-003, I-005)
-HIGH: 4 (A-003, C-001, E-001, I-002)
-MEDIUM: 11 (incl. K-004 + K-005, both HIGH-regression-risk)
+HIGH: 3 (A-003, C-001, I-002) — E-001 reclassified to "Closed prior" per Resolution
+MEDIUM: 12 (incl. K-004 + K-005, both HIGH-regression-risk; +E-005 added 2026-05-18 per W1.5 survey)
 LOW: 13
 N/A (credit/strategic): 10
 
