@@ -1431,6 +1431,77 @@ STOP after session 2 per Frank's "Etter session 2 merget: state-rapport per sess
 
 ---
 
+## PR #143 — 2026-05-18 — verdict GO — review-surface: mekanisk P4.9-backfill session 3a (8 findings); first M1.13 drift catch (F-004) via designed-to-be-verified status finding
+
+**Source:** M1.13 / issue #127 — P4.9 audit-finding verification backfill, session 3a of 3.
+
+### Session 3a scope + results
+
+Scope (8 findings): E-004, E-005, F-004, G-001, G-002, G-003, H-004, I-004.
+
+Results:
+- **VERIFIED OPEN: 7**
+- **CLOSED VIA VERIFICATION: 1** (F-004 — parking_lot migration confirmed complete)
+- **AMBIGUOUS: 0**
+- **Refinements noted: 1** (I-004 — install.ps1 → `%ProgramFiles%` source-level confirmed; ACL VM-spot-check still pending)
+
+### F-004 drift detail
+
+F-004 was the only finding in 27 backfill-verified items so far that was DESIGNED-TO-BE-CLOSED-BY-VERIFICATION rather than a genuine audit-vs-codebase drift. The finding text said: "status is unverified this turn; need a quick grep to confirm zero `std::sync::Mutex` remains in tray".
+
+Session 3a executed the verify:
+- `grep -rn 'std::sync::Mutex\|std::sync::RwLock' crates/tray/src/` → ZERO matches
+- `grep -rn 'parking_lot::Mutex' crates/tray/src/` → 2 matches at `ipc_client.rs:37`, `main.rs:27`
+
+Conclusion: PHASE2-PLAN.md item 3.2 migration is complete; SUMMARY.md "What's already good" credit was accurate. F-004 closed via verification.
+
+**Drift-shape distinction:** PRE-L-006 + E-001 were genuine audit-vs-codebase drifts (audit said "open" when code had already addressed the underlying gap, written hours before the audit). F-004 is **audit-state-progression** — the audit correctly identified "needs verification"; this session performed the verification; result confirmed the underlying work was done.
+
+For drift-rate accounting, F-004 counts but is qualitatively different. True audit-vs-codebase drift count remains 2 (PRE-L-006 + E-001). With cascade-2's M1.13 numbering catch + F-004, total catches across engagement: 4 in ~78 actions (~5.1%, within variance of 4.5% base-rate).
+
+### Hypothesis test status (3 of 3 backfill sessions covering E/G/pre-L axes)
+
+Pre-session-2 hypothesis: E/G/pre-L axes might drift more than A/B (because diffuse claims age worse).
+
+Session-by-session coverage of "diffuse-claim" axes:
+- Session 1: A + B + 1 from C. Zero E/G/pre-L. Drift count: 0.
+- Session 2: C + D + 2 from E. Drift count: 0 (E-axis fully covered for E-002, E-003 only).
+- Session 3a: 2 from E (E-004, E-005) + 3 G + F-004 + H-004 + I-004. Drift count: 1 (F-004, F-axis).
+
+E-axis: 4 findings covered, 0 drifts. G-axis: 3 findings covered, 0 drifts. **Hypothesis NOT confirmed** at this point. Session 3b (pre-L axis) is the final test.
+
+### Review-surface honesty
+
+**What was actually done:**
+- 8 findings verified using multi-step verification on E/G/F/H/I (per Frank's session-3a guidance "Vær ekstra grundig i verifikasjons-kommandoene for disse — overflate-grep kan glipp finne drift som mer detaljert sjekk ville fanget").
+- F-004 specifically: 2-step grep (residue check + parking_lot positive check). Sufficient because the finding's claim was binary (zero std::sync::Mutex residue or not).
+- I-004 multi-step: source-grep for install.ps1 path + ACL comment + ls for verification doc. Refinement captured both source-level closure half + VM-spot-check still-pending half.
+- E-004 multi-step: function-existence (compute_attribution_summary) + string-search (Did FrameSage help / degraded) + directory-listing (spike/research). Confirmed dependency on C-005 + negative-session-capture work.
+- E-005 multi-step: companion-method check + test-name search + existing test inventory.
+- **No mobile-Claude review** per established cascade-pattern.
+
+**Defects fanget:** F-004 closure (counted as drift).
+
+**Verdict:** GO. PR #143 merged as commit `557df2e`. Session 3a complete.
+
+### Cumulative engagement state
+
+| Phase | Drifts (genuine audit-vs-codebase + audit-state-progression) |
+|---|---|
+| PRE-L-006 inline catch (Phase 3 drafting) | 1 (genuine) |
+| E-001 META 1 sweep catch (W1.5) | 1 (genuine) |
+| Cascade-2 numbering-conflict (cascade application) | 1 (pre-push catch) |
+| M1.13 session 1 | 0 |
+| M1.13 session 2 | 0 |
+| **M1.13 session 3a** | **1 (audit-state-progression — F-004 verify-status)** |
+| **Cumulative** | **4 in ~78 actions; 2 of those are genuine drift** |
+
+### Session pacing
+
+STOP after session 3a per Frank's "Etter session 3a merged: state-rapport, avventer direktiv på 3b". Session 3b will cover K-001, K-003 (consistency check), PRE-L-001 through PRE-L-005 + finalization (status summary update + issue #127 closure if all drifts captured).
+
+---
+
 ## How to use this log going forward
 
 Each new buddy review that surfaces a concern gets a new
