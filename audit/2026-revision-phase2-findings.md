@@ -723,6 +723,8 @@ Gap holds. Recommend Phase 3 Group A week 3 kickoff add a CI-runnable real-ETW s
 **Effort:** M (deliberate-bad-profile build + 1 game session + screenshot)
 **Gate:** v0.7.1
 
+**Verified open (M1.13 / P4.9 backfill session 3a, 2026-05-18):** Multi-step verification. (1) `compute_attribution_summary` function does not exist (`git grep` zero matches; consistent with C-005 session 2 finding). (2) "Did FrameSage help" / "degraded your 1% lows" string not present in `crates/` or `spike/`. (3) `audit/research/install-verification-*` exists but no negative-session screenshot or session-report file. E-004 depends on C-005's `compute_attribution_summary` existing + a real negative session being captured; both prerequisites are unmet. Group C deliverable (M3.1) is the unblocker. Gap holds; BLOCKER-v0.7.1 retained.
+
 ## E-005 — Existing `mode_5_session_level_full_flow_panic` test exercises String-payload catch_unwind extraction branch only; the `downcast_ref::<&str>` branch is uncovered
 
 **Severity:** MEDIUM
@@ -769,6 +771,8 @@ re-reading the catch_unwind extraction logic at session.rs:775-783
 while drafting the E-001 resolution. Cross-references: E-001 Resolution
 above; `audit/buddy-disagreements.md` PR #84-closure entry; P4.9
 process note.
+
+**Verified open (M1.13 / P4.9 backfill session 3a, 2026-05-18):** Multi-step verification. (1) `git grep 'arm_direct_panic\|panic_any.*static\|fn .*direct_panic' -- '*.rs'` → ZERO matches; no companion `arm_direct_panic_in_process_trace` method on `MockEtwSysCalls`. (2) `grep 'fn .*static_str_panic\|fn .*panic.*static_str' crates/etw/src/session.rs` → ZERO matches; no second panic test for &str-payload path. (3) Existing `mode_5_session_level_full_flow_panic` test at line 1720 still uses `arm_panic_in_process_trace("synthetic test panic — Day 4 Mode 5")`, which the mock at line 500-501 dispatches as `panic!("{}", msg)` (formatted → String payload, NOT &'static str literal). Gap holds: Branch 1 (`downcast_ref::<&str>`) uncovered.
 
 # AXIS F — UX/UI (first-run, config discoverability, error messages)
 
@@ -849,6 +853,8 @@ Multi-line strings via `\n` joining. Tray needs to render multi-line errors read
 **Effort:** S
 **Gate:** Month 1
 
+**Resolution — verified done (M1.13 / P4.9 backfill session 3a, 2026-05-18):** The verification this finding's Fix asked for is now executed; result confirms the migration is complete. `grep -rn 'std::sync::Mutex\|std::sync::RwLock' crates/tray/src/` → ZERO matches (no residue). `grep -rn 'parking_lot::Mutex' crates/tray/src/` → 2 matches at `crates/tray/src/ipc_client.rs:37` (`use parking_lot::Mutex;`) and `crates/tray/src/main.rs:27` (`use parking_lot::Mutex;`). The PHASE2-PLAN.md item 3.2 migration from `std::sync::Mutex` to `parking_lot::Mutex` is complete; the SUMMARY.md "What's already good" audit credit was accurate. F-004's "status unverified" gap is now resolved. **Drift catch #4 of the engagement (counting PRE-L-006 + E-001 + cascade-2 + this).** Severity reclassified from LOW → closed-via-verification.
+
 # AXIS G — Performance (allocations, sustained event-rate, memory growth)
 
 ## G-001 — Drop-poll task at 1Hz performs synchronous `ControlTraceW(QUERY)` inside a tokio worker tick — blocks tokio runtime worker for the syscall duration
@@ -862,6 +868,8 @@ Multi-line strings via `\n` joining. Tray needs to render multi-line errors read
 
 **Effort:** S
 **Gate:** Month 3
+
+**Verified open (M1.13 / P4.9 backfill session 3a, 2026-05-18):** `sed -n '230,260p' crates/service/src/closed_loop.rs` confirms `monitor.poll_drop_stats(...)` called synchronously inside `tokio::spawn(async move { ... loop { interval.tick().await; match monitor.poll_drop_stats(...) } ... })` at lines 231-255. `poll_drop_stats` issues sync `ControlTraceW(QUERY)` via the syscalls trait. `grep -n 'spawn_blocking\|tokio::task' crates/service/src/closed_loop.rs` → no `spawn_blocking` wrapper exists. Gap holds; per finding text, "not a perf issue today" but defensive optimization deferred to Month 3.
 
 ## G-002 — `consumer_loop`'s `event_record_callback` does `fetch_add(1, Relaxed)` per kernel event — at 100k events/sec the atomic-contention cost is non-zero but bounded; the bigger cost is the unconditional `if ctx.is_null()` check + pointer-cast per call
 
@@ -886,12 +894,16 @@ unsafe extern "system" fn event_record_callback(event_record: *mut EVENT_RECORD)
 **Effort:** S (deferred)
 **Gate:** Group A week 3+
 
+**Verified open (M1.13 / P4.9 backfill session 3a, 2026-05-18):** Multi-step verification. (1) `sed -n '1402,1416p' crates/etw/src/session.rs` confirms `event_record_callback` body still has TWO null-checks (event_record + ctx) followed by `fetch_add(1, Relaxed)` — no ring-buffer dispatch logic added. (2) `grep -rn 'ring_buffer\|crossbeam_queue\|ArrayQueue\|parser_dispatch' crates/etw/src/` → ZERO matches; no parser/ring-buffer infrastructure exists. (3) Aligns with Group A week 3+ unbuilt status. Gap holds; performance optimization correctly deferred.
+
 ## G-003 — `validate_policy_against_safe_list` allocates `Vec<String>` per call; not on hot path (only SetPolicy IPC), but the error message also clones the safe-list rationale strings into the formatted output
 
 **Severity:** LOW (matches A-006)
 **Evidence:** See A-006.
 
 **Fix:** Combined with A-006.
+
+**Verified open (M1.13 / P4.9 backfill session 3a, 2026-05-18):** `sed -n '1022,1060p' crates/service/src/runtime.rs` confirms `fn validate_policy_against_safe_list(policy: &Policy) -> Vec<String>` at line 1032 returns `Vec<String>` built via `format!()` (lines 1046, 1057) which clones the `reason` rationale string from `ServiceVerdict::Denied(reason)` / `ProcessVerdict::Denied(reason)`. Cross-ref to A-006 (session 1 verified open) still valid — same call site, same fresh `SafeList::bundled()` per call. Gap holds.
 
 # AXIS H — Security & privilege
 
@@ -930,6 +942,8 @@ Random 128-bit value; collision odds astronomically low.
 
 **Effort:** S
 **Gate:** Month 3
+
+**Verified open (M1.13 / P4.9 backfill session 3a, 2026-05-18):** Multi-step verification. (1) `grep -n 'BuildOverrideGuard\|build_gate_pass\|build_gate_detected_build' crates/service/src/closed_loop.rs` → service has its own `BuildOverrideGuard` struct at line 60 + `build_gate_pass()` wrapper at line 79 + `build_gate_detected_build()` wrapper at line 91 + test-usage at line 319. (2) `grep -n 'pub.*override\|pub.*set_build_override\|pub.*BuildOverrideGuard' crates/etw/src/build_gate.rs` → etw has its own `set_build_override` at line 53 + `BuildOverrideGuard` at line 60, both `pub(crate)` to the etw crate (NOT reachable from service crate). Dual-layer override seam still in place; service-side has parallel implementation rather than re-exporting from etw. Gap holds.
 
 ## H-005 — AC outreach (cross-listed at I-005) — see Axis I.
 
@@ -998,6 +1012,8 @@ v0.7 ship.
 
 **Effort:** S
 **Gate:** Month 1
+
+**Verified open with refinement (M1.13 / P4.9 backfill session 3a, 2026-05-18):** Multi-step verification. (1) `grep -n 'ProgramFiles\|FrameSage\\\\\|icacls\|Administrators:F\|SYSTEM:F\|Users:RX' install.ps1` → install.ps1 line 52 confirms `$installDir = Join-Path $env:ProgramFiles "FrameSage"`. Path target is correct. (2) install.ps1 lines 105-110 comments indicate ACL is INHERITED from `%ProgramFiles%`'s default (which IS `Administrators:F SYSTEM:F Users:RX`), NOT explicitly set via `icacls`. Line 125 echoes the expected ACL to user during install for transparency. (3) `ls audit/research/install-verification*` → file does NOT exist; the clean-VM spot-check + `icacls` output capture (which the finding's Fix asks for) has not been performed. **Refinement:** path-targeting half of finding (install.ps1 → %ProgramFiles%) is verified correct in source; the ACL VM-spot-check half remains pending per Fix-text. Gap partially-closed at source-level; full closure needs clean-VM verification.
 
 ## I-005 — Anti-cheat outreach (Riot/Vanguard, EAC, BattlEye, FACEIT, ESEA) — pre-ship research at `audit/research/ANTI-CHEAT-MATRIX.md` (not re-read this turn) — was the user-mandated dual-listed BLOCKER-v0.7.1 item (per Phase 1 confirmation)
 
@@ -1314,12 +1330,12 @@ The 89-finding SUMMARY.md + 43-item PHASE2-PLAN.md + 5Q/4Q buddy reviews + post-
 ## Status
 
 Phase 2 findings file initialized + populated across all 11 axes (A–K + pre-audit L).
-Findings count: **45** (23 actionable open + 1 closed-prior + 5 won't-fix-per-scope-revision + 2 reframed + 6 credits/PASS-after-analysis + 6 pre-audit + 2 strategic). E-001 moved to closed-prior 2026-05-18 per W1.5 (#84) survey. E-005 added 2026-05-18 for the catch_unwind `&str`-branch coverage gap. Cascade-1 of scope revision (PR #129) reclassified I-001 / I-002 / I-003 / I-005 / J-004 to won't-fix and J-001 / J-003 to reframed-not-closed; see per-finding Resolution blocks.
+Findings count: **45** (22 actionable open + 2 closed-prior + 5 won't-fix-per-scope-revision + 2 reframed + 6 credits/PASS-after-analysis + 6 pre-audit + 2 strategic). E-001 moved to closed-prior 2026-05-18 per W1.5 (#84) survey. E-005 added 2026-05-18 for the catch_unwind `&str`-branch coverage gap. Cascade-1 of scope revision (PR #129) reclassified I-001 / I-002 / I-003 / I-005 / J-004 to won't-fix and J-001 / J-003 to reframed-not-closed. **F-004 moved to closed-via-verification 2026-05-18 per M1.13 / P4.9 backfill session 3a** — parking_lot migration confirmed complete (zero std::sync::Mutex residue in tray); 4th drift catch in the engagement.
 BLOCKER-v0.7: 2 (F-001, F-002 — with conflict-with-audit-position flag on F-002)
 BLOCKER-v0.7.1: 2 (C-005, E-004) — I-001, I-003, I-005 reclassified to won't-fix per scope revision
 HIGH: 2 (A-003, C-001) — I-002 reclassified to won't-fix per scope revision; E-001 to closed-prior per W1.5
 MEDIUM: 12 (incl. K-004 + K-005, both HIGH-regression-risk, both now indefinitely deferred per scope revision DP #4; +E-005 added 2026-05-18 per W1.5 survey)
-LOW: 13
+LOW: 12 — F-004 closed-via-verification per M1.13 session 3a (was 13)
 N/A (credit/strategic): 10
 
 PRE-L-006 closed inline (spike/etw-schemas.md verified — 713 LOC, structured per ground rule).
