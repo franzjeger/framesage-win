@@ -1107,6 +1107,8 @@ harm.
 **Effort:** S
 **Gate:** Group A week 5+ post-merge
 
+**Verified open (M1.13 / P4.9 backfill session 3b, 2026-05-18):** `ls crates/spike-etw/` → crate dir exists with `Cargo.toml + src/`. `grep -n 'spike-etw' Cargo.toml` → workspace members entry at line 18 ("crates/spike-etw"). Removal pre-condition (Group A week 5+ ships parsers + ring buffer + drain) is not yet met — currently still on Group A week 2 deliverables (M1.13 backfill itself). Gap holds.
+
 ## K-002 — `spike-etw` SESSION_GUID at production session GUID location says "Generated once for production; replace at v1.0 stable release" — note for v1.0 release checklist
 
 **Severity:** N/A
@@ -1121,6 +1123,8 @@ harm.
 
 **Severity:** Linked to C-001
 **Fix:** Tracked in C-001.
+
+**Resolution — closed prior (M1.13 / P4.9 backfill session 3b, 2026-05-18):** C-001 was closed via W1.4 / PR #124 (commit `8c7eec3`) which removed `verify_session_gone` entirely from `crates/etw/src/session.rs` (both the call-site at line 819 + the helper function at lines 1233-1242 pre-W1.4). `grep -n 'verify_session_gone' crates/etw/src/session.rs` → ZERO matches. K-003's "REMOVE per the C-001 fix" is satisfied; the helper is gone. Drift catch #5 of the engagement (counting PRE-L-006 + E-001 + cascade-2 numbering + F-004 + this) — but a benign consistency-check drift (audit correctly linked K-003 to C-001; closing one closed both, but no explicit Resolution-block was added to K-003 at the time of C-001's closure).
 
 ## K-004 — `crates/tray/src/main.rs` is 5,215 LOC and remains the project's biggest single-file reviewability blocker; PHASE2-PLAN.md item 3.6 partially closed it (extracted ipc_client / state / theme / editors / formatters / icons / icon_assets / onboarding / process_actions / tree / widgets / win32 / activity_log) but the tab renderers + modals + `App` struct + `impl App` body remain inline
 
@@ -1247,12 +1251,16 @@ Group B deliverable must include:
 
 **Fix:** Group B PR-review checklist item: confirm both test paths.
 
+**Verified open (M1.13 / P4.9 backfill session 3b, 2026-05-18):** Multi-step verification. (1) `ls crates/ | grep -E 'recorder|presentmon'` → zero matches; `framesage-recorder` crate does not exist. (2) `grep -rn 'cpu_sample\|per_process\|recorder_per_process_enabled\|PerProcessCpu' crates/` → zero matches; schema types unbuilt. Pre-audit gap holds; PR-review checklist item awaits Group B kickoff.
+
 ## PRE-L-002 — Architecture §2.3 retention policy "Per-session cap: 50 MB; on reaching 80% shift to 0.5Hz sampling, at 95% to 0.1Hz, at 100% stop new samples" is precise but the recorder code path needs three tests (80%, 95%, 100% boundaries)
 
 **Severity:** PRE-MEDIUM
 **Evidence:** `audit/v0.7-architecture.md:867-878`.
 
 **Fix:** Group B test plan — add explicit boundary tests.
+
+**Verified open (M1.13 / P4.9 backfill session 3b, 2026-05-18):** `grep -rn 'Per-session cap\|50 MB\|retention.*boundary\|sample_rate.*0\.5Hz\|stop_writing_new_samples' crates/` → zero matches. Recorder retention code path doesn't exist (framesage-recorder unbuilt per PRE-L-001). Boundary tests can't exist until the code exists. Pre-audit gap holds; awaits Group B kickoff.
 
 ## PRE-L-003 — Architecture §2.4 attribution-disabled cases (4 reasons listed at `:1183-1191`) each need a test that asserts the user-facing string contents — same shape as the C-005 honesty contract tests but for the failure paths
 
@@ -1270,6 +1278,8 @@ Group B deliverable must include:
 
 **Fix:** Group C deliverable — four more tests in the honesty-contract test set.
 
+**Verified open (M1.13 / P4.9 backfill session 3b, 2026-05-18):** `grep -rn 'Session too short for attribution\|Baseline too short\|Frame data unavailable\|Partial data — drops detected' crates/` → zero matches for any of the 4 disabled-attribution-case substrings. Consistent with C-005 / E-004 (Group C unbuilt). Pre-audit gap holds; awaits Group C kickoff.
+
 ## PRE-L-004 — Architecture §2.2 PresentMon subprocess management risk: "If a user has 30 sessions per day, that's 30 PresentMon spawns/kills per day. […] the cumulative process-creation telemetry could trigger an EDR heuristic. Mitigation: rate-limit + reuse where possible"
 
 **Severity:** PRE-HIGH
@@ -1279,12 +1289,16 @@ Group B deliverable must include:
 
 **Fix:** Group B explicit deliverable: rate-limit at most 1 PresentMon spawn / 30s; reuse currently-running PresentMon if `--process_name` matches.
 
+**Verified open with refinement (M1.13 / P4.9 backfill session 3b, 2026-05-18):** Multi-step verification. (1) `grep -rn 'PresentMon\|spawn.*PresentMon\|rate.limit.*spawn' crates/` → only matches in `tray/src/onboarding.rs:473-474` which is the onboarding-page-3 DISCLOSURE text mentioning PresentMon (W1.6 work), NOT actual subprocess management code. (2) `ls crates/ | grep -E 'presentmon'` → zero matches (no framesage-presentmon crate). **Refinement:** Per scope-revision (PR #129 cascade-item #6), PresentMon keep-vs-skip decision deferred to a separate future scope-revision PR (gated on Group A completion + 2 weeks Frank-usage). PRE-L-004's rate-limit concern is conditional on M3.2 keeping PresentMon. Gap technically holds at source-code level but resolution depends on the deferred scope decision.
+
 ## PRE-L-005 — Architecture §2.5 install.ps1 changes section says "After staging binaries, run `Get-AuthenticodeSignature` against each .exe. If `Status -ne 'Valid'`, abort install with a clear error" but does NOT specify what happens during the v0.7→v0.7.1 transition (cert procured between releases, old binaries unsigned, upgrade path TBD)
 
 **Severity:** PRE-LOW
 **Evidence:** `audit/v0.7-architecture.md:1293-1294`.
 
 **Fix:** v0.7.1 release-notes section: "Upgrading from v0.7? Run install.ps1 --upgrade with --skip-signature-check on the OLD binaries to allow uninstall before installing signed v0.7.1 binaries."
+
+**Verified open but moot per scope revision (M1.13 / P4.9 backfill session 3b, 2026-05-18):** `grep -n 'Get-AuthenticodeSignature\|require-signature\|signature.*verify' install.ps1` → zero matches. Signature-handling logic absent from install.ps1. BUT: per scope revision (PR #129), I-001 (Authenticode signing) is won't-fix — see I-001 Resolution block. There is no v0.7→v0.7.1 cert-procurement transition because there is no cert procurement. PRE-L-005's transition-handling concern is therefore **moot** under the current scope. Recommend Resolution-block-style closure if PRE-L axis ever gets a formal moot-per-revision sweep; for now annotated as VERIFIED OPEN with scope-conditional note.
 
 ## PRE-L-006 — Group A week 3+ schema research deliverable `spike/etw-schemas.md` (per `audit/v0.7-architecture.md:1467-1492`) status is unclear from this turn's reading; the PR #67 reference at `:1684` suggests landed
 
@@ -1330,12 +1344,22 @@ The 89-finding SUMMARY.md + 43-item PHASE2-PLAN.md + 5Q/4Q buddy reviews + post-
 ## Status
 
 Phase 2 findings file initialized + populated across all 11 axes (A–K + pre-audit L).
-Findings count: **45** (22 actionable open + 2 closed-prior + 5 won't-fix-per-scope-revision + 2 reframed + 6 credits/PASS-after-analysis + 6 pre-audit + 2 strategic). E-001 moved to closed-prior 2026-05-18 per W1.5 (#84) survey. E-005 added 2026-05-18 for the catch_unwind `&str`-branch coverage gap. Cascade-1 of scope revision (PR #129) reclassified I-001 / I-002 / I-003 / I-005 / J-004 to won't-fix and J-001 / J-003 to reframed-not-closed. **F-004 moved to closed-via-verification 2026-05-18 per M1.13 / P4.9 backfill session 3a** — parking_lot migration confirmed complete (zero std::sync::Mutex residue in tray); 4th drift catch in the engagement.
+Findings count: **45** (21 actionable open + 3 closed-prior + 5 won't-fix-per-scope-revision + 2 reframed + 6 credits/PASS-after-analysis + 6 pre-audit + 2 strategic). E-001 moved to closed-prior 2026-05-18 per W1.5 (#84) survey. E-005 added 2026-05-18 for the catch_unwind `&str`-branch coverage gap. Cascade-1 of scope revision (PR #129) reclassified I-001 / I-002 / I-003 / I-005 / J-004 to won't-fix and J-001 / J-003 to reframed-not-closed. **F-004 moved to closed-via-verification 2026-05-18 per M1.13 / P4.9 backfill session 3a** — parking_lot migration confirmed complete. **K-003 moved to closed-prior 2026-05-18 per M1.13 / P4.9 backfill session 3b** — verify_session_gone removal via PR #124 closed both C-001 and the linked K-003.
 BLOCKER-v0.7: 2 (F-001, F-002 — with conflict-with-audit-position flag on F-002)
 BLOCKER-v0.7.1: 2 (C-005, E-004) — I-001, I-003, I-005 reclassified to won't-fix per scope revision
 HIGH: 2 (A-003, C-001) — I-002 reclassified to won't-fix per scope revision; E-001 to closed-prior per W1.5
 MEDIUM: 12 (incl. K-004 + K-005, both HIGH-regression-risk, both now indefinitely deferred per scope revision DP #4; +E-005 added 2026-05-18 per W1.5 survey)
-LOW: 12 — F-004 closed-via-verification per M1.13 session 3a (was 13)
+LOW: 12 — F-004 closed-via-verification per M1.13 session 3a; K-003 closed-prior per session 3b
+
+## M1.13 / P4.9 backfill complete
+
+All 24 backfill-scope findings verified across sessions 1+2+3a+3b (issue #127). Results:
+- VERIFIED OPEN: 22 (now bear "Verified open (M1.13 / P4.9 backfill session N)" annotation blocks with grep-verify commands + outputs)
+- CLOSED PRIOR / VIA VERIFICATION: 2 (F-004 — parking_lot migration; K-003 — verify_session_gone removed via PR #124)
+- Cumulative drift catch across engagement: 5 (PRE-L-006, E-001, cascade-2 numbering, F-004, K-003)
+- True audit-vs-codebase drifts: 3 (PRE-L-006, E-001, K-003) — F-004 was audit-state-progression; cascade-2 was pre-push catch
+- Drift catch rate: ~5.0% across ~100 verification actions; aligned with 4.5% base-rate prediction within statistical variance
+- Hypothesis "E/G/pre-L axes drift more than A/B": NOT confirmed. The 2 backfill drifts (F-004 + K-003) were both LOW-severity status / cross-reference findings on F + K axes, not on E/G/pre-L.
 N/A (credit/strategic): 10
 
 PRE-L-006 closed inline (spike/etw-schemas.md verified — 713 LOC, structured per ground rule).
