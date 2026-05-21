@@ -1502,6 +1502,96 @@ STOP after session 3a per Frank's "Etter session 3a merged: state-rapport, avven
 
 ---
 
+## PR #145 — 2026-05-18 — verdict GO — review-surface: mekanisk P4.9-backfill session 3b (FINAL); K-003 cross-reference drift catch; M1.13 / issue #127 closed
+
+**Source:** M1.13 / issue #127 — P4.9 audit-finding verification backfill, session 3b (FINAL).
+
+### Session 3b scope + results
+
+Scope (7 findings): K-001, K-003, PRE-L-001 through PRE-L-005.
+
+Results:
+- **VERIFIED OPEN: 5** (K-001 + PRE-L-001 + PRE-L-002 + PRE-L-003 + PRE-L-004-with-refinement + PRE-L-005-moot-per-scope-revision)
+- **CLOSED PRIOR: 1** (K-003 — cross-reference drift; verify_session_gone removed by PR #124 closed K-003 by side-effect, but no Resolution-block added at the time)
+- **Refinements noted: 2** (PRE-L-004 conditional on scope-revision cascade-item #6; PRE-L-005 moot per I-001 won't-fix)
+
+### K-003 drift detail
+
+K-003's finding text: "**Severity:** Linked to C-001 / **Fix:** Tracked in C-001." This is the **cross-reference drift** shape — when C-001 closed via PR #124 (W1.4), the verify_session_gone removal satisfied K-003's REMOVE clause too, but no explicit Resolution-block was added to K-003 at the time. Session 3b's verification (`grep verify_session_gone` → 0 matches in `crates/etw/src/session.rs`) caught the missing Resolution and added it.
+
+**Drift-shape classification (expanding the engagement's taxonomy):**
+- **Genuine audit-vs-codebase drift** (PRE-L-006, E-001): audit said "open" when code had already addressed the gap, possibly hours before the audit was written
+- **Audit-state-progression drift** (F-004): audit correctly said "needs verification"; later session performed the verification
+- **Cross-reference drift** (K-003): one finding's closure should have triggered another's but didn't; the linked finding sat stale until later sweep
+- **Pre-push consistency catch** (cascade-2 numbering): caught at PR-push time by author's own grep-verify discipline, before the audit got the chance to drift
+
+All four shapes count for drift-rate accounting but qualitatively differ on where intervention is most valuable.
+
+### M1.13 backfill cumulative state (4 sessions)
+
+| Session | Findings | VERIFIED OPEN | CLOSED | Drift type |
+|---|---|---|---|---|
+| 1 | 10 | 10 | 0 | — |
+| 2 | 9 | 9 | 0 | — |
+| 3a | 8 | 7 | 1 (F-004) | Audit-state-progression |
+| 3b | 7 | 6 | 1 (K-003) | Cross-reference |
+| **Total** | **34** | **32** | **2** | |
+
+**Engagement cumulative drifts: 5 in ~100 actions (~5.0%)**, within variance of 4.5% base-rate prediction:
+1. PRE-L-006 (genuine, inline-catch during Phase 3 drafting)
+2. E-001 (genuine, META 1 sweep during W1.5)
+3. Cascade-2 M1.13 numbering (pre-push catch during cascade application)
+4. F-004 (audit-state-progression, M1.13 session 3a)
+5. K-003 (cross-reference, M1.13 session 3b)
+
+### Hypothesis test result (E/G/pre-L drifts more than A/B): NOT confirmed
+
+By axis drift count / verified count:
+- A: 0/5, B: 0/4, C: 0/3, D: 0/5, E: 0/4
+- F: 1/2 (F-004 — designed-to-be-verified shape)
+- G: 0/3, H: 0/1, I: 0/1
+- K: 1/2 (K-003 — cross-reference shape)
+- Pre-L: 0/5
+
+Drifts clustered on **cross-reference + designed-to-be-verified shapes**, NOT on diffuse-claim axes. The pre-session-2 hypothesis was reasonable but the engagement didn't validate it. Future audit cycles should track drift-shape distribution; the lesson here is that linked findings and status-check findings are more likely to drift than diffuse claims (which usually sit in known-unbuilt territory and don't move).
+
+### P4.9 process improvement validated end-to-end
+
+P4.9's premise: open-classification is a weaker guarantee than closed-classification; backfill verification commands belong inline in the audit file.
+
+Validation outcome:
+- ~5% catch rate is meaningful — not so high it overwhelms (would suggest the audit is unreliable) and not so low it's noise (would suggest the verification isn't valuable)
+- The catches were qualitatively diverse (4 distinct drift shapes)
+- The inline annotations now ground every still-open finding in a verifiable command, making FUTURE audit cycles cheaper (they can re-run the verification commands to spot-check current state without re-deriving them)
+
+**P4.9 lesson for future audit cycles:** run the verification at issue-creation time, NOT as a separate post-hoc sweep. M1.13 was the reference implementation; the discipline transfers to every future Phase 2 audit pass.
+
+### Issue #127 closed
+
+`gh issue close 127` executed with full state-rapport comment (cross-referencing this PR + the 4 session PRs + the 4 buddy-log entries).
+
+### Review-surface honesty
+
+**What was actually done:**
+- 7 findings verified using multi-step verification on pre-L axis per Frank's session-2/3 guidance.
+- K-003 drift caught via cross-reference grep (`grep verify_session_gone` in cited file → 0 matches; C-001 closure side-effect).
+- Status summary updated to reflect K-003 closure (23 → 22 actionable open).
+- M1.13 finalization block added documenting all 4 sessions' totals + drift-shape taxonomy.
+- **No mobile-Claude review** per established cascade-pattern.
+- Self-attestation Q1–Q5 in PR body.
+
+**Defects fanget:** K-003 closure (counted as drift; cross-reference shape).
+
+**Verdict:** GO. PR #145 merged as commit `ce4688c`. M1.13 backfill complete; issue #127 closed.
+
+### Final M1.13 engagement summary
+
+M1.13 / P4.9 backfill is now reference instance for the project's audit-discipline toolkit. The 4-session structure (with state-rapport between each) is generalizable to future audit cycles. The buddy-log format ("review-surface honesty" + per-session results table + drift-shape taxonomy) is the durable audit-trail for the P4.9 process improvement.
+
+**Awaiting Frank's direktiv on next reelt arbeidsstykke.** Sannsynlig kandidat per mobile-Claude's pre-M1.13 anbefaling: Group A week 3 (ETW parsers) — substantielt kode-arbeid. Frank's call.
+
+---
+
 ## How to use this log going forward
 
 Each new buddy review that surfaces a concern gets a new
