@@ -332,6 +332,7 @@ mod tests {
             "vgc",
             "EasyAntiCheat",
             "BEService",
+            "FACEITService",
             "AudioSrv",
             "Dhcp",
             "Dnscache",
@@ -354,6 +355,17 @@ mod tests {
             "lsass.exe",
             "services.exe",
         ] {
+            match list.check_process(must_deny) {
+                ProcessVerdict::Denied(_) => {}
+                other => panic!("{must_deny} must be denied, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn anticheat_user_mode_processes_are_explicitly_denied() {
+        let list = SafeList::bundled();
+        for must_deny in ["faceitservice.exe", "faceitclient.exe"] {
             match list.check_process(must_deny) {
                 ProcessVerdict::Denied(_) => {}
                 other => panic!("{must_deny} must be denied, got {other:?}"),
