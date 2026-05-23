@@ -377,6 +377,51 @@ struct RuleForm {
     note: String,
 }
 
+/// Transparent wrapper around `tray_icon::TrayIcon` that exists solely so
+/// the window-close-bug diagnostic can observe the inner `TrayIcon::drop`
+/// firing (foreign type — no way to `impl Drop for tray_icon::TrayIcon`
+/// from this crate). When the bug investigation is closed, this wrapper
+/// can be removed in a single revert: the field type goes back to
+/// `TrayIcon` and the one `self.tray.0` access becomes `self.tray` again.
+///
+/// `ManuallyDrop` is used so we can bracket the inner drop with `info!`
+/// lines on both sides (a plain `TrayIcon` field would only get a
+/// before-line — Rust field destructors run AFTER the manual `drop()`
+/// body returns). Zero behavior change: the inner `TrayIcon::drop` still
+/// runs exactly once, at the same point in the lifecycle.
+#[cfg(windows)]
+struct LoggedTrayIcon(std::mem::ManuallyDrop<TrayIcon>);
+
+#[cfg(windows)]
+impl Drop for LoggedTrayIcon {
+    fn drop(&mut self) {
+        // Diagnostic checkpoint #5a (window-close bug investigation):
+        // entry to the wrapper's drop — equivalently, "we are about to
+        // drop the inner TrayIcon".
+        tracing::info!(
+            "diag: LoggedTrayIcon::drop entry — about to invoke inner \
+             TrayIcon::drop (checkpoint 5a/7)"
+        );
+        // SAFETY: self.0 is the sole owner of the inner TrayIcon; it has
+        // not been moved out of (we hold &mut self exclusively) and is
+        // not accessed again — this drop runs at most once per
+        // LoggedTrayIcon (Rust's drop semantics: Drop::drop is called
+        // exactly once on a live value). After this call the
+        // ManuallyDrop's contents are uninitialised but the outer struct
+        // is about to be deallocated, so no further field destructors
+        // can observe the freed state.
+        unsafe { std::mem::ManuallyDrop::drop(&mut self.0) };
+        // Diagnostic checkpoint #5b: inner TrayIcon::drop completed.
+        // If checkpoint 5a fired but 5b didn't, the inner drop hung
+        // (likely waiting on the menu / click receiver threads in
+        // icon_assets.rs).
+        tracing::info!(
+            "diag: LoggedTrayIcon::drop exit — inner TrayIcon::drop returned \
+             cleanly (checkpoint 5b/7)"
+        );
+    }
+}
+
 struct FramesageApp {
     state: Arc<Mutex<AppState>>,
     commands: TrayCommands,
@@ -442,12 +487,41 @@ struct FramesageApp {
     /// Holding the tray icon for its lifetime — drop = icon disappears.
     /// Now also a live handle: we call `set_tooltip` from `update()` to
     /// reflect the current engine state in the tray's hover-tooltip.
+    ///
+    /// Wrapped in [`LoggedTrayIcon`] (a transparent newtype) so the
+    /// window-close-bug diagnostic logs can see the inner `TrayIcon::drop`
+    /// fire. `TrayIcon` is a foreign type, so the wrapper is the only way
+    /// to hang a `Drop` impl on it from this crate.
     #[cfg(windows)]
-    tray: TrayIcon,
+    tray: LoggedTrayIcon,
     /// Last tooltip we wrote — avoids a `set_tooltip` syscall on every
     /// frame when the state hasn't changed.
     #[cfg(windows)]
     last_tray_tooltip: String,
+}
+
+/// Diagnostic-only `Drop` impl (window-close bug investigation). Brackets
+/// the start and end of the implicit field-drop chain with `info!` lines.
+/// Fields drop in declaration order *after* this body returns: state,
+/// commands, …, icons, tray (→ [`LoggedTrayIcon`] checkpoints 5a/5b),
+/// last_tray_tooltip. If checkpoint 4 (eframe::run_native returned) fired
+/// but checkpoint 6 (this impl's exit) didn't, the Box<dyn App> hand-back
+/// in eframe stalled. Zero behavior change: the body only emits logs.
+impl Drop for FramesageApp {
+    fn drop(&mut self) {
+        tracing::info!(
+            "diag: FramesageApp::drop entry — fields are about to drop in \
+             declaration order (state, commands, …, tray, last_tray_tooltip) \
+             (checkpoint 6a/7)"
+        );
+        // Implicit field destructors run here after this fn returns.
+        tracing::info!(
+            "diag: FramesageApp::drop exit — control returns to caller; \
+             field destructors will fire next; if checkpoint 5a never \
+             follows this line, a field declared before `tray` is hanging \
+             (checkpoint 6b/7)"
+        );
+    }
 }
 
 impl FramesageApp {
@@ -554,7 +628,9 @@ impl FramesageApp {
         // the window parks the message loop and tray clicks fall on the floor
         // — flags get set, but `update()` never runs to read them.
         #[cfg(windows)]
-        let tray = build_tray(&commands, cc.egui_ctx.clone()).expect("build tray icon");
+        let tray = LoggedTrayIcon(std::mem::ManuallyDrop::new(
+            build_tray(&commands, cc.egui_ctx.clone()).expect("build tray icon"),
+        ));
 
         Self {
             state,
@@ -759,6 +835,14 @@ impl eframe::App for FramesageApp {
         if close_requested {
             if self.commands.exit_requested.load(Ordering::Relaxed) {
                 // Let the close propagate — the egui runtime will exit.
+                // Diagnostic checkpoint #2 (window-close bug investigation):
+                // close_requested AND exit_requested both true — the path
+                // that hands control to eframe's default close handling.
+                tracing::info!(
+                    "diag: close-to-tray propagate branch entered (close_requested=true, \
+                     exit_requested=true) — letting close propagate to eframe runtime \
+                     (checkpoint 2/7)"
+                );
             } else {
                 ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
                 ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
@@ -768,6 +852,16 @@ impl eframe::App for FramesageApp {
         if self.commands.exit_requested.load(Ordering::Relaxed) && !close_requested {
             // Exit menu was clicked while the window may not even be open;
             // ensure we send a Close to actually quit.
+            //
+            // Diagnostic checkpoint #3 (window-close bug investigation):
+            // exit_requested observed without an in-flight close_requested
+            // (the common "Exit from tray while window hidden" case) —
+            // synthesising a Close command via ViewportCommand::Close.
+            tracing::info!(
+                "diag: sending ViewportCommand::Close (exit_requested=true, \
+                 close_requested=false) — synthesising close because the window \
+                 may not be open (checkpoint 3/7)"
+            );
             ctx.send_viewport_cmd(egui::ViewportCommand::Close);
         }
 
@@ -799,7 +893,7 @@ impl eframe::App for FramesageApp {
         {
             let new_tooltip = format_tray_tooltip(connected, status_snapshot.as_ref());
             if new_tooltip != self.last_tray_tooltip {
-                let _ = self.tray.set_tooltip(Some(&new_tooltip));
+                let _ = self.tray.0.set_tooltip(Some(&new_tooltip));
                 self.last_tray_tooltip = new_tooltip;
             }
         }
@@ -4983,6 +5077,24 @@ impl FramesageApp {
 // ─── main ────────────────────────────────────────────────────────────────────
 
 fn main() -> eframe::Result<()> {
+    // ── Diagnostic-only tracing init (window-close bug investigation) ────
+    //
+    // The tray binary has `windows_subsystem = "windows"`, so it has no
+    // console attached — `tracing::info!` calls would surface nowhere
+    // without an explicit subscriber + sink (confirmed in audit
+    // 08-code-quality.md: tray has the deps but never calls init). We
+    // route to a single file appender at
+    //   `%LOCALAPPDATA%\framesage\logs\framesage-tray.diag.log`
+    // (`rolling::never` = no rotation; this log is scratchpad for the
+    // close-bug investigation, not the canonical logs that PHASE2-PLAN
+    // §"observability" will land later).
+    //
+    // The `WorkerGuard` returned by `non_blocking` must outlive every
+    // other local in this function so the diag-log writer survives until
+    // after `_singleton` drops; bind it FIRST (Rust drops locals in
+    // reverse declaration order, so first-declared drops last).
+    let _log_guard = init_diag_tracing();
+
     // Singleton + elevation handoff: if another tray is running, wait
     // briefly for it to exit (covers the elevation-handoff window). If it
     // doesn't, signal the existing instance to bring its window forward
@@ -5035,11 +5147,99 @@ fn main() -> eframe::Result<()> {
     };
 
     let cmds_for_app = commands.clone();
-    eframe::run_native(
+    tracing::info!("diag: entering eframe::run_native — runtime takes over");
+    let result = eframe::run_native(
         "FrameSage",
         options,
         Box::new(move |cc| Ok(Box::new(FramesageApp::new(cc, cmds_for_app, elevated)))),
-    )
+    );
+    // ── Diagnostic checkpoint #4 (window-close bug investigation) ────────
+    //
+    // This is THE KEY SIGNAL for the close-bug triage: if this line
+    // appears in the diag log, eframe::run_native returned and the bug
+    // is downstream (in our Drop chain or after main returns). If this
+    // line is ABSENT — the prior log ends at checkpoint 3 — then the
+    // runtime is hanging inside run_native and the bug is upstream.
+    match &result {
+        Ok(()) => tracing::info!(
+            "diag: eframe::run_native returned Ok — runtime exited cleanly. \
+             IF YOU SEE THIS, the bug is AFTER the runtime (in Drop chain or \
+             post-main); if this line was missing, the runtime HUNG INSIDE \
+             run_native (checkpoint 4/7)"
+        ),
+        Err(e) => tracing::info!(
+            error = %e,
+            "diag: eframe::run_native returned Err — runtime exited with error. \
+             IF YOU SEE THIS, the bug is AFTER the runtime (in Drop chain or \
+             post-main); if this line was missing, the runtime HUNG INSIDE \
+             run_native (checkpoint 4/7)"
+        ),
+    }
+    // After this fn returns, locals drop in reverse declaration order:
+    //   1. `_singleton` (SingletonGuard, w/ entry/exit logs — checkpoint 7)
+    //   2. `_log_guard` (tracing-appender WorkerGuard — flushes file)
+    // The Box<dyn App> holding FramesageApp was already dropped INSIDE
+    // run_native before it returned, so checkpoints 5-6 fire above this
+    // return, not below it.
+    result
+}
+
+/// Diagnostic-only tracing initialiser for the window-close-bug
+/// investigation. Routes `tracing::info!` and friends to a single file at
+/// `%LOCALAPPDATA%\framesage\logs\framesage-tray.diag.log` so the
+/// close-bug log lines actually surface (the tray binary has no console).
+///
+/// Returns the `WorkerGuard` for the non-blocking appender; the caller
+/// must hold it for the lifetime of `main` (drop = flush + join). On
+/// failure (file create error, init race) the function returns
+/// `None`-equivalent and the tray runs without diag logs rather than
+/// aborting — a missing diag is better than a missing tray.
+fn init_diag_tracing() -> Option<tracing_appender::non_blocking::WorkerGuard> {
+    use tracing_subscriber::EnvFilter;
+
+    let log_dir = framesage_core::paths::user_data_dir().join("logs");
+    if let Err(e) = std::fs::create_dir_all(&log_dir) {
+        // No subscriber yet — go direct to stderr so a dev running from a
+        // console can see the failure. Production runs swallow this
+        // silently (no console attached).
+        eprintln!(
+            "framesage-tray: diag-log dir create failed at {}: {e}",
+            log_dir.display()
+        );
+        return None;
+    }
+    let file_appender = tracing_appender::rolling::never(&log_dir, "framesage-tray.diag.log");
+    let (non_blocking, guard) = tracing_appender::non_blocking(file_appender);
+    let filter = EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| EnvFilter::new("framesage_tray=info,info"));
+    // `try_init` because tests in this crate may also set a subscriber;
+    // first-writer-wins is fine, this is best-effort diag infrastructure.
+    let init_ok = tracing_subscriber::fmt()
+        .with_writer(non_blocking)
+        .with_ansi(false)
+        .with_target(true)
+        .with_thread_names(true)
+        .with_env_filter(filter)
+        .try_init()
+        .is_ok();
+    if init_ok {
+        tracing::info!(
+            log_path = %log_dir.join("framesage-tray.diag.log").display(),
+            "diag: tray tracing initialised — window-close-bug investigation \
+             (diag/window-close-bug-logging branch)"
+        );
+        Some(guard)
+    } else {
+        // Another subscriber is already installed; our appender is
+        // attached but won't receive events. Drop the guard so the
+        // background writer thread exits cleanly.
+        eprintln!(
+            "framesage-tray: tracing subscriber already installed — diag logs \
+             will go to that subscriber's sink, not the diag file."
+        );
+        drop(guard);
+        None
+    }
 }
 
 /// Open a file, folder, or URL in the OS shell handler. Best-effort: we

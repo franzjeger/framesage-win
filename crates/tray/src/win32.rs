@@ -95,10 +95,26 @@ pub struct SingletonGuard {
 
 impl Drop for SingletonGuard {
     fn drop(&mut self) {
+        // Diagnostic checkpoint #7a (window-close bug investigation): the
+        // singleton guard is the last RAII handle holding the process
+        // open for the user's perspective ("a tray is running"). If
+        // checkpoint 4 fired but 7a didn't, control never returned from
+        // main / something downstream of main is hanging.
+        tracing::info!(
+            "diag: SingletonGuard::drop entry — about to release the cross-\
+             session singleton mutex (checkpoint 7a/7)"
+        );
         if !self.handle.is_invalid() {
             // SAFETY: mutex handle is valid and owned by us.
             let _ = unsafe { CloseHandle(self.handle) };
         }
+        // Diagnostic checkpoint #7b: CloseHandle returned. If 7a fired
+        // but 7b didn't, CloseHandle itself stalled (unlikely; would
+        // indicate a corrupted kernel handle table).
+        tracing::info!(
+            "diag: SingletonGuard::drop exit — singleton mutex handle released; \
+             a fresh tray launch will now succeed (checkpoint 7b/7)"
+        );
     }
 }
 

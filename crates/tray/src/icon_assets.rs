@@ -309,6 +309,14 @@ pub(crate) fn build_tray(
                 } else if ev.id == ids.edit_policy {
                     cmds_menu.edit_policy.store(true, Ordering::Relaxed);
                 } else if ev.id == ids.exit {
+                    // Diagnostic checkpoint #1 (window-close bug investigation):
+                    // first observable signal that the Exit path was triggered.
+                    // If this line is missing from the diag log, the menu event
+                    // never reached this thread.
+                    tracing::info!(
+                        "diag: tray Exit menu event received — setting \
+                         exit_requested flag (checkpoint 1/7)"
+                    );
                     cmds_menu.exit_requested.store(true, Ordering::Relaxed);
                 } else {
                     continue;
