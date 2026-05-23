@@ -502,6 +502,14 @@
     {
       "exe": "RadeonSoftware.exe",
       "rationale": "AMD Adrenalin Software UI. Suspending breaks the in-game overlay and recording. Permanently denied."
+    },
+    {
+      "exe": "faceitservice.exe",
+      "rationale": "FACEIT Anti-Cheat service binary (ESL FACEIT Group). User-mode component that coordinates the kernel driver and game-launch handshake. Suspending it stops anti-cheat enforcement mid-match — the textbook anti-cheat bypass pattern and an instant flag/ban from FACEIT's match-watcher. Permanently denied."
+    },
+    {
+      "exe": "faceitclient.exe",
+      "rationale": "FACEIT Anti-Cheat client binary. Pairs with faceitservice.exe; the client is what the game launcher hands off to. Suspending it kills the launch handshake and is flagged the same way. Permanently denied."
     }
   ]
 }

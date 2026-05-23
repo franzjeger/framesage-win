@@ -270,6 +270,10 @@
       "rationale": "BattlEye service. Same reasoning. Permanently denied."
     },
     {
+      "id": "FACEITService",
+      "rationale": "FACEIT Anti-Cheat Windows service (ESL FACEIT Group). Stopping it is equivalent to suspending faceitservice.exe — anti-cheat enforcement goes offline mid-session and trips FACEIT's match-watcher. Permanently denied."
+    },
+    {
       "id": "Dhcp",
       "rationale": "DHCP client. Stopping it kills the network. Permanently denied."
     },
