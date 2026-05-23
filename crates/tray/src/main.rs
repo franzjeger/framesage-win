@@ -377,6 +377,23 @@ struct RuleForm {
     note: String,
 }
 
+/// Transparent wrapper around `tray_icon::TrayIcon` reserved as a
+/// future-debug seam — emits one `tracing::debug!` line when the tray
+/// is torn down so a future regression investigation can observe the
+/// teardown point without re-introducing diagnostic scaffolding (see
+/// closed PR #149 for the precedent). Zero behavior change vs a plain
+/// `TrayIcon`: the inner field destructor runs in the same place at
+/// the same lifecycle point.
+#[cfg(windows)]
+struct LoggedTrayIcon(TrayIcon);
+
+#[cfg(windows)]
+impl Drop for LoggedTrayIcon {
+    fn drop(&mut self) {
+        tracing::debug!("framesage-tray: LoggedTrayIcon dropping");
+    }
+}
+
 struct FramesageApp {
     state: Arc<Mutex<AppState>>,
     commands: TrayCommands,
@@ -442,8 +459,12 @@ struct FramesageApp {
     /// Holding the tray icon for its lifetime — drop = icon disappears.
     /// Now also a live handle: we call `set_tooltip` from `update()` to
     /// reflect the current engine state in the tray's hover-tooltip.
+    ///
+    /// Wrapped in [`LoggedTrayIcon`] (transparent newtype) so the
+    /// teardown point is observable at `debug!` level for future
+    /// regression triage.
     #[cfg(windows)]
-    tray: TrayIcon,
+    tray: LoggedTrayIcon,
     /// Last tooltip we wrote — avoids a `set_tooltip` syscall on every
     /// frame when the state hasn't changed.
     #[cfg(windows)]
@@ -554,7 +575,8 @@ impl FramesageApp {
         // the window parks the message loop and tray clicks fall on the floor
         // — flags get set, but `update()` never runs to read them.
         #[cfg(windows)]
-        let tray = build_tray(&commands, cc.egui_ctx.clone()).expect("build tray icon");
+        let tray =
+            LoggedTrayIcon(build_tray(&commands, cc.egui_ctx.clone()).expect("build tray icon"));
 
         Self {
             state,
@@ -799,7 +821,7 @@ impl eframe::App for FramesageApp {
         {
             let new_tooltip = format_tray_tooltip(connected, status_snapshot.as_ref());
             if new_tooltip != self.last_tray_tooltip {
-                let _ = self.tray.set_tooltip(Some(&new_tooltip));
+                let _ = self.tray.0.set_tooltip(Some(&new_tooltip));
                 self.last_tray_tooltip = new_tooltip;
             }
         }
@@ -4988,8 +5010,11 @@ fn main() -> eframe::Result<()> {
     // doesn't, signal the existing instance to bring its window forward
     // and exit cleanly — the user clicked the .exe / Start-menu icon
     // expecting "show the app," not "fail silently."
+    // Bound as `singleton` (not `_singleton`) because the post-run_native
+    // exit path drops it explicitly before calling `process::exit` — see
+    // the "Hard exit after teardown" block below.
     #[cfg(windows)]
-    let _singleton = match win32::acquire_singleton() {
+    let singleton = match win32::acquire_singleton() {
         Ok(win32::SingletonAttempt::Primary(guard)) => guard,
         Ok(win32::SingletonAttempt::AlreadyRunning) => {
             // Best-effort signal — we don't care if it succeeded; either
@@ -5035,11 +5060,49 @@ fn main() -> eframe::Result<()> {
     };
 
     let cmds_for_app = commands.clone();
-    eframe::run_native(
+    let result = eframe::run_native(
         "FrameSage",
         options,
         Box::new(move |cc| Ok(Box::new(FramesageApp::new(cc, cmds_for_app, elevated)))),
-    )
+    );
+
+    // ── Hard exit after teardown ─────────────────────────────────────────
+    //
+    // Two of the tray's long-running detached threads (menu + click
+    // event receivers in `icon_assets.rs`) block on `tray_icon`/`muda`
+    // global-static channels whose Sender side is never dropped upstream
+    // (`muda-0.19.1` line 490 and `tray-icon-0.24.0` line 653 —
+    // `static *_CHANNEL: Lazy<(Sender, Receiver)> = ...` with no public
+    // disconnect API; verified during investigation in closed PR #149 /
+    // #150). The library's documented termination contract is "process
+    // exits via `ExitProcess`"; joining those threads is structurally
+    // impossible without forking upstream.
+    //
+    // Decision boundary for future regressions: if this exit ever hangs
+    // >5 s, the cause is a `DLL_PROCESS_DETACH` stall in some loaded
+    // DLL (graphics-driver `DllMain` is the classic offender); escalate
+    // to `TerminateProcess(GetCurrentProcess(), 0)` via `windows-rs`,
+    // which bypasses atexit + DllMain entirely.
+    //
+    // `process::exit` does NOT run destructors, so we `drop(singleton)`
+    // explicitly first to release the cross-session mutex.
+
+    #[cfg(windows)]
+    drop(singleton);
+
+    match result {
+        Ok(()) => {
+            tracing::debug!("framesage-tray: process::exit(0) after teardown");
+            std::process::exit(0);
+        }
+        Err(e) => {
+            tracing::error!(
+                error = %e,
+                "framesage-tray: eframe::run_native returned Err — process::exit(1)"
+            );
+            std::process::exit(1);
+        }
+    }
 }
 
 /// Open a file, folder, or URL in the OS shell handler. Best-effort: we
