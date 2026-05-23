@@ -5083,17 +5083,20 @@ fn main() -> eframe::Result<()> {
     // console attached — `tracing::info!` calls would surface nowhere
     // without an explicit subscriber + sink (confirmed in audit
     // 08-code-quality.md: tray has the deps but never calls init). We
-    // route to a single file appender at
+    // route to a single file at
     //   `%LOCALAPPDATA%\framesage\logs\framesage-tray.diag.log`
-    // (`rolling::never` = no rotation; this log is scratchpad for the
-    // close-bug investigation, not the canonical logs that PHASE2-PLAN
-    // §"observability" will land later).
+    // (scratchpad for the close-bug investigation, not the canonical
+    // logs that PHASE2-PLAN §"observability" will land later).
     //
-    // The `WorkerGuard` returned by `non_blocking` must outlive every
-    // other local in this function so the diag-log writer survives until
-    // after `_singleton` drops; bind it FIRST (Rust drops locals in
-    // reverse declaration order, so first-declared drops last).
-    let _log_guard = init_diag_tracing();
+    // **Synchronous writer on purpose.** `tracing-appender::non_blocking`
+    // would put events on an in-process channel drained by a background
+    // thread — and the WorkerGuard's flush-on-drop can be skipped on
+    // abnormal exit, which is exactly the window we're trying to
+    // observe. A `Mutex<File>` writer makes every `tracing::info!` a
+    // synchronous `write()` to the OS file descriptor; the OS page
+    // cache survives the process going away, so no tail lines are
+    // lost even if the runtime is the thing that hangs.
+    init_diag_tracing();
 
     // Singleton + elevation handoff: if another tray is running, wait
     // briefly for it to exit (covers the elevation-handoff window). If it
@@ -5175,12 +5178,14 @@ fn main() -> eframe::Result<()> {
              run_native (checkpoint 4/7)"
         ),
     }
-    // After this fn returns, locals drop in reverse declaration order:
-    //   1. `_singleton` (SingletonGuard, w/ entry/exit logs — checkpoint 7)
-    //   2. `_log_guard` (tracing-appender WorkerGuard — flushes file)
-    // The Box<dyn App> holding FramesageApp was already dropped INSIDE
+    // After this fn returns, only `_singleton` (SingletonGuard) remains
+    // in local scope; its `Drop` impl emits checkpoints 7a/7b. The
+    // Box<dyn App> holding FramesageApp was already dropped INSIDE
     // run_native before it returned, so checkpoints 5-6 fire above this
-    // return, not below it.
+    // return, not below it. The diag-log subscriber writes synchronously
+    // through `Mutex<File>` (see `init_diag_tracing`), so no flush-guard
+    // is needed — each `tracing::info!` is already on disk before the
+    // macro returns.
     result
 }
 
@@ -5189,33 +5194,60 @@ fn main() -> eframe::Result<()> {
 /// `%LOCALAPPDATA%\framesage\logs\framesage-tray.diag.log` so the
 /// close-bug log lines actually surface (the tray binary has no console).
 ///
-/// Returns the `WorkerGuard` for the non-blocking appender; the caller
-/// must hold it for the lifetime of `main` (drop = flush + join). On
-/// failure (file create error, init race) the function returns
-/// `None`-equivalent and the tray runs without diag logs rather than
-/// aborting — a missing diag is better than a missing tray.
-fn init_diag_tracing() -> Option<tracing_appender::non_blocking::WorkerGuard> {
+/// **Synchronous on purpose.** The diag log's tail lines are exactly the
+/// ones we need to discriminate "hanging inside the runtime" from
+/// "exited then hanging in Drop." `tracing-appender::non_blocking` would
+/// queue events to a background thread whose flush-on-drop can be
+/// skipped on abnormal exit, dropping those tail lines silently. A
+/// plain `Mutex<File>` writer makes every event a synchronous
+/// `write()` to the OS file descriptor; the kernel page cache survives
+/// process death, so the worst case is "the last write was mid-buffer
+/// when the process was force-killed" — the line either appears in
+/// full or not at all, never half-truncated in a way that fakes a
+/// hang.
+///
+/// On failure (file open error, init race) the function logs to stderr
+/// and the tray runs without diag logs rather than aborting — a
+/// missing diag is better than a missing tray.
+fn init_diag_tracing() {
+    use std::sync::Mutex;
     use tracing_subscriber::EnvFilter;
 
     let log_dir = framesage_core::paths::user_data_dir().join("logs");
     if let Err(e) = std::fs::create_dir_all(&log_dir) {
-        // No subscriber yet — go direct to stderr so a dev running from a
-        // console can see the failure. Production runs swallow this
-        // silently (no console attached).
         eprintln!(
             "framesage-tray: diag-log dir create failed at {}: {e}",
             log_dir.display()
         );
-        return None;
+        return;
     }
-    let file_appender = tracing_appender::rolling::never(&log_dir, "framesage-tray.diag.log");
-    let (non_blocking, guard) = tracing_appender::non_blocking(file_appender);
+    let log_path = log_dir.join("framesage-tray.diag.log");
+    let file = match std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&log_path)
+    {
+        Ok(f) => f,
+        Err(e) => {
+            eprintln!(
+                "framesage-tray: diag-log open failed at {}: {e}",
+                log_path.display()
+            );
+            return;
+        }
+    };
+    // `Mutex<File>` impls `tracing_subscriber::fmt::MakeWriter`. The
+    // subscriber takes ownership; under contention the mutex serialises
+    // writers so two threads logging at the same instant don't interleave
+    // bytes. `File::write` on Windows is a direct kernel call — no
+    // user-space buffer between us and the OS file descriptor.
+    let writer = Mutex::new(file);
     let filter = EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| EnvFilter::new("framesage_tray=info,info"));
     // `try_init` because tests in this crate may also set a subscriber;
     // first-writer-wins is fine, this is best-effort diag infrastructure.
     let init_ok = tracing_subscriber::fmt()
-        .with_writer(non_blocking)
+        .with_writer(writer)
         .with_ansi(false)
         .with_target(true)
         .with_thread_names(true)
@@ -5224,21 +5256,16 @@ fn init_diag_tracing() -> Option<tracing_appender::non_blocking::WorkerGuard> {
         .is_ok();
     if init_ok {
         tracing::info!(
-            log_path = %log_dir.join("framesage-tray.diag.log").display(),
+            log_path = %log_path.display(),
             "diag: tray tracing initialised — window-close-bug investigation \
-             (diag/window-close-bug-logging branch)"
+             (diag/window-close-bug-logging branch); synchronous Mutex<File> \
+             writer so tail lines survive abnormal exit"
         );
-        Some(guard)
     } else {
-        // Another subscriber is already installed; our appender is
-        // attached but won't receive events. Drop the guard so the
-        // background writer thread exits cleanly.
         eprintln!(
             "framesage-tray: tracing subscriber already installed — diag logs \
              will go to that subscriber's sink, not the diag file."
         );
-        drop(guard);
-        None
     }
 }
 
