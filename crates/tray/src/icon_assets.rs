@@ -315,7 +315,7 @@ pub(crate) fn build_tray(
                     // never reached this thread.
                     tracing::info!(
                         "diag: tray Exit menu event received — setting \
-                         exit_requested flag (checkpoint 1/7)"
+                         exit_requested flag (checkpoint 1/9)"
                     );
                     cmds_menu.exit_requested.store(true, Ordering::Relaxed);
                 } else {

@@ -102,7 +102,7 @@ impl Drop for SingletonGuard {
         // main / something downstream of main is hanging.
         tracing::info!(
             "diag: SingletonGuard::drop entry — about to release the cross-\
-             session singleton mutex (checkpoint 7a/7)"
+             session singleton mutex (checkpoint 7a/9)"
         );
         if !self.handle.is_invalid() {
             // SAFETY: mutex handle is valid and owned by us.
@@ -113,7 +113,7 @@ impl Drop for SingletonGuard {
         // indicate a corrupted kernel handle table).
         tracing::info!(
             "diag: SingletonGuard::drop exit — singleton mutex handle released; \
-             a fresh tray launch will now succeed (checkpoint 7b/7)"
+             a fresh tray launch will now succeed (checkpoint 7b/9)"
         );
     }
 }

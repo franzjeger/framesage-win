@@ -400,7 +400,7 @@ impl Drop for LoggedTrayIcon {
         // drop the inner TrayIcon".
         tracing::info!(
             "diag: LoggedTrayIcon::drop entry — about to invoke inner \
-             TrayIcon::drop (checkpoint 5a/7)"
+             TrayIcon::drop (checkpoint 5a/9)"
         );
         // SAFETY: self.0 is the sole owner of the inner TrayIcon; it has
         // not been moved out of (we hold &mut self exclusively) and is
@@ -417,7 +417,7 @@ impl Drop for LoggedTrayIcon {
         // icon_assets.rs).
         tracing::info!(
             "diag: LoggedTrayIcon::drop exit — inner TrayIcon::drop returned \
-             cleanly (checkpoint 5b/7)"
+             cleanly (checkpoint 5b/9)"
         );
     }
 }
@@ -512,14 +512,14 @@ impl Drop for FramesageApp {
         tracing::info!(
             "diag: FramesageApp::drop entry — fields are about to drop in \
              declaration order (state, commands, …, tray, last_tray_tooltip) \
-             (checkpoint 6a/7)"
+             (checkpoint 6a/9)"
         );
         // Implicit field destructors run here after this fn returns.
         tracing::info!(
             "diag: FramesageApp::drop exit — control returns to caller; \
              field destructors will fire next; if checkpoint 5a never \
              follows this line, a field declared before `tray` is hanging \
-             (checkpoint 6b/7)"
+             (checkpoint 6b/9)"
         );
     }
 }
@@ -841,7 +841,7 @@ impl eframe::App for FramesageApp {
                 tracing::info!(
                     "diag: close-to-tray propagate branch entered (close_requested=true, \
                      exit_requested=true) — letting close propagate to eframe runtime \
-                     (checkpoint 2/7)"
+                     (checkpoint 2/9)"
                 );
             } else {
                 ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
@@ -860,7 +860,7 @@ impl eframe::App for FramesageApp {
             tracing::info!(
                 "diag: sending ViewportCommand::Close (exit_requested=true, \
                  close_requested=false) — synthesising close because the window \
-                 may not be open (checkpoint 3/7)"
+                 may not be open (checkpoint 3/9)"
             );
             ctx.send_viewport_cmd(egui::ViewportCommand::Close);
         }
@@ -5103,8 +5103,17 @@ fn main() -> eframe::Result<()> {
     // doesn't, signal the existing instance to bring its window forward
     // and exit cleanly — the user clicked the .exe / Start-menu icon
     // expecting "show the app," not "fail silently."
+    //
+    // Bound as `singleton` (no leading underscore) because the
+    // post-run_native exit path will `drop(singleton)` it explicitly
+    // before calling `process::exit(0)`; `process::exit` does NOT run
+    // destructors, so we have to fire `SingletonGuard::drop` (checkpoints
+    // 7a/7b — releases the cross-session mutex) ourselves. Without the
+    // explicit drop a subsequent fresh tray launch would have to wait
+    // the full `SINGLETON_HANDOFF_TIMEOUT` (3 s) before claiming the
+    // mutex.
     #[cfg(windows)]
-    let _singleton = match win32::acquire_singleton() {
+    let singleton = match win32::acquire_singleton() {
         Ok(win32::SingletonAttempt::Primary(guard)) => guard,
         Ok(win32::SingletonAttempt::AlreadyRunning) => {
             // Best-effort signal — we don't care if it succeeded; either
@@ -5168,25 +5177,115 @@ fn main() -> eframe::Result<()> {
             "diag: eframe::run_native returned Ok — runtime exited cleanly. \
              IF YOU SEE THIS, the bug is AFTER the runtime (in Drop chain or \
              post-main); if this line was missing, the runtime HUNG INSIDE \
-             run_native (checkpoint 4/7)"
+             run_native (checkpoint 4/9)"
         ),
         Err(e) => tracing::info!(
             error = %e,
             "diag: eframe::run_native returned Err — runtime exited with error. \
              IF YOU SEE THIS, the bug is AFTER the runtime (in Drop chain or \
              post-main); if this line was missing, the runtime HUNG INSIDE \
-             run_native (checkpoint 4/7)"
+             run_native (checkpoint 4/9)"
         ),
     }
-    // After this fn returns, only `_singleton` (SingletonGuard) remains
-    // in local scope; its `Drop` impl emits checkpoints 7a/7b. The
-    // Box<dyn App> holding FramesageApp was already dropped INSIDE
-    // run_native before it returned, so checkpoints 5-6 fire above this
-    // return, not below it. The diag-log subscriber writes synchronously
-    // through `Mutex<File>` (see `init_diag_tracing`), so no flush-guard
-    // is needed — each `tracing::info!` is already on disk before the
-    // macro returns.
-    result
+    // ── Hard exit after teardown ─────────────────────────────────────────
+    //
+    // Diagnosis (per PR #149 diag run, verified):
+    //
+    //   Two of the six long-running detached threads (the menu and
+    //   click event-receiver threads in `icon_assets.rs`) block on
+    //   `tray_icon`/`muda` global-static `Lazy<(Sender<_>, Receiver<_>)>`
+    //   channels whose Sender side is never dropped by the upstream
+    //   library (verified in `muda-0.19.1` line 490 and
+    //   `tray-icon-0.24.0` line 653 — `static *_CHANNEL: Lazy<...>` with
+    //   no public disconnect API and platform `Drop` impls that don't
+    //   touch the channel). The library's documented termination
+    //   contract is "process exits via `ExitProcess`."
+    //
+    //   The diag run (PR #149) proved our owned cleanup chain —
+    //   close-handling (checkpoints 1-3), `FramesageApp::drop` (6a/6b),
+    //   `LoggedTrayIcon::drop` → inner `TrayIcon::drop` (5a/5b),
+    //   `SingletonGuard::drop` (7a/7b) — completes cleanly within
+    //   ~12 ms of the user clicking Exit. The residual non-exit is
+    //   two upstream-owned threads we cannot release without forking
+    //   the library. `process::exit(0)` after teardown lets us honor
+    //   the upstream contract without faking it.
+    //
+    // Two further considerations:
+    //
+    //   * `process::exit` does NOT run destructors. We `drop(singleton)`
+    //     explicitly below so `SingletonGuard::drop` (7a/7b) still
+    //     fires and the cross-session mutex is released. `_log_guard`
+    //     no longer exists (init_diag_tracing uses synchronous
+    //     Mutex<File>; nothing to flush).
+    //
+    //   * `process::exit` on Windows ultimately calls `c::exit` →
+    //     `ExitProcess`, the same termination call that Rust's
+    //     `Termination::report` would invoke on natural main-return.
+    //     So if the actual hang is in `DLL_PROCESS_DETACH` for some
+    //     loaded DLL (graphics-driver `DllMain` is the classic
+    //     offender), `process::exit(0)` doesn't help any more than
+    //     letting main return — both reach the same `ExitProcess` and
+    //     both will hang in the same `DllMain`. The pre-exit
+    //     checkpoint 8 below lets the next diag run tell us cleanly:
+    //     if 8 fires and the process is still alive >5 s later, the
+    //     fix mechanism needs to escalate to direct
+    //     `TerminateProcess(GetCurrentProcess(), 0)` (windows-rs;
+    //     bypasses atexit + DllMain entirely). The diag log up to
+    //     now does NOT hint at a driver-detach stall, so this is
+    //     written as a documented escalation path, not the expected
+    //     case.
+
+    // Result code is intentionally dropped on the floor — the Err arm
+    // already logged via checkpoint 4 above, and the termination
+    // contract here is "exit hard, not propagate code."
+    let _ = result;
+
+    // Explicit `drop` so `SingletonGuard::drop` fires (checkpoints
+    // 7a/7b). Without this the cross-session mutex would leak until
+    // the kernel reaped the handle on real process exit — typically
+    // fast, but the explicit drop is the honest pattern.
+    #[cfg(windows)]
+    drop(singleton);
+
+    // ── Diagnostic checkpoint #8 (pre-exit signal) ───────────────────────
+    //
+    // Load-bearing signal for verifying THIS fix in the next diag run:
+    // if checkpoint 8 fires and the process is still alive >5 s later,
+    // `process::exit(0)` reached the runtime but `ExitProcess` is
+    // hanging in `DLL_PROCESS_DETACH` — escalate to the documented
+    // `TerminateProcess` fallback (see block comment above).
+    tracing::info!(
+        "diag: about to call process::exit(0) — owned cleanup complete \
+         (checkpoints 1-7 fired per PR #149 diag run), upstream-owned \
+         tray-icon/muda receiver threads will be released by ExitProcess. \
+         If this line fires and the process is still alive >5s, \
+         ExitProcess is hanging in DLL_PROCESS_DETACH; escalate to \
+         TerminateProcess(GetCurrentProcess(), 0) (checkpoint 8/9 — \
+         pre-exit)"
+    );
+
+    std::process::exit(0);
+
+    // ── Diagnostic checkpoint #9 (post-exit canary) ──────────────────────
+    //
+    // The line below is intentionally reachable in the source-level
+    // sense even though `std::process::exit` is typed `-> !` and the
+    // compiler knows this code is unreachable. Kept as an explicit
+    // canary: if it ever fires, the documented contract was violated
+    // (some Windows-runtime hooking layer intercepted `exit`) and we
+    // want concrete evidence rather than silent confusion. Type-checks
+    // because `!` coerces to any type, so the block's tail expression
+    // (`result`) supplies the function's `eframe::Result<()>` return.
+    #[allow(unreachable_code)]
+    {
+        tracing::info!(
+            "diag: process::exit(0) returned — IMPOSSIBLE under the \
+             documented `-> !` contract. Falling through to natural \
+             main return (which will reach the same ExitProcess via \
+             Termination::report) (checkpoint 9/9 — post-exit canary)"
+        );
+        result
+    }
 }
 
 /// Diagnostic-only tracing initialiser for the window-close-bug
