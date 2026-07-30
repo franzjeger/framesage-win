@@ -150,6 +150,10 @@ pub struct Engine {
     clock: Arc<dyn Clock>,
 }
 
+// Several sampling-cache fields are only read inside `cfg(windows)`
+// code paths (list_process_snapshots etc.); non-Windows check builds
+// see them as never-read.
+#[cfg_attr(not(windows), allow(dead_code))]
 struct EngineState {
     policy: Policy,
     /// Item 2.3 / audit H-04. Topology is immutable after startup —
