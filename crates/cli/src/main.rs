@@ -1343,8 +1343,8 @@ fn print_session_list(sessions: &[framesage_ipc::framesage_recorder::SessionList
         return;
     }
     println!(
-        "{:<38}  {:<24}  {:<12}  {:>8}  {}",
-        "session id", "game", "profile", "duration", "flags"
+        "{:<38}  {:<24}  {:<12}  {:>8}  flags",
+        "session id", "game", "profile", "duration"
     );
     for e in sessions {
         let dur = match e.duration_secs {
