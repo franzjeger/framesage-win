@@ -40,6 +40,9 @@ struct ActiveRecording {
     session_id: String,
     started: Instant,
     actions_applied: u32,
+    /// 1 Hz cpu_sample tick counter — drives the §2.3 downsampling.
+    cpu_ticks: u64,
+    kernel_signals: u32,
 }
 
 /// Event-driven session recorder. Platform-independent and IO-light:
@@ -149,6 +152,8 @@ impl SessionRecorder {
                             session_id,
                             started: Instant::now(),
                             actions_applied: 1,
+                            cpu_ticks: 0,
+                            kernel_signals: 0,
                         });
                     }
                     Err(e) => {
@@ -221,6 +226,62 @@ impl SessionRecorder {
         }
     }
 
+    /// #7 — append a §2.3 `cpu_sample` line if a session is recording.
+    /// The 1 Hz caller downsamples per the writer's §2.3 sample rate
+    /// (0.5 Hz at 80% of the per-session cap, 0.1 Hz at 95%).
+    pub fn record_cpu_sample(&mut self, total_pct: u8, per_core_pct: Vec<u8>) {
+        let Some(rec) = self.current.as_mut() else {
+            return;
+        };
+        rec.cpu_ticks = rec.cpu_ticks.wrapping_add(1);
+        let keep_every = match rec.writer.sample_rate() {
+            framesage_recorder::SampleRate::Full1Hz => 1,
+            framesage_recorder::SampleRate::Half => 2,
+            framesage_recorder::SampleRate::Tenth => 10,
+            framesage_recorder::SampleRate::ActionsOnly => return,
+        };
+        if rec.cpu_ticks % keep_every != 0 {
+            return;
+        }
+        let at_ms = rec.started.elapsed().as_millis() as u64;
+        let event = SessionEvent::CpuSample {
+            schema_version: SCHEMA_VERSION,
+            at_ms,
+            total_pct,
+            per_core_pct,
+            // §2.3: ALWAYS null in v0.7.x (reserved v0.8 slot).
+            per_process: None,
+        };
+        if let Err(e) = rec.writer.append(&event) {
+            warn!(error = %e, session = %rec.session_id, "cpu_sample append failed; dropping recording");
+            self.current = None;
+        }
+    }
+
+    /// #8 — append a §2.3 `kernel_signal` line from the ETW drain's
+    /// spike detector. Signals are rare by construction (cooldown in
+    /// the detector), so they are always written.
+    pub fn record_kernel_signal(&mut self, sig: &framesage_etw::KernelSignal) {
+        let Some(rec) = self.current.as_mut() else {
+            return;
+        };
+        let at_ms = rec.started.elapsed().as_millis() as u64;
+        let event = SessionEvent::KernelSignal {
+            schema_version: SCHEMA_VERSION,
+            at_ms,
+            signal: sig.signal.to_string(),
+            rate_per_sec: sig.rate_per_sec,
+            baseline_5min_per_sec: sig.baseline_5min_per_sec,
+            above_baseline_pct: sig.above_baseline_pct,
+        };
+        if let Err(e) = rec.writer.append(&event) {
+            warn!(error = %e, session = %rec.session_id, "kernel_signal append failed; dropping recording");
+            self.current = None;
+        } else {
+            rec.kernel_signals = rec.kernel_signals.saturating_add(1);
+        }
+    }
+
     fn finish_current(&mut self, reason: &str) {
         let Some(rec) = self.current.take() else {
             return;
@@ -243,7 +304,7 @@ impl SessionRecorder {
                 frame_time_p99_us_baseline: None,
                 frame_time_p99_us_with_rules: None,
                 actions_applied: rec.actions_applied,
-                kernel_signals: 0,
+                kernel_signals: rec.kernel_signals,
             },
         };
         let session_id = rec.session_id.clone();
@@ -290,24 +351,48 @@ fn host_system_info() -> SystemInfo {
 pub fn spawn(
     engine: std::sync::Arc<framesage_engine::Engine>,
     dir: PathBuf,
+    mut kernel_signals: tokio::sync::broadcast::Receiver<framesage_etw::KernelSignal>,
 ) -> tokio::task::JoinHandle<()> {
     let mut rx = engine.subscribe();
     tokio::spawn(async move {
         let mut recorder = SessionRecorder::new(dir);
+        // #7 — 1 Hz cpu_sample tick while a session is recording.
+        let mut cpu_interval = tokio::time::interval(std::time::Duration::from_secs(1));
+        cpu_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        let mut signals_closed = false;
         loop {
-            match rx.recv().await {
-                Ok(event) => {
-                    // Sample the policy gate at event time — a toggle
-                    // flip applies from the next session start.
-                    let enabled = engine.status().policy.closed_loop_enabled;
-                    recorder.handle_event(&event, enabled);
-                }
-                Err(tokio::sync::broadcast::error::RecvError::Lagged(missed)) => {
-                    warn!(missed, "session recorder lagged behind engine events");
-                }
-                Err(tokio::sync::broadcast::error::RecvError::Closed) => {
-                    info!("engine event stream closed; session recorder exiting");
-                    return;
+            tokio::select! {
+                event = rx.recv() => match event {
+                    Ok(event) => {
+                        // #11 — cheap policy-gate read instead of
+                        // cloning the whole policy per event.
+                        let enabled = engine.closed_loop_enabled();
+                        recorder.handle_event(&event, enabled);
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(missed)) => {
+                        warn!(missed, "session recorder lagged behind engine events");
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                        info!("engine event stream closed; session recorder exiting");
+                        return;
+                    }
+                },
+                sig = kernel_signals.recv(), if !signals_closed => match sig {
+                    // #8 — kernel_signal lines from the ETW drain.
+                    Ok(sig) => recorder.record_kernel_signal(&sig),
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(missed)) => {
+                        warn!(missed, "session recorder lagged behind kernel signals");
+                    }
+                    // Closed-loop disabled / torn down: keep serving
+                    // engine events; permanently disarm this arm.
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                        signals_closed = true;
+                    }
+                },
+                _ = cpu_interval.tick() => {
+                    if let Some((total, per_core)) = engine.sample_cpu_for_recorder() {
+                        recorder.record_cpu_sample(total, per_core);
+                    }
                 }
             }
         }

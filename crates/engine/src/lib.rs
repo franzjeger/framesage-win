@@ -235,6 +235,11 @@ struct EngineState {
     /// because the Processes tab needs CPU% whether or not the user has
     /// ProBalance enabled. Updated on every IPC `ListProcesses` request.
     list_processes_prev_samples: HashMap<u32, u64>,
+    /// Recorder's own previous system/per-core CPU samples — separate
+    /// slots from the list-processes ones so the two 1 Hz consumers
+    /// don't corrupt each other's deltas.
+    recorder_prev_system_cpu: Option<framesage_sys::process::SystemCpuTimes>,
+    recorder_prev_per_cpu: Option<Vec<framesage_sys::process::PerCpuTimes>>,
     /// Wall-clock instant matching `list_processes_prev_samples`. Used to
     /// turn CPU-time deltas into a % of one logical CPU.
     list_processes_last_sample_at: Option<Instant>,
@@ -489,6 +494,8 @@ impl Engine {
                 probalance_last_sample_at: None,
                 probalance_restrained: HashMap::new(),
                 list_processes_prev_samples: HashMap::new(),
+                recorder_prev_system_cpu: None,
+                recorder_prev_per_cpu: None,
                 list_processes_last_sample_at: None,
                 list_processes_prev_system_cpu: None,
                 list_processes_prev_per_cpu: None,
@@ -997,6 +1004,69 @@ impl Engine {
             summary,
             failure,
         }))
+    }
+
+    /// Cheap read of the closed-loop opt-in — used on hot event paths
+    /// (session recorder) where cloning the whole policy via
+    /// `status()` would be waste.
+    pub fn closed_loop_enabled(&self) -> bool {
+        self.state.read().policy.closed_loop_enabled
+    }
+
+    /// 1 Hz CPU sample for the session recorder (§2.3 `cpu_sample`).
+    /// Returns `None` until two samples have accumulated (deltas need
+    /// a baseline) or where the kernel refuses the per-CPU query.
+    /// Uses recorder-private previous-sample slots so it can tick on
+    /// its own cadence without disturbing the Processes-tab deltas.
+    pub fn sample_cpu_for_recorder(&self) -> Option<(u8, Vec<u8>)> {
+        let mut s = self.state.write();
+
+        let sys_cpu_now = self.sys.system_cpu_times().ok();
+        let total_pct = match (&sys_cpu_now, &s.recorder_prev_system_cpu) {
+            (Some(now), Some(prev)) => {
+                let idle = now.idle_100ns.saturating_sub(prev.idle_100ns);
+                let kernel = now.kernel_100ns.saturating_sub(prev.kernel_100ns);
+                let user = now.user_100ns.saturating_sub(prev.user_100ns);
+                let total = kernel + user;
+                if total == 0 {
+                    None
+                } else {
+                    let busy = total.saturating_sub(idle);
+                    Some(((busy as u128 * 100 / total as u128).min(100)) as u8)
+                }
+            }
+            _ => None,
+        };
+        s.recorder_prev_system_cpu = sys_cpu_now;
+
+        let per_cpu_now = self.sys.per_cpu_times().ok();
+        let per_core: Option<Vec<u8>> = match (&per_cpu_now, &s.recorder_prev_per_cpu) {
+            (Some(now_v), Some(prev_v)) if now_v.len() == prev_v.len() && !now_v.is_empty() => {
+                Some(
+                    now_v
+                        .iter()
+                        .zip(prev_v.iter())
+                        .map(|(n, p)| {
+                            let total = n.total_100ns().saturating_sub(p.total_100ns());
+                            let idle = n.idle_100ns.saturating_sub(p.idle_100ns);
+                            if total == 0 {
+                                0u8
+                            } else {
+                                let busy = total.saturating_sub(idle);
+                                ((busy as u128 * 100 / total as u128).min(100)) as u8
+                            }
+                        })
+                        .collect(),
+                )
+            }
+            _ => None,
+        };
+        s.recorder_prev_per_cpu = per_cpu_now;
+
+        match (total_pct, per_core) {
+            (Some(t), Some(cores)) => Some((t, cores)),
+            _ => None,
+        }
     }
 
     pub fn status(&self) -> StatusSnapshot {
@@ -4448,7 +4518,7 @@ mod tests {
         AppliedRecord {
             profile_id: ProfileId("perf".into()),
             exe_name: "notepad.exe".into(),
-            state: framesage_sys::apply::AppliedState::default(),
+            state: Default::default(),
             applied_priority_class_raw,
             applied_affinity_mask,
         }
@@ -5228,7 +5298,7 @@ mod tests {
         let record = AppliedRecord {
             profile_id: ProfileId("game-x3d".into()),
             exe_name: "Diablo IV.exe".into(),
-            state: framesage_sys::apply::AppliedState::default(),
+            state: Default::default(),
             // Item 4.7 — leave the drift-detection fields as None so
             // detect_apply_drift sees no signal to read and lets the
             // revert proceed (the existing assertion still holds).
