@@ -4821,6 +4821,216 @@ mod tests {
         (engine, rx)
     }
 
+    // ─── M1.6 / #95 — Manual Global Game Mode interaction matrix ────────────
+    //
+    // PHASE2-PLAN §2.11's contract is "manual wins, focus-driven is
+    // suppressed." These tests drive the enable/disable × reconcile
+    // orderings against the mock SysApi. Game-mode *planning* is
+    // platform-gated (empty plans off Windows), so the assertions pin
+    // the state machine: the manual pin, the ownership guard in
+    // reconcile_system_mode_locked, and the teardown/reset on exit.
+
+    fn manual_global_policy() -> Policy {
+        let mut profiles = std::collections::HashMap::new();
+        profiles.insert(ProfileId("default".into()), Profile::default());
+        let mut game = Profile {
+            id: "game-x3d".into(),
+            manual_global_eligible: true,
+            ..Profile::default()
+        };
+        game.game_mode = Some(framesage_core::game_mode::GameModeActions {
+            hide_taskbar: true,
+            stop_services: vec!["SysMain".into()],
+            ..Default::default()
+        });
+        profiles.insert(ProfileId("game-x3d".into()), game);
+        let mut ineligible = Profile {
+            id: "eco".into(),
+            manual_global_eligible: false,
+            ..Profile::default()
+        };
+        ineligible.game_mode = Some(framesage_core::game_mode::GameModeActions {
+            hide_taskbar: true,
+            ..Default::default()
+        });
+        profiles.insert(ProfileId("eco".into()), ineligible);
+        Policy {
+            default_profile: ProfileId("default".into()),
+            profiles,
+            ..Default::default()
+        }
+    }
+
+    fn engine_with_manual_global_policy() -> Engine {
+        let sys = Arc::new(MockSysApi::new());
+        let clock = Arc::new(FakeClock::new());
+        let (engine, _rx) = engine_with_mocks(sys, clock);
+        engine.state.write().policy = manual_global_policy();
+        engine
+    }
+
+    fn fake_active_mode(profile: &str) -> ActiveSystemMode {
+        ActiveSystemMode {
+            profile_id: ProfileId(profile.into()),
+            previous: PreviousState {
+                taskbar_visible: true,
+                active_power_plan: None,
+                services: vec![],
+                suspended_pids: vec![],
+            },
+            applied: AppliedActions::default(),
+            journal_session_id: uuid::Uuid::new_v4(),
+            started_at_unix_secs: 0,
+        }
+    }
+
+    // Cells 1a-1c — eligibility gates on enable.
+    #[test]
+    fn manual_global_enable_rejects_invalid_profiles() {
+        let engine = engine_with_manual_global_policy();
+        assert!(engine
+            .enable_manual_global_game_mode(ProfileId("nope".into()))
+            .is_err());
+        assert!(
+            engine
+                .enable_manual_global_game_mode(ProfileId("eco".into()))
+                .is_err(),
+            "manual_global_eligible = false must be refused"
+        );
+        assert!(
+            engine
+                .enable_manual_global_game_mode(ProfileId("default".into()))
+                .is_err(),
+            "profile without game_mode actions must be refused"
+        );
+        assert!(engine.state.read().manual_global_active.is_none());
+    }
+
+    // Cell 2 — manual active + foreground-driven reconcile for a
+    // DIFFERENT profile: the ownership guard must skip, leaving the
+    // pinned session untouched.
+    #[test]
+    fn manual_pin_suppresses_focus_driven_reconcile() {
+        let engine = engine_with_manual_global_policy();
+        engine
+            .enable_manual_global_game_mode(ProfileId("game-x3d".into()))
+            .expect("eligible profile enables");
+
+        {
+            let mut s = engine.state.write();
+            // Simulate the manual session being live system-wide.
+            s.system_mode = Some(fake_active_mode("game-x3d"));
+            // Focus-driven reconcile now attempts a different profile
+            // with non-default actions — the §2.11 conflict cell.
+            Engine::reconcile_system_mode_locked(
+                &mut s,
+                &engine.journal,
+                engine.safe_list,
+                &ProfileId("eco".into()),
+                Some(framesage_core::game_mode::GameModeActions {
+                    hide_taskbar: true,
+                    ..Default::default()
+                }),
+                &engine.events,
+                "test_foreground",
+            );
+        }
+
+        let s = engine.state.read();
+        assert_eq!(
+            s.manual_global_active,
+            Some(ProfileId("game-x3d".into())),
+            "manual pin must survive a focus-driven reconcile"
+        );
+        let active = s
+            .system_mode
+            .as_ref()
+            .expect("pinned session not torn down");
+        assert_eq!(active.profile_id, ProfileId("game-x3d".into()));
+    }
+
+    // Cell 3 — manual disable mid-session: reverts the session, clears
+    // the pin, and forces the next tick to re-evaluate the foreground.
+    #[test]
+    fn manual_disable_mid_session_reverts_and_resets_foreground() {
+        let engine = engine_with_manual_global_policy();
+        engine
+            .enable_manual_global_game_mode(ProfileId("game-x3d".into()))
+            .expect("enable");
+        {
+            let mut s = engine.state.write();
+            s.system_mode = Some(fake_active_mode("game-x3d"));
+            s.current_foreground = Some(4242);
+        }
+
+        engine.disable_manual_global_game_mode();
+
+        let s = engine.state.read();
+        assert!(s.manual_global_active.is_none());
+        assert!(s.system_mode.is_none(), "session must be reverted");
+        assert!(
+            s.current_foreground.is_none(),
+            "foreground must be cleared so the next tick re-evaluates"
+        );
+    }
+
+    // Cell 4 — disable with nothing active is a no-op (idempotent).
+    #[test]
+    fn manual_disable_is_idempotent() {
+        let engine = engine_with_manual_global_policy();
+        engine.disable_manual_global_game_mode();
+        engine.disable_manual_global_game_mode();
+        assert!(engine.state.read().manual_global_active.is_none());
+    }
+
+    // Cell 5 — after disable, a focus-driven reconcile is no longer
+    // suppressed (the guard only bites while the pin is set).
+    #[test]
+    fn focus_driven_reconcile_resumes_after_manual_disable() {
+        let engine = engine_with_manual_global_policy();
+        engine
+            .enable_manual_global_game_mode(ProfileId("game-x3d".into()))
+            .expect("enable");
+        engine.disable_manual_global_game_mode();
+
+        let mut s = engine.state.write();
+        s.system_mode = Some(fake_active_mode("game-x3d"));
+        // With the pin cleared, a reconcile for another profile must
+        // NOT be skipped: the stale session gets torn down (planning
+        // for the new profile is platform-gated and may yield nothing,
+        // but the revert must happen).
+        Engine::reconcile_system_mode_locked(
+            &mut s,
+            &engine.journal,
+            engine.safe_list,
+            &ProfileId("eco".into()),
+            None,
+            &engine.events,
+            "test_foreground",
+        );
+        assert!(
+            s.system_mode.is_none(),
+            "without the manual pin the old session must be torn down"
+        );
+    }
+
+    // Cell 6 — rapid enable/disable cycling: no deadlock, no panic,
+    // clean end state. (Single write-lock discipline; a regression that
+    // re-enters the lock would hang this test.)
+    #[test]
+    fn rapid_manual_enable_disable_cycles_stay_clean() {
+        let engine = engine_with_manual_global_policy();
+        for _ in 0..50 {
+            engine
+                .enable_manual_global_game_mode(ProfileId("game-x3d".into()))
+                .expect("enable");
+            engine.disable_manual_global_game_mode();
+        }
+        let s = engine.state.read();
+        assert!(s.manual_global_active.is_none());
+        assert!(s.system_mode.is_none());
+    }
+
     /// Issue #148 G1 — the background affinity-rule scan must consult
     /// the denylist before pinning. A rule whose match lands on a
     /// protected exe (here csrss.exe, kernel-critical) is skipped; a
