@@ -158,9 +158,20 @@ where
 const _: () = {
     use static_assertions::assert_impl_all;
 
-    use crate::session::ConsumerState;
+    use crate::session::{ConsumerState, RealEtwSysCalls};
 
     assert_impl_all!(ConsumerState: std::panic::RefUnwindSafe);
+    // M1.7 / D-001 — the catch_unwind closure also captures the
+    // `consumer_syscalls: S` value, so the production syscall type must
+    // be RefUnwindSafe too (trivially true today: RealEtwSysCalls is a
+    // ZST). MockEtwSysCalls is deliberately NOT asserted: it contains a
+    // RefCell and is not RefUnwindSafe. That is acceptable only under
+    // the test-side constraint that panic injection happens strictly
+    // before any `borrow_mut` in the mock (arm_panic_in_process_trace
+    // fires at function entry), so no torn RefCell state can be
+    // observed across the unwind boundary. If a future mock injects
+    // panics mid-borrow, it must switch the RefCell to a Mutex first.
+    assert_impl_all!(RealEtwSysCalls: std::panic::RefUnwindSafe);
 };
 
 // ─── Inline tests ────────────────────────────────────────────────────────────
