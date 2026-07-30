@@ -92,6 +92,28 @@ enum Cmd {
     /// or add a quick exe-name rule from the shell.
     #[command(subcommand)]
     Policy(PolicyCmd),
+    /// M1.14 — toggle the closed-loop ETW subsystem without editing
+    /// policy.json by hand. `on`/`off` mutate `closed_loop_enabled` in
+    /// the live policy and commit via SetPolicy, so the service
+    /// persists through its usual atomic-rename save path. `status`
+    /// prints the current value plus whether this Windows build
+    /// supports the closed loop at all.
+    #[command(subcommand)]
+    ClosedLoop(ClosedLoopCmd),
+}
+
+#[derive(Subcommand, Debug)]
+enum ClosedLoopCmd {
+    /// Set `closed_loop_enabled = true` in the live policy. The service
+    /// picks the new value up on its next start — the ETW session is
+    /// only created during service startup, so a restart is required
+    /// for the toggle to take effect (the verb prints a reminder).
+    On,
+    /// Set `closed_loop_enabled = false` in the live policy.
+    Off,
+    /// Print the current `closed_loop_enabled` value and whether the
+    /// running service's build gate supports the closed loop.
+    Status,
 }
 
 #[derive(Subcommand, Debug)]
@@ -223,7 +245,75 @@ fn main() -> Result<()> {
                 tokio_block(async { policy_add_rule(&exe, &profile).await })
             }
         },
+        Cmd::ClosedLoop(sub) => match sub {
+            ClosedLoopCmd::On => tokio_block(async { closed_loop_set(true).await }),
+            ClosedLoopCmd::Off => tokio_block(async { closed_loop_set(false).await }),
+            ClosedLoopCmd::Status => tokio_block(async { closed_loop_status().await }),
+        },
     }
+}
+
+/// M1.14 — apply `enabled` to `policy.closed_loop_enabled` in place.
+/// Returns `true` if the value actually changed. Pulled out of the
+/// IPC-driven verb so the mutation semantics are unit-testable on
+/// every host platform.
+fn set_closed_loop_enabled(policy: &mut framesage_core::Policy, enabled: bool) -> bool {
+    let changed = policy.closed_loop_enabled != enabled;
+    policy.closed_loop_enabled = enabled;
+    changed
+}
+
+/// M1.14 — one-line human summary for `framesage closed-loop status`.
+fn describe_closed_loop(enabled: bool, build_supported: bool) -> String {
+    let state = if enabled { "enabled" } else { "disabled" };
+    let build = if build_supported {
+        "supported on this build"
+    } else {
+        "NOT supported on this build (requires Windows 11 24H2 or later)"
+    };
+    format!("closed loop: {state} (policy.closed_loop_enabled)\nbuild gate:  {build}")
+}
+
+/// M1.14 — fetch live policy, flip `closed_loop_enabled`, commit via
+/// SetPolicy. The service persists through its atomic-rename +
+/// ACL-respecting save path; nothing here touches policy.json
+/// directly.
+#[cfg(windows)]
+async fn closed_loop_set(enabled: bool) -> Result<()> {
+    let mut policy = fetch_live_policy().await?;
+    let changed = set_closed_loop_enabled(&mut policy, enabled);
+    send_simple(Request::SetPolicy { policy }).await?;
+    let state = if enabled { "enabled" } else { "disabled" };
+    if changed {
+        println!("closed loop {state}");
+        println!("  restart the service (`framesage stop && framesage start`) for the change to take effect");
+    } else {
+        println!("closed loop already {state} (no change)");
+    }
+    Ok(())
+}
+
+#[cfg(not(windows))]
+async fn closed_loop_set(_enabled: bool) -> Result<()> {
+    Err(anyhow!("closed-loop verbs are Windows-only"))
+}
+
+#[cfg(windows)]
+async fn closed_loop_status() -> Result<()> {
+    let snapshot = fetch_status_snapshot().await?;
+    println!(
+        "{}",
+        describe_closed_loop(
+            snapshot.policy.closed_loop_enabled,
+            snapshot.closed_loop_build_supported
+        )
+    );
+    Ok(())
+}
+
+#[cfg(not(windows))]
+async fn closed_loop_status() -> Result<()> {
+    Err(anyhow!("closed-loop verbs are Windows-only"))
 }
 
 /// Item 4.3 — export the live policy via Status, write as
@@ -310,6 +400,14 @@ async fn policy_add_rule(_exe: &str, _profile: &str) -> Result<()> {
 /// `policy add-rule`.
 #[cfg(windows)]
 async fn fetch_live_policy() -> Result<framesage_core::Policy> {
+    Ok(fetch_status_snapshot().await?.policy)
+}
+
+/// Pull the full StatusSnapshot off the running service. Shared by
+/// `fetch_live_policy` and `closed-loop status` (which also needs
+/// the `closed_loop_build_supported` gate bit).
+#[cfg(windows)]
+async fn fetch_status_snapshot() -> Result<StatusSnapshot> {
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
     let stream = open_pipe(Request::Status.target_pipe()).await?;
     let (read_half, mut write_half) = tokio::io::split(stream);
@@ -323,7 +421,7 @@ async fn fetch_live_policy() -> Result<framesage_core::Policy> {
     };
     let resp: Response = serde_json::from_str(&resp_line)?;
     match resp {
-        Response::Status(s) => Ok(s.policy.clone()),
+        Response::Status(s) => Ok(*s),
         Response::Error { message } => Err(anyhow!(message)),
         other => Err(anyhow!("expected Status response, got {other:?}")),
     }
@@ -1216,5 +1314,53 @@ fn print_status_snapshot(s: &StatusSnapshot) {
     match &s.active_profile {
         Some(p) => println!("active profile: {} ({})", p.id, p.description),
         None => println!("active profile: <none>"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // M1.14 happy path — `closed-loop on` sets the field and read-back
+    // confirms; a second application is a no-op reported as unchanged.
+    #[test]
+    fn set_closed_loop_enabled_mutates_and_reports_change() {
+        let mut policy = framesage_core::Policy::default();
+        assert!(!policy.closed_loop_enabled, "default must be off in v0.7");
+
+        assert!(set_closed_loop_enabled(&mut policy, true));
+        assert!(policy.closed_loop_enabled);
+
+        // Idempotent re-apply: value stays, but reported as unchanged.
+        assert!(!set_closed_loop_enabled(&mut policy, true));
+        assert!(policy.closed_loop_enabled);
+
+        assert!(set_closed_loop_enabled(&mut policy, false));
+        assert!(!policy.closed_loop_enabled);
+    }
+
+    // M1.14 — the toggled policy survives the same JSON round-trip the
+    // SetPolicy path performs, so the persisted file reflects the verb.
+    #[test]
+    fn closed_loop_toggle_survives_policy_serde_round_trip() {
+        let mut policy = framesage_core::Policy::default();
+        set_closed_loop_enabled(&mut policy, true);
+        let json = serde_json::to_string(&policy).expect("serialize policy");
+        let back: framesage_core::Policy = serde_json::from_str(&json).expect("parse policy");
+        assert!(back.closed_loop_enabled);
+    }
+
+    // M1.14 degraded path — status output must call out an unsupported
+    // build explicitly instead of implying the toggle will work.
+    #[test]
+    fn describe_closed_loop_covers_all_states() {
+        let s = describe_closed_loop(true, true);
+        assert!(s.contains("enabled"));
+        assert!(s.contains("supported on this build"));
+
+        let s = describe_closed_loop(false, false);
+        assert!(s.contains("disabled"));
+        assert!(s.contains("NOT supported on this build"));
+        assert!(s.contains("Windows 11 24H2"));
     }
 }

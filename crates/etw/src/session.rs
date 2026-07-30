@@ -619,7 +619,28 @@ mod windows_impl {
         Running(EtwSession<S>),
         /// Session not instantiated. Variant carries the reason so the
         /// service can surface it in logs and (Group C) the UI banner.
+        ///
+        /// Retry policy (M2.3 / A-002): use [`EtwSubsystem::is_retryable`]
+        /// instead of matching the inner [`DegradationMode`] — the mode
+        /// itself owns the start-time retry classification via
+        /// [`DegradationMode::is_start_retryable`].
         Disabled(DegradationMode),
+    }
+
+    impl<S: EtwSysCalls> EtwSubsystem<S> {
+        /// M2.3 / A-002 — can a later `EtwSession::start()` attempt
+        /// succeed without operator/host change?
+        ///
+        /// `Running` returns `false` (there is nothing to retry);
+        /// `Disabled(mode)` defers to
+        /// [`DegradationMode::is_start_retryable`] so callers never
+        /// need to match the inner mode to pick a retry policy.
+        pub fn is_retryable(&self) -> bool {
+            match self {
+                EtwSubsystem::Running(_) => false,
+                EtwSubsystem::Disabled(mode) => mode.is_start_retryable(),
+            }
+        }
     }
 
     // ─── EtwSession (now generic over S) ─────────────────────────────────────
@@ -969,25 +990,9 @@ mod windows_impl {
             };
 
             // Best-effort STOP. We're in Drop — cannot panic, cannot
-            // bail. Log at warn on unexpected errors so leaks are
-            // visible in tracing output with a remediation hint.
-            match stop_session(&syscalls, &self.session_name) {
-                Ok(()) => {
-                    tracing::info!(
-                        session = %self.session_name,
-                        "EtwSession::drop: session stopped (fallback path)"
-                    );
-                }
-                Err(e) => {
-                    tracing::warn!(
-                        session = %self.session_name,
-                        error = %e,
-                        "EtwSession::drop: ControlTraceW(STOP) failed; session may be leaked. \
-                         Run `logman stop \"{session_name}\" -ets` (elevated) to clean up.",
-                        session_name = self.session_name,
-                    );
-                }
-            }
+            // bail. Shared with SessionShutdownHandle's Drop (M3.3 /
+            // A-007): both fallback paths run the same stop + log core.
+            drop_stop_session_core(&syscalls, &self.session_name, "EtwSession::drop");
 
             // Join the consumer thread so we don't return from Drop
             // while the kernel callback is still running (UAF risk if
@@ -1158,28 +1163,41 @@ mod windows_impl {
             let session_name = String::from_utf16_lossy(
                 &self.session_name[..self.session_name.len().saturating_sub(1)],
             );
-            match stop_session(&syscalls, &session_name) {
-                Ok(()) => {
-                    tracing::info!(
-                        session = %session_name,
-                        "SessionShutdownHandle::drop: session stopped (fallback path)"
-                    );
-                }
-                Err(e) => {
-                    tracing::warn!(
-                        session = %session_name,
-                        error = %e,
-                        "SessionShutdownHandle::drop: ControlTraceW(STOP) failed; session may be leaked. \
-                         Run `logman stop \"{session_name}\" -ets` (elevated) to clean up.",
-                        session_name = session_name,
-                    );
-                }
-            }
+            drop_stop_session_core(&syscalls, &session_name, "SessionShutdownHandle::drop");
             let _ = self.session_handle;
         }
     }
 
     // ─── Helpers — now generic over the syscalls trait ───────────────────────
+
+    /// M3.3 / A-007 — the shared best-effort stop core for the two Drop
+    /// fallback paths (`EtwSession` and `SessionShutdownHandle`). Runs
+    /// only on the leak path — explicit `stop()` / `shutdown()` /
+    /// decomposition takes `syscalls` first, making the Drops no-ops.
+    /// Must not panic (we're inside Drop); unexpected errors are logged
+    /// at warn with the manual `logman` remediation hint so leaks are
+    /// visible in tracing output.
+    fn drop_stop_session_core<S: EtwSysCalls>(syscalls: &S, session_name: &str, context: &str) {
+        match stop_session(syscalls, session_name) {
+            Ok(()) => {
+                tracing::info!(
+                    session = %session_name,
+                    context,
+                    "session stopped (Drop fallback path)"
+                );
+            }
+            Err(e) => {
+                tracing::warn!(
+                    session = %session_name,
+                    context,
+                    error = %e,
+                    "ControlTraceW(STOP) failed in Drop; session may be leaked. \
+                     Run `logman stop \"{session_name}\" -ets` (elevated) to clean up.",
+                    session_name = session_name,
+                );
+            }
+        }
+    }
 
     fn cleanup_stale_session<S: EtwSysCalls>(syscalls: &S, session_name: &str) {
         let opts = SessionOptions {
@@ -1399,6 +1417,13 @@ mod windows_impl {
         Ok(())
     }
 
+    /// M3.3 / D-002 — ABI-stability contract: this function is handed
+    /// to the kernel via `EVENT_TRACE_LOGFILEW.EventRecordCallback` and
+    /// invoked by ETW with the C `system` ABI. Its signature must stay
+    /// exactly `unsafe extern "system" fn(*mut EVENT_RECORD)` — no
+    /// generics, no closures, no captured environment — and it must
+    /// never unwind across the FFI boundary (everything inside is
+    /// panic-free: null checks + one Relaxed atomic increment).
     unsafe extern "system" fn event_record_callback(event_record: *mut EVENT_RECORD) {
         if event_record.is_null() {
             return;
@@ -1412,6 +1437,11 @@ mod windows_impl {
         // SAFETY: ctx was set to Arc::as_ptr(&state) in consumer_loop;
         // state Arc lives for ProcessTrace's duration.
         let state = unsafe { &*ctx };
+        // M3.3 / D-004 — Relaxed is sufficient: events_seen is a
+        // monotonic statistics counter with no other memory that
+        // readers synchronize against. Readers (query_stats /
+        // MonitorHandle) tolerate an arbitrarily stale value; no
+        // acquire/release pairing buys them anything here.
         state.events_seen.fetch_add(1, Ordering::Relaxed);
     }
 

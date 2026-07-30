@@ -58,6 +58,39 @@ pub enum DegradationMode {
     BuildUnsupported { detected_build: Option<u32> },
 }
 
+impl DegradationMode {
+    /// M2.3 / A-002 — start-time retry policy for this mode.
+    ///
+    /// `true` means a later `EtwSession::start()` attempt may succeed
+    /// without any change to the host (the blocking condition is
+    /// transient or externally owned):
+    ///
+    /// * `AlreadyExists` — another consumer holds the session name;
+    ///   retry succeeds once it exits.
+    /// * `KernelDrops` / `OurDrops` — runtime data-loss modes that
+    ///   recover automatically on the next clean window; a session
+    ///   restart is always worth attempting.
+    ///
+    /// `false` means retrying without operator/host change is futile:
+    ///
+    /// * `AccessDenied` — EDR / policy block; retrying re-triggers the
+    ///   same denial (and may look like probing to the EDR).
+    /// * `BuildUnsupported` — the Windows build won't change under us.
+    /// * `ConsumerPanic` — per architecture §2.1 mode 5, the subsystem
+    ///   stays down for the service lifetime; a restart of the service
+    ///   (not a blind in-process retry) is the recovery path.
+    pub fn is_start_retryable(&self) -> bool {
+        match self {
+            DegradationMode::AlreadyExists
+            | DegradationMode::KernelDrops
+            | DegradationMode::OurDrops => true,
+            DegradationMode::AccessDenied
+            | DegradationMode::ConsumerPanic
+            | DegradationMode::BuildUnsupported { .. } => false,
+        }
+    }
+}
+
 /// Carries a `DegradationMode` to the consumer (production: a
 /// `tracing::error!` sink per v3 secondary decision Option C; tests:
 /// a captured-event-vec closure).
@@ -124,6 +157,25 @@ mod tests {
             detected_build: None,
         };
         assert_ne!(with, without);
+    }
+
+    // M2.3 / A-002 — the retry classification is load-bearing for the
+    // service's future retry loop; lock each variant's disposition.
+    #[test]
+    fn start_retry_policy_per_variant() {
+        assert!(DegradationMode::AlreadyExists.is_start_retryable());
+        assert!(DegradationMode::KernelDrops.is_start_retryable());
+        assert!(DegradationMode::OurDrops.is_start_retryable());
+        assert!(!DegradationMode::AccessDenied.is_start_retryable());
+        assert!(!DegradationMode::ConsumerPanic.is_start_retryable());
+        assert!(!DegradationMode::BuildUnsupported {
+            detected_build: Some(22631)
+        }
+        .is_start_retryable());
+        assert!(!DegradationMode::BuildUnsupported {
+            detected_build: None
+        }
+        .is_start_retryable());
     }
 
     #[test]

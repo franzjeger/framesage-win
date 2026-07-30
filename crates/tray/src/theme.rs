@@ -42,7 +42,7 @@ pub fn apply(ctx: &egui::Context) {
     visuals.override_text_color = Some(TEXT);
     visuals.panel_fill = BG;
     visuals.window_fill = SURFACE;
-    visuals.window_stroke = Stroke::new(1.0, BORDER);
+    visuals.window_stroke = Stroke::new(1.0_f32, BORDER);
     visuals.window_rounding = Rounding::same(6.0);
 
     visuals.extreme_bg_color = Color32::from_rgb(0x08, 0x0b, 0x10);
@@ -50,7 +50,7 @@ pub fn apply(ctx: &egui::Context) {
     visuals.code_bg_color = Color32::from_rgb(0x0a, 0x0e, 0x14);
 
     visuals.selection.bg_fill = Color32::from_rgba_premultiplied(0x58, 0xa6, 0xff, 0x55);
-    visuals.selection.stroke = Stroke::new(1.0, ACCENT);
+    visuals.selection.stroke = Stroke::new(1.0_f32, ACCENT);
 
     visuals.hyperlink_color = ACCENT;
     visuals.warn_fg_color = WARNING;
@@ -60,32 +60,32 @@ pub fn apply(ctx: &egui::Context) {
     let widgets = &mut visuals.widgets;
     widgets.noninteractive.bg_fill = SURFACE;
     widgets.noninteractive.weak_bg_fill = SURFACE;
-    widgets.noninteractive.bg_stroke = Stroke::new(1.0, BORDER);
-    widgets.noninteractive.fg_stroke = Stroke::new(1.0, TEXT);
+    widgets.noninteractive.bg_stroke = Stroke::new(1.0_f32, BORDER);
+    widgets.noninteractive.fg_stroke = Stroke::new(1.0_f32, TEXT);
     widgets.noninteractive.rounding = Rounding::same(4.0);
 
     widgets.inactive.bg_fill = SURFACE;
     widgets.inactive.weak_bg_fill = SURFACE;
-    widgets.inactive.bg_stroke = Stroke::new(1.0, BORDER);
-    widgets.inactive.fg_stroke = Stroke::new(1.0, TEXT);
+    widgets.inactive.bg_stroke = Stroke::new(1.0_f32, BORDER);
+    widgets.inactive.fg_stroke = Stroke::new(1.0_f32, TEXT);
     widgets.inactive.rounding = Rounding::same(4.0);
 
     widgets.hovered.bg_fill = SURFACE_HOVER;
     widgets.hovered.weak_bg_fill = SURFACE_HOVER;
-    widgets.hovered.bg_stroke = Stroke::new(1.0, ACCENT);
-    widgets.hovered.fg_stroke = Stroke::new(1.0, TEXT);
+    widgets.hovered.bg_stroke = Stroke::new(1.0_f32, ACCENT);
+    widgets.hovered.fg_stroke = Stroke::new(1.0_f32, TEXT);
     widgets.hovered.rounding = Rounding::same(4.0);
 
     widgets.active.bg_fill = SURFACE_ACTIVE;
     widgets.active.weak_bg_fill = SURFACE_ACTIVE;
-    widgets.active.bg_stroke = Stroke::new(1.0, ACCENT_HOVER);
-    widgets.active.fg_stroke = Stroke::new(1.5, TEXT);
+    widgets.active.bg_stroke = Stroke::new(1.0_f32, ACCENT_HOVER);
+    widgets.active.fg_stroke = Stroke::new(1.5_f32, TEXT);
     widgets.active.rounding = Rounding::same(4.0);
 
     widgets.open.bg_fill = SURFACE_ACTIVE;
     widgets.open.weak_bg_fill = SURFACE_ACTIVE;
-    widgets.open.bg_stroke = Stroke::new(1.0, BORDER);
-    widgets.open.fg_stroke = Stroke::new(1.0, TEXT);
+    widgets.open.bg_stroke = Stroke::new(1.0_f32, BORDER);
+    widgets.open.fg_stroke = Stroke::new(1.0_f32, TEXT);
     widgets.open.rounding = Rounding::same(4.0);
 
     ctx.set_visuals(visuals);
@@ -129,7 +129,7 @@ pub fn apply(ctx: &egui::Context) {
 pub fn card() -> egui::Frame {
     egui::Frame::none()
         .fill(SURFACE)
-        .stroke(Stroke::new(1.0, BORDER))
+        .stroke(Stroke::new(1.0_f32, BORDER))
         .rounding(Rounding::same(6.0))
         .inner_margin(egui::Margin::symmetric(14.0, 10.0))
 }
@@ -140,7 +140,7 @@ pub fn card() -> egui::Frame {
 pub fn hero() -> egui::Frame {
     egui::Frame::none()
         .fill(SURFACE_ACTIVE)
-        .stroke(Stroke::new(1.0, BORDER))
+        .stroke(Stroke::new(1.0_f32, BORDER))
         .rounding(Rounding::same(8.0))
         .inner_margin(egui::Margin::symmetric(16.0, 12.0))
 }
@@ -152,7 +152,7 @@ pub fn banner(color: Color32) -> egui::Frame {
     let bg = Color32::from_rgba_premultiplied(color.r(), color.g(), color.b(), 0x1f);
     egui::Frame::none()
         .fill(bg)
-        .stroke(Stroke::new(1.0, color))
+        .stroke(Stroke::new(1.0_f32, color))
         .rounding(Rounding::same(6.0))
         .inner_margin(egui::Margin::symmetric(12.0, 8.0))
 }
@@ -163,7 +163,7 @@ pub fn status_badge(color: Color32) -> egui::Frame {
     let bg = Color32::from_rgba_premultiplied(color.r(), color.g(), color.b(), 0x33);
     egui::Frame::none()
         .fill(bg)
-        .stroke(Stroke::new(1.0, color))
+        .stroke(Stroke::new(1.0_f32, color))
         .rounding(Rounding::same(10.0))
         .inner_margin(egui::Margin::symmetric(8.0, 2.0))
 }

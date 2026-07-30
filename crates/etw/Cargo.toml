@@ -47,6 +47,13 @@ windows = { workspace = true, features = [
     "Wdk_System_SystemServices",
 ] }
 
+[features]
+# M2.6 / H-004 — expose the build-gate test override seam to dependent
+# crates' test builds (framesage-service enables this from its
+# dev-dependencies). Production builds never enable it, so the seam
+# still compiles out of shipping binaries.
+test-override = []
+
 [dev-dependencies]
 # tracing-test provides #[traced_test] attribute + logs_contain
 # assertion for the Mode 5 test in §4 Day 4. Per v3 secondary

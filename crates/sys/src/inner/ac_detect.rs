@@ -183,6 +183,32 @@ mod tests {
         let _ = presence.any_present();
     }
 
+    /// Issue #148 G3 — containment: every AC marker exe (except the
+    /// deliberately-excluded ESEA names — ESEA migrated to FACEIT AC
+    /// in 2023) must be on the gamemode process denylist. The marker
+    /// list and the denylist are two hand-maintained records of the
+    /// same fact ("this exe hosts / talks to a kernel AC driver");
+    /// this test catches the drift-class that produced #148 G2, where
+    /// nine marker names were absent from the denylist and ProBalance
+    /// / profile applies could perturb the vgk.sys / BEDaisy.sys
+    /// hosts.
+    #[test]
+    fn every_ac_marker_exe_is_on_the_process_denylist() {
+        use framesage_gamemode::safe_list::{ProcessVerdict, SafeList};
+        let safe_list = SafeList::bundled();
+        for (marker, exe) in AC_PROCESS_MARKERS {
+            if matches!(marker, AcMarker::Esea) {
+                continue; // deliberate exclusion per #148 out-of-scope note
+            }
+            assert!(
+                matches!(safe_list.check_process(exe), ProcessVerdict::Denied(_)),
+                "AC marker exe {exe} is not on the gamemode process denylist — \
+                 add it to safe_lists/processes.json + KERNEL_CRITICAL_PROCESSES \
+                 (see issue #148 G2/G3)"
+            );
+        }
+    }
+
     /// AC_PROCESS_MARKERS covers every variant of `AcMarker` EXCEPT
     /// Javelin. Catches the bug-class where someone adds a new
     /// variant (e.g., a new AC vendor) but forgets to wire the

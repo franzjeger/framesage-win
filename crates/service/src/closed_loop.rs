@@ -30,73 +30,15 @@ use framesage_etw::{
 };
 use tracing::{error, info, warn};
 
-// ─── Test-only build-gate override seam (Step 11 finding #11.1) ──────────────
-//
-// Per Step 11 batch finding: the `build_gate_fallthrough_emits_structured_build_unsupported_event`
-// test on elevated Win11 24H2+ falls through the BuildUnsupported branch
-// (host build passes) and reaches `EtwSession::start()` -> `spawn_closed_loop_tasks`
-// -> `tokio::spawn`, panicking outside a tokio runtime. Solution: same
-// thread_local override pattern as `framesage-etw`'s `build_gate` module
-// (per Day 1's S-A1 inline-tests resolution), but composed at the
-// framesage-service layer so the test doesn't need cross-crate `pub(crate)`
-// visibility into framesage-etw's internals.
-//
-// Production builds compile this seam out entirely (the `#[cfg(test)]`
-// blocks inside the wrappers below collapse to nothing in release).
-
+// M2.6 / H-004 — the build-gate test override seam lives solely in
+// `framesage_etw::build_gate`. Service-side tests reach it through the
+// `test-override` cargo feature enabled from this crate's
+// dev-dependencies (Cargo feature unification applies it to test
+// builds only; production binaries compile the seam out). The
+// service-local thread_local duplicate that used to sit here is gone —
+// one seam, one place.
 #[cfg(test)]
-thread_local! {
-    /// Per-test override.
-    /// `Some(Ok(build))`  -> wrappers treat the host as that build.
-    /// `Some(Err(()))`    -> wrappers treat the build probe as failed.
-    /// `None`             -> wrappers fall through to framesage_etw::build_gate.
-    static CLOSED_LOOP_BUILD_OVERRIDE: std::cell::RefCell<Option<Result<u32, ()>>> =
-        const { std::cell::RefCell::new(None) };
-}
-
-/// RAII guard: resets the per-thread override on Drop so a panicking
-/// test can't leak its override into the next test on the same thread.
-#[cfg(test)]
-pub(crate) struct BuildOverrideGuard;
-#[cfg(test)]
-impl BuildOverrideGuard {
-    pub(crate) fn set(v: Option<Result<u32, ()>>) -> Self {
-        CLOSED_LOOP_BUILD_OVERRIDE.with(|c| *c.borrow_mut() = v);
-        Self
-    }
-}
-#[cfg(test)]
-impl Drop for BuildOverrideGuard {
-    fn drop(&mut self) {
-        CLOSED_LOOP_BUILD_OVERRIDE.with(|c| *c.borrow_mut() = None);
-    }
-}
-
-/// Wrapper around `framesage_etw::build_gate::closed_loop_enabled_for_this_build()`.
-/// In tests, consults the thread_local override first; in production,
-/// falls through to the real probe directly (zero overhead — the
-/// `#[cfg(test)]` block compiles out).
-fn build_gate_pass() -> bool {
-    #[cfg(test)]
-    {
-        if let Some(v) = CLOSED_LOOP_BUILD_OVERRIDE.with(|c| *c.borrow()) {
-            return matches!(v, Ok(b) if b >= build_gate::MIN_BUILD_FOR_CLOSED_LOOP);
-        }
-    }
-    build_gate::closed_loop_enabled_for_this_build()
-}
-
-/// Wrapper around `framesage_etw::build_gate::detected_build()`. Same
-/// override pattern as `build_gate_pass`.
-fn build_gate_detected_build() -> Option<u32> {
-    #[cfg(test)]
-    {
-        if let Some(v) = CLOSED_LOOP_BUILD_OVERRIDE.with(|c| *c.borrow()) {
-            return v.ok();
-        }
-    }
-    build_gate::detected_build()
-}
+use build_gate::BuildOverrideGuard;
 
 /// Result of evaluating + (conditionally) starting the closed-loop
 /// subsystem at service startup. The variants are mutually exclusive
@@ -146,8 +88,8 @@ pub fn start_closed_loop_if_enabled(policy: &Policy) -> ClosedLoopStartup {
         return ClosedLoopStartup::OptedOut;
     }
 
-    if !build_gate_pass() {
-        let detected = build_gate_detected_build();
+    if !build_gate::closed_loop_enabled_for_this_build() {
+        let detected = build_gate::detected_build();
         info!(
             reason = "build_unsupported",
             detected_build = ?detected,
@@ -228,6 +170,13 @@ fn spawn_closed_loop_tasks(session: EtwSession) {
     // MonitorHandle::poll_drop_stats. Self-terminates when the
     // session is gone (query_session_stats fails). The on_event sink
     // is the same shape as the supervisor's — tracing::error! emission.
+    //
+    // M3.3 / G-001 — poll_drop_stats runs a blocking ControlTraceW
+    // (QUERY) syscall directly on the async executor. At the current
+    // 1 Hz cadence the sub-millisecond call is harmless; if the poll
+    // rate is ever increased (or the query observed slow under load),
+    // wrap the call in tokio::task::spawn_blocking so it can't stall
+    // the runtime's worker threads.
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(Duration::from_secs(1));
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);

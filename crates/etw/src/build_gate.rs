@@ -32,7 +32,7 @@ pub const MIN_BUILD_FOR_CLOSED_LOOP: u32 = 26100;
 /// Outer `None`        = probe hasn't been called yet.
 static CACHED_BUILD: OnceLock<Option<u32>> = OnceLock::new();
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-override"))]
 thread_local! {
     /// Per-test override.
     /// `Some(Ok(build))`  → `detected_build()` returns `Some(build)`.
@@ -49,25 +49,25 @@ thread_local! {
 /// Test-only seam. Tests should prefer `BuildOverrideGuard::set(...)`
 /// so a panic mid-test doesn't poison subsequent tests on the same
 /// thread.
-#[cfg(test)]
-pub(crate) fn set_build_override(v: Option<Result<u32, ()>>) {
+#[cfg(any(test, feature = "test-override"))]
+pub fn set_build_override(v: Option<Result<u32, ()>>) {
     BUILD_OVERRIDE.with(|cell| *cell.borrow_mut() = v);
 }
 
 /// RAII override: resets the per-thread override on Drop so a panicking
 /// test can't leak its override into the next test on the same thread.
-#[cfg(test)]
-pub(crate) struct BuildOverrideGuard;
+#[cfg(any(test, feature = "test-override"))]
+pub struct BuildOverrideGuard;
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-override"))]
 impl BuildOverrideGuard {
-    pub(crate) fn set(v: Option<Result<u32, ()>>) -> Self {
+    pub fn set(v: Option<Result<u32, ()>>) -> Self {
         set_build_override(v);
         Self
     }
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-override"))]
 impl Drop for BuildOverrideGuard {
     fn drop(&mut self) {
         set_build_override(None);
@@ -84,7 +84,7 @@ pub fn closed_loop_enabled_for_this_build() -> bool {
 /// (extremely unusual; logged at INFO on first probe). Repeated calls
 /// are free — the result is cached in `CACHED_BUILD`.
 pub fn detected_build() -> Option<u32> {
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-override"))]
     {
         if let Some(override_val) = BUILD_OVERRIDE.with(|cell| *cell.borrow()) {
             return override_val.ok();

@@ -878,7 +878,7 @@ impl eframe::App for FramesageApp {
                 egui::Frame::none()
                     .fill(theme::SURFACE)
                     .inner_margin(egui::Margin::symmetric(8.0, 4.0))
-                    .stroke(egui::Stroke::new(1.0, theme::BORDER)),
+                    .stroke(egui::Stroke::new(1.0_f32, theme::BORDER)),
             )
             .show(ctx, |ui| {
                 self.render_menubar(ui, connected, paused);
@@ -894,7 +894,7 @@ impl eframe::App for FramesageApp {
                 egui::Frame::none()
                     .fill(theme::BG)
                     .inner_margin(egui::Margin::symmetric(8.0, 4.0))
-                    .stroke(egui::Stroke::new(1.0, theme::BORDER)),
+                    .stroke(egui::Stroke::new(1.0_f32, theme::BORDER)),
             )
             .show(ctx, |ui| {
                 self.render_toolbar(ui, paused, manual_override.is_some());
@@ -913,7 +913,7 @@ impl eframe::App for FramesageApp {
                         top: 0.0,
                         bottom: 0.0,
                     })
-                    .stroke(egui::Stroke::new(1.0, theme::BORDER)),
+                    .stroke(egui::Stroke::new(1.0_f32, theme::BORDER)),
             )
             .show(ctx, |ui| {
                 self.render_tab_strip(ui);
@@ -942,7 +942,7 @@ impl eframe::App for FramesageApp {
                 egui::Frame::none()
                     .fill(theme::SURFACE)
                     .inner_margin(egui::Margin::symmetric(10.0, 3.0))
-                    .stroke(egui::Stroke::new(1.0, theme::BORDER)),
+                    .stroke(egui::Stroke::new(1.0_f32, theme::BORDER)),
             )
             .show(ctx, |ui| {
                 render_status_bar(
@@ -3436,7 +3436,7 @@ impl FramesageApp {
                                 egui::RichText::new("Apply to foreground").strong(),
                             )
                             .fill(theme::ACCENT)
-                            .stroke(egui::Stroke::new(1.0, theme::ACCENT_HOVER));
+                            .stroke(egui::Stroke::new(1.0_f32, theme::ACCENT_HOVER));
                             if ui
                                 .add_enabled(apply_enabled, apply_btn)
                                 .on_hover_text(
@@ -4090,7 +4090,7 @@ impl FramesageApp {
                                         ui.painter().rect_stroke(
                                             rect,
                                             egui::Rounding::ZERO,
-                                            egui::Stroke::new(1.0, theme::ACCENT),
+                                            egui::Stroke::new(1.0_f32, theme::ACCENT),
                                         );
                                     }
                                     if resp.clicked() {
@@ -4122,7 +4122,7 @@ impl FramesageApp {
                                                 targets.len()
                                             ));
                                         } else {
-                                            ui.label(format!("{} (pid {})", &exe, pid));
+                                            ui.label(format!("{} (pid {})", exe, pid));
                                         }
                                         ui.separator();
                                         ui.menu_button("Set priority", |ui| {

@@ -150,6 +150,10 @@ pub struct Engine {
     clock: Arc<dyn Clock>,
 }
 
+// Several sampling-cache fields are only read inside `cfg(windows)`
+// code paths (list_process_snapshots etc.); non-Windows check builds
+// see them as never-read.
+#[cfg_attr(not(windows), allow(dead_code))]
 struct EngineState {
     policy: Policy,
     /// Item 2.3 / audit H-04. Topology is immutable after startup —
@@ -1944,7 +1948,7 @@ impl Engine {
         let mut s = self.state.write();
         self.reconcile(&mut s, foreground)?;
         Self::maybe_scan_background_locked(&mut s, self.safe_list, &self.events, self.sys.as_ref());
-        Self::maybe_reassert_persistent_locked(&mut s, self.sys.as_ref());
+        Self::maybe_reassert_persistent_locked(&mut s, self.safe_list, self.sys.as_ref());
         self.maybe_run_probalance_locked(&mut s);
         Ok(())
     }
@@ -2302,7 +2306,11 @@ impl Engine {
     /// Bounded by `PERSISTENT_REASSERT_INTERVAL` (2 s). Each sweep just calls
     /// the per-knob setters; no prev-state capture, no revert plan rewrite —
     /// the original `AppliedRecord` continues to describe what to undo.
-    fn maybe_reassert_persistent_locked(s: &mut EngineState, sys: &dyn framesage_sys::SysApi) {
+    fn maybe_reassert_persistent_locked(
+        s: &mut EngineState,
+        safe_list: &'static SafeList,
+        sys: &dyn framesage_sys::SysApi,
+    ) {
         let now = Instant::now();
         if let Some(last) = s.last_persistent_reassert {
             if now.duration_since(last) < PERSISTENT_REASSERT_INTERVAL {
@@ -2328,10 +2336,10 @@ impl Engine {
             })
             .collect();
 
-        if pids_to_reassert.is_empty() {
-            return;
-        }
-
+        // Issue #148 G1 follow-on: this used to `return` when empty,
+        // which silently skipped the standalone affinity-rule re-assert
+        // below for users with rules but no persistent profiles. Only
+        // skip the profile loop; the rule sweep runs regardless.
         let topology = s.topology.clone();
         let mut stale_pids: Vec<u32> = Vec::new();
         for (pid, expected_exe, profile) in pids_to_reassert {
@@ -2400,6 +2408,16 @@ impl Engine {
                     stale_rule_pids.push(pid);
                     continue;
                 };
+                // Issue #148 G1 — denylist gate. A rule that matches a
+                // protected exe (kernel-critical / AV / anti-cheat host)
+                // must never be re-asserted. Release the PID so the
+                // sweep doesn't retry every 2 s.
+                if check_process_modifiable(safe_list, &live_exe, "re-assert affinity rule")
+                    .is_err()
+                {
+                    stale_rule_pids.push(pid);
+                    continue;
+                }
                 let indices = topology.resolve(&rule.selector);
                 if indices.is_empty() {
                     continue;
@@ -2523,6 +2541,17 @@ impl Engine {
                     Ok(None) | Err(_) => continue,
                 };
                 if let Some(rule) = s.policy.affinity_rule_for(&live_exe) {
+                    // Issue #148 G1 — denylist gate. Without this, a
+                    // user-authored affinity rule naming a protected exe
+                    // (kernel-critical / AV / anti-cheat host) would be
+                    // pinned by the background scan with no safety check —
+                    // the one-off set_process_affinity path gates, so this
+                    // path must too.
+                    if check_process_modifiable(safe_list, &live_exe, "apply affinity rule")
+                        .is_err()
+                    {
+                        continue;
+                    }
                     rule_applies.push((
                         pid,
                         rule.selector.clone(),
@@ -4582,6 +4611,13 @@ mod tests {
         next_priority_class: std::sync::Mutex<Option<u32>>,
         /// Item 4.7 — scripted live affinity mask. Same semantics.
         next_affinity_mask: std::sync::Mutex<Option<u64>>,
+        /// Issue #148 G1 — scripted live PID list + exe names, and a
+        /// record of every set_affinity_mask_for_pid call, so the
+        /// background affinity-rule scan and re-assert sweep are
+        /// testable end-to-end.
+        live_pids: std::sync::Mutex<Vec<u32>>,
+        exe_by_pid: std::sync::Mutex<std::collections::HashMap<u32, String>>,
+        affinity_writes: std::sync::Mutex<Vec<(u32, u64)>>,
     }
 
     impl MockSysApi {
@@ -4593,7 +4629,17 @@ mod tests {
                 topology_calls: std::sync::atomic::AtomicUsize::new(0),
                 next_priority_class: std::sync::Mutex::new(None),
                 next_affinity_mask: std::sync::Mutex::new(None),
+                live_pids: std::sync::Mutex::new(Vec::new()),
+                exe_by_pid: std::sync::Mutex::new(std::collections::HashMap::new()),
+                affinity_writes: std::sync::Mutex::new(Vec::new()),
             }
+        }
+        fn add_live_process(&self, pid: u32, exe: &str) {
+            self.live_pids.lock().unwrap().push(pid);
+            self.exe_by_pid.lock().unwrap().insert(pid, exe.to_owned());
+        }
+        fn affinity_writes(&self) -> Vec<(u32, u64)> {
+            self.affinity_writes.lock().unwrap().clone()
         }
         fn set_ac(&self, p: framesage_core::AntiCheatPresence) {
             *self.next_ac.lock().unwrap() = p;
@@ -4628,7 +4674,7 @@ mod tests {
             Ok(self.next_topology.lock().unwrap().clone())
         }
         fn iter_pids(&self) -> Result<Vec<u32>> {
-            Ok(Vec::new())
+            Ok(self.live_pids.lock().unwrap().clone())
         }
         fn iter_pid_snapshots(&self) -> Result<Vec<framesage_sys::process::PidSnapshot>> {
             Ok(Vec::new())
@@ -4636,8 +4682,8 @@ mod tests {
         fn enumerate_processes(&self) -> Result<Vec<framesage_sys::sys_proc_info::SysProcInfo>> {
             Err(anyhow::anyhow!("mock: not supported"))
         }
-        fn exe_for_pid(&self, _pid: u32) -> Result<Option<String>> {
-            Ok(None)
+        fn exe_for_pid(&self, pid: u32) -> Result<Option<String>> {
+            Ok(self.exe_by_pid.lock().unwrap().get(&pid).cloned())
         }
         fn user_for_pid(&self, _pid: u32) -> Result<Option<String>> {
             Ok(None)
@@ -4696,7 +4742,8 @@ mod tests {
         fn restore_priority_class_for_pid(&self, _pid: u32, _raw_class: u32) -> Result<()> {
             Ok(())
         }
-        fn set_affinity_mask_for_pid(&self, _pid: u32, _mask: u64) -> Result<()> {
+        fn set_affinity_mask_for_pid(&self, pid: u32, mask: u64) -> Result<()> {
+            self.affinity_writes.lock().unwrap().push((pid, mask));
             Ok(())
         }
         fn trim_working_set_for_pid(&self, _pid: u32) -> Result<()> {
@@ -4772,6 +4819,131 @@ mod tests {
         });
         let rx = engine.subscribe();
         (engine, rx)
+    }
+
+    /// Issue #148 G1 — the background affinity-rule scan must consult
+    /// the denylist before pinning. A rule whose match lands on a
+    /// protected exe (here csrss.exe, kernel-critical) is skipped; a
+    /// rule on an ordinary exe still applies.
+    #[test]
+    fn background_affinity_rule_scan_gates_on_denylist() {
+        let sys = Arc::new(MockSysApi::new());
+        let clock = Arc::new(FakeClock::new());
+        let (engine, _rx) = engine_with_mocks(sys.clone(), clock);
+
+        sys.add_live_process(100, "csrss.exe");
+        sys.add_live_process(200, "notepad.exe");
+
+        {
+            let mut s = engine.state.write();
+            s.topology = Arc::new(four_cpu_topology());
+            s.policy.background_profile = Some(ProfileId("default".into()));
+            s.policy.affinity_rules = vec![
+                framesage_core::AffinityRule {
+                    exe_name: "csrss.exe".into(),
+                    selector: framesage_core::CpuSelector::All,
+                    note: String::new(),
+                },
+                framesage_core::AffinityRule {
+                    exe_name: "notepad.exe".into(),
+                    selector: framesage_core::CpuSelector::All,
+                    note: String::new(),
+                },
+            ];
+        }
+
+        {
+            let mut s = engine.state.write();
+            Engine::maybe_scan_background_locked(
+                &mut s,
+                engine.safe_list,
+                &engine.events,
+                sys.as_ref() as &dyn framesage_sys::SysApi,
+            );
+        }
+
+        let writes = sys.affinity_writes();
+        assert!(
+            writes.iter().all(|(pid, _)| *pid != 100),
+            "denylisted csrss.exe must never receive an affinity write; got {writes:?}"
+        );
+        assert!(
+            writes.iter().any(|(pid, _)| *pid == 200),
+            "unlisted notepad.exe must still be pinned; got {writes:?}"
+        );
+    }
+
+    /// Issue #148 G1 — the 2 s affinity re-assert sweep must gate the
+    /// same way, and must release a denylisted PID so it isn't
+    /// retried every sweep.
+    #[test]
+    fn affinity_reassert_sweep_gates_on_denylist_and_releases_pid() {
+        let sys = Arc::new(MockSysApi::new());
+        let clock = Arc::new(FakeClock::new());
+        let (engine, _rx) = engine_with_mocks(sys.clone(), clock);
+
+        sys.add_live_process(100, "csrss.exe");
+        sys.add_live_process(200, "notepad.exe");
+
+        {
+            let mut s = engine.state.write();
+            s.topology = Arc::new(four_cpu_topology());
+            s.policy.affinity_rules = vec![
+                framesage_core::AffinityRule {
+                    exe_name: "csrss.exe".into(),
+                    selector: framesage_core::CpuSelector::All,
+                    note: String::new(),
+                },
+                framesage_core::AffinityRule {
+                    exe_name: "notepad.exe".into(),
+                    selector: framesage_core::CpuSelector::All,
+                    note: String::new(),
+                },
+            ];
+            // Simulate both PIDs having been pinned before the gate
+            // existed (or via a stale policy).
+            s.affinity_rule_applied.insert(100);
+            s.affinity_rule_applied.insert(200);
+        }
+
+        {
+            let mut s = engine.state.write();
+            Engine::maybe_reassert_persistent_locked(
+                &mut s,
+                engine.safe_list,
+                sys.as_ref() as &dyn framesage_sys::SysApi,
+            );
+        }
+
+        let writes = sys.affinity_writes();
+        assert!(
+            writes.iter().all(|(pid, _)| *pid != 100),
+            "denylisted csrss.exe must never be re-asserted; got {writes:?}"
+        );
+        assert!(
+            writes.iter().any(|(pid, _)| *pid == 200),
+            "unlisted notepad.exe must still be re-asserted; got {writes:?}"
+        );
+        assert!(
+            !engine.state.read().affinity_rule_applied.contains(&100),
+            "denylisted PID must be released so the sweep doesn't retry it"
+        );
+    }
+
+    fn four_cpu_topology() -> CpuTopology {
+        CpuTopology {
+            cpus: (0..4)
+                .map(|i| framesage_core::LogicalCpu {
+                    index: i,
+                    physical_core: i / 2,
+                    ccd: 0,
+                    kind: framesage_core::CoreKind::Performance,
+                    cppc_rank: Some(100 - i),
+                    l3_cache_bytes: None,
+                    is_smt_sibling: i % 2 == 1,
+                })
+                .collect(),
+        }
     }
 
     /// First-ever AC probe fires (no `last_ac_probe` yet, so the

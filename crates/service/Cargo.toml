@@ -32,6 +32,10 @@ notify = { workspace = true }
 framesage-etw = { workspace = true }
 
 [dev-dependencies]
+# M2.6 / H-004 — enable framesage-etw's build-gate override seam for
+# service-side tests (single seam lives in framesage-etw::build_gate;
+# the service-local duplicate was removed).
+framesage-etw = { workspace = true, features = ["test-override"] }
 # tracing-test for the build-gate-fallthrough integration test
 # (asserts structured tracing event fields, not substring-matching
 # the formatted output, per Mode 5 / build-gate log structure
