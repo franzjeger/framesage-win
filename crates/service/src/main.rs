@@ -28,6 +28,7 @@ mod closed_loop;
 #[cfg(windows)]
 mod pipe;
 mod runtime;
+mod session_recorder;
 
 #[cfg(windows)]
 mod service_main {
