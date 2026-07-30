@@ -620,8 +620,9 @@ fn render_page_manual_hotkey(ui: &mut egui::Ui, next: &mut Option<NextAction>) {
     ui.add_space(8.0);
     ui.label(
         egui::RichText::new(
-            "For v0.6 the hotkey is fixed at Ctrl+Alt+G (default). Custom binding lives \
-             in the Settings tab — coming in v0.7.",
+            "A global hotkey (default Ctrl+Alt+G) is planned but not yet available — \
+             the hotkey-binding UI is a v0.7 stretch item. Until then, use the entry \
+             points below.",
         )
         .color(theme::TEXT_MUTED),
     );
