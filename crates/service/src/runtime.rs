@@ -104,7 +104,21 @@ pub async fn run(inputs: RuntimeInputs) -> Result<()> {
     // amendment (proposal/v0.7-arch-mode5-amendment PR #77), supervisor
     // exit is not a critical service failure. See closed_loop.rs's
     // module docstring for the ownership rationale.
-    let closed_loop_startup = crate::closed_loop::start_closed_loop_if_enabled(&policy);
+    // M1.2 / B-001 — start_closed_loop_if_enabled runs blocking work
+    // (cleanup_stale_session → StartTraceW → std::thread spawn), so
+    // park it on the blocking pool instead of a runtime worker thread.
+    // Harmless at startup, but it makes a future "restart on policy
+    // hot-reload flip" call site trivially correct. tokio::spawn
+    // inside the closure still works — spawn_blocking preserves the
+    // runtime context.
+    let closed_loop_policy = policy.clone();
+    let closed_loop_startup = tokio::task::spawn_blocking(move || {
+        crate::closed_loop::start_closed_loop_if_enabled(&closed_loop_policy)
+    })
+    .await
+    .unwrap_or_else(|join_err| crate::closed_loop::ClosedLoopStartup::StartupError {
+        message: format!("closed-loop startup task panicked: {join_err}"),
+    });
     info!(
         startup_result = ?closed_loop_startup,
         "closed-loop startup decision made"
