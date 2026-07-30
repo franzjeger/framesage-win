@@ -209,35 +209,39 @@ pub fn list_sessions(dir: &Path) -> Result<Vec<SessionListEntry>> {
             continue;
         }
         let file_bytes = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
-        let (events, _skipped) = match read_session(&path) {
-            Ok(r) => r,
+        // Only the first line (session_start) and last line
+        // (session_end) matter for the list row — a 50 MB session
+        // must not be read in full just to render one row.
+        let (first_line, last_line) = match read_first_and_last_lines(&path) {
+            Ok(pair) => pair,
             Err(_) => continue,
         };
-        let Some(SessionEvent::SessionStart {
+        let Ok(SessionEvent::SessionStart {
             session_id,
             game_exe,
             profile_id,
             started_at_unix_secs,
             ..
-        }) = events.first()
+        }) = serde_json::from_str::<SessionEvent>(&first_line)
         else {
             continue;
         };
-        let (duration_secs, partial_data) = match events.last() {
-            Some(SessionEvent::SessionEnd {
+        let (duration_secs, partial_data) = match serde_json::from_str::<SessionEvent>(&last_line) {
+            Ok(SessionEvent::SessionEnd {
                 partial_data,
                 summary,
                 ..
-            }) => (Some(summary.duration_secs), *partial_data),
-            // No session_end: crashed / in-progress session. Surface
-            // it as partial rather than hiding it.
+            }) => (Some(summary.duration_secs), partial_data),
+            // No parseable session_end on the last line: crashed /
+            // in-progress / torn-tail session. Surface it as partial
+            // rather than hiding it.
             _ => (None, true),
         };
         entries.push(SessionListEntry {
-            session_id: session_id.clone(),
-            game_exe: game_exe.clone(),
-            profile_id: profile_id.clone(),
-            started_at_unix_secs: *started_at_unix_secs,
+            session_id,
+            game_exe,
+            profile_id,
+            started_at_unix_secs,
             duration_secs,
             partial_data,
             file_bytes,
@@ -245,6 +249,48 @@ pub fn list_sessions(dir: &Path) -> Result<Vec<SessionListEntry>> {
     }
     entries.sort_by_key(|e| std::cmp::Reverse(e.started_at_unix_secs));
     Ok(entries)
+}
+
+/// Read the first line and the last non-empty line of a file without
+/// scanning the middle: the head is one BufRead line; the tail is
+/// found by seeking backwards in fixed-size chunks from EOF.
+fn read_first_and_last_lines(path: &Path) -> Result<(String, String)> {
+    use std::io::{Read as _, Seek, SeekFrom};
+    let mut file = File::open(path).with_context(|| format!("open session {}", path.display()))?;
+
+    let mut reader = BufReader::new(&mut file);
+    let mut first = String::new();
+    reader.read_line(&mut first)?;
+    let first = first.trim_end().to_string();
+
+    let len = file.seek(SeekFrom::End(0))?;
+    const CHUNK: u64 = 8 * 1024;
+    let mut tail: Vec<u8> = Vec::new();
+    let mut pos = len;
+    let last = loop {
+        if pos == 0 {
+            break String::from_utf8_lossy(&tail).trim().to_string();
+        }
+        let read_from = pos.saturating_sub(CHUNK);
+        let mut chunk = vec![0u8; (pos - read_from) as usize];
+        file.seek(SeekFrom::Start(read_from))?;
+        file.read_exact(&mut chunk)?;
+        chunk.extend_from_slice(&tail);
+        tail = chunk;
+        pos = read_from;
+        // Trim trailing newlines, then look for the previous one.
+        let trimmed_len = tail
+            .iter()
+            .rposition(|&b| b != b'\n' && b != b'\r')
+            .map(|i| i + 1)
+            .unwrap_or(0);
+        if let Some(nl) = tail[..trimmed_len].iter().rposition(|&b| b == b'\n') {
+            break String::from_utf8_lossy(&tail[nl + 1..trimmed_len])
+                .trim()
+                .to_string();
+        }
+    };
+    Ok((first, last))
 }
 
 /// §2.3 total-cap cleanup: while the directory exceeds
@@ -445,6 +491,35 @@ mod tests {
         assert_eq!(list[1].session_id, "old");
         assert!(!list[1].partial_data);
         assert_eq!(list[1].duration_secs, Some(5));
+    }
+
+    // #9 optimization — the tail-seek must cross chunk boundaries
+    // correctly when the file (and its final line) exceed one 8 KiB
+    // chunk.
+    #[test]
+    fn list_sessions_handles_files_larger_than_one_tail_chunk() {
+        let dir = tempfile::tempdir().unwrap();
+        let start = synthetic_session_start("big", "big.exe", "p");
+        let mut w = SessionWriter::create(dir.path(), "big", &start).unwrap();
+        for i in 0..2000u64 {
+            w.append(&SessionEvent::FrameSample {
+                schema_version: SCHEMA_VERSION,
+                at_ms: i * 1000,
+                frame_count: 60,
+                frame_time_us_p50: 16_000,
+                frame_time_us_p99: 22_000,
+                frames_dropped: 0,
+            })
+            .unwrap();
+        }
+        w.finish(&end_event(2_000_000, false)).unwrap();
+
+        let list = list_sessions(dir.path()).unwrap();
+        assert_eq!(list.len(), 1);
+        assert_eq!(list[0].session_id, "big");
+        assert_eq!(list[0].duration_secs, Some(2000));
+        assert!(!list[0].partial_data);
+        assert!(list[0].file_bytes > 8 * 1024);
     }
 
     #[test]
