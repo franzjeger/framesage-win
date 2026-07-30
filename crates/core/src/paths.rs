@@ -101,6 +101,20 @@ pub fn activity_log_path() -> PathBuf {
     user_data_dir().join(ACTIVITY_LOG_FILE_NAME)
 }
 
+/// v0.7.1 Group B (#111, architecture §2.2) — the bundled
+/// `PresentMon.exe` (Intel's MIT-licensed frame-timing tool). The
+/// installer ships it next to `framesage-svc.exe`, so we resolve it
+/// relative to the running service binary rather than a fixed path;
+/// that keeps a portable/dev layout working and avoids a hard-coded
+/// `C:\Program Files\...`. Returns `None` if the exe dir can't be
+/// determined; callers treat absence as "PresentMon unavailable" and
+/// record honest `presentmon_state: "disabled"`.
+pub fn presentmon_exe_path() -> Option<PathBuf> {
+    let exe = std::env::current_exe().ok()?;
+    let dir = exe.parent()?;
+    Some(dir.join("PresentMon.exe"))
+}
+
 /// Item 4.1 — marker file written when the user completes the
 /// first-run onboarding wizard. Presence of the file gates the
 /// modal: if it exists, skip onboarding. If it doesn't exist (fresh

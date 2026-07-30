@@ -143,12 +143,38 @@ pub async fn run(inputs: RuntimeInputs) -> Result<()> {
     // loop launches.
     engine.recover_orphan_journal();
 
+    // #111 — PresentMon frame source. The manager spawns a real
+    // PresentMon.exe against the foreground game while a closed-loop
+    // session is active and forwards 1 Hz frame_sample buckets into the
+    // recorder over this mpsc channel. It reports whether PresentMon.exe
+    // is even present on disk, which becomes the recorder's honest
+    // presentmon_state capability. Not in the watchdog select! either.
+    let (frame_tx, frame_rx) = tokio::sync::mpsc::channel::<framesage_presentmon::FrameStats>(64);
+    let (presentmon_available, _presentmon_mgr) =
+        crate::presentmon::spawn(engine.clone(), frame_tx);
+
+    // Honest capability stamp for every session_start: ETW is active when
+    // the closed-loop drain actually started; PresentMon is active when a
+    // real PresentMon.exe is available to attach.
+    let caps = crate::session_recorder::SessionCapabilities {
+        etw_active: matches!(
+            closed_loop_startup,
+            crate::closed_loop::ClosedLoopStartup::Running
+        ),
+        presentmon_active: presentmon_available,
+    };
+
     // #110 drain worker — records Game Mode sessions to the sessions
     // dir when policy.closed_loop_enabled is on. Not in the watchdog
     // select! below: recorder death must never take the rule engine
     // down (same contract as the closed-loop tasks).
-    let _session_recorder =
-        crate::session_recorder::spawn(engine.clone(), paths::sessions_dir(), kernel_signal_rx);
+    let _session_recorder = crate::session_recorder::spawn(
+        engine.clone(),
+        paths::sessions_dir(),
+        kernel_signal_rx,
+        frame_rx,
+        caps,
+    );
 
     let tick_engine = engine.clone();
     let mut tick_handle = tokio::spawn(async move {

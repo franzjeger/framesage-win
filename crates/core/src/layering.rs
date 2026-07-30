@@ -80,6 +80,7 @@ const ALLOWED_EDGES: &[(&str, &[&str])] = &[
             "framesage-etw",
             "framesage-gamemode",
             "framesage-ipc",
+            "framesage-presentmon",
             "framesage-recorder",
             "framesage-sys",
         ],

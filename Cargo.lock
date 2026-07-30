@@ -1045,6 +1045,7 @@ dependencies = [
  "framesage-etw",
  "framesage-gamemode",
  "framesage-ipc",
+ "framesage-presentmon",
  "framesage-recorder",
  "framesage-sys",
  "notify",
