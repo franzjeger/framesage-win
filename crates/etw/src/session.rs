@@ -608,6 +608,36 @@ mod windows_impl {
     #[derive(Debug)]
     pub struct ConsumerState {
         pub events_seen: AtomicU64,
+        /// Group A drain — per-[`crate::classify::KernelEventKind`]
+        /// cumulative counts, indexed by `kind as usize`. Incremented
+        /// by the kernel callback (Relaxed, same monotonic-statistics
+        /// rationale as `events_seen`); snapshotted at 1 Hz by the
+        /// drop-poll task for the §2.3 kernel_signal detector.
+        pub kernel_counts: [AtomicU64; crate::classify::KERNEL_EVENT_KINDS],
+    }
+
+    impl ConsumerState {
+        pub fn new() -> Self {
+            Self {
+                events_seen: AtomicU64::new(0),
+                kernel_counts: Default::default(),
+            }
+        }
+
+        /// Snapshot the cumulative per-kind counts for the detector.
+        pub fn kernel_counts_snapshot(&self) -> [u64; crate::classify::KERNEL_EVENT_KINDS] {
+            let mut out = [0u64; crate::classify::KERNEL_EVENT_KINDS];
+            for (slot, counter) in out.iter_mut().zip(self.kernel_counts.iter()) {
+                *slot = counter.load(Ordering::Relaxed);
+            }
+            out
+        }
+    }
+
+    impl Default for ConsumerState {
+        fn default() -> Self {
+            Self::new()
+        }
     }
 
     // ─── EtwSubsystem return type (per plan §3.2) ────────────────────────────
@@ -787,6 +817,7 @@ mod windows_impl {
             // ─── Spawn consumer thread w/ catch_unwind + oneshot ─────────────
             let state = Arc::new(ConsumerState {
                 events_seen: AtomicU64::new(0),
+                kernel_counts: Default::default(),
             });
             let consumer_state = Arc::clone(&state);
             let consumer_syscalls = syscalls.clone();
@@ -1101,6 +1132,22 @@ mod windows_impl {
             }
             Ok(stats)
         }
+
+        /// Group A drain — run the §2.3 kernel_signal detector against
+        /// the consumer's per-kind counters. Called from the same 1 Hz
+        /// drop-poll task as `poll_drop_stats`; `second_index` is the
+        /// tick number since session start. Returns the signals that
+        /// fire this second (empty after teardown).
+        pub fn poll_kernel_signals(
+            &self,
+            detector: &mut crate::signal::KernelSignalDetector,
+            second_index: u64,
+        ) -> Vec<crate::signal::KernelSignal> {
+            if self.torn_down.load(Ordering::Acquire) {
+                return Vec::new();
+            }
+            detector.tick(second_index, &self.state.kernel_counts_snapshot())
+        }
     }
 
     // M1.5 / C-002 — teardown-flag semantics. Constructed directly
@@ -1116,9 +1163,7 @@ mod windows_impl {
             let monitor: MonitorHandle<MockEtwSysCalls> = MonitorHandle {
                 syscalls: MockEtwSysCalls::new(),
                 session_name: "test-session".into(),
-                state: Arc::new(ConsumerState {
-                    events_seen: AtomicU64::new(0),
-                }),
+                state: Arc::new(ConsumerState::new()),
                 torn_down: Arc::clone(&torn),
             };
             torn.store(true, std::sync::atomic::Ordering::Release);
@@ -1520,6 +1565,22 @@ mod windows_impl {
         // MonitorHandle) tolerate an arbitrarily stale value; no
         // acquire/release pairing buys them anything here.
         state.events_seen.fetch_add(1, Ordering::Relaxed);
+
+        // Group A drain — classify the record into the five §2.3
+        // kernel_signal families and bump the per-kind counter.
+        // Everything here stays panic-free (D-002 ABI contract): a
+        // table lookup + one Relaxed increment.
+        let provider = crate::classify::ProviderGuid {
+            data1: er.EventHeader.ProviderId.data1,
+            data2: er.EventHeader.ProviderId.data2,
+            data3: er.EventHeader.ProviderId.data3,
+            data4: er.EventHeader.ProviderId.data4,
+        };
+        if let Some(kind) =
+            crate::classify::classify(&provider, er.EventHeader.EventDescriptor.Opcode)
+        {
+            state.kernel_counts[kind as usize].fetch_add(1, Ordering::Relaxed);
+        }
     }
 
     // (Entry 5 / Step 16 finding: the private `ERROR_ACCESS_DENIED()`
