@@ -228,7 +228,7 @@ pub fn list_sessions(dir: &Path) -> Result<Vec<SessionListEntry>> {
             file_bytes,
         });
     }
-    entries.sort_by(|a, b| b.started_at_unix_secs.cmp(&a.started_at_unix_secs));
+    entries.sort_by_key(|e| std::cmp::Reverse(e.started_at_unix_secs));
     Ok(entries)
 }
 
