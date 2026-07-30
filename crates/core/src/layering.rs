@@ -60,6 +60,12 @@ const ALLOWED_EDGES: &[(&str, &[&str])] = &[
     // + degradation types. Only `framesage-service` depends on it
     // (the service host spawns the supervisor task).
     ("framesage-etw", &[]),
+    // v0.7.1 Group C (issue #110): session recorder — on-disk jsonl
+    // schema + retention + the honest-attribution computation. Zero
+    // framesage deps by design so it stays platform-independent and
+    // testable everywhere; the service host (drain worker + IPC) and
+    // the tray (Sessions tab) will consume it.
+    ("framesage-recorder", &[]),
     // Only the service depends on engine (and on etw, added v0.7).
     (
         "framesage-service",

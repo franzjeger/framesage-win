@@ -1,0 +1,20 @@
+[package]
+name = "framesage-recorder"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "v0.7.1 Group C session recorder: on-disk session schema (jsonl), retention policy, and the honest-attribution computation (architecture §2.3 + §2.4)."
+
+[dependencies]
+anyhow = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+uuid = { workspace = true }
+
+[dev-dependencies]
+tempfile = "3"
