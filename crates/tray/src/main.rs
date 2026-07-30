@@ -1794,6 +1794,13 @@ impl FramesageApp {
                     .on_hover_text(hover)
                     .clicked()
                 {
+                    // #10 — refetch the session list on tab activate
+                    // (§2.4): drop the cache so render() re-issues
+                    // ListSessions. Cheap — the detail pane keeps its
+                    // selection.
+                    if t == Tab::Sessions && self.tab != Tab::Sessions {
+                        self.state.lock().sessions = None;
+                    }
                     self.tab = t;
                 }
             }
@@ -1846,6 +1853,16 @@ impl FramesageApp {
             }
             Some(crate::tabs::sessions::SessionsAction::OpenDetail(session_id)) => {
                 self.spawn_session_detail_fetch(session_id);
+            }
+            Some(crate::tabs::sessions::SessionsAction::OpenClosedLoopOptIn) => {
+                // #5 — reopen the onboarding wizard positioned on the
+                // closed-loop opt-in page so the EDR-implications
+                // disclosure is shown before the toggle flips. Finish
+                // commits the choice via the existing SetPolicy path.
+                self.onboarding = Some(crate::onboarding::OnboardingState {
+                    page: crate::onboarding::CLOSED_LOOP_PAGE,
+                    ..Default::default()
+                });
             }
             None => {}
         }

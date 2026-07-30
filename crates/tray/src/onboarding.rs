@@ -130,6 +130,12 @@ pub enum OnboardingResult {
     StillVisible,
 }
 
+/// Page index of the closed-loop opt-in page in the wizard's
+/// `render` dispatch (`match state.page`). Reused by the Sessions
+/// tab's "Enable…" button (#5) to reopen the wizard directly on the
+/// EDR-disclosure page.
+pub const CLOSED_LOOP_PAGE: u8 = 2;
+
 /// True when the onboarding marker doesn't exist yet — caller
 /// should show the wizard.
 pub fn should_show() -> bool {

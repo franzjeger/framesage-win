@@ -275,6 +275,10 @@ The session is journaled with a `manual_global` trigger tag, so the Status tab's
 
 A global **Ctrl+Alt+G** toggle for Manual Global Game Mode (same effect as the tray-menu toggle) is planned; the hotkey-binding UI is a v0.7 stretch item — see Roadmap. Until it lands, use the tray menu, the Status-tab Quick actions panel, or the CLI verbs above.
 
+## System requirements (closed-loop measurement)
+
+The static-rule engine (rules, Game Mode, ProBalance) supports Windows 10 22H2 and Windows 11. **Closed-loop measurement** — session recording and the "Did it help?" attribution UI — additionally requires **Windows 11 24H2 (build 26100) or later**. ETW kernel-event schemas are stable on builds we've empirically validated, and v0.7 ships with empirical validation only on Win11 24H2. Older builds may or may not work, and v0.7 won't claim measurement results it can't substantiate.
+
 ## Roadmap
 
 ### Shipped
