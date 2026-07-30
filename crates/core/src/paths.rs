@@ -51,6 +51,14 @@ pub fn policy_path() -> PathBuf {
     config_dir().join(POLICY_FILE_NAME)
 }
 
+/// v0.7.1 Group C (#110, architecture §2.3) — on-disk session
+/// recordings: `<config_dir>/sessions/<session-id>.jsonl`. Inherits
+/// the hardened config-dir DACL (Administrators + LocalSystem write;
+/// users read-only) because it's on-disk personal data.
+pub fn sessions_dir() -> PathBuf {
+    config_dir().join("sessions")
+}
+
 /// Item 2.9 / audit M-03. Per-user data directory — distinct from
 /// [`config_dir`] because the service hardens the latter's DACL to
 /// LocalSystem + Administrators (so an unprivileged tray running in

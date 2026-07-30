@@ -1005,6 +1005,7 @@ version = "0.5.0"
 dependencies = [
  "anyhow",
  "framesage-core",
+ "framesage-recorder",
  "serde",
  "serde_json",
  "thiserror 1.0.69",
@@ -1035,6 +1036,7 @@ dependencies = [
  "framesage-etw",
  "framesage-gamemode",
  "framesage-ipc",
+ "framesage-recorder",
  "framesage-sys",
  "notify",
  "serde_json",

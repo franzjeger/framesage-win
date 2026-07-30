@@ -36,6 +36,11 @@ use serde::{Deserialize, Serialize};
 use framesage_core::{AffinityRule, Policy, Profile, ProfileId};
 
 /// Status pipe — readable + writable by Authenticated Users for round-tripping
+/// Re-export so IPC clients (CLI, tray) can name the session types
+/// carried in [`Response::Sessions`] / [`Response::SessionDetail`]
+/// without taking their own `framesage-recorder` dependency edge.
+pub use framesage_recorder;
+
 /// status queries. The service rejects any non-read-only request received on
 /// this pipe regardless of caller identity.
 pub const PIPE_NAME_STATUS: &str = r"\\.\pipe\framesage-status";
@@ -185,6 +190,16 @@ pub enum Request {
     /// for the tray's discover-services view in the profile editor.
     /// Returns `Response::Services { services }`.
     ListServices,
+    /// v0.7.1 Group C (#110, architecture §2.4) — list stored
+    /// sessions for the Sessions tab, newest first, capped at
+    /// `limit`. Read-only; served from the sessions directory's
+    /// first/last jsonl lines.
+    ListSessions { limit: u32 },
+    /// v0.7.1 Group C (#110, architecture §2.4) — full event stream
+    /// for one session, for the detail view. `session_id` is
+    /// validated server-side against the UUID character set before
+    /// any path is touched.
+    ReadSession { session_id: String },
     /// Item 3.7 — manually trigger a CPU topology re-detection.
     /// The engine already refreshes topology automatically on
     /// `SystemEvent::Resume`, but power-plan tweaks (core parking,
@@ -209,7 +224,9 @@ impl Request {
             | Request::Subscribe
             | Request::ListProcesses
             | Request::ListServices
-            | Request::UndoLogList { .. } => true,
+            | Request::UndoLogList { .. }
+            | Request::ListSessions { .. }
+            | Request::ReadSession { .. } => true,
             Request::SetPolicy { .. }
             | Request::ApplyOnce { .. }
             | Request::SetManualOverride { .. }
@@ -272,6 +289,17 @@ pub enum Response {
     },
     /// Item 3.5 — result of `Request::UndoLogList`. Entries are
     /// ordered newest-first.
+    /// v0.7.1 Group C (#110) — Sessions-tab list rows.
+    Sessions {
+        sessions: Vec<framesage_recorder::SessionListEntry>,
+    },
+    /// v0.7.1 Group C (#110) — full event stream for one session.
+    /// `skipped_lines` counts malformed / unknown-kind lines the
+    /// reader tolerated (crash-torn tail, future schema additions).
+    SessionDetail {
+        events: Vec<framesage_recorder::SessionEvent>,
+        skipped_lines: u32,
+    },
     UndoLog {
         entries: Vec<framesage_core::UndoEntry>,
     },
@@ -703,6 +731,11 @@ mod tests {
             exe_name: String::new(),
             path: String::new(),
             title: String::new(),
+        }
+        .is_read_only());
+        assert!(Request::ListSessions { limit: 20 }.is_read_only());
+        assert!(Request::ReadSession {
+            session_id: "f47ac10b".into()
         }
         .is_read_only());
         assert!(!Request::ReportNoForeground.is_read_only());

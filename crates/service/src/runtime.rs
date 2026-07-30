@@ -814,6 +814,54 @@ async fn handle_client(
                 let entries = engine.undo_log_snapshot(limit as usize);
                 write_response(&mut write_half, &Response::UndoLog { entries }).await?;
             }
+            Request::ListSessions { limit } => {
+                // v0.7.1 Group C (#110) — Sessions-tab list. Directory
+                // enumeration + first/last-line parsing is cheap but
+                // still filesystem work; park it on the blocking pool
+                // so a large sessions dir can't stall the IPC worker.
+                let dir = paths::sessions_dir();
+                let result =
+                    tokio::task::spawn_blocking(move || framesage_recorder::list_sessions(&dir))
+                        .await;
+                let resp = match result {
+                    Ok(Ok(mut sessions)) => {
+                        sessions.truncate(limit.clamp(1, 500) as usize);
+                        Response::Sessions { sessions }
+                    }
+                    Ok(Err(e)) => Response::Error {
+                        message: format!("list sessions failed: {e:#}"),
+                    },
+                    Err(join_err) => Response::Error {
+                        message: format!("list sessions task failed: {join_err}"),
+                    },
+                };
+                write_response(&mut write_half, &resp).await?;
+            }
+            Request::ReadSession { session_id } => {
+                // v0.7.1 Group C (#110) — session detail. The id is
+                // client-supplied; session_file_path validates it
+                // against the UUID character set BEFORE any path is
+                // built (path-traversal trust boundary).
+                let dir = paths::sessions_dir();
+                let result = tokio::task::spawn_blocking(move || {
+                    let path = framesage_recorder::session_file_path(&dir, &session_id)?;
+                    framesage_recorder::read_session(&path)
+                })
+                .await;
+                let resp = match result {
+                    Ok(Ok((events, skipped))) => Response::SessionDetail {
+                        events,
+                        skipped_lines: skipped as u32,
+                    },
+                    Ok(Err(e)) => Response::Error {
+                        message: format!("read session failed: {e:#}"),
+                    },
+                    Err(join_err) => Response::Error {
+                        message: format!("read session task failed: {join_err}"),
+                    },
+                };
+                write_response(&mut write_half, &resp).await?;
+            }
             Request::RefreshTopology => {
                 // Item 3.7 — manual topology refresh. The engine
                 // logs the outcome internally and falls back to the

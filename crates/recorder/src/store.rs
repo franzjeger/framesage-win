@@ -169,7 +169,7 @@ pub fn read_session(path: &Path) -> Result<(Vec<SessionEvent>, usize)> {
 /// One row for the Sessions-tab list view (§2.4). Derived from the
 /// first and last lines only — cheap enough to build for every stored
 /// session.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct SessionListEntry {
     pub session_id: String,
     pub game_exe: String,
@@ -178,6 +178,21 @@ pub struct SessionListEntry {
     pub duration_secs: Option<u64>,
     pub partial_data: bool,
     pub file_bytes: u64,
+}
+
+/// Resolve `<dir>/<session_id>.jsonl`, refusing ids that could
+/// escape the sessions directory. Session ids are UUID hex strings
+/// with dashes (§2.3); anything else — path separators, dots, drive
+/// letters — is rejected at this trust boundary. The IPC handler
+/// calls this with a client-supplied id.
+pub fn session_file_path(dir: &Path, session_id: &str) -> Result<PathBuf> {
+    let valid = !session_id.is_empty()
+        && session_id.len() <= 64
+        && session_id
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-');
+    anyhow::ensure!(valid, "invalid session id");
+    Ok(dir.join(format!("{session_id}.jsonl")))
 }
 
 /// Enumerate `<dir>/*.jsonl` into list entries, newest first.
@@ -454,5 +469,28 @@ mod tests {
         assert!(deleted[0].to_string_lossy().contains("a.jsonl"));
         let remaining = list_sessions(dir.path()).unwrap();
         assert_eq!(remaining.len(), 2);
+    }
+}
+
+#[cfg(test)]
+mod session_id_tests {
+    use super::*;
+
+    #[test]
+    fn session_file_path_rejects_traversal_and_junk() {
+        let dir = Path::new("/tmp/sessions");
+        assert!(session_file_path(dir, "f47ac10b-58cc-4372-a567-0e02b2c3d479").is_ok());
+        for bad in [
+            "../etc/passwd",
+            "..",
+            "a/b",
+            "a\\b",
+            "",
+            "c:evil",
+            "x.jsonl",
+            &"a".repeat(65),
+        ] {
+            assert!(session_file_path(dir, bad).is_err(), "must reject {bad:?}");
+        }
     }
 }

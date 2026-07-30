@@ -627,7 +627,9 @@ impl FramesageApp {
                 | Ok(Response::Processes { .. })
                 | Ok(Response::Services { .. })
                 | Ok(Response::UndoResult { .. })
-                | Ok(Response::UndoLog { .. }) => {
+                | Ok(Response::UndoLog { .. })
+                | Ok(Response::Sessions { .. })
+                | Ok(Response::SessionDetail { .. }) => {
                     format!("{label}: ok")
                 }
                 Ok(Response::Error { message }) => format!("{label}: error — {message}"),
