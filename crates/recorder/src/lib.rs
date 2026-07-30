@@ -27,6 +27,6 @@ pub use attribution::{
 };
 pub use schema::{SessionEvent, SessionSummary, SystemInfo, SCHEMA_VERSION};
 pub use store::{
-    enforce_total_cap, list_sessions, read_session, sample_rate_for_bytes, SampleRate,
-    SessionListEntry, SessionWriter, PER_SESSION_CAP_BYTES, TOTAL_CAP_BYTES,
+    enforce_total_cap, list_sessions, read_session, sample_rate_for_bytes, session_file_path,
+    SampleRate, SessionListEntry, SessionWriter, PER_SESSION_CAP_BYTES, TOTAL_CAP_BYTES,
 };

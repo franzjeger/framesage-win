@@ -31,6 +31,10 @@ notify = { workspace = true }
 # when both pass.
 framesage-etw = { workspace = true }
 
+# v0.7.1 Group C (#110) — sessions read path for the Sessions tab
+# (ListSessions / ReadSession IPC served from the sessions dir).
+framesage-recorder = { workspace = true }
+
 [dev-dependencies]
 # M2.6 / H-004 — enable framesage-etw's build-gate override seam for
 # service-side tests (single seam lives in framesage-etw::build_gate;

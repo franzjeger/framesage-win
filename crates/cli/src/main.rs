@@ -100,6 +100,26 @@ enum Cmd {
     /// supports the closed loop at all.
     #[command(subcommand)]
     ClosedLoop(ClosedLoopCmd),
+    /// v0.7.1 Group C (#110) — inspect recorded sessions. `list`
+    /// shows stored sessions newest first; `show <session-id>` prints
+    /// the session's attribution verdict plus an event-count summary.
+    #[command(subcommand)]
+    Sessions(SessionsCmd),
+}
+
+#[derive(Subcommand, Debug)]
+enum SessionsCmd {
+    /// List stored sessions, newest first.
+    List {
+        /// Maximum sessions to show (default 20).
+        #[arg(long, default_value_t = 20)]
+        limit: u32,
+    },
+    /// Show one session: honest-attribution verdict + event counts.
+    Show {
+        /// Session id (the UUID from `sessions list`).
+        session_id: String,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -249,6 +269,14 @@ fn main() -> Result<()> {
             ClosedLoopCmd::On => tokio_block(async { closed_loop_set(true).await }),
             ClosedLoopCmd::Off => tokio_block(async { closed_loop_set(false).await }),
             ClosedLoopCmd::Status => tokio_block(async { closed_loop_status().await }),
+        },
+        Cmd::Sessions(sub) => match sub {
+            SessionsCmd::List { limit } => {
+                tokio_block(async { send_simple(Request::ListSessions { limit }).await })
+            }
+            SessionsCmd::Show { session_id } => {
+                tokio_block(async { send_simple(Request::ReadSession { session_id }).await })
+            }
         },
     }
 }
@@ -1216,6 +1244,11 @@ async fn send_simple(req: Request) -> Result<()> {
                 None => println!("nothing to undo"),
             },
             Response::UndoLog { entries } => print_undo_log(&entries),
+            Response::Sessions { sessions } => print_session_list(&sessions),
+            Response::SessionDetail {
+                events,
+                skipped_lines,
+            } => print_session_detail(&events, skipped_lines),
             Response::Error { message } => return Err(anyhow!(message)),
         }
     }
@@ -1294,10 +1327,83 @@ async fn print_status() -> Result<()> {
         Response::Ok => println!("ok"),
         Response::Processes { .. } => println!("ok"),
         Response::Services { .. } => println!("ok"),
-        Response::UndoResult { .. } | Response::UndoLog { .. } => println!("ok"),
+        Response::UndoResult { .. }
+        | Response::UndoLog { .. }
+        | Response::Sessions { .. }
+        | Response::SessionDetail { .. } => println!("ok"),
         Response::Error { message } => return Err(anyhow!(message)),
     }
     Ok(())
+}
+
+/// #110 — one row per stored session, newest first.
+fn print_session_list(sessions: &[framesage_ipc::framesage_recorder::SessionListEntry]) {
+    if sessions.is_empty() {
+        println!("no sessions recorded yet");
+        return;
+    }
+    println!(
+        "{:<38}  {:<24}  {:<12}  {:>8}  flags",
+        "session id", "game", "profile", "duration"
+    );
+    for e in sessions {
+        let dur = match e.duration_secs {
+            Some(secs) => format!("{}m{:02}s", secs / 60, secs % 60),
+            None => "?".into(),
+        };
+        let flags = if e.partial_data { "partial" } else { "" };
+        println!(
+            "{:<38}  {:<24}  {:<12}  {:>8}  {}",
+            e.session_id, e.game_exe, e.profile_id, dur, flags
+        );
+    }
+}
+
+/// #110 — attribution verdict + event-count summary for one session.
+fn print_session_detail(events: &[framesage_ipc::framesage_recorder::SessionEvent], skipped: u32) {
+    use framesage_ipc::framesage_recorder::{compute_attribution_summary, Attribution};
+    println!(
+        "events: {} ({} malformed lines skipped)",
+        events.len(),
+        skipped
+    );
+    let mut counts: std::collections::BTreeMap<&'static str, usize> = Default::default();
+    for ev in events {
+        use framesage_ipc::framesage_recorder::SessionEvent as E;
+        let kind = match ev {
+            E::SessionStart { .. } => "session_start",
+            E::FramesageAction { .. } => "framesage_action",
+            E::KernelSignal { .. } => "kernel_signal",
+            E::FrameSample { .. } => "frame_sample",
+            E::CpuSample { .. } => "cpu_sample",
+            E::WorkingSetDelta { .. } => "working_set_delta",
+            E::SessionEnd { .. } => "session_end",
+        };
+        *counts.entry(kind).or_default() += 1;
+    }
+    for (kind, n) in counts {
+        println!("  {kind:<20} {n}");
+    }
+    match compute_attribution_summary(events) {
+        Attribution::Computed(summary) => {
+            println!();
+            println!("{}", summary.headline);
+            println!(
+                "  1% lows: {:+.1}%   avg: {:+.1}%   variance: {:+.1}%",
+                summary.p99_delta_pct, summary.avg_frame_time_delta_pct, summary.variance_delta_pct
+            );
+        }
+        Attribution::Disabled {
+            reason,
+            computed_anyway,
+        } => {
+            println!();
+            println!("attribution disabled: {}", reason.message());
+            if let Some(summary) = computed_anyway {
+                println!("  (if shown anyway: {})", summary.headline);
+            }
+        }
+    }
 }
 
 fn print_status_snapshot(s: &StatusSnapshot) {

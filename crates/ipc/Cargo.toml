@@ -10,6 +10,7 @@ description = "Named-pipe protocol between framesage service and clients (tray, 
 
 [dependencies]
 framesage-core = { workspace = true }
+framesage-recorder = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 tokio = { workspace = true }

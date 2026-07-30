@@ -35,7 +35,7 @@ use serde::Deserialize;
 const ALLOWED_EDGES: &[(&str, &[&str])] = &[
     // Bottom of the stack — zero framesage deps.
     ("framesage-core", &[]),
-    ("framesage-ipc", &["framesage-core"]),
+    ("framesage-ipc", &["framesage-core", "framesage-recorder"]),
     ("framesage-gamemode", &["framesage-core"]),
     // The one inversion: sys imports gamemode for the Win32 impl of
     // SystemStateQuery + the AppliedActions / PreviousState data
@@ -75,6 +75,7 @@ const ALLOWED_EDGES: &[(&str, &[&str])] = &[
             "framesage-etw",
             "framesage-gamemode",
             "framesage-ipc",
+            "framesage-recorder",
             "framesage-sys",
         ],
     ),
