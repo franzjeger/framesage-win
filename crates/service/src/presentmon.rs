@@ -112,13 +112,14 @@ mod windows_impl {
     /// SpawnPolicy is the real rate limiter.
     const RECONCILE_INTERVAL: Duration = Duration::from_secs(2);
 
-    /// A currently-attached child: the blocking drain thread's handle plus
-    /// the exe name it's measuring (so a foreground change to a *different*
-    /// game triggers a re-attach, but the same game is left alone).
+    /// A currently-attached child: the killable process handle, the
+    /// blocking drain thread's join handle, and the exe name it's measuring
+    /// (so a foreground change to a *different* game triggers a re-attach,
+    /// but the same game is left alone).
     struct Attached {
         target_exe: String,
-        stop: mpsc::Sender<()>,
-        join: tokio::task::JoinHandle<bool>,
+        child: framesage_presentmon::child::PresentMonChild,
+        join: tokio::task::JoinHandle<()>,
     }
 
     pub async fn run(
@@ -146,15 +147,16 @@ mod windows_impl {
         loop {
             interval.tick().await;
 
-            // Reap a child that drained to EOF on its own (game exited with
-            // `--terminate_on_proc_exit`): mark it exited so the budget/
-            // reuse state stays accurate.
-            if let Some(a) = attached.as_ref() {
-                if a.join.is_finished() {
-                    let a = attached.take().unwrap();
-                    let crashed = matches!(a.join.await, Ok(false) | Err(_));
-                    policy.note_exited(crashed);
-                }
+            // Reap a child whose drain thread finished on its own — the
+            // game exited (`--terminate_on_proc_exit` closed stdout, ending
+            // the drain). Wait() reports whether it exited cleanly so the
+            // restart budget stays accurate.
+            if attached.as_ref().is_some_and(|a| a.join.is_finished()) {
+                let a = attached.take().unwrap();
+                let _ = a.join.await;
+                let clean = a.child.wait().unwrap_or(false);
+                policy.note_exited(!clean);
+                info!(exe = %a.target_exe, clean, "PresentMon child exited on its own");
             }
 
             let status = engine.status();
@@ -220,42 +222,36 @@ mod windows_impl {
             }
         }
 
-        let (stop_tx, mut stop_rx) = mpsc::channel::<()>(1);
-        let exe = exe.to_path_buf();
-        let target_pid = want.pid;
-        let frame_tx = frame_tx.clone();
-
-        // The child driver's drain loop is blocking (BufRead over the child
-        // stdout pipe), so it owns a dedicated blocking thread. It forwards
-        // each 1 Hz bucket via `blocking_send`; a stop signal or a closed
-        // recorder channel ends it.
-        let join = tokio::task::spawn_blocking(move || {
-            let child =
-                match framesage_presentmon::child::PresentMonChild::spawn(&exe, target_pid) {
-                    Ok(c) => c,
-                    Err(e) => {
-                        warn!(error = %e, pid = target_pid, "PresentMon spawn failed");
-                        return false; // counts as a crash against the budget
-                    }
-                };
-            let result = child.drain(|stats| {
-                // Stop requested (session end / re-attach)? Draining can't be
-                // interrupted mid-`read`, but we drop frames once asked to
-                // stop so a stale child can't keep writing.
-                if stop_rx.try_recv().is_ok() {
+        let mut child =
+            match framesage_presentmon::child::PresentMonChild::spawn(exe, want.pid) {
+                Ok(c) => c,
+                Err(e) => {
+                    warn!(error = %e, pid = want.pid, "PresentMon spawn failed");
+                    // A failed spawn counts as a crash against the budget so
+                    // a persistently-failing PresentMon eventually gives up.
+                    policy.note_spawned(&want.exe_name, Instant::now());
+                    policy.note_exited(true);
                     return;
                 }
-                if frame_tx.blocking_send(stats).is_err() {
-                    // Recorder gone — nothing more to do; the outer wait()
-                    // still reaps the process.
-                }
-            });
-            match result {
-                Ok(clean) => clean,
-                Err(e) => {
-                    warn!(error = %e, "PresentMon drain ended with error");
-                    false
-                }
+            };
+        let Some(pipe) = child.take_frame_pipe() else {
+            warn!(pid = want.pid, "PresentMon child has no stdout pipe; skipping");
+            child.stop();
+            return;
+        };
+
+        // The drain loop is blocking (BufRead over the child stdout pipe),
+        // so it owns a dedicated blocking thread. It forwards each 1 Hz
+        // bucket via `blocking_send`; the loop ends when the child closes
+        // stdout — either the game exits or `detach` kills the process.
+        let frame_tx = frame_tx.clone();
+        let join = tokio::task::spawn_blocking(move || {
+            if let Err(e) = pipe.drain(|stats| {
+                // A closed recorder channel is not fatal here — keep draining
+                // (and reaping) the child; frames are simply dropped.
+                let _ = frame_tx.blocking_send(stats);
+            }) {
+                warn!(error = %e, "PresentMon drain ended with error");
             }
         });
 
@@ -267,20 +263,26 @@ mod windows_impl {
         );
         *attached = Some(Attached {
             target_exe: want.exe_name.clone(),
-            stop: stop_tx,
+            child,
             join,
         });
     }
 
-    /// Signal the drain thread to stop, wait for it, and update the policy's
-    /// exit accounting (orderly stop → resets the restart budget).
+    /// Terminate the child now and wait for its drain thread to finish.
+    /// Killing the process closes stdout, which unblocks the blocking drain;
+    /// we then join it. An orderly detach (session end / foreground game
+    /// switch) is never a crash, so it resets the restart budget.
     async fn detach(a: Attached, policy: &mut SpawnPolicy) {
-        let _ = a.stop.send(()).await;
-        let _ = a.join.await;
-        // An orderly detach at session end (or foreground game switch) is
-        // never a crash: reset the restart budget for the next session.
+        let Attached {
+            target_exe,
+            child,
+            join,
+        } = a;
+        // Kill on a blocking thread — kill()+wait() can block briefly.
+        let _ = tokio::task::spawn_blocking(move || child.stop()).await;
+        let _ = join.await;
         policy.note_exited(false);
-        info!(exe = %a.target_exe, "PresentMon detached");
+        info!(exe = %target_exe, "PresentMon detached");
     }
 }
 
