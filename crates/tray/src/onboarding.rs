@@ -393,7 +393,7 @@ fn radio_card(
         theme::TEXT_MUTED
     };
     egui::Frame::none()
-        .stroke(egui::Stroke::new(1.0, border))
+        .stroke(egui::Stroke::new(1.0_f32, border))
         .rounding(6.0)
         .inner_margin(egui::Margin::same(10.0))
         .show(ui, |ui| {
@@ -585,7 +585,7 @@ fn closed_loop_radio_card(
         theme::TEXT_MUTED
     };
     egui::Frame::none()
-        .stroke(egui::Stroke::new(1.0, border))
+        .stroke(egui::Stroke::new(1.0_f32, border))
         .rounding(6.0)
         .inner_margin(egui::Margin::same(10.0))
         .show(ui, |ui| {

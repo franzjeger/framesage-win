@@ -427,8 +427,8 @@ pub(crate) fn draw_sparkline(painter: &egui::Painter, rect: egui::Rect, history:
 
     // CPU line in accent, memory in a muted secondary color. Each gets a
     // subtle fill below the line for visual mass.
-    let cpu_stroke = Stroke::new(1.5, theme::ACCENT);
-    let mem_stroke = Stroke::new(1.0, Color32::from_rgb(140, 90, 200));
+    let cpu_stroke = Stroke::new(1.5_f32, theme::ACCENT);
+    let mem_stroke = Stroke::new(1.0_f32, Color32::from_rgb(140, 90, 200));
 
     // Filled area under the CPU line (the more eye-catching of the two,
     // matching its priority for the user).
@@ -479,7 +479,7 @@ pub(crate) fn draw_single_sparkline(painter: &egui::Painter, rect: egui::Rect, h
         Color32::from_rgba_unmultiplied(50, 130, 246, 30),
         Stroke::NONE,
     ));
-    painter.add(PathShape::line(points, Stroke::new(1.5, theme::ACCENT)));
+    painter.add(PathShape::line(points, Stroke::new(1.5_f32, theme::ACCENT)));
 }
 
 /// One-line status bar at the very bottom of the window. Shows engine state,
