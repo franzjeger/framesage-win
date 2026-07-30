@@ -2,12 +2,15 @@
 //!
 //! W1.6 / closes F-002 (Phase 3 roadmap item #85).
 //!
-//! **Scaffold scope (v0.7 ship):** This module renders the two
-//! empty-state variants per `audit/v0.7-architecture.md` §2.4. It
-//! does NOT yet contain the list view, detail view, attribution
-//! panel, or any IPC wiring for `Request::ListSessions` /
-//! `Request::ReadSession` — those land in Phase 3 Month 3 M3.1
-//! (Group C deliverable, #110).
+//! **#110 slice 3:** on top of the W1.6 empty-state scaffold, this
+//! now renders the list view (rows from `Request::ListSessions`) and
+//! the detail pane with the §2.4 honest-attribution panel (events
+//! from `Request::ReadSession`, verdict via
+//! `framesage_recorder::compute_attribution_summary`). Fetching is
+//! the caller's job — `render` returns a [`SessionsAction`] and
+//! main.rs spawns the IPC thread; this module stays IO-free and
+//! testable. Still deferred: the frame-time timeline chart and
+//! per-core heatmap (§2.4 detail view, Group D polish).
 //!
 //! The load-bearing v0.7 contract is the **substring contents** of
 //! the two empty-state messages (Group C acceptance criterion at
@@ -33,9 +36,23 @@
 //! The tray crate does NOT depend on `framesage-etw` directly.
 
 use eframe::egui;
+use framesage_ipc::framesage_recorder::{
+    compute_attribution_summary, Attribution, DeltaBand, SessionEvent, SessionListEntry,
+};
 use framesage_ipc::StatusSnapshot;
 
+use crate::state::SessionDetailState;
 use crate::theme;
+
+/// What the caller (main.rs) should do after this frame. The render
+/// fn never does IPC itself.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SessionsAction {
+    /// Fetch / refresh the session list (`Request::ListSessions`).
+    RefreshList,
+    /// Fetch one session's events (`Request::ReadSession`).
+    OpenDetail(String),
+}
 
 // ─── Load-bearing string constants — DO NOT EDIT WITHOUT UPDATING TESTS ──
 //
@@ -92,7 +109,13 @@ pub const NO_SESSIONS_PRIVACY_FOOTER: &str =
 /// In v0.7 there is no "sessions exist" branch — the recorder isn't
 /// wired yet (M3.1 deliverable). The third row of the table renders
 /// the same empty-state framing, just with the toggle state flipped.
-pub fn render(ui: &mut egui::Ui, status: Option<&StatusSnapshot>) {
+pub fn render(
+    ui: &mut egui::Ui,
+    status: Option<&StatusSnapshot>,
+    sessions: Option<&[SessionListEntry]>,
+    detail: Option<&mut SessionDetailState>,
+    fetch_pending: bool,
+) -> Option<SessionsAction> {
     let Some(snap) = status else {
         // No status yet (IPC hasn't connected). Render a neutral
         // placeholder; do NOT default to either empty state because
@@ -104,14 +127,214 @@ pub fn render(ui: &mut egui::Ui, status: Option<&StatusSnapshot>) {
                 egui::RichText::new("Connecting to FrameSage service…").color(theme::TEXT_MUTED),
             );
         });
-        return;
+        return None;
     };
 
     if !snap.closed_loop_build_supported {
         render_unsupported_build(ui);
-    } else {
-        render_no_sessions_yet(ui, snap.policy.closed_loop_enabled);
+        return None;
     }
+
+    match sessions {
+        // Not fetched yet — kick off the first fetch, show a
+        // lightweight placeholder meanwhile.
+        None => {
+            ui.add_space(40.0);
+            ui.vertical_centered(|ui| {
+                ui.label(egui::RichText::new("Loading sessions…").color(theme::TEXT_MUTED));
+            });
+            if fetch_pending {
+                None
+            } else {
+                Some(SessionsAction::RefreshList)
+            }
+        }
+        // Fetched, nothing recorded — the load-bearing §2.4 empty
+        // states, unchanged from the W1.6 scaffold.
+        Some([]) => {
+            render_no_sessions_yet(ui, snap.policy.closed_loop_enabled);
+            None
+        }
+        Some(list) => render_list_and_detail(ui, list, detail, fetch_pending),
+    }
+}
+
+/// §2.4 list view (top) + detail pane (bottom).
+fn render_list_and_detail(
+    ui: &mut egui::Ui,
+    list: &[SessionListEntry],
+    detail: Option<&mut SessionDetailState>,
+    fetch_pending: bool,
+) -> Option<SessionsAction> {
+    let mut action = None;
+
+    let total_bytes: u64 = list.iter().map(|e| e.file_bytes).sum();
+    ui.horizontal(|ui| {
+        ui.label(
+            egui::RichText::new(format!(
+                "📁 {} session{} stored · {:.0} MB · cap 1 GB",
+                list.len(),
+                if list.len() == 1 { "" } else { "s" },
+                total_bytes as f64 / (1024.0 * 1024.0)
+            ))
+            .color(theme::TEXT_MUTED),
+        );
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            if ui
+                .add_enabled(!fetch_pending, egui::Button::new("Refresh"))
+                .clicked()
+            {
+                action = Some(SessionsAction::RefreshList);
+            }
+        });
+    });
+    ui.separator();
+
+    let selected_id = detail.as_ref().map(|d| d.session_id.clone());
+    egui::ScrollArea::vertical()
+        .id_source("sessions-list")
+        .max_height(ui.available_height() * 0.45)
+        .show(ui, |ui| {
+            for entry in list {
+                let is_selected = selected_id.as_deref() == Some(entry.session_id.as_str());
+                let dur = match entry.duration_secs {
+                    Some(secs) => format!("{}m{:02}s", secs / 60, secs % 60),
+                    None => "in progress / crashed".to_string(),
+                };
+                let mut label = format!("🎮 {} · {} · {}", entry.game_exe, entry.profile_id, dur);
+                if entry.partial_data {
+                    label.push_str("  ⚠ partial data");
+                }
+                let resp = ui.selectable_label(is_selected, label);
+                if resp.clicked() && !is_selected {
+                    action = Some(SessionsAction::OpenDetail(entry.session_id.clone()));
+                }
+            }
+        });
+
+    ui.separator();
+    match detail {
+        Some(d) => render_detail(ui, d),
+        None => {
+            ui.add_space(8.0);
+            ui.label(
+                egui::RichText::new(if fetch_pending {
+                    "Loading session…"
+                } else {
+                    "Select a session to see the \"Did it help?\" attribution."
+                })
+                .color(theme::TEXT_MUTED),
+            );
+        }
+    }
+    action
+}
+
+/// Detail pane: event summary + the §2.4 honest-attribution panel.
+/// Charts (frame-time timeline, per-core heatmap) are Group D polish
+/// and intentionally absent from this slice.
+fn render_detail(ui: &mut egui::Ui, detail: &mut SessionDetailState) {
+    ui.label(
+        egui::RichText::new(format!("Session {}", detail.session_id))
+            .strong()
+            .size(14.0),
+    );
+    let frame_samples = detail
+        .events
+        .iter()
+        .filter(|e| matches!(e, SessionEvent::FrameSample { .. }))
+        .count();
+    let actions = detail
+        .events
+        .iter()
+        .filter(|e| matches!(e, SessionEvent::FramesageAction { .. }))
+        .count();
+    ui.label(
+        egui::RichText::new(format!(
+            "{} events · {} frame samples · {} actions{}",
+            detail.events.len(),
+            frame_samples,
+            actions,
+            if detail.skipped_lines > 0 {
+                format!(" · {} malformed lines skipped", detail.skipped_lines)
+            } else {
+                String::new()
+            }
+        ))
+        .size(12.0)
+        .color(theme::TEXT_MUTED),
+    );
+    ui.add_space(8.0);
+
+    ui.label(
+        egui::RichText::new("\"Did FrameSage help?\" attribution")
+            .strong()
+            .size(13.0),
+    );
+    ui.add_space(4.0);
+    match compute_attribution_summary(&detail.events) {
+        Attribution::Computed(summary) => render_attribution_summary(ui, &summary),
+        Attribution::Disabled {
+            reason,
+            computed_anyway,
+        } => {
+            ui.label(
+                egui::RichText::new(format!("Attribution disabled: {}", reason.message()))
+                    .color(theme::WARNING),
+            );
+            if let Some(summary) = computed_anyway {
+                ui.checkbox(
+                    &mut detail.show_partial_anyway,
+                    "Show anyway (partial data — treat with caution)",
+                );
+                if detail.show_partial_anyway {
+                    render_attribution_summary(ui, &summary);
+                }
+            }
+        }
+    }
+}
+
+fn render_attribution_summary(
+    ui: &mut egui::Ui,
+    summary: &framesage_ipc::framesage_recorder::AttributionSummary,
+) {
+    // §2.4 band colors: green only above the conservative +8% claim
+    // threshold; the degraded banner is loud by design.
+    let color = match summary.band {
+        DeltaBand::Improved => theme::SUCCESS,
+        DeltaBand::ModestImprovement | DeltaBand::NoEffect => theme::TEXT_MUTED,
+        DeltaBand::SlightRegression | DeltaBand::Degraded => theme::WARNING,
+    };
+    // The stored headline carries the **degraded** emphasis marker
+    // asserted by the honesty-contract tests; render it as bold text
+    // without the literal asterisks.
+    let display = summary.headline.replace("**", "");
+    let mut text = egui::RichText::new(display).color(color).size(13.0);
+    if matches!(summary.band, DeltaBand::Degraded | DeltaBand::Improved) {
+        text = text.strong();
+    }
+    ui.label(text);
+    ui.add_space(4.0);
+    ui.label(
+        egui::RichText::new(format!(
+            "1% lows: {:+.1}%   ·   avg frame time: {:+.1}%   ·   variance: {:+.1}%",
+            summary.p99_delta_pct, summary.avg_frame_time_delta_pct, summary.variance_delta_pct
+        ))
+        .size(12.0)
+        .color(theme::TEXT_MUTED),
+    );
+    ui.label(
+        egui::RichText::new(format!(
+            "baseline {}s–{}s · with rules {}s–{}s",
+            summary.baseline_window_ms.0 / 1000,
+            summary.baseline_window_ms.1 / 1000,
+            summary.with_rules_window_ms.0 / 1000,
+            summary.with_rules_window_ms.1 / 1000
+        ))
+        .size(11.0)
+        .color(theme::TEXT_MUTED),
+    );
 }
 
 fn render_unsupported_build(ui: &mut egui::Ui) {

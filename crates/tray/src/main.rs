@@ -1811,11 +1811,116 @@ impl FramesageApp {
             Tab::Status => self.render_status_tab(ctx, ui, status, recent),
             Tab::Processes => self.render_processes_tab(ui, status),
             Tab::Activity => self.render_activity_tab(ui),
-            Tab::Sessions => crate::tabs::sessions::render(ui, status.as_ref()),
+            Tab::Sessions => self.render_sessions_tab(ui, status),
             Tab::Rules => self.render_rules_tab(ui, status),
             Tab::Profiles => self.render_profiles_tab(ui, status),
             Tab::Settings => self.render_settings_tab(ui, status),
         }
+    }
+
+    /// #110 slice 3 — Sessions tab: pulls list/detail out of AppState,
+    /// renders, and services the returned action by spawning a
+    /// status-pipe fetch thread (read-only requests; no UAC needed).
+    fn render_sessions_tab(&mut self, ui: &mut egui::Ui, status: &Option<StatusSnapshot>) {
+        let action = {
+            let mut s = self.state.lock();
+            // Split-borrow the fields the renderer needs.
+            let crate::state::AppState {
+                sessions,
+                session_detail,
+                sessions_fetch_pending,
+                session_detail_pending,
+                ..
+            } = &mut *s;
+            crate::tabs::sessions::render(
+                ui,
+                status.as_ref(),
+                sessions.as_deref(),
+                session_detail.as_mut(),
+                *sessions_fetch_pending || *session_detail_pending,
+            )
+        };
+        match action {
+            Some(crate::tabs::sessions::SessionsAction::RefreshList) => {
+                self.spawn_sessions_list_fetch();
+            }
+            Some(crate::tabs::sessions::SessionsAction::OpenDetail(session_id)) => {
+                self.spawn_session_detail_fetch(session_id);
+            }
+            None => {}
+        }
+    }
+
+    fn spawn_sessions_list_fetch(&self) {
+        {
+            let mut s = self.state.lock();
+            if s.sessions_fetch_pending {
+                return;
+            }
+            s.sessions_fetch_pending = true;
+        }
+        let state = self.state.clone();
+        std::thread::spawn(move || {
+            let result = crate::ipc_client::send_request_blocking(
+                framesage_ipc::PIPE_NAME_STATUS,
+                &Request::ListSessions { limit: 200 },
+            );
+            let mut s = state.lock();
+            s.sessions_fetch_pending = false;
+            match result {
+                Ok(Response::Sessions { sessions }) => {
+                    s.sessions = Some(sessions);
+                }
+                Ok(Response::Error { message }) => {
+                    s.last_error = Some(format!("list sessions: {message}"));
+                }
+                Ok(_) => {}
+                Err(e) => {
+                    s.last_error = Some(format!("list sessions: {e:#}"));
+                }
+            }
+        });
+    }
+
+    fn spawn_session_detail_fetch(&self, session_id: String) {
+        {
+            let mut s = self.state.lock();
+            if s.session_detail_pending {
+                return;
+            }
+            s.session_detail_pending = true;
+        }
+        let state = self.state.clone();
+        std::thread::spawn(move || {
+            let result = crate::ipc_client::send_request_blocking(
+                framesage_ipc::PIPE_NAME_STATUS,
+                &Request::ReadSession {
+                    session_id: session_id.clone(),
+                },
+            );
+            let mut s = state.lock();
+            s.session_detail_pending = false;
+            match result {
+                Ok(Response::SessionDetail {
+                    events,
+                    skipped_lines,
+                }) => {
+                    s.session_detail = Some(crate::state::SessionDetailState {
+                        session_id,
+                        events,
+                        skipped_lines,
+                        show_partial_anyway: false,
+                    });
+                }
+                Ok(Response::Error { message }) => {
+                    s.last_error = Some(format!("read session: {message}"));
+                }
+                Ok(_) => {}
+                Err(e) => {
+                    s.last_error = Some(format!("read session: {e:#}"));
+                }
+            }
+        });
     }
 
     fn render_status_tab(

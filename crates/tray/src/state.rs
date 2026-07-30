@@ -47,6 +47,27 @@ pub(crate) struct AppState {
     /// the Processes-tab detail panel. PIDs that disappear between
     /// snapshots are evicted to keep the map bounded.
     pub(crate) per_pid_cpu_history: HashMap<u32, VecDeque<u8>>,
+    /// #110 Sessions tab — latest ListSessions result. `None` until
+    /// the first fetch completes; `Some(vec![])` means "fetched,
+    /// nothing recorded" (drives the §2.4 empty states).
+    pub(crate) sessions: Option<Vec<framesage_ipc::framesage_recorder::SessionListEntry>>,
+    /// True while a ListSessions fetch thread is in flight — stops the
+    /// UI from stacking refetches on every frame.
+    pub(crate) sessions_fetch_pending: bool,
+    /// #110 Sessions tab — detail for the clicked session, if any.
+    pub(crate) session_detail: Option<SessionDetailState>,
+    /// True while a ReadSession fetch thread is in flight.
+    pub(crate) session_detail_pending: bool,
+}
+
+/// #110 — one fetched session's full event stream plus derived bits
+/// for the detail pane.
+pub(crate) struct SessionDetailState {
+    pub(crate) session_id: String,
+    pub(crate) events: Vec<framesage_ipc::framesage_recorder::SessionEvent>,
+    pub(crate) skipped_lines: u32,
+    /// §2.4 "show anyway" opt-in for partial-data sessions.
+    pub(crate) show_partial_anyway: bool,
 }
 
 /// Number of samples kept in `AppState.system_history` and each
