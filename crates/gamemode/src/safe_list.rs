@@ -666,9 +666,19 @@ mod tests {
             "nvdisplay.container.exe",
             "atiesrxx.exe",
             "radeonsoftware.exe",
-            // Anti-cheat (user-mode)
+            // Anti-cheat (user-mode). Issue #148 G2: the Vanguard /
+            // EAC / BattlEye hosts mirror `ac_detect.rs`'s marker list
+            // (minus ESEAClient — ESEA migrated to FACEIT AC in 2023).
             "faceitservice.exe",
             "faceitclient.exe",
+            "faceit_ac.exe",
+            "faceit_start_protected_game.exe",
+            "vgc.exe",
+            "vgtray.exe",
+            "easyanticheat.exe",
+            "easyanticheat_eos.exe",
+            "beservice.exe",
+            "beservicelauncher.exe",
         ];
 
         // Canonical list of kernel-critical service IDs — must match the
@@ -684,6 +694,7 @@ mod tests {
             // Anti-cheat
             "vgc",
             "easyanticheat",
+            "easyanticheat_eos",
             "beservice",
             "faceitservice",
             // Network

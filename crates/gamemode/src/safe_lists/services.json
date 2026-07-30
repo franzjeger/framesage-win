@@ -266,6 +266,10 @@
       "rationale": "Epic / Tencent Easy Anti-Cheat user-mode component. Same reasoning as Vanguard. Permanently denied."
     },
     {
+      "id": "EasyAntiCheat_EOS",
+      "rationale": "Easy Anti-Cheat EOS-variant service shipped with Epic Online Services titles. Same reasoning as EasyAntiCheat. Permanently denied."
+    },
+    {
       "id": "BEService",
       "rationale": "BattlEye service. Same reasoning. Permanently denied."
     },

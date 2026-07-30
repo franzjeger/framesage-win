@@ -510,6 +510,38 @@
     {
       "exe": "faceitclient.exe",
       "rationale": "FACEIT Anti-Cheat client binary. Pairs with faceitservice.exe; the client is what the game launcher hands off to. Suspending it kills the launch handshake and is flagged the same way. Permanently denied."
+    },
+    {
+      "exe": "FACEIT_AC.exe",
+      "rationale": "FACEIT Anti-Cheat host process (legacy client name). Same enforcement role as faceitclient.exe — perturbing it mid-match trips FACEIT's match-watcher. Permanently denied."
+    },
+    {
+      "exe": "FACEIT_Start_Protected_Game.exe",
+      "rationale": "FACEIT protected-game launcher. Runs the launch handshake with the FACEIT.sys kernel driver; suspending or deprioritising it breaks the handshake and flags the player. Permanently denied."
+    },
+    {
+      "exe": "vgc.exe",
+      "rationale": "Riot Vanguard user-mode service host — the process that coordinates the vgk.sys kernel driver. Any suspend / priority / affinity change here is exactly what Vanguard's tamper heuristics look for. Permanently denied."
+    },
+    {
+      "exe": "vgtray.exe",
+      "rationale": "Riot Vanguard tray client. Talks to vgc/vgk.sys; perturbing it reads as tampering to Vanguard. Permanently denied."
+    },
+    {
+      "exe": "EasyAntiCheat.exe",
+      "rationale": "Easy Anti-Cheat user-mode host (Epic / Tencent). Same reasoning as Vanguard — perturbation is the textbook bypass pattern. Permanently denied."
+    },
+    {
+      "exe": "EasyAntiCheat_EOS.exe",
+      "rationale": "Easy Anti-Cheat EOS-variant host shipped with Epic Online Services titles. Same enforcement role as EasyAntiCheat.exe. Permanently denied."
+    },
+    {
+      "exe": "BEService.exe",
+      "rationale": "BattlEye service host — the user-mode process that coordinates the BEDaisy.sys kernel driver. Suspending or deprioritising it stops enforcement mid-match and flags the player. Permanently denied."
+    },
+    {
+      "exe": "BEServiceLauncher.exe",
+      "rationale": "BattlEye service launcher. Runs the game-start handshake with BEService; perturbing it breaks the handshake. Permanently denied."
     }
   ]
 }
