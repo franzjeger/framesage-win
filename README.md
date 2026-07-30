@@ -200,6 +200,8 @@ Ctrl+C stops it.
 
 ## Building
 
+Contributor note: all Win32 syscalls sit behind mock-injectable seam traits (`framesage-sys::SysApi`, `framesage-etw::EtwSysCalls`) so the decision logic tests run on any host. New adapters must follow the same shape — see [docs/syscall-seam-pattern.md](docs/syscall-seam-pattern.md).
+
 ### On Windows
 
 ```pwsh
