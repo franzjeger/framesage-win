@@ -10,12 +10,6 @@ members = [
     "crates/tray",
     "crates/sim",
     "crates/gamemode",
-    # v0.7 Phase 1 spike — standalone binary, not wired into the
-    # bundled distribution. Lives in the workspace so it picks up
-    # the workspace `windows` version + `anyhow` etc., but it's
-    # not built by default and the v0.6 release scripts never
-    # ship it.
-    "crates/spike-etw",
     # v0.7 Group A — ETW kernel-event consumer (Day 1 scaffold).
     # Production crate the service host wires into on Day 5.
     "crates/etw",
