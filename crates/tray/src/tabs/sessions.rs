@@ -52,6 +52,10 @@ pub enum SessionsAction {
     RefreshList,
     /// Fetch one session's events (`Request::ReadSession`).
     OpenDetail(String),
+    /// #5 — open the closed-loop opt-in dialog (the onboarding
+    /// page's EDR-implications disclosure) before flipping the
+    /// policy toggle.
+    OpenClosedLoopOptIn,
 }
 
 // ─── Load-bearing string constants — DO NOT EDIT WITHOUT UPDATING TESTS ──
@@ -86,6 +90,16 @@ pub const NO_SESSIONS_BODY: &str =
      frame-time and CPU history per session, which profile FrameSage \
      applied and when, and the honest answer to \"Did 1% lows improve?\" — \
      including when they didn't.";
+
+/// Inline "Why this requirement?" help copy. MUST stay verbatim-
+/// aligned with README's "System requirements (closed-loop
+/// measurement)" section — the Group C acceptance criterion at
+/// architecture §2.4 — pinned by the include_str! test below.
+pub const WHY_REQUIREMENT_BODY: &str =
+    "ETW kernel-event schemas are stable on builds we've empirically validated, \
+     and v0.7 ships with empirical validation only on Win11 24H2. Older builds \
+     may or may not work, and v0.7 won't claim measurement results it can't \
+     substantiate.";
 
 /// Privacy footer shared by both no-sessions-yet sub-states.
 pub const NO_SESSIONS_PRIVACY_FOOTER: &str =
@@ -152,8 +166,9 @@ pub fn render(
         // Fetched, nothing recorded — the load-bearing §2.4 empty
         // states, unchanged from the W1.6 scaffold.
         Some([]) => {
-            render_no_sessions_yet(ui, snap.policy.closed_loop_enabled);
-            None
+            let mut action = None;
+            render_no_sessions_yet(ui, snap.policy.closed_loop_enabled, &mut action);
+            action
         }
         Some(list) => render_list_and_detail(ui, list, detail, fetch_pending),
     }
@@ -266,6 +281,14 @@ fn render_detail(ui: &mut egui::Ui, detail: &mut SessionDetailState) {
     );
     ui.add_space(8.0);
 
+    // #3 — frame-time timeline (p50 line, p99 shaded) with the
+    // Game Mode enter marker. Drawn from the session's frame_sample
+    // events; absent-frame-data sessions show a hint instead.
+    render_frame_time_chart(ui, &detail.events);
+    // #1 — per-core CPU heatmap from the session's cpu_sample events.
+    render_cpu_heatmap(ui, &detail.events);
+    ui.add_space(8.0);
+
     ui.label(
         egui::RichText::new("\"Did FrameSage help?\" attribution")
             .strong()
@@ -373,19 +396,30 @@ fn render_unsupported_build(ui: &mut egui::Ui) {
                         // on the pane and decides.
                         crate::open_in_shell("ms-settings:windowsupdate");
                     }
-                    ui.add_space(8.0);
-                    let _ = ui
-                        .add_enabled(false, egui::Button::new("Why this requirement?"))
-                        .on_hover_text(
-                            "Inline help panel lands in v0.7 Group C deliverable (#110).",
-                        );
                 });
             });
         });
+        ui.add_space(10.0);
+        // #4 — inline help panel per §2.4: reproduces the README
+        // "System requirements" rationale verbatim.
+        egui::CollapsingHeader::new("Why this requirement?")
+            .id_source("why-requirement")
+            .default_open(false)
+            .show(ui, |ui| {
+                ui.label(
+                    egui::RichText::new(WHY_REQUIREMENT_BODY)
+                        .size(12.0)
+                        .color(theme::TEXT_MUTED),
+                );
+            });
     });
 }
 
-fn render_no_sessions_yet(ui: &mut egui::Ui, closed_loop_enabled: bool) {
+fn render_no_sessions_yet(
+    ui: &mut egui::Ui,
+    closed_loop_enabled: bool,
+    action: &mut Option<SessionsAction>,
+) {
     ui.add_space(40.0);
     ui.vertical_centered(|ui| {
         ui.set_max_width(560.0);
@@ -424,14 +458,16 @@ fn render_no_sessions_yet(ui: &mut egui::Ui, closed_loop_enabled: bool) {
                     } else {
                         ui.label(egui::RichText::new("OFF").strong().color(theme::TEXT_MUTED));
                         ui.add_space(8.0);
-                        let _ = ui
-                            .add_enabled(false, egui::Button::new("Enable…"))
+                        if ui
+                            .button("Enable…")
                             .on_hover_text(
-                                "Re-opens first-run onboarding's closed-loop opt-in page \
-                                     so the EDR-implications disclosure is shown before \
-                                     flipping the toggle. Full wiring lands in v0.7 Group C \
-                                     deliverable (#110).",
-                            );
+                                "Opens the closed-loop opt-in with the EDR-implications \
+                                 disclosure before flipping the toggle.",
+                            )
+                            .clicked()
+                        {
+                            *action = Some(SessionsAction::OpenClosedLoopOptIn);
+                        }
                     }
                 });
             });
@@ -444,6 +480,156 @@ fn render_no_sessions_yet(ui: &mut egui::Ui, closed_loop_enabled: bool) {
                 .color(theme::TEXT_MUTED),
         );
     });
+}
+
+/// #3 — frame-time timeline: p99 as a shaded band, p50 as a line,
+/// with a vertical marker at the first apply/enter action. µs → ms on
+/// the axis. No frame samples → an honest "no frame data" hint (the
+/// session was recorded without PresentMon).
+fn render_frame_time_chart(ui: &mut egui::Ui, events: &[SessionEvent]) {
+    let samples: Vec<(u64, f32, f32)> = events
+        .iter()
+        .filter_map(|e| match e {
+            SessionEvent::FrameSample {
+                at_ms,
+                frame_time_us_p50,
+                frame_time_us_p99,
+                ..
+            } => Some((
+                *at_ms,
+                *frame_time_us_p50 as f32 / 1000.0,
+                *frame_time_us_p99 as f32 / 1000.0,
+            )),
+            _ => None,
+        })
+        .collect();
+
+    ui.label(egui::RichText::new("Frame time (ms)").size(12.0).strong());
+    if samples.len() < 2 {
+        ui.label(
+            egui::RichText::new("no frame data recorded for this session")
+                .size(11.0)
+                .color(theme::TEXT_MUTED),
+        );
+        return;
+    }
+
+    let apply_ms = events.iter().find_map(|e| match e {
+        SessionEvent::FramesageAction { at_ms, action, .. }
+            if action == "apply_profile" || action == "game_mode_entered" =>
+        {
+            Some(*at_ms)
+        }
+        _ => None,
+    });
+
+    let (min_t, max_t) = (samples[0].0, samples[samples.len() - 1].0);
+    let span_t = (max_t - min_t).max(1) as f32;
+    let max_ms = samples.iter().map(|s| s.2).fold(1.0_f32, f32::max).max(1.0);
+
+    let (rect, _resp) =
+        ui.allocate_exact_size(egui::vec2(ui.available_width(), 90.0), egui::Sense::hover());
+    let painter = ui.painter_at(rect);
+    let x = |t: u64| rect.left() + (t - min_t) as f32 / span_t * rect.width();
+    let y = |ms: f32| rect.bottom() - (ms / max_ms) * rect.height();
+
+    painter.rect_filled(rect, 2.0, theme::SURFACE);
+    // p99 shaded band (baseline 0 → p99).
+    for w in samples.windows(2) {
+        let (a, b) = (w[0], w[1]);
+        let poly = vec![
+            egui::pos2(x(a.0), y(a.2)),
+            egui::pos2(x(b.0), y(b.2)),
+            egui::pos2(x(b.0), rect.bottom()),
+            egui::pos2(x(a.0), rect.bottom()),
+        ];
+        painter.add(egui::Shape::convex_polygon(
+            poly,
+            theme::ACCENT.gamma_multiply(0.18),
+            egui::Stroke::NONE,
+        ));
+    }
+    // p50 line.
+    for w in samples.windows(2) {
+        painter.line_segment(
+            [
+                egui::pos2(x(w[0].0), y(w[0].1)),
+                egui::pos2(x(w[1].0), y(w[1].1)),
+            ],
+            egui::Stroke::new(1.5_f32, theme::ACCENT),
+        );
+    }
+    // Game Mode enter marker.
+    if let Some(t) = apply_ms {
+        if t >= min_t && t <= max_t {
+            painter.line_segment(
+                [
+                    egui::pos2(x(t), rect.top()),
+                    egui::pos2(x(t), rect.bottom()),
+                ],
+                egui::Stroke::new(1.0_f32, theme::WARNING),
+            );
+        }
+    }
+    ui.label(
+        egui::RichText::new(format!(
+            "p50 line · p99 shaded · peak {max_ms:.1} ms · orange = Game Mode entered"
+        ))
+        .size(10.0)
+        .color(theme::TEXT_MUTED),
+    );
+}
+
+/// #1 — per-core CPU heatmap: one row per logical CPU, time on x,
+/// cell brightness = utilisation. Drawn from cpu_sample events.
+fn render_cpu_heatmap(ui: &mut egui::Ui, events: &[SessionEvent]) {
+    let samples: Vec<&Vec<u8>> = events
+        .iter()
+        .filter_map(|e| match e {
+            SessionEvent::CpuSample { per_core_pct, .. } if !per_core_pct.is_empty() => {
+                Some(per_core_pct)
+            }
+            _ => None,
+        })
+        .collect();
+    if samples.is_empty() {
+        return;
+    }
+    let cores = samples.iter().map(|s| s.len()).max().unwrap_or(0);
+    if cores == 0 {
+        return;
+    }
+    ui.add_space(6.0);
+    ui.label(
+        egui::RichText::new(format!("Per-core CPU ({cores} cores)"))
+            .size(12.0)
+            .strong(),
+    );
+    let row_h = 6.0_f32;
+    let (rect, _resp) = ui.allocate_exact_size(
+        egui::vec2(ui.available_width(), row_h * cores as f32),
+        egui::Sense::hover(),
+    );
+    let painter = ui.painter_at(rect);
+    painter.rect_filled(rect, 2.0, theme::SURFACE);
+    let cell_w = rect.width() / samples.len() as f32;
+    for (col, sample) in samples.iter().enumerate() {
+        for core in 0..cores {
+            let pct = sample.get(core).copied().unwrap_or(0) as f32 / 100.0;
+            // Blue→green→yellow→red-ish via accent gamma; cheap and
+            // theme-consistent (a full perceptual colormap is the
+            // Group D polish item).
+            let color = theme::ACCENT.gamma_multiply(0.15 + pct * 0.85);
+            let cell = egui::Rect::from_min_size(
+                egui::pos2(
+                    rect.left() + col as f32 * cell_w,
+                    rect.top() + core as f32 * row_h,
+                ),
+                egui::vec2(cell_w.ceil(), row_h),
+            );
+            painter.rect_filled(cell, 0.0, color);
+        }
+    }
 }
 
 // ─── Acceptance-criterion substring tests ────────────────────────────────
@@ -497,6 +683,23 @@ mod tests {
             NO_SESSIONS_BODY.contains("After your first 90-second gaming session"),
             "NO_SESSIONS_BODY must contain the Group C acceptance \
              criterion substring verbatim — got: {NO_SESSIONS_BODY:?}",
+        );
+    }
+
+    /// #4 / Group C acceptance criterion — the inline help panel's
+    /// copy must match the README "System requirements" rationale
+    /// verbatim. include_str! makes the alignment a compile-coupled
+    /// source-level check: edit either side without the other and
+    /// this fails.
+    #[test]
+    fn why_requirement_panel_matches_readme_verbatim() {
+        let readme = include_str!("../../../../README.md");
+        // The README wraps at different points; compare on
+        // whitespace-normalized text so only wording drift fails.
+        let normalize = |s: &str| s.split_whitespace().collect::<Vec<_>>().join(" ");
+        assert!(
+            normalize(readme).contains(&normalize(WHY_REQUIREMENT_BODY)),
+            "README 'System requirements' rationale must contain the panel copy verbatim"
         );
     }
 

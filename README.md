@@ -271,9 +271,13 @@ framesage game-mode off-global
 
 The session is journaled with a `manual_global` trigger tag, so the Status tab's Recent Sessions view distinguishes script-driven sessions from focus-driven ones.
 
-### Global hotkey (planned)
+### Global hotkey
 
-A global **Ctrl+Alt+G** toggle for Manual Global Game Mode (same effect as the tray-menu toggle) is planned; the hotkey-binding UI is a v0.7 stretch item — see Roadmap. Until it lands, use the tray menu, the Status-tab Quick actions panel, or the CLI verbs above.
+Press **Ctrl+Alt+G** anywhere to toggle Manual Global Game Mode (same effect as the tray-menu toggle). If another application already owns that combo, the hotkey is disabled and the tray logs it; a custom-binding UI is a later item. The tray menu, Status-tab Quick actions panel, and CLI verbs above all reach the same toggle.
+
+## System requirements (closed-loop measurement)
+
+The static-rule engine (rules, Game Mode, ProBalance) supports Windows 10 22H2 and Windows 11. **Closed-loop measurement** — session recording and the "Did it help?" attribution UI — additionally requires **Windows 11 24H2 (build 26100) or later**. ETW kernel-event schemas are stable on builds we've empirically validated, and v0.7 ships with empirical validation only on Win11 24H2. Older builds may or may not work, and v0.7 won't claim measurement results it can't substantiate.
 
 ## Roadmap
 

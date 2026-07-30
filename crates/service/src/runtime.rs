@@ -111,9 +111,14 @@ pub async fn run(inputs: RuntimeInputs) -> Result<()> {
     // hot-reload flip" call site trivially correct. tokio::spawn
     // inside the closure still works — spawn_blocking preserves the
     // runtime context.
+    // #8 — kernel_signal channel: the closed-loop drop-poll task is
+    // the producer; the session recorder is the consumer. Broadcast so
+    // future consumers (UI banner) can tap in without re-plumbing.
+    let (kernel_signal_tx, kernel_signal_rx) =
+        tokio::sync::broadcast::channel::<framesage_etw::KernelSignal>(64);
     let closed_loop_policy = policy.clone();
     let closed_loop_startup = tokio::task::spawn_blocking(move || {
-        crate::closed_loop::start_closed_loop_if_enabled(&closed_loop_policy)
+        crate::closed_loop::start_closed_loop_if_enabled(&closed_loop_policy, kernel_signal_tx)
     })
     .await
     .unwrap_or_else(
@@ -142,7 +147,8 @@ pub async fn run(inputs: RuntimeInputs) -> Result<()> {
     // dir when policy.closed_loop_enabled is on. Not in the watchdog
     // select! below: recorder death must never take the rule engine
     // down (same contract as the closed-loop tasks).
-    let _session_recorder = crate::session_recorder::spawn(engine.clone(), paths::sessions_dir());
+    let _session_recorder =
+        crate::session_recorder::spawn(engine.clone(), paths::sessions_dir(), kernel_signal_rx);
 
     let tick_engine = engine.clone();
     let mut tick_handle = tokio::spawn(async move {

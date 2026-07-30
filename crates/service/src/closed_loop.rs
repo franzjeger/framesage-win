@@ -79,7 +79,14 @@ pub enum ClosedLoopStartup {
 /// fields (`reason`, `detected_build`, `degradation_mode`) so the
 /// integration test can assert against fields rather than substring-
 /// matching the formatted message.
-pub fn start_closed_loop_if_enabled(policy: &Policy) -> ClosedLoopStartup {
+pub fn start_closed_loop_if_enabled(
+    policy: &Policy,
+    kernel_signal_tx: tokio::sync::broadcast::Sender<framesage_etw::KernelSignal>,
+) -> ClosedLoopStartup {
+    // Windows-only consumer; the sender is unused on other hosts and
+    // on every fall-through branch below.
+    #[cfg(not(windows))]
+    let _ = &kernel_signal_tx;
     if !policy.closed_loop_enabled {
         info!(
             reason = "policy_opt_out",
@@ -104,7 +111,7 @@ pub fn start_closed_loop_if_enabled(policy: &Policy) -> ClosedLoopStartup {
     let opts = SessionOptions::default();
     match EtwSession::start(opts) {
         Ok(EtwSubsystem::Running(session)) => {
-            spawn_closed_loop_tasks(session);
+            spawn_closed_loop_tasks(session, kernel_signal_tx);
             info!(
                 reason = "running",
                 "closed-loop ETW session started + supervisor/drop-poll tasks spawned"
@@ -136,7 +143,10 @@ pub fn start_closed_loop_if_enabled(policy: &Policy) -> ClosedLoopStartup {
 /// these tasks are **not** added to the v0.6 watchdog select! —
 /// their exit is not a critical service failure.
 #[cfg(windows)]
-fn spawn_closed_loop_tasks(session: EtwSession) {
+fn spawn_closed_loop_tasks(
+    session: EtwSession,
+    kernel_signal_tx: tokio::sync::broadcast::Sender<framesage_etw::KernelSignal>,
+) {
     // M1.1 / A-001: decomposition is fallible (one-shot API). A fresh
     // Running session always decomposes; if it somehow doesn't, fall
     // back to static-rule mode instead of panicking the service.
@@ -208,6 +218,9 @@ fn spawn_closed_loop_tasks(session: EtwSession) {
                     above_baseline_pct = sig.above_baseline_pct,
                     "kernel signal"
                 );
+                // #8 — feed the session recorder; a lagging/absent
+                // receiver must never stall the poll loop.
+                let _ = kernel_signal_tx.send(sig);
             }
             match monitor.poll_drop_stats(|ev: DegradationEvent| {
                 error!(
@@ -232,7 +245,10 @@ fn spawn_closed_loop_tasks(session: EtwSession) {
 }
 
 #[cfg(not(windows))]
-fn spawn_closed_loop_tasks(_session: EtwSession) {
+fn spawn_closed_loop_tasks(
+    _session: EtwSession,
+    _kernel_signal_tx: tokio::sync::broadcast::Sender<framesage_etw::KernelSignal>,
+) {
     // Non-Windows stub: EtwSession::start would have bailed before
     // reaching here. This branch exists so the function signature
     // resolves cross-platform.
@@ -262,7 +278,8 @@ mod tests {
             closed_loop_enabled: false,
             ..Policy::default()
         };
-        let result = start_closed_loop_if_enabled(&policy);
+        let (tx, _rx) = tokio::sync::broadcast::channel(4);
+        let result = start_closed_loop_if_enabled(&policy, tx);
         assert!(matches!(result, ClosedLoopStartup::OptedOut));
         // Assert against the structured-field formatting.
         assert!(logs_contain("reason=\"policy_opt_out\""));
@@ -298,7 +315,8 @@ mod tests {
             closed_loop_enabled: true,
             ..Policy::default()
         };
-        let result = start_closed_loop_if_enabled(&policy);
+        let (tx, _rx) = tokio::sync::broadcast::channel(4);
+        let result = start_closed_loop_if_enabled(&policy, tx);
         assert!(
             matches!(
                 result,

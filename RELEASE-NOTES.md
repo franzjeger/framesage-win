@@ -1,3 +1,64 @@
+# Release notes
+
+## v0.7.1-dev — 2026-07-30 backlog + Group A/B/C engagement
+
+10 PRs (#153–#162) in one continuous agentic session; workspace
+test count rose from ~180 to ~235. All Month-1/Month-2 audit items
+buildable off Windows are closed; the Group A/B/C scaffolds for the
+closed-loop v0.7.1 release are code-complete pending the Windows
+runtime batch.
+
+### For users
+
+- **`framesage closed-loop on|off|status`** — flip closed-loop
+  measurement without editing policy.json (M1.14).
+- **`framesage sessions list|show <id>`** — inspect recorded
+  sessions from the shell, including the honest-attribution verdict.
+- **Sessions tab** — list + detail with the §2.4 "Did FrameSage
+  help?" attribution panel (asymmetric bands, explicit disabled
+  reasons, partial-data opt-in).
+- **Session recording** — Game Mode sessions are recorded to
+  `%ProgramData%\framesage\sessions\` when closed-loop is enabled
+  (strictly opt-in, local-only, 1 GB cap): actions, 1 Hz CPU
+  samples, and kernel spike signals.
+- **Denylist hardening** — the Vanguard / EAC / BattlEye user-mode
+  hosts joined the FACEIT pair on the non-overridable denylist, and
+  the affinity-rule paths that previously bypassed the denylist are
+  gated (issue #148 audit).
+- **README "Power-user workflows"** — OBS scene-scripting examples
+  for Manual Global Game Mode.
+- Multi-line policy-rejection errors render readably in the tray;
+  Subscribe connections are capped per client process.
+
+### Under the hood
+
+- New crates: `framesage-recorder` (§2.3 jsonl schema + retention +
+  attribution; five C-005 honesty-contract tests), and
+  `framesage-presentmon` (CSV parser, 1 Hz aggregator, PRE-L-004
+  spawn policy; PresentMon MIT license bundled in
+  THIRD_PARTY_LICENSES.md).
+- Group A kernel drain: MSDN-cited win11_24h2_26200 classification
+  table + rolling-baseline kernel_signal detector wired through the
+  consumer callback and 1 Hz drop-poll.
+- One-shot ETW APIs return typed AlreadyStoppedError instead of
+  panicking; drop-poll/shutdown race closed with a shared teardown
+  flag; RealEtwSysCalls RefUnwindSafe statically asserted.
+- Build-gate test override folded to a single seam
+  (`test-override` feature); watchdog-exclusion pinned by
+  source-level tests; syscall seam pattern documented in
+  `docs/syscall-seam-pattern.md`.
+- `crates/spike-etw` removed (M3.4) — findings preserved in
+  `spike/`.
+
+### Still gated on Windows hardware / external clocks
+
+Live session recording verification, E-004 negative-session
+screenshot, PresentMon/ETW integration runs, %ProgramFiles% ACL
+verification (#99), EDR matrix attestation, and the v0.7.1
+default-on flip (M3.5 dogfood gate).
+
+---
+
 # Release notes — Phase 3 audit response
 
 This release covers the four-group rollup of audit findings from

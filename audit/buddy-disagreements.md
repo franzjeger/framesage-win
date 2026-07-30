@@ -1638,6 +1638,37 @@ M1.13 / P4.9 backfill is now reference instance for the project's audit-discipli
 
 **Verdict: GO with one exception — Month 1 is closed except M1.10 (issue #99), which stays open pending Windows-VM verification.** Also carried forward: M1.8's visual check in the next Windows runtime batch.
 
+## Interim status note — 2026-07-30 — Group A/B/C code-complete off-Windows (no verdict; informational)
+
+Not a buddy review — M2.8 (#109) and M3.7 (#116) remain gated on the
+cert/EDR closeouts and the Windows runtime batch. This note keeps the
+audit trail current on what has shipped since the M1.15 verdict above,
+all in PRs #153–#162 (grep-verifiable per the P4.9 discipline):
+
+- **M2 small items closed:** M2.3 (A-002 retry typestate), M2.4
+  (A-005 per-PID Subscribe cap), M2.5 (A-006/G-003 — found already
+  resolved by #152, closed by verification), M2.6 (H-004 single
+  override seam).
+- **M3.1 (Group C) code-complete off Windows:** framesage-recorder
+  (schema/retention/attribution; the five C-005 honesty-contract
+  tests assert the verbatim §2.4 substrings), ListSessions/
+  ReadSession IPC, Sessions-tab list/detail UI, drain worker.
+  Outstanding: E-004 screenshot + live verification (runtime batch).
+- **M3.2 (Group B) adapter scaffold:** framesage-presentmon with the
+  PRE-L-004 spawn policy; license compliance shipped. Outstanding:
+  service integration + Valorant acceptance run (runtime batch).
+  Note: this resolves PR #129 cascade-item #6 keep-vs-skip to KEEP,
+  per Frank's direction 2026-07-30.
+- **M3.3 closed** (doc-drift sweep) and **M3.4 closed** (spike-etw
+  removed — gate satisfied by the Group A classification/detector
+  landing in framesage-etw).
+- **#148 audit closed out:** five path-trace paragraphs delivered;
+  G1/G2 (affinity denylist bypass + missing AC hosts) found and
+  fixed; G3 containment test prevents recurrence.
+
+When M2.1/M2.2 close, the M2.8 review should treat the code-side
+questions (a)/(c) as answered by the above and focus on (b)/(d).
+
 ## How to use this log going forward
 
 Each new buddy review that surfaces a concern gets a new

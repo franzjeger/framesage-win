@@ -119,6 +119,10 @@ enum SessionsCmd {
     Show {
         /// Session id (the UUID from `sessions list`).
         session_id: String,
+        /// Emit a machine-readable JSON object instead of the human
+        /// summary — scriptable for the dogfood-gate evidence trail.
+        #[arg(long)]
+        json: bool,
     },
 }
 
@@ -274,10 +278,87 @@ fn main() -> Result<()> {
             SessionsCmd::List { limit } => {
                 tokio_block(async { send_simple(Request::ListSessions { limit }).await })
             }
-            SessionsCmd::Show { session_id } => {
-                tokio_block(async { send_simple(Request::ReadSession { session_id }).await })
+            SessionsCmd::Show { session_id, json } => {
+                tokio_block(async { sessions_show(session_id, json).await })
             }
         },
+    }
+}
+
+/// #5 — `framesage sessions show <id> [--json]`. Fetches the session
+/// detail and renders either the human summary (same as the generic
+/// send_simple path) or a machine-readable JSON attribution object.
+#[cfg(windows)]
+async fn sessions_show(session_id: String, json: bool) -> Result<()> {
+    if !json {
+        return send_simple(Request::ReadSession { session_id }).await;
+    }
+    use framesage_ipc::framesage_recorder::{compute_attribution_summary, Attribution};
+    let (events, skipped) = fetch_session_detail(&session_id).await?;
+    let attribution = match compute_attribution_summary(&events) {
+        Attribution::Computed(s) => serde_json::json!({
+            "status": "computed",
+            "headline": s.headline,
+            "band": format!("{:?}", s.band),
+            "p99_delta_pct": s.p99_delta_pct,
+            "avg_frame_time_delta_pct": s.avg_frame_time_delta_pct,
+            "variance_delta_pct": s.variance_delta_pct,
+            "baseline_window_ms": s.baseline_window_ms,
+            "with_rules_window_ms": s.with_rules_window_ms,
+        }),
+        Attribution::Disabled {
+            reason,
+            computed_anyway,
+        } => serde_json::json!({
+            "status": "disabled",
+            "reason": reason.message(),
+            "computed_anyway": computed_anyway.map(|s| serde_json::json!({
+                "headline": s.headline,
+                "p99_delta_pct": s.p99_delta_pct,
+            })),
+        }),
+    };
+    let out = serde_json::json!({
+        "session_id": session_id,
+        "event_count": events.len(),
+        "skipped_lines": skipped,
+        "attribution": attribution,
+    });
+    println!("{}", serde_json::to_string_pretty(&out)?);
+    Ok(())
+}
+
+#[cfg(not(windows))]
+async fn sessions_show(_session_id: String, _json: bool) -> Result<()> {
+    Err(anyhow!("session verbs are Windows-only"))
+}
+
+/// #5 helper — pull one session's event stream via ReadSession.
+#[cfg(windows)]
+async fn fetch_session_detail(
+    session_id: &str,
+) -> Result<(Vec<framesage_ipc::framesage_recorder::SessionEvent>, u32)> {
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+    let req = Request::ReadSession {
+        session_id: session_id.to_string(),
+    };
+    let stream = open_pipe(req.target_pipe()).await?;
+    let (read_half, mut write_half) = tokio::io::split(stream);
+    let mut reader = BufReader::new(read_half).lines();
+    let mut line = serde_json::to_vec(&req)?;
+    line.push(b'\n');
+    write_half.write_all(&line).await?;
+    write_half.flush().await?;
+    let Some(resp_line) = reader.next_line().await? else {
+        return Err(anyhow!("service closed pipe without responding"));
+    };
+    match serde_json::from_str::<Response>(&resp_line)? {
+        Response::SessionDetail {
+            events,
+            skipped_lines,
+        } => Ok((events, skipped_lines)),
+        Response::Error { message } => Err(anyhow!(message)),
+        other => Err(anyhow!("expected SessionDetail, got {other:?}")),
     }
 }
 
