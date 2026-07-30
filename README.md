@@ -235,6 +235,44 @@ rustup target add x86_64-pc-windows-gnu
 cargo check --workspace --target x86_64-pc-windows-gnu
 ```
 
+## Power-user workflows
+
+### Manual Global Game Mode from the shell
+
+`framesage game-mode on <profile>` enters Game Mode system-wide regardless of which window has focus, and it stays active until you turn it off. The profile must be marked `manual_global_eligible` in your policy (the default `game-x3d` profile is). Useful for video editing, benchmarking, livestreaming — anything where you want the aggressive profile without focus-gating.
+
+```pwsh
+# Enter Manual Global Game Mode with the default aggressive profile:
+framesage game-mode on game-x3d
+
+# Exit Manual Global Game Mode only (a focus-driven session, if one is
+# running, keeps going):
+framesage game-mode off-global
+
+# Panic button — revert EVERYTHING immediately (manual AND focus-driven):
+framesage game-mode off
+```
+
+Both verbs are idempotent, exit 0 on success, and non-zero with a stderr diagnostic on failure — safe to call from scripts.
+
+### OBS scene scripting
+
+Because the verbs are idempotent, you can bind them to OBS scene transitions (Tools → Scripts, or an Advanced Scene Switcher macro running a command) so Game Mode follows your stream layout:
+
+```pwsh
+# Scene "Gaming" activated:
+framesage game-mode on game-x3d
+
+# Scene "Just Chatting" / BRB activated:
+framesage game-mode off-global
+```
+
+The session is journaled with a `manual_global` trigger tag, so the Status tab's Recent Sessions view distinguishes script-driven sessions from focus-driven ones.
+
+### Global hotkey (planned)
+
+A global **Ctrl+Alt+G** toggle for Manual Global Game Mode (same effect as the tray-menu toggle) is planned; the hotkey-binding UI is a v0.7 stretch item — see Roadmap. Until it lands, use the tray menu, the Status-tab Quick actions panel, or the CLI verbs above.
+
 ## Roadmap
 
 ### Shipped
