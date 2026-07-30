@@ -190,8 +190,25 @@ fn spawn_closed_loop_tasks(session: EtwSession) {
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(Duration::from_secs(1));
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        // Group A drain — §2.3 kernel_signal detection rides the same
+        // 1 Hz tick. Signals are emitted as structured tracing events
+        // (the Option-C wire, same as degradation events); feeding
+        // them into the session recorder's jsonl is the follow-up
+        // integration once both run against real kernel data.
+        let mut signal_detector = framesage_etw::KernelSignalDetector::new();
+        let mut second_index: u64 = 0;
         loop {
             interval.tick().await;
+            second_index += 1;
+            for sig in monitor.poll_kernel_signals(&mut signal_detector, second_index) {
+                warn!(
+                    signal = sig.signal,
+                    rate_per_sec = sig.rate_per_sec,
+                    baseline_5min_per_sec = sig.baseline_5min_per_sec,
+                    above_baseline_pct = sig.above_baseline_pct,
+                    "kernel signal"
+                );
+            }
             match monitor.poll_drop_stats(|ev: DegradationEvent| {
                 error!(
                     degradation_mode = ?ev.mode,

@@ -12,16 +12,20 @@
 #![cfg_attr(not(windows), allow(dead_code, unused_imports))]
 
 pub mod build_gate;
+pub mod classify;
 pub mod degradation;
 pub mod session;
+pub mod signal;
 pub mod supervisor;
 
 pub use build_gate::{
     closed_loop_enabled_for_this_build, detected_build, MIN_BUILD_FOR_CLOSED_LOOP,
 };
+pub use classify::{classify, KernelEventKind, ProviderGuid, KERNEL_EVENT_KINDS};
 pub use degradation::{DegradationEvent, DegradationMode};
 pub use session::{
     EtwSession, EtwSubsystem, EtwSysCalls, MonitorHandle, RealEtwSysCalls, SessionOptions,
     SessionShutdownHandle, SessionStats,
 };
+pub use signal::{KernelSignal, KernelSignalDetector};
 pub use supervisor::{ConsumerExitReason, SupervisorLoop};
