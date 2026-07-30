@@ -1592,6 +1592,52 @@ M1.13 / P4.9 backfill is now reference instance for the project's audit-discipli
 
 ---
 
+## W1.10 (issue #89) — 2026-07-30 — Week 1 buddy review — verdict GO
+
+**Format:** 4Q planning-phase. Reviewer: Claude (agentic session, PRs #153/#154 author — self-review with grep-verified evidence per the P4.9 "verification at review time" discipline; each claim below cites a re-runnable check).
+
+**(a) Do the W1.1–W1.6 closures match the roadmap's spec?**
+- W1.1 / W1.7 / W1.8 / W1.9 — WON'T-FIX per scope revision (PR #129); struck through in the roadmap itself. Match.
+- W1.2 (A-003) — `grep bf6.exe crates/sys/src/inner/ac_detect.rs` hits only the doc-comment explaining the removal; the Javelin marker list is empty with a regression-guard test. Match.
+- W1.3 (A-004) — the consumer-loop Arc::as_ptr lifetime contract comment is present in `crates/etw/src/session.rs` (tagged "W1.3 / closes A-004"). Match.
+- W1.4 (C-001) — `grep verify_session_gone crates/` hits only `crates/spike-etw` (the spike, out of scope); `EtwSession::stop()` carries the "deliberately NOT re-querying" rationale block. Option (a) as recommended. Match.
+- W1.5 (E-001) — `arm_panic_in_process_trace` infrastructure exists and the Mode-5 supervisor test drives the synthetic panic through the oneshot. Match in substance; the test lives at the supervisor level rather than under the exact name the roadmap sketched.
+- W1.6 (F-001/F-002) — Option B shipped: `crates/tray/src/tabs/sessions.rs` exists and onboarding carries the required "EDR validation in progress for v0.7.1" substring. Match.
+
+**(b) Are W1.2/W1.3/W1.4/W1.5 atomic enough for separate PRs?** Historically landed as separate commits/PRs during the Week-1 wave; atomicity honored.
+
+**(c) Is Option B the intended W1.6 choice?** Yes — confirmed by the shipped scaffold + the roadmap's own recommendation.
+
+**(d) External-dep kickoffs documented?** Moot — W1.7–W1.9 are WON'T-FIX per scope revision; no EXTERNAL-DEADLINES.md needed. **(e) New Week-1 items surfaced?** None beyond what the 2026-07-30 #148 audit later caught (logged separately in that issue).
+
+**Verdict: GO.** Week 1 closed.
+
+## M1.15 (issue #101) — 2026-07-30 — Month 1 buddy review — verdict GO with one exception
+
+**Format:** 4Q planning-phase. Reviewer: Claude (same session; author of the #153/#154 closures — findings below grep-verified, not asserted from memory).
+
+**(a) Do M1.1–M1.11 closures match the roadmap's spec?**
+- M1.1 (A-001) — one-shot APIs return typed `AlreadyStoppedError`; no `.expect` misuse panics remain on the explicit paths (PR #154). Match.
+- M1.2 (B-001) — `start_closed_loop_if_enabled` wrapped in `spawn_blocking`, JoinError → `StartupError` (PR #154). Match.
+- M1.3 (B-002) — source-level watchdog-exclusion tests (`watchdog_exclusion_tests` in runtime.rs) pin the select! contents (PR #154). Match.
+- M1.4 (B-003) — `docs/syscall-seam-pattern.md` + README Building-section reference (PR #154). Match.
+- M1.5 (C-002) — shared `torn_down` flag closes the drop-poll/shutdown race, unit-tested (PR #154). Match.
+- M1.6 (C-004+D-006) — six §2.11 matrix cells as engine tests incl. 50× rapid-cycle stress (PR #154). Match, with the caveat that game-mode *planning* is platform-gated, so the cells pin the state machine + ownership guard; live plan/apply remains Windows-runtime-batch territory.
+- M1.7 (D-001) — `assert_impl_all!(RealEtwSysCalls: RefUnwindSafe)` + documented mock exemption (PR #154). Match.
+- M1.8 (F-003) — multi-line error banner renders first line + collapsible details (PR #154). Code-complete; **visual verification outstanding** (no Windows GUI in the authoring environment) — fold into the next Windows runtime batch.
+- M1.9 (F-004) — verified zero residual `std::sync::Mutex` in `crates/tray/src`; closed as completed. Match.
+- M1.10 (I-004) — **OPEN.** Requires a clean Windows VM + `icacls` capture; cannot be executed from a Linux agent session. This is the exception.
+- M1.11 (J-003) — README "Power-user workflows" section with CLI + OBS examples (PR #153); hotkey honestly documented as planned. Match.
+- M1.13 / M1.14 — closed earlier (PR #145 backfill; PR #153 CLI verb).
+
+**(b) External-dependency clocks tracking?** W1.8 cert / W1.1 AC outreach are WON'T-FIX per scope revision. W1.9/M2.2 EDR matrix remains the live external clock for the v0.7.1 default-on flip (M3.5) — unchanged status, still Frank-owned.
+
+**(c) Findings demoted/promoted from real-world behavior?** Two promotions out of the #148 audit wave: G1 (affinity-path denylist bypass) and G2 (missing AC-host denylist names) — both fixed and merged in #153. One stale finding demoted/closed by verification: A-006/G-003 (#106) was already resolved by #152's `OnceLock` bundled list.
+
+**(d) Month 2 sequencing — K-005-first still correct?** No contrary evidence surfaced; the small M2 items (M2.3–M2.6) are already closed via #153, which if anything strengthens the case for tackling K-005 next with a clean slate.
+
+**Verdict: GO with one exception — Month 1 is closed except M1.10 (issue #99), which stays open pending Windows-VM verification.** Also carried forward: M1.8's visual check in the next Windows runtime batch.
+
 ## How to use this log going forward
 
 Each new buddy review that surfaces a concern gets a new
