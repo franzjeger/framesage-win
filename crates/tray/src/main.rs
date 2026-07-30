@@ -971,7 +971,35 @@ impl eframe::App for FramesageApp {
 
         egui::CentralPanel::default().show(ctx, |ui| {
             if let Some(err) = &last_error {
-                ui.colored_label(theme::ERROR, err);
+                // M1.8 / F-003 — SetPolicy rejections arrive as multi-line
+                // strings (one \n-joined rationale per denylisted entry).
+                // A single colored_label renders them as a wall of red;
+                // show the first line + an expandable, scrollable details
+                // section so 5+ rejections stay readable.
+                let mut lines = err.lines();
+                let first = lines.next().unwrap_or_default();
+                let rest: Vec<&str> = lines.collect();
+                if rest.is_empty() {
+                    ui.colored_label(theme::ERROR, err);
+                } else {
+                    ui.colored_label(theme::ERROR, first);
+                    egui::CollapsingHeader::new(
+                        egui::RichText::new(format!("details ({} more)", rest.len()))
+                            .color(theme::ERROR),
+                    )
+                    .id_source("last-error-details")
+                    .default_open(false)
+                    .show(ui, |ui| {
+                        egui::ScrollArea::vertical()
+                            .id_source("last-error-scroll")
+                            .max_height(160.0_f32)
+                            .show(ui, |ui| {
+                                for line in &rest {
+                                    ui.colored_label(theme::ERROR, *line);
+                                }
+                            });
+                    });
+                }
             }
 
             // Cap content width so the UI doesn't stretch into a single

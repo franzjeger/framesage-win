@@ -137,8 +137,18 @@ pub fn start_closed_loop_if_enabled(policy: &Policy) -> ClosedLoopStartup {
 /// their exit is not a critical service failure.
 #[cfg(windows)]
 fn spawn_closed_loop_tasks(session: EtwSession) {
-    let (consumer_join, exit_rx, shutdown, monitor) =
-        session.into_supervisable_parts_with_monitor();
+    // M1.1 / A-001: decomposition is fallible (one-shot API). A fresh
+    // Running session always decomposes; if it somehow doesn't, fall
+    // back to static-rule mode instead of panicking the service.
+    let (consumer_join, exit_rx, shutdown, monitor) = match session
+        .into_supervisable_parts_with_monitor()
+    {
+        Ok(parts) => parts,
+        Err(e) => {
+            error!(error = %e, "closed-loop decomposition failed; engine runs in v0.6 static-rule mode");
+            return;
+        }
+    };
 
     // Production on_event sink: tracing::error! emission. Per v3
     // secondary decision Option C, tracing IS the wire to the (future)

@@ -104,7 +104,23 @@ pub async fn run(inputs: RuntimeInputs) -> Result<()> {
     // amendment (proposal/v0.7-arch-mode5-amendment PR #77), supervisor
     // exit is not a critical service failure. See closed_loop.rs's
     // module docstring for the ownership rationale.
-    let closed_loop_startup = crate::closed_loop::start_closed_loop_if_enabled(&policy);
+    // M1.2 / B-001 — start_closed_loop_if_enabled runs blocking work
+    // (cleanup_stale_session → StartTraceW → std::thread spawn), so
+    // park it on the blocking pool instead of a runtime worker thread.
+    // Harmless at startup, but it makes a future "restart on policy
+    // hot-reload flip" call site trivially correct. tokio::spawn
+    // inside the closure still works — spawn_blocking preserves the
+    // runtime context.
+    let closed_loop_policy = policy.clone();
+    let closed_loop_startup = tokio::task::spawn_blocking(move || {
+        crate::closed_loop::start_closed_loop_if_enabled(&closed_loop_policy)
+    })
+    .await
+    .unwrap_or_else(
+        |join_err| crate::closed_loop::ClosedLoopStartup::StartupError {
+            message: format!("closed-loop startup task panicked: {join_err}"),
+        },
+    );
     info!(
         startup_result = ?closed_loop_startup,
         "closed-loop startup decision made"
@@ -1160,6 +1176,59 @@ fn validate_policy_against_safe_list(policy: &Policy) -> Vec<String> {
         }
     }
     denied
+}
+
+#[cfg(test)]
+mod watchdog_exclusion_tests {
+    // M1.3 / B-002 — architecture §2.1 mode 5 amendment: closed-loop
+    // task crashes must NOT crash the service, which structurally
+    // means the supervisor/drop-poll handles never join the watchdog
+    // `tokio::select!` in `run()`. That contract is only enforced by
+    // code shape, so pin it with a source-level assertion: extract the
+    // watchdog select! block and check its contents.
+
+    const RUNTIME_SRC: &str = include_str!("runtime.rs");
+
+    fn watchdog_select_block() -> &'static str {
+        let start = RUNTIME_SRC
+            .find("let unexpected_exit: Option<&'static str> = tokio::select! {")
+            .expect("watchdog select! block not found — update this test's anchor");
+        let end = RUNTIME_SRC[start..]
+            .find("};")
+            .expect("watchdog select! block unterminated");
+        &RUNTIME_SRC[start..start + end]
+    }
+
+    #[test]
+    fn watchdog_covers_exactly_the_v06_critical_tasks() {
+        let block = watchdog_select_block();
+        for handle in [
+            "shutdown",
+            "tick_handle",
+            "admin_handle",
+            "status_handle",
+            "reload_handle",
+            "sys_handle",
+        ] {
+            assert!(
+                block.contains(handle),
+                "critical task {handle} missing from watchdog select!"
+            );
+        }
+    }
+
+    #[test]
+    fn closed_loop_tasks_are_not_in_the_watchdog() {
+        let block = watchdog_select_block();
+        for forbidden in ["closed_loop", "supervisor", "drop_poll", "monitor"] {
+            assert!(
+                !block.contains(forbidden),
+                "closed-loop task '{forbidden}' found in the watchdog select! — \
+                 this violates architecture §2.1 mode 5 (supervisor exit is NOT \
+                 a critical service failure)"
+            );
+        }
+    }
 }
 
 #[cfg(test)]

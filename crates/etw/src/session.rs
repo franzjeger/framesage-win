@@ -643,6 +643,36 @@ mod windows_impl {
         }
     }
 
+    /// Decomposition product of [`EtwSession::into_supervisable_parts`]:
+    /// consumer-thread JoinHandle, consumer-exit oneshot receiver, and
+    /// the teardown-owning shutdown handle.
+    pub type SupervisableParts<S> = (
+        JoinHandle<()>,
+        tokio::sync::oneshot::Receiver<crate::supervisor::ConsumerExitReason>,
+        SessionShutdownHandle<S>,
+    );
+
+    /// [`SupervisableParts`] plus the read-only [`MonitorHandle`] for the
+    /// drop-poll sibling task.
+    pub type SupervisablePartsWithMonitor<S> = (
+        JoinHandle<()>,
+        tokio::sync::oneshot::Receiver<crate::supervisor::ConsumerExitReason>,
+        SessionShutdownHandle<S>,
+        MonitorHandle<S>,
+    );
+
+    /// M1.1 / A-001 — recoverable misuse error for the one-shot
+    /// explicit APIs (`stop`, `query_stats`, `into_supervisable_parts*`,
+    /// `SessionShutdownHandle::shutdown`). Calling any of them after the
+    /// session state has already been taken returns this instead of
+    /// panicking; the Drop fallback remains the leak-prevention net.
+    #[derive(Debug, thiserror::Error)]
+    #[error("ETW session already stopped or decomposed ({api} is one-shot)")]
+    pub struct AlreadyStoppedError {
+        /// Which one-shot API was re-entered.
+        pub api: &'static str,
+    }
+
     // ─── EtwSession (now generic over S) ─────────────────────────────────────
 
     #[derive(Debug)]
@@ -824,10 +854,9 @@ mod windows_impl {
             // explicitly stopped — Drop sees None and is a no-op.
             // Prevents double-stop if anyone holds an EtwSession and
             // both calls stop() and lets it drop.
-            let syscalls = self
-                .syscalls
-                .take()
-                .expect("EtwSession::stop called twice or after decomposition");
+            let syscalls = self.syscalls.take().ok_or(AlreadyStoppedError {
+                api: "EtwSession::stop",
+            })?;
             stop_session(&syscalls, &self.session_name)?;
             if let Some(handle) = self.consumer_join.take() {
                 if let Err(panic_payload) = handle.join() {
@@ -853,10 +882,9 @@ mod windows_impl {
         }
 
         pub fn query_stats(&self) -> Result<SessionStats> {
-            let syscalls = self
-                .syscalls
-                .as_ref()
-                .expect("query_stats called after stop() or decomposition");
+            let syscalls = self.syscalls.as_ref().ok_or(AlreadyStoppedError {
+                api: "EtwSession::query_stats",
+            })?;
             let q = query_session_stats(syscalls, &self.session_name)?;
             Ok(SessionStats {
                 events_lost: q.events_lost,
@@ -903,48 +931,44 @@ mod windows_impl {
         /// Day 5: decompose with an additional `MonitorHandle` for the
         /// drop-poll sibling task. Same as `into_supervisable_parts`
         /// otherwise.
-        pub fn into_supervisable_parts_with_monitor(
-            self,
-        ) -> (
-            JoinHandle<()>,
-            tokio::sync::oneshot::Receiver<crate::supervisor::ConsumerExitReason>,
-            SessionShutdownHandle<S>,
-            MonitorHandle<S>,
-        )
+        pub fn into_supervisable_parts_with_monitor(self) -> Result<SupervisablePartsWithMonitor<S>>
         where
             S: Clone,
         {
+            let syscalls_clone = self
+                .syscalls
+                .as_ref()
+                .ok_or(AlreadyStoppedError {
+                    api: "EtwSession::into_supervisable_parts_with_monitor",
+                })?
+                .clone();
+            let session_name = self.session_name.clone();
+            let state = Arc::clone(&self.state);
+            let (join, rx, shutdown) = self.into_supervisable_parts()?;
+            // Share the shutdown handle's teardown flag (M1.5 / C-002)
+            // so the monitor observes shutdown() / Drop immediately.
             let monitor = MonitorHandle {
-                syscalls: self
-                    .syscalls
-                    .as_ref()
-                    .expect("session already stopped or decomposed")
-                    .clone(),
-                session_name: self.session_name.clone(),
-                state: Arc::clone(&self.state),
+                syscalls: syscalls_clone,
+                session_name,
+                state,
+                torn_down: Arc::clone(&shutdown.torn_down),
             };
-            let (join, rx, shutdown) = self.into_supervisable_parts();
-            (join, rx, shutdown, monitor)
+            Ok((join, rx, shutdown, monitor))
         }
 
         /// Decompose the session into the three parts the
         /// `SupervisorLoop` needs: the consumer-thread JoinHandle, the
         /// oneshot Receiver, and a SessionShutdownHandle that owns
         /// just the teardown surface.
-        pub fn into_supervisable_parts(
-            mut self,
-        ) -> (
-            JoinHandle<()>,
-            tokio::sync::oneshot::Receiver<crate::supervisor::ConsumerExitReason>,
-            SessionShutdownHandle<S>,
-        ) {
-            let consumer_join = self
-                .consumer_join
-                .take()
-                .expect("consumer_join populated by start_with_syscalls; into_supervisable_parts is one-shot");
-            let exit_rx = self.exit_rx.take().expect(
-                "exit_rx populated by start_with_syscalls; into_supervisable_parts is one-shot",
-            );
+        /// One-shot: consumes the session; a second decomposition (or a
+        /// call after `stop()`) returns [`AlreadyStoppedError`].
+        pub fn into_supervisable_parts(mut self) -> Result<SupervisableParts<S>> {
+            let consumer_join = self.consumer_join.take().ok_or(AlreadyStoppedError {
+                api: "EtwSession::into_supervisable_parts",
+            })?;
+            let exit_rx = self.exit_rx.take().ok_or(AlreadyStoppedError {
+                api: "EtwSession::into_supervisable_parts",
+            })?;
             let session_name_wide: Vec<u16> = self
                 .session_name
                 .encode_utf16()
@@ -953,13 +977,12 @@ mod windows_impl {
             let shutdown = SessionShutdownHandle {
                 session_handle: self.handle,
                 session_name: session_name_wide,
-                syscalls: Some(
-                    self.syscalls
-                        .take()
-                        .expect("into_supervisable_parts called twice or after stop()"),
-                ),
+                syscalls: Some(self.syscalls.take().ok_or(AlreadyStoppedError {
+                    api: "EtwSession::into_supervisable_parts",
+                })?),
+                torn_down: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             };
-            (consumer_join, exit_rx, shutdown)
+            Ok((consumer_join, exit_rx, shutdown))
         }
     }
 
@@ -1033,6 +1056,11 @@ mod windows_impl {
         syscalls: S,
         session_name: String,
         state: Arc<ConsumerState>,
+        /// M1.5 / C-002 — set by SessionShutdownHandle when the session
+        /// is torn down, so the 1 Hz drop-poll can't fire a QUERY
+        /// against a just-detached session and emit a stale
+        /// KernelDrops event.
+        torn_down: Arc<std::sync::atomic::AtomicBool>,
     }
 
     impl<S: EtwSysCalls> std::fmt::Debug for MonitorHandle<S> {
@@ -1051,6 +1079,13 @@ mod windows_impl {
             &self,
             on_event: impl Fn(crate::degradation::DegradationEvent),
         ) -> Result<SessionStats> {
+            // M1.5 / C-002 — refuse to poll a torn-down session. The
+            // drop-poll task treats any Err as "session gone" and
+            // self-terminates, so no stale KernelDrops event can be
+            // emitted from the shutdown/poll race window.
+            if self.torn_down.load(Ordering::Acquire) {
+                bail!("session torn down; drop-poll should terminate");
+            }
             let q = query_session_stats(&self.syscalls, &self.session_name)?;
             let stats = SessionStats {
                 events_lost: q.events_lost,
@@ -1065,6 +1100,35 @@ mod windows_impl {
                 });
             }
             Ok(stats)
+        }
+    }
+
+    // M1.5 / C-002 — teardown-flag semantics. Constructed directly
+    // (private fields visible in this module) so the test needs no
+    // full session bring-up.
+    #[cfg(test)]
+    mod teardown_flag_tests {
+        use super::*;
+
+        #[test]
+        fn poll_refuses_and_stays_silent_after_teardown() {
+            let torn = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let monitor: MonitorHandle<MockEtwSysCalls> = MonitorHandle {
+                syscalls: MockEtwSysCalls::new(),
+                session_name: "test-session".into(),
+                state: Arc::new(ConsumerState {
+                    events_seen: AtomicU64::new(0),
+                }),
+                torn_down: Arc::clone(&torn),
+            };
+            torn.store(true, std::sync::atomic::Ordering::Release);
+            let result = monitor.poll_drop_stats(|ev| {
+                panic!("no degradation event may fire after teardown; got {ev:?}")
+            });
+            assert!(
+                result.is_err(),
+                "poll after teardown must Err so the drop-poll task exits"
+            );
         }
     }
 
@@ -1087,6 +1151,11 @@ mod windows_impl {
         session_handle: CONTROLTRACE_HANDLE,
         session_name: Vec<u16>,
         syscalls: Option<S>,
+        /// M1.5 / C-002 — shared with the MonitorHandle created by
+        /// `into_supervisable_parts_with_monitor`; set on shutdown()
+        /// and in the Drop fallback so the drop-poll self-terminates
+        /// without emitting stale events.
+        torn_down: Arc<std::sync::atomic::AtomicBool>,
     }
 
     impl<S: EtwSysCalls> std::fmt::Debug for SessionShutdownHandle<S> {
@@ -1104,10 +1173,14 @@ mod windows_impl {
         /// the session is already gone (ERROR_WMI_INSTANCE_NOT_FOUND),
         /// treated as success.
         pub fn shutdown(mut self) -> Result<()> {
-            let syscalls = self
-                .syscalls
-                .take()
-                .expect("SessionShutdownHandle::shutdown called twice");
+            // M1.5 / C-002 — flip the flag before the STOP syscall so a
+            // concurrently-ticking drop-poll bails instead of querying
+            // the session mid-teardown.
+            self.torn_down
+                .store(true, std::sync::atomic::Ordering::Release);
+            let syscalls = self.syscalls.take().ok_or(AlreadyStoppedError {
+                api: "SessionShutdownHandle::shutdown",
+            })?;
             let mut props_opts = SessionOptions {
                 session_name: String::from_utf16_lossy(
                     &self.session_name[..self.session_name.len().saturating_sub(1)],
@@ -1157,6 +1230,10 @@ mod windows_impl {
     /// might.
     impl<S: EtwSysCalls> Drop for SessionShutdownHandle<S> {
         fn drop(&mut self) {
+            // M1.5 / C-002 — task-killed path: the monitor may outlive
+            // this handle's task; make sure it stops polling.
+            self.torn_down
+                .store(true, std::sync::atomic::Ordering::Release);
             let Some(syscalls) = self.syscalls.take() else {
                 return;
             };
@@ -1765,7 +1842,9 @@ mod tests {
             EtwSubsystem::Running(s) => s,
             other => panic!("expected Running; got {other:?}"),
         };
-        let (consumer_join, exit_rx, shutdown) = running.into_supervisable_parts();
+        let (consumer_join, exit_rx, shutdown) = running
+            .into_supervisable_parts()
+            .expect("fresh Running session decomposes");
 
         let captured: Arc<Mutex<Vec<DegradationEvent>>> = Arc::new(Mutex::new(Vec::new()));
         let captured_for_sink = Arc::clone(&captured);
