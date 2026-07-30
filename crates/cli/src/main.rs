@@ -421,7 +421,7 @@ async fn fetch_status_snapshot() -> Result<StatusSnapshot> {
     };
     let resp: Response = serde_json::from_str(&resp_line)?;
     match resp {
-        Response::Status(s) => Ok(s),
+        Response::Status(s) => Ok(*s),
         Response::Error { message } => Err(anyhow!(message)),
         other => Err(anyhow!("expected Status response, got {other:?}")),
     }
