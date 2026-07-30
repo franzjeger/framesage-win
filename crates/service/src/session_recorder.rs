@@ -63,6 +63,8 @@ impl SessionRecorder {
         }
     }
 
+    /// Test-only probe; production callers only feed events.
+    #[cfg(test)]
     pub fn is_recording(&self) -> bool {
         self.current.is_some()
     }
