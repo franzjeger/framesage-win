@@ -643,6 +643,24 @@ mod windows_impl {
         }
     }
 
+    /// Decomposition product of [`EtwSession::into_supervisable_parts`]:
+    /// consumer-thread JoinHandle, consumer-exit oneshot receiver, and
+    /// the teardown-owning shutdown handle.
+    pub type SupervisableParts<S> = (
+        JoinHandle<()>,
+        tokio::sync::oneshot::Receiver<crate::supervisor::ConsumerExitReason>,
+        SessionShutdownHandle<S>,
+    );
+
+    /// [`SupervisableParts`] plus the read-only [`MonitorHandle`] for the
+    /// drop-poll sibling task.
+    pub type SupervisablePartsWithMonitor<S> = (
+        JoinHandle<()>,
+        tokio::sync::oneshot::Receiver<crate::supervisor::ConsumerExitReason>,
+        SessionShutdownHandle<S>,
+        MonitorHandle<S>,
+    );
+
     /// M1.1 / A-001 — recoverable misuse error for the one-shot
     /// explicit APIs (`stop`, `query_stats`, `into_supervisable_parts*`,
     /// `SessionShutdownHandle::shutdown`). Calling any of them after the
@@ -913,14 +931,7 @@ mod windows_impl {
         /// Day 5: decompose with an additional `MonitorHandle` for the
         /// drop-poll sibling task. Same as `into_supervisable_parts`
         /// otherwise.
-        pub fn into_supervisable_parts_with_monitor(
-            self,
-        ) -> Result<(
-            JoinHandle<()>,
-            tokio::sync::oneshot::Receiver<crate::supervisor::ConsumerExitReason>,
-            SessionShutdownHandle<S>,
-            MonitorHandle<S>,
-        )>
+        pub fn into_supervisable_parts_with_monitor(self) -> Result<SupervisablePartsWithMonitor<S>>
         where
             S: Clone,
         {
@@ -951,13 +962,7 @@ mod windows_impl {
         /// just the teardown surface.
         /// One-shot: consumes the session; a second decomposition (or a
         /// call after `stop()`) returns [`AlreadyStoppedError`].
-        pub fn into_supervisable_parts(
-            mut self,
-        ) -> Result<(
-            JoinHandle<()>,
-            tokio::sync::oneshot::Receiver<crate::supervisor::ConsumerExitReason>,
-            SessionShutdownHandle<S>,
-        )> {
+        pub fn into_supervisable_parts(mut self) -> Result<SupervisableParts<S>> {
             let consumer_join = self.consumer_join.take().ok_or(AlreadyStoppedError {
                 api: "EtwSession::into_supervisable_parts",
             })?;
