@@ -49,6 +49,7 @@ mod process_actions;
 mod state;
 mod tabs;
 mod theme;
+mod tray_prefs;
 mod tree;
 mod widgets;
 
@@ -476,6 +477,8 @@ struct FramesageApp {
     /// #6 — keeps the global-hotkey message pump alive; dropped on
     /// app exit (unregisters Ctrl+Alt+G + joins the thread).
     _hotkey_guard: Option<hotkey::HotkeyGuard>,
+    /// #2 — per-user tray UI prefs (Processes-tab column visibility).
+    tray_prefs: tray_prefs::TrayPrefs,
 }
 
 impl FramesageApp {
@@ -628,6 +631,7 @@ impl FramesageApp {
             #[cfg(windows)]
             last_tray_tooltip: String::new(),
             _hotkey_guard: hotkey_guard,
+            tray_prefs: tray_prefs::TrayPrefs::load(),
         }
     }
 
@@ -2315,6 +2319,34 @@ impl FramesageApp {
                          display preference; not persisted across launches.",
                     );
             });
+        });
+        ui.add_space(10.0);
+
+        // ─── Processes-tab columns (#2, tray-prefs, persisted) ────────
+        theme::card().show(ui, |ui| {
+            ui.label(theme::section_heading("Processes columns"));
+            ui.add_space(6.0);
+            ui.label(
+                egui::RichText::new(
+                    "Hide optional columns in the Processes tab. Saved per-user;                      PID / CPU / Memory / Process / Profile / Status are always shown.",
+                )
+                .size(11.0)
+                .color(theme::TEXT_MUTED),
+            );
+            ui.add_space(4.0);
+            let c = &mut self.tray_prefs.processes_columns;
+            let mut changed = false;
+            ui.horizontal_wrapped(|ui| {
+                changed |= ui.checkbox(&mut c.description, "Description").changed();
+                changed |= ui.checkbox(&mut c.company, "Company").changed();
+                changed |= ui.checkbox(&mut c.user, "User").changed();
+                changed |= ui.checkbox(&mut c.threads, "Threads").changed();
+                changed |= ui.checkbox(&mut c.priority, "Priority").changed();
+                changed |= ui.checkbox(&mut c.affinity, "Affinity").changed();
+            });
+            if changed {
+                self.tray_prefs.save();
+            }
         });
         ui.add_space(10.0);
 
@@ -4110,46 +4142,77 @@ impl FramesageApp {
             egui::vec2(ui.available_width(), table_h),
             egui::Layout::top_down(egui::Align::LEFT),
             |ui| {
-                TableBuilder::new(ui)
+                // #2 — optional-column visibility from tray prefs.
+                let cols = self.tray_prefs.processes_columns.clone();
+                let mut builder = TableBuilder::new(ui)
                     .striped(true)
                     .resizable(true)
                     .cell_layout(egui::Layout::left_to_right(egui::Align::Center))
                     .column(Column::exact(6.0)) // State marker (no header)
                     .column(Column::exact(22.0)) // Icon (no header)
-                    .column(Column::initial(220.0).at_least(120.0)) // Exe
-                    .column(Column::initial(200.0).at_least(120.0)) // Description
-                    .column(Column::initial(140.0).at_least(80.0)) // Company
-                    .column(Column::initial(140.0).at_least(80.0)) // User
+                    .column(Column::initial(220.0).at_least(120.0)); // Exe
+                if cols.description {
+                    builder = builder.column(Column::initial(200.0).at_least(120.0));
+                }
+                if cols.company {
+                    builder = builder.column(Column::initial(140.0).at_least(80.0));
+                }
+                if cols.user {
+                    builder = builder.column(Column::initial(140.0).at_least(80.0));
+                }
+                builder = builder
                     .column(Column::initial(60.0).at_least(50.0)) // PID
                     .column(Column::initial(60.0).at_least(45.0)) // CPU%
-                    .column(Column::initial(85.0).at_least(60.0)) // Memory
-                    .column(Column::initial(55.0).at_least(45.0)) // Threads
-                    .column(Column::initial(85.0).at_least(60.0)) // Priority
-                    .column(Column::initial(110.0).at_least(70.0)) // Affinity
+                    .column(Column::initial(85.0).at_least(60.0)); // Memory
+                if cols.threads {
+                    builder = builder.column(Column::initial(55.0).at_least(45.0));
+                }
+                if cols.priority {
+                    builder = builder.column(Column::initial(85.0).at_least(60.0));
+                }
+                if cols.affinity {
+                    builder = builder.column(Column::initial(110.0).at_least(70.0));
+                }
+                builder = builder
                     .column(Column::initial(100.0).at_least(70.0)) // Profile
-                    .column(Column::remainder().at_least(70.0)) // Status
+                    .column(Column::remainder().at_least(70.0)); // Status
+                builder
                     .header(20.0, |mut header| {
                         header.col(|_ui| {}); // marker column — no header glyph
                         header.col(|_ui| {}); // icon column — no header glyph
                         header
                             .col(|ui| self.sortable_header(ui, "Process", ProcessSortKey::ExeName));
-                        header.col(|ui| {
-                            self.sortable_header(ui, "Description", ProcessSortKey::Description)
-                        });
-                        header
-                            .col(|ui| self.sortable_header(ui, "Company", ProcessSortKey::Company));
-                        header.col(|ui| self.sortable_header(ui, "User", ProcessSortKey::User));
+                        if cols.description {
+                            header.col(|ui| {
+                                self.sortable_header(ui, "Description", ProcessSortKey::Description)
+                            });
+                        }
+                        if cols.company {
+                            header.col(|ui| {
+                                self.sortable_header(ui, "Company", ProcessSortKey::Company)
+                            });
+                        }
+                        if cols.user {
+                            header.col(|ui| self.sortable_header(ui, "User", ProcessSortKey::User));
+                        }
                         header.col(|ui| self.sortable_header(ui, "PID", ProcessSortKey::Pid));
                         header.col(|ui| self.sortable_header(ui, "CPU %", ProcessSortKey::Cpu));
                         header.col(|ui| self.sortable_header(ui, "Memory", ProcessSortKey::Memory));
-                        header
-                            .col(|ui| self.sortable_header(ui, "Threads", ProcessSortKey::Threads));
-                        header.col(|ui| {
-                            self.sortable_header(ui, "Priority", ProcessSortKey::Priority)
-                        });
-                        header.col(|ui| {
-                            ui.label("Affinity");
-                        });
+                        if cols.threads {
+                            header.col(|ui| {
+                                self.sortable_header(ui, "Threads", ProcessSortKey::Threads)
+                            });
+                        }
+                        if cols.priority {
+                            header.col(|ui| {
+                                self.sortable_header(ui, "Priority", ProcessSortKey::Priority)
+                            });
+                        }
+                        if cols.affinity {
+                            header.col(|ui| {
+                                ui.label("Affinity");
+                            });
+                        }
                         header
                             .col(|ui| self.sortable_header(ui, "Profile", ProcessSortKey::Profile));
                         header.col(|ui| {
@@ -4664,58 +4727,64 @@ impl FramesageApp {
                             // "Steam Client Service Helper"). Truncates with
                             // an ellipsis when the cell can't fit the full
                             // string; full text shown on hover.
-                            row.col(|ui| match &p.description {
-                                Some(desc) => {
-                                    let resp = ui.add(egui::Label::new(desc).truncate());
-                                    if desc.len() > 24 {
-                                        let _ = resp.on_hover_text(desc);
+                            if cols.description {
+                                row.col(|ui| match &p.description {
+                                    Some(desc) => {
+                                        let resp = ui.add(egui::Label::new(desc).truncate());
+                                        if desc.len() > 24 {
+                                            let _ = resp.on_hover_text(desc);
+                                        }
                                     }
-                                }
-                                None => {
-                                    ui.weak("—");
-                                }
-                            });
+                                    None => {
+                                        ui.weak("—");
+                                    }
+                                });
+                            }
                             // Company: publisher string from the same version
                             // resource the description came from.
-                            row.col(|ui| match &p.company {
-                                Some(co) => {
-                                    let resp = ui.add(egui::Label::new(co).truncate());
-                                    if co.len() > 18 {
-                                        let _ = resp.on_hover_text(co);
+                            if cols.company {
+                                row.col(|ui| match &p.company {
+                                    Some(co) => {
+                                        let resp = ui.add(egui::Label::new(co).truncate());
+                                        if co.len() > 18 {
+                                            let _ = resp.on_hover_text(co);
+                                        }
                                     }
-                                }
-                                None => {
-                                    ui.weak("—");
-                                }
-                            });
+                                    None => {
+                                        ui.weak("—");
+                                    }
+                                });
+                            }
                             // User: owning account, "DOMAIN\\username" or
                             // just "username" for local accounts. Color
                             // SYSTEM / NT-SERVICE rows muted so the eye
                             // skips OS background and lands on user code.
-                            row.col(|ui| match &p.user {
-                                Some(u) => {
-                                    let is_system = u.starts_with("NT AUTHORITY\\")
-                                        || u == "SYSTEM"
-                                        || u.starts_with("NT SERVICE\\")
-                                        || u.starts_with("Window Manager\\")
-                                        || u.starts_with("Font Driver Host\\");
-                                    let label = egui::Label::new(egui::RichText::new(u).color(
-                                        if is_system {
-                                            theme::TEXT_MUTED
-                                        } else {
-                                            theme::TEXT
-                                        },
-                                    ))
-                                    .truncate();
-                                    let resp = ui.add(label);
-                                    if u.len() > 18 {
-                                        let _ = resp.on_hover_text(u);
+                            if cols.user {
+                                row.col(|ui| match &p.user {
+                                    Some(u) => {
+                                        let is_system = u.starts_with("NT AUTHORITY\\")
+                                            || u == "SYSTEM"
+                                            || u.starts_with("NT SERVICE\\")
+                                            || u.starts_with("Window Manager\\")
+                                            || u.starts_with("Font Driver Host\\");
+                                        let label = egui::Label::new(egui::RichText::new(u).color(
+                                            if is_system {
+                                                theme::TEXT_MUTED
+                                            } else {
+                                                theme::TEXT
+                                            },
+                                        ))
+                                        .truncate();
+                                        let resp = ui.add(label);
+                                        if u.len() > 18 {
+                                            let _ = resp.on_hover_text(u);
+                                        }
                                     }
-                                }
-                                None => {
-                                    ui.weak("—");
-                                }
-                            });
+                                    None => {
+                                        ui.weak("—");
+                                    }
+                                });
+                            }
                             row.col(|ui| {
                                 ui.monospace(p.pid.to_string());
                             });
@@ -4743,77 +4812,86 @@ impl FramesageApp {
                                 );
                                 let _ = resp.on_hover_text(tip);
                             });
-                            row.col(|ui| {
-                                ui.monospace(p.threads.to_string());
-                            });
-                            row.col(|ui| {
-                                ui.label(priority_class_label(p.priority_class_raw));
-                            });
-                            row.col(|ui| {
-                                // Affinity cell is now an interactive badge:
-                                // clicking it opens the picker for this PID
-                                // (one click vs right-click → submenu →
-                                // Custom). A leading 📌 marker indicates a
-                                // persistent rule exists for the exe — same
-                                // signal Process Lasso uses in its CPU
-                                // Affinity column. Right-click brings the
-                                // delete option.
-                                let has_rule =
-                                    rule_exists_for_exe.contains(&p.exe_name.to_ascii_lowercase());
-                                let mask_text = format!("{:#x}", p.affinity_mask);
-                                let cell_text = if has_rule {
-                                    egui::RichText::new(format!("📌 {mask_text}"))
-                                        .color(theme::ACCENT)
-                                        .monospace()
-                                } else {
-                                    egui::RichText::new(mask_text).monospace()
-                                };
-                                let resp =
-                                    ui.add(egui::Label::new(cell_text).sense(egui::Sense::click()));
-                                let mut decoded = decode_affinity_mask(p.affinity_mask);
-                                if has_rule {
-                                    decoded.push_str(
-                                        "\n\n📌 Persistent affinity rule active \
+                            if cols.threads {
+                                row.col(|ui| {
+                                    ui.monospace(p.threads.to_string());
+                                });
+                            }
+                            if cols.priority {
+                                row.col(|ui| {
+                                    ui.label(priority_class_label(p.priority_class_raw));
+                                });
+                            }
+                            if cols.affinity {
+                                row.col(|ui| {
+                                    // Affinity cell is now an interactive badge:
+                                    // clicking it opens the picker for this PID
+                                    // (one click vs right-click → submenu →
+                                    // Custom). A leading 📌 marker indicates a
+                                    // persistent rule exists for the exe — same
+                                    // signal Process Lasso uses in its CPU
+                                    // Affinity column. Right-click brings the
+                                    // delete option.
+                                    let has_rule = rule_exists_for_exe
+                                        .contains(&p.exe_name.to_ascii_lowercase());
+                                    let mask_text = format!("{:#x}", p.affinity_mask);
+                                    let cell_text = if has_rule {
+                                        egui::RichText::new(format!("📌 {mask_text}"))
+                                            .color(theme::ACCENT)
+                                            .monospace()
+                                    } else {
+                                        egui::RichText::new(mask_text).monospace()
+                                    };
+                                    let resp = ui.add(
+                                        egui::Label::new(cell_text).sense(egui::Sense::click()),
+                                    );
+                                    let mut decoded = decode_affinity_mask(p.affinity_mask);
+                                    if has_rule {
+                                        decoded.push_str(
+                                            "\n\n📌 Persistent affinity rule active \
                                          for this exe. Click to edit, right-click \
                                          to remove.",
-                                    );
-                                } else {
-                                    decoded.push_str(
-                                        "\n\nClick to edit affinity. Toggle the \
+                                        );
+                                    } else {
+                                        decoded.push_str(
+                                            "\n\nClick to edit affinity. Toggle the \
                                          Save-as-rule checkbox in the picker to \
                                          make it persistent across launches.",
-                                    );
-                                }
-                                let resp = resp.on_hover_text(decoded);
-                                if resp.clicked() {
-                                    action_queue.push(ProcessAction::RequestAffinityPicker {
-                                        pid: p.pid,
-                                        exe_name: p.exe_name.clone(),
-                                    });
-                                }
-                                resp.context_menu(|ui| {
-                                    if ui.button("Edit affinity / rule…").clicked() {
+                                        );
+                                    }
+                                    let resp = resp.on_hover_text(decoded);
+                                    if resp.clicked() {
                                         action_queue.push(ProcessAction::RequestAffinityPicker {
                                             pid: p.pid,
                                             exe_name: p.exe_name.clone(),
                                         });
-                                        ui.close_menu();
                                     }
-                                    if has_rule
-                                        && ui
-                                            .button(
-                                                egui::RichText::new("Remove persistent rule")
-                                                    .color(theme::ERROR),
-                                            )
-                                            .clicked()
-                                    {
-                                        action_queue.push(ProcessAction::DeleteAffinityRule {
-                                            exe_name: p.exe_name.clone(),
-                                        });
-                                        ui.close_menu();
-                                    }
+                                    resp.context_menu(|ui| {
+                                        if ui.button("Edit affinity / rule…").clicked() {
+                                            action_queue.push(
+                                                ProcessAction::RequestAffinityPicker {
+                                                    pid: p.pid,
+                                                    exe_name: p.exe_name.clone(),
+                                                },
+                                            );
+                                            ui.close_menu();
+                                        }
+                                        if has_rule
+                                            && ui
+                                                .button(
+                                                    egui::RichText::new("Remove persistent rule")
+                                                        .color(theme::ERROR),
+                                                )
+                                                .clicked()
+                                        {
+                                            action_queue.push(ProcessAction::DeleteAffinityRule {
+                                                exe_name: p.exe_name.clone(),
+                                            });
+                                            ui.close_menu();
+                                        }
+                                    });
                                 });
-                            });
+                            }
                             row.col(|ui| match &p.managed_profile {
                                 Some(id) => {
                                     // ★ prefix marks rows whose profile came from a
