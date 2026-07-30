@@ -4122,7 +4122,7 @@ impl FramesageApp {
                                                 targets.len()
                                             ));
                                         } else {
-                                            ui.label(format!("{} (pid {})", &exe, pid));
+                                            ui.label(format!("{} (pid {})", exe, pid));
                                         }
                                         ui.separator();
                                         ui.menu_button("Set priority", |ui| {

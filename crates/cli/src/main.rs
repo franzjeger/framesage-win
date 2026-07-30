@@ -1300,6 +1300,23 @@ async fn print_status() -> Result<()> {
     Ok(())
 }
 
+fn print_status_snapshot(s: &StatusSnapshot) {
+    println!("paused: {}", s.paused);
+    println!("rules:  {}", s.policy.rules.len());
+    println!("default profile: {}", s.policy.default_profile);
+    match &s.foreground {
+        Some(fg) => println!(
+            "foreground: pid={} exe={} title={:?}",
+            fg.pid, fg.exe_name, fg.title
+        ),
+        None => println!("foreground: <none>"),
+    }
+    match &s.active_profile {
+        Some(p) => println!("active profile: {} ({})", p.id, p.description),
+        None => println!("active profile: <none>"),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1345,22 +1362,5 @@ mod tests {
         assert!(s.contains("disabled"));
         assert!(s.contains("NOT supported on this build"));
         assert!(s.contains("Windows 11 24H2"));
-    }
-}
-
-fn print_status_snapshot(s: &StatusSnapshot) {
-    println!("paused: {}", s.paused);
-    println!("rules:  {}", s.policy.rules.len());
-    println!("default profile: {}", s.policy.default_profile);
-    match &s.foreground {
-        Some(fg) => println!(
-            "foreground: pid={} exe={} title={:?}",
-            fg.pid, fg.exe_name, fg.title
-        ),
-        None => println!("foreground: <none>"),
-    }
-    match &s.active_profile {
-        Some(p) => println!("active profile: {} ({})", p.id, p.description),
-        None => println!("active profile: <none>"),
     }
 }
