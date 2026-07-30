@@ -222,20 +222,22 @@ mod windows_impl {
             }
         }
 
-        let mut child =
-            match framesage_presentmon::child::PresentMonChild::spawn(exe, want.pid) {
-                Ok(c) => c,
-                Err(e) => {
-                    warn!(error = %e, pid = want.pid, "PresentMon spawn failed");
-                    // A failed spawn counts as a crash against the budget so
-                    // a persistently-failing PresentMon eventually gives up.
-                    policy.note_spawned(&want.exe_name, Instant::now());
-                    policy.note_exited(true);
-                    return;
-                }
-            };
+        let mut child = match framesage_presentmon::child::PresentMonChild::spawn(exe, want.pid) {
+            Ok(c) => c,
+            Err(e) => {
+                warn!(error = %e, pid = want.pid, "PresentMon spawn failed");
+                // A failed spawn counts as a crash against the budget so
+                // a persistently-failing PresentMon eventually gives up.
+                policy.note_spawned(&want.exe_name, Instant::now());
+                policy.note_exited(true);
+                return;
+            }
+        };
         let Some(pipe) = child.take_frame_pipe() else {
-            warn!(pid = want.pid, "PresentMon child has no stdout pipe; skipping");
+            warn!(
+                pid = want.pid,
+                "PresentMon child has no stdout pipe; skipping"
+            );
             child.stop();
             return;
         };

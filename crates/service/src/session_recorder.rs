@@ -755,7 +755,10 @@ mod tests {
         rec.handle_event(&exited("done"), true);
 
         let entry = &list_sessions(dir.path()).unwrap()[0];
-        assert!(entry.partial_data, "dropped frames mark the session partial");
+        assert!(
+            entry.partial_data,
+            "dropped frames mark the session partial"
+        );
     }
 
     // #7/#8 — cpu_sample + kernel_signal actually land in the file and
