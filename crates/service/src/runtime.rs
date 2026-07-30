@@ -444,12 +444,118 @@ async fn futures_pending() -> ! {
     unreachable!()
 }
 
+// ─── Subscriber caps (item 1.8 H-16 + M2.4 A-005) ─────────────────────────
+
+/// Process-wide ceiling on concurrent Subscribe streams.
+const MAX_SUBSCRIBERS_TOTAL: usize = 32;
+/// Per-client-PID ceiling. One tray plus a few debug CLIs from the
+/// same process never legitimately exceeds this; a client leaking
+/// subscriptions hits its own cap without starving other PIDs.
+const MAX_SUBSCRIBERS_PER_PID: usize = 8;
+
+/// Sentinel PID used when `GetNamedPipeClientProcessId` fails — those
+/// clients share one per-PID budget instead of bypassing the cap.
+const UNKNOWN_CLIENT_PID: u32 = u32::MAX;
+
+/// Why a Subscribe was refused. Debug-logged; `user_message` is the
+/// IPC error surface.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SubscribeDenied {
+    TotalCap,
+    PerPidCap,
+}
+
+impl SubscribeDenied {
+    fn user_message(self) -> String {
+        match self {
+            SubscribeDenied::TotalCap => format!(
+                "Subscribe rejected: maximum of {MAX_SUBSCRIBERS_TOTAL} concurrent \
+                 subscribers reached — close another client first"
+            ),
+            SubscribeDenied::PerPidCap => format!(
+                "Subscribe rejected: maximum of {MAX_SUBSCRIBERS_PER_PID} concurrent \
+                 subscribers per client process reached — close another \
+                 subscription from this process first"
+            ),
+        }
+    }
+}
+
+/// M2.4 / A-005 — layered subscriber accounting keyed on client PID.
+/// Platform-independent so the cap semantics are unit-testable off
+/// Windows; the PID itself comes from `GetNamedPipeClientProcessId`
+/// at accept time on the real pipe path.
+struct SubscriberCaps {
+    by_pid: std::sync::Mutex<std::collections::HashMap<u32, usize>>,
+}
+
+impl SubscriberCaps {
+    fn new() -> Self {
+        Self {
+            by_pid: std::sync::Mutex::new(std::collections::HashMap::new()),
+        }
+    }
+
+    /// Reserve a slot for `pid`. On `Err` nothing is reserved.
+    fn try_acquire(&self, pid: u32) -> Result<(), SubscribeDenied> {
+        let mut map = self.by_pid.lock().expect("subscriber cap lock poisoned");
+        let total: usize = map.values().sum();
+        if total >= MAX_SUBSCRIBERS_TOTAL {
+            return Err(SubscribeDenied::TotalCap);
+        }
+        let count = map.entry(pid).or_insert(0);
+        if *count >= MAX_SUBSCRIBERS_PER_PID {
+            return Err(SubscribeDenied::PerPidCap);
+        }
+        *count += 1;
+        Ok(())
+    }
+
+    /// Release a slot previously acquired for `pid`. Zeroed entries
+    /// are removed so exited clients don't grow the map forever.
+    fn release(&self, pid: u32) {
+        let mut map = self.by_pid.lock().expect("subscriber cap lock poisoned");
+        if let Some(count) = map.get_mut(&pid) {
+            *count = count.saturating_sub(1);
+            if *count == 0 {
+                map.remove(&pid);
+            }
+        }
+    }
+}
+
+/// Global instance shared by every IPC connection task.
+fn subscriber_caps() -> &'static SubscriberCaps {
+    static CAPS: std::sync::OnceLock<SubscriberCaps> = std::sync::OnceLock::new();
+    CAPS.get_or_init(SubscriberCaps::new)
+}
+
+/// M2.4 / A-005 — resolve the PID on the client end of the pipe.
+/// `None` if the query fails (the caller buckets those under
+/// `UNKNOWN_CLIENT_PID`).
+#[cfg(windows)]
+fn pipe_client_pid(stream: &tokio::net::windows::named_pipe::NamedPipeServer) -> Option<u32> {
+    use std::os::windows::io::AsRawHandle;
+    use windows::Win32::Foundation::HANDLE;
+    use windows::Win32::System::Pipes::GetNamedPipeClientProcessId;
+
+    let mut pid: u32 = 0;
+    // SAFETY: the handle comes from a live NamedPipeServer borrowed
+    // for the duration of the call; GetNamedPipeClientProcessId only
+    // reads it and writes the PID out-param.
+    unsafe { GetNamedPipeClientProcessId(HANDLE(stream.as_raw_handle()), &mut pid) }.ok()?;
+    Some(pid)
+}
+
 #[cfg(windows)]
 async fn handle_client(
     stream: tokio::net::windows::named_pipe::NamedPipeServer,
     engine: Arc<Engine>,
     kind: PipeKind,
 ) -> Result<()> {
+    // Capture the client PID while we still hold the unsplit stream;
+    // the Subscribe cap below is keyed on it.
+    let client_pid = pipe_client_pid(&stream).unwrap_or(UNKNOWN_CLIENT_PID);
     let (read_half, mut write_half) = tokio::io::split(stream);
     let mut reader = BufReader::new(read_half).lines();
 
@@ -879,42 +985,34 @@ async fn handle_client(
                 write_response(&mut write_half, &Response::Ok).await?;
             }
             Request::Subscribe => {
-                // Item 1.8 / audit H-16. Status pipe has unlimited
-                // instances (PIPE_UNLIMITED_INSTANCES = 255 max), and
-                // any Authenticated User can call Subscribe — which
-                // holds a pipe instance open indefinitely while
-                // streaming events. Without a cap, an unprivileged
-                // user could spawn ~255 Subscribe clients, exhaust
-                // the kernel pipe-instance table, and prevent the
+                // Item 1.8 / audit H-16 + M2.4 / A-005. Status pipe has
+                // unlimited instances (PIPE_UNLIMITED_INSTANCES = 255
+                // max), and any Authenticated User can call Subscribe —
+                // which holds a pipe instance open indefinitely while
+                // streaming events. Without caps, an unprivileged user
+                // could spawn ~255 Subscribe clients, exhaust the
+                // kernel pipe-instance table, and prevent the
                 // legitimate tray's status traffic from connecting.
                 //
-                // 32 is well above legitimate use (one tray + a
-                // handful of debug CLIs) and well below the 255
-                // pipe cap so the rest of the IPC plane keeps
-                // working. The counter is process-wide rather than
-                // per-PID because per-PID would require plumbing
-                // `GetNamedPipeClientProcessId` through every
-                // accept; if 32 connections are actually open from
-                // one PID that's already pathological.
-                use std::sync::atomic::{AtomicUsize, Ordering};
-                static ACTIVE_SUBSCRIBES: AtomicUsize = AtomicUsize::new(0);
-                const MAX_SUBSCRIBES: usize = 32;
-
-                let prev = ACTIVE_SUBSCRIBES.fetch_add(1, Ordering::Relaxed);
-                if prev >= MAX_SUBSCRIBES {
-                    ACTIVE_SUBSCRIBES.fetch_sub(1, Ordering::Relaxed);
+                // Two layered caps (see SubscriberCaps):
+                // * 32 process-wide — well above legitimate use (one
+                //   tray + a handful of debug CLIs), well below the
+                //   255 pipe cap so the rest of the IPC plane keeps
+                //   working.
+                // * 8 per client PID (via GetNamedPipeClientProcessId,
+                //   captured at accept time) — one misbehaving client
+                //   can no longer exhaust the shared cap for everyone
+                //   else.
+                if let Err(denied) = subscriber_caps().try_acquire(client_pid) {
                     warn!(
-                        active = prev + 1,
-                        max = MAX_SUBSCRIBES,
-                        "Subscribe rejected: active subscriber cap reached"
+                        client_pid,
+                        reason = ?denied,
+                        "Subscribe rejected: subscriber cap reached"
                     );
                     write_response(
                         &mut write_half,
                         &Response::Error {
-                            message: format!(
-                                "Subscribe rejected: maximum of {MAX_SUBSCRIBES} concurrent \
-                                 subscribers reached — close another client first"
-                            ),
+                            message: denied.user_message(),
                         },
                     )
                     .await?;
@@ -925,13 +1023,15 @@ async fn handle_client(
                 // the connection dies mid-stream / panics / hits an
                 // IO error. Without this, every dropped Subscribe
                 // would leak a count and we'd hit the cap quickly.
-                struct SubGuard;
+                struct SubGuard {
+                    pid: u32,
+                }
                 impl Drop for SubGuard {
                     fn drop(&mut self) {
-                        ACTIVE_SUBSCRIBES.fetch_sub(1, Ordering::Relaxed);
+                        subscriber_caps().release(self.pid);
                     }
                 }
-                let _sub_guard = SubGuard;
+                let _sub_guard = SubGuard { pid: client_pid };
 
                 write_response(&mut write_half, &Response::Ok).await?;
                 let mut rx = engine.subscribe();
@@ -1060,6 +1160,77 @@ fn validate_policy_against_safe_list(policy: &Policy) -> Vec<String> {
         }
     }
     denied
+}
+
+#[cfg(test)]
+mod subscriber_cap_tests {
+    use super::*;
+
+    // M2.4 / A-005 acceptance criterion: one PID holding its full
+    // per-PID budget cannot block other PIDs from subscribing.
+    #[test]
+    fn per_pid_cap_does_not_starve_other_pids() {
+        let caps = SubscriberCaps::new();
+        for _ in 0..MAX_SUBSCRIBERS_PER_PID {
+            caps.try_acquire(1111).expect("within per-PID budget");
+        }
+        assert_eq!(
+            caps.try_acquire(1111),
+            Err(SubscribeDenied::PerPidCap),
+            "9th subscription from the same PID must be refused"
+        );
+        caps.try_acquire(2222)
+            .expect("a different PID must still get a slot");
+    }
+
+    #[test]
+    fn total_cap_still_enforced_across_pids() {
+        let caps = SubscriberCaps::new();
+        let full_pids = MAX_SUBSCRIBERS_TOTAL / MAX_SUBSCRIBERS_PER_PID;
+        for pid in 0..full_pids as u32 {
+            for _ in 0..MAX_SUBSCRIBERS_PER_PID {
+                caps.try_acquire(pid).expect("under total cap");
+            }
+        }
+        assert_eq!(
+            caps.try_acquire(9999),
+            Err(SubscribeDenied::TotalCap),
+            "process-wide ceiling holds even for a fresh PID"
+        );
+    }
+
+    #[test]
+    fn release_frees_the_slot_and_prunes_zeroed_entries() {
+        let caps = SubscriberCaps::new();
+        for _ in 0..MAX_SUBSCRIBERS_PER_PID {
+            caps.try_acquire(42).unwrap();
+        }
+        assert!(caps.try_acquire(42).is_err());
+        caps.release(42);
+        caps.try_acquire(42).expect("released slot is reusable");
+        for _ in 0..MAX_SUBSCRIBERS_PER_PID {
+            caps.release(42);
+        }
+        assert!(
+            caps.by_pid.lock().unwrap().is_empty(),
+            "fully-released PID entries are pruned"
+        );
+        // Extra release for an absent PID is a no-op, not a panic/underflow.
+        caps.release(42);
+    }
+
+    #[test]
+    fn unknown_pid_clients_share_one_budget() {
+        let caps = SubscriberCaps::new();
+        for _ in 0..MAX_SUBSCRIBERS_PER_PID {
+            caps.try_acquire(UNKNOWN_CLIENT_PID).unwrap();
+        }
+        assert_eq!(
+            caps.try_acquire(UNKNOWN_CLIENT_PID),
+            Err(SubscribeDenied::PerPidCap),
+            "PID-query failures cannot bypass the cap"
+        );
+    }
 }
 
 #[cfg(test)]
