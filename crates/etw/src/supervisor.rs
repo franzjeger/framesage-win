@@ -250,7 +250,9 @@ mod tests {
 
         // EtwSession::into_supervisable_parts gives us the real
         // JoinHandle, oneshot Receiver, and SessionShutdownHandle.
-        let (consumer_join, exit_rx, shutdown) = running.into_supervisable_parts();
+        let (consumer_join, exit_rx, shutdown) = running
+            .into_supervisable_parts()
+            .expect("fresh Running session decomposes");
 
         // The actual ETW consumer thread is running with the mock
         // process_trace queue empty (returns ERROR_SUCCESS by default),

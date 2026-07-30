@@ -643,6 +643,18 @@ mod windows_impl {
         }
     }
 
+    /// M1.1 / A-001 — recoverable misuse error for the one-shot
+    /// explicit APIs (`stop`, `query_stats`, `into_supervisable_parts*`,
+    /// `SessionShutdownHandle::shutdown`). Calling any of them after the
+    /// session state has already been taken returns this instead of
+    /// panicking; the Drop fallback remains the leak-prevention net.
+    #[derive(Debug, thiserror::Error)]
+    #[error("ETW session already stopped or decomposed ({api} is one-shot)")]
+    pub struct AlreadyStoppedError {
+        /// Which one-shot API was re-entered.
+        pub api: &'static str,
+    }
+
     // ─── EtwSession (now generic over S) ─────────────────────────────────────
 
     #[derive(Debug)]
@@ -824,10 +836,9 @@ mod windows_impl {
             // explicitly stopped — Drop sees None and is a no-op.
             // Prevents double-stop if anyone holds an EtwSession and
             // both calls stop() and lets it drop.
-            let syscalls = self
-                .syscalls
-                .take()
-                .expect("EtwSession::stop called twice or after decomposition");
+            let syscalls = self.syscalls.take().ok_or(AlreadyStoppedError {
+                api: "EtwSession::stop",
+            })?;
             stop_session(&syscalls, &self.session_name)?;
             if let Some(handle) = self.consumer_join.take() {
                 if let Err(panic_payload) = handle.join() {
@@ -853,10 +864,9 @@ mod windows_impl {
         }
 
         pub fn query_stats(&self) -> Result<SessionStats> {
-            let syscalls = self
-                .syscalls
-                .as_ref()
-                .expect("query_stats called after stop() or decomposition");
+            let syscalls = self.syscalls.as_ref().ok_or(AlreadyStoppedError {
+                api: "EtwSession::query_stats",
+            })?;
             let q = query_session_stats(syscalls, &self.session_name)?;
             Ok(SessionStats {
                 events_lost: q.events_lost,
@@ -905,23 +915,25 @@ mod windows_impl {
         /// otherwise.
         pub fn into_supervisable_parts_with_monitor(
             self,
-        ) -> (
+        ) -> Result<(
             JoinHandle<()>,
             tokio::sync::oneshot::Receiver<crate::supervisor::ConsumerExitReason>,
             SessionShutdownHandle<S>,
             MonitorHandle<S>,
-        )
+        )>
         where
             S: Clone,
         {
             let syscalls_clone = self
                 .syscalls
                 .as_ref()
-                .expect("session already stopped or decomposed")
+                .ok_or(AlreadyStoppedError {
+                    api: "EtwSession::into_supervisable_parts_with_monitor",
+                })?
                 .clone();
             let session_name = self.session_name.clone();
             let state = Arc::clone(&self.state);
-            let (join, rx, shutdown) = self.into_supervisable_parts();
+            let (join, rx, shutdown) = self.into_supervisable_parts()?;
             // Share the shutdown handle's teardown flag (M1.5 / C-002)
             // so the monitor observes shutdown() / Drop immediately.
             let monitor = MonitorHandle {
@@ -930,27 +942,28 @@ mod windows_impl {
                 state,
                 torn_down: Arc::clone(&shutdown.torn_down),
             };
-            (join, rx, shutdown, monitor)
+            Ok((join, rx, shutdown, monitor))
         }
 
         /// Decompose the session into the three parts the
         /// `SupervisorLoop` needs: the consumer-thread JoinHandle, the
         /// oneshot Receiver, and a SessionShutdownHandle that owns
         /// just the teardown surface.
+        /// One-shot: consumes the session; a second decomposition (or a
+        /// call after `stop()`) returns [`AlreadyStoppedError`].
         pub fn into_supervisable_parts(
             mut self,
-        ) -> (
+        ) -> Result<(
             JoinHandle<()>,
             tokio::sync::oneshot::Receiver<crate::supervisor::ConsumerExitReason>,
             SessionShutdownHandle<S>,
-        ) {
-            let consumer_join = self
-                .consumer_join
-                .take()
-                .expect("consumer_join populated by start_with_syscalls; into_supervisable_parts is one-shot");
-            let exit_rx = self.exit_rx.take().expect(
-                "exit_rx populated by start_with_syscalls; into_supervisable_parts is one-shot",
-            );
+        )> {
+            let consumer_join = self.consumer_join.take().ok_or(AlreadyStoppedError {
+                api: "EtwSession::into_supervisable_parts",
+            })?;
+            let exit_rx = self.exit_rx.take().ok_or(AlreadyStoppedError {
+                api: "EtwSession::into_supervisable_parts",
+            })?;
             let session_name_wide: Vec<u16> = self
                 .session_name
                 .encode_utf16()
@@ -959,14 +972,12 @@ mod windows_impl {
             let shutdown = SessionShutdownHandle {
                 session_handle: self.handle,
                 session_name: session_name_wide,
-                syscalls: Some(
-                    self.syscalls
-                        .take()
-                        .expect("into_supervisable_parts called twice or after stop()"),
-                ),
+                syscalls: Some(self.syscalls.take().ok_or(AlreadyStoppedError {
+                    api: "EtwSession::into_supervisable_parts",
+                })?),
                 torn_down: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             };
-            (consumer_join, exit_rx, shutdown)
+            Ok((consumer_join, exit_rx, shutdown))
         }
     }
 
@@ -1162,10 +1173,9 @@ mod windows_impl {
             // the session mid-teardown.
             self.torn_down
                 .store(true, std::sync::atomic::Ordering::Release);
-            let syscalls = self
-                .syscalls
-                .take()
-                .expect("SessionShutdownHandle::shutdown called twice");
+            let syscalls = self.syscalls.take().ok_or(AlreadyStoppedError {
+                api: "SessionShutdownHandle::shutdown",
+            })?;
             let mut props_opts = SessionOptions {
                 session_name: String::from_utf16_lossy(
                     &self.session_name[..self.session_name.len().saturating_sub(1)],
@@ -1827,7 +1837,9 @@ mod tests {
             EtwSubsystem::Running(s) => s,
             other => panic!("expected Running; got {other:?}"),
         };
-        let (consumer_join, exit_rx, shutdown) = running.into_supervisable_parts();
+        let (consumer_join, exit_rx, shutdown) = running
+            .into_supervisable_parts()
+            .expect("fresh Running session decomposes");
 
         let captured: Arc<Mutex<Vec<DegradationEvent>>> = Arc::new(Mutex::new(Vec::new()));
         let captured_for_sink = Arc::clone(&captured);
