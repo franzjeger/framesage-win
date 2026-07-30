@@ -59,6 +59,7 @@ checks the union against the diagram below.
 | `framesage-engine`   | Policy engine (the orchestrator)      | core, ipc, gamemode, sys             |
 | `framesage-etw`      | v0.7 closed-loop ETW kernel-event consumer (cfg(windows)) | — (windows + tokio + parking_lot, no framesage deps) |
 | `framesage-recorder` | v0.7.1 session recorder: jsonl schema, retention, honest attribution (§2.3/§2.4) | — (serde + uuid, no framesage deps) |
+| `framesage-presentmon` | v0.7.1 PresentMon adapter: CSV parse, 1 Hz aggregation, PRE-L-004 spawn policy (§2.2) | — (no framesage deps) |
 | `framesage-service`  | Windows service host (LocalSystem)    | core, engine, etw, gamemode, ipc, sys |
 | `framesage-cli`      | `framesage.exe` (status, install, …)  | core, gamemode, ipc, sys             |
 | `framesage-tray`     | Tray UI (egui + tray-icon)            | core, gamemode, ipc, sys             |
