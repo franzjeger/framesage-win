@@ -914,16 +914,22 @@ mod windows_impl {
         where
             S: Clone,
         {
-            let monitor = MonitorHandle {
-                syscalls: self
-                    .syscalls
-                    .as_ref()
-                    .expect("session already stopped or decomposed")
-                    .clone(),
-                session_name: self.session_name.clone(),
-                state: Arc::clone(&self.state),
-            };
+            let syscalls_clone = self
+                .syscalls
+                .as_ref()
+                .expect("session already stopped or decomposed")
+                .clone();
+            let session_name = self.session_name.clone();
+            let state = Arc::clone(&self.state);
             let (join, rx, shutdown) = self.into_supervisable_parts();
+            // Share the shutdown handle's teardown flag (M1.5 / C-002)
+            // so the monitor observes shutdown() / Drop immediately.
+            let monitor = MonitorHandle {
+                syscalls: syscalls_clone,
+                session_name,
+                state,
+                torn_down: Arc::clone(&shutdown.torn_down),
+            };
             (join, rx, shutdown, monitor)
         }
 
@@ -958,6 +964,7 @@ mod windows_impl {
                         .take()
                         .expect("into_supervisable_parts called twice or after stop()"),
                 ),
+                torn_down: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             };
             (consumer_join, exit_rx, shutdown)
         }
@@ -1033,6 +1040,11 @@ mod windows_impl {
         syscalls: S,
         session_name: String,
         state: Arc<ConsumerState>,
+        /// M1.5 / C-002 — set by SessionShutdownHandle when the session
+        /// is torn down, so the 1 Hz drop-poll can't fire a QUERY
+        /// against a just-detached session and emit a stale
+        /// KernelDrops event.
+        torn_down: Arc<std::sync::atomic::AtomicBool>,
     }
 
     impl<S: EtwSysCalls> std::fmt::Debug for MonitorHandle<S> {
@@ -1051,6 +1063,13 @@ mod windows_impl {
             &self,
             on_event: impl Fn(crate::degradation::DegradationEvent),
         ) -> Result<SessionStats> {
+            // M1.5 / C-002 — refuse to poll a torn-down session. The
+            // drop-poll task treats any Err as "session gone" and
+            // self-terminates, so no stale KernelDrops event can be
+            // emitted from the shutdown/poll race window.
+            if self.torn_down.load(Ordering::Acquire) {
+                bail!("session torn down; drop-poll should terminate");
+            }
             let q = query_session_stats(&self.syscalls, &self.session_name)?;
             let stats = SessionStats {
                 events_lost: q.events_lost,
@@ -1065,6 +1084,35 @@ mod windows_impl {
                 });
             }
             Ok(stats)
+        }
+    }
+
+    // M1.5 / C-002 — teardown-flag semantics. Constructed directly
+    // (private fields visible in this module) so the test needs no
+    // full session bring-up.
+    #[cfg(test)]
+    mod teardown_flag_tests {
+        use super::*;
+
+        #[test]
+        fn poll_refuses_and_stays_silent_after_teardown() {
+            let torn = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let monitor: MonitorHandle<MockEtwSysCalls> = MonitorHandle {
+                syscalls: MockEtwSysCalls::new(),
+                session_name: "test-session".into(),
+                state: Arc::new(ConsumerState {
+                    events_seen: AtomicU64::new(0),
+                }),
+                torn_down: Arc::clone(&torn),
+            };
+            torn.store(true, std::sync::atomic::Ordering::Release);
+            let result = monitor.poll_drop_stats(|ev| {
+                panic!("no degradation event may fire after teardown; got {ev:?}")
+            });
+            assert!(
+                result.is_err(),
+                "poll after teardown must Err so the drop-poll task exits"
+            );
         }
     }
 
@@ -1087,6 +1135,11 @@ mod windows_impl {
         session_handle: CONTROLTRACE_HANDLE,
         session_name: Vec<u16>,
         syscalls: Option<S>,
+        /// M1.5 / C-002 — shared with the MonitorHandle created by
+        /// `into_supervisable_parts_with_monitor`; set on shutdown()
+        /// and in the Drop fallback so the drop-poll self-terminates
+        /// without emitting stale events.
+        torn_down: Arc<std::sync::atomic::AtomicBool>,
     }
 
     impl<S: EtwSysCalls> std::fmt::Debug for SessionShutdownHandle<S> {
@@ -1104,6 +1157,11 @@ mod windows_impl {
         /// the session is already gone (ERROR_WMI_INSTANCE_NOT_FOUND),
         /// treated as success.
         pub fn shutdown(mut self) -> Result<()> {
+            // M1.5 / C-002 — flip the flag before the STOP syscall so a
+            // concurrently-ticking drop-poll bails instead of querying
+            // the session mid-teardown.
+            self.torn_down
+                .store(true, std::sync::atomic::Ordering::Release);
             let syscalls = self
                 .syscalls
                 .take()
@@ -1157,6 +1215,10 @@ mod windows_impl {
     /// might.
     impl<S: EtwSysCalls> Drop for SessionShutdownHandle<S> {
         fn drop(&mut self) {
+            // M1.5 / C-002 — task-killed path: the monitor may outlive
+            // this handle's task; make sure it stops polling.
+            self.torn_down
+                .store(true, std::sync::atomic::Ordering::Release);
             let Some(syscalls) = self.syscalls.take() else {
                 return;
             };

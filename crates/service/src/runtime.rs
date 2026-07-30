@@ -116,9 +116,11 @@ pub async fn run(inputs: RuntimeInputs) -> Result<()> {
         crate::closed_loop::start_closed_loop_if_enabled(&closed_loop_policy)
     })
     .await
-    .unwrap_or_else(|join_err| crate::closed_loop::ClosedLoopStartup::StartupError {
-        message: format!("closed-loop startup task panicked: {join_err}"),
-    });
+    .unwrap_or_else(
+        |join_err| crate::closed_loop::ClosedLoopStartup::StartupError {
+            message: format!("closed-loop startup task panicked: {join_err}"),
+        },
+    );
     info!(
         startup_result = ?closed_loop_startup,
         "closed-loop startup decision made"
