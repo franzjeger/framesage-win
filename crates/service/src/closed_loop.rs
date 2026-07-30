@@ -170,6 +170,13 @@ fn spawn_closed_loop_tasks(session: EtwSession) {
     // MonitorHandle::poll_drop_stats. Self-terminates when the
     // session is gone (query_session_stats fails). The on_event sink
     // is the same shape as the supervisor's — tracing::error! emission.
+    //
+    // M3.3 / G-001 — poll_drop_stats runs a blocking ControlTraceW
+    // (QUERY) syscall directly on the async executor. At the current
+    // 1 Hz cadence the sub-millisecond call is harmless; if the poll
+    // rate is ever increased (or the query observed slow under load),
+    // wrap the call in tokio::task::spawn_blocking so it can't stall
+    // the runtime's worker threads.
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(Duration::from_secs(1));
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
