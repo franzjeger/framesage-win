@@ -525,11 +525,7 @@ fn render_frame_time_chart(ui: &mut egui::Ui, events: &[SessionEvent]) {
 
     let (min_t, max_t) = (samples[0].0, samples[samples.len() - 1].0);
     let span_t = (max_t - min_t).max(1) as f32;
-    let max_ms = samples
-        .iter()
-        .map(|s| s.2)
-        .fold(1.0_f32, f32::max)
-        .max(1.0);
+    let max_ms = samples.iter().map(|s| s.2).fold(1.0_f32, f32::max).max(1.0);
 
     let (rect, _resp) =
         ui.allocate_exact_size(egui::vec2(ui.available_width(), 90.0), egui::Sense::hover());
@@ -625,7 +621,10 @@ fn render_cpu_heatmap(ui: &mut egui::Ui, events: &[SessionEvent]) {
             // Group D polish item).
             let color = theme::ACCENT.gamma_multiply(0.15 + pct * 0.85);
             let cell = egui::Rect::from_min_size(
-                egui::pos2(rect.left() + col as f32 * cell_w, rect.top() + core as f32 * row_h),
+                egui::pos2(
+                    rect.left() + col as f32 * cell_w,
+                    rect.top() + core as f32 * row_h,
+                ),
                 egui::vec2(cell_w.ceil(), row_h),
             );
             painter.rect_filled(cell, 0.0, color);

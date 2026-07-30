@@ -34,6 +34,7 @@ use framesage_ipc::{Request, Response, StatusSnapshot};
 use tray_icon::TrayIcon;
 
 #[cfg(windows)]
+mod hotkey;
 mod icons;
 #[cfg(windows)]
 mod win32;
@@ -103,6 +104,9 @@ struct TrayCommands {
     resume_engine: Arc<AtomicBool>,
     /// Panic button — force-revert any active Game Mode session.
     game_mode_off: Arc<AtomicBool>,
+    /// #6 — global hotkey (Ctrl+Alt+G) pressed; toggle Manual Global
+    /// Game Mode. Set by the hotkey pump thread, drained in update().
+    hotkey_toggle: Arc<AtomicBool>,
     /// Reveal `%ProgramData%\framesage\` in Explorer.
     open_config_folder: Arc<AtomicBool>,
     /// Open `policy.json` in the system's default text editor.
@@ -469,6 +473,9 @@ struct FramesageApp {
     /// frame when the state hasn't changed.
     #[cfg(windows)]
     last_tray_tooltip: String,
+    /// #6 — keeps the global-hotkey message pump alive; dropped on
+    /// app exit (unregisters Ctrl+Alt+G + joins the thread).
+    _hotkey_guard: Option<hotkey::HotkeyGuard>,
 }
 
 impl FramesageApp {
@@ -578,6 +585,17 @@ impl FramesageApp {
         let tray =
             LoggedTrayIcon(build_tray(&commands, cc.egui_ctx.clone()).expect("build tray icon"));
 
+        // #6 — register the global Ctrl+Alt+G toggle. Failure /
+        // conflict is non-fatal: the tray menu + CLI still reach
+        // Manual Global Game Mode.
+        let hotkey_guard = {
+            let (status, guard) = hotkey::register_toggle_hotkey(commands.hotkey_toggle.clone());
+            if status == hotkey::HotkeyStatus::Conflict {
+                tracing::warn!("Ctrl+Alt+G is already registered by another app; hotkey disabled");
+            }
+            guard
+        };
+
         Self {
             state,
             commands,
@@ -609,6 +627,7 @@ impl FramesageApp {
             tray,
             #[cfg(windows)]
             last_tray_tooltip: String::new(),
+            _hotkey_guard: hotkey_guard,
         }
     }
 
@@ -757,6 +776,44 @@ impl eframe::App for FramesageApp {
         }
         if self.commands.game_mode_off.swap(false, Ordering::Relaxed) {
             self.send_admin_request(Request::GameModeOff, "game-mode off");
+        }
+        // #6 — global hotkey pressed: toggle Manual Global Game Mode.
+        // Active → disable; otherwise enable the first eligible
+        // profile (preferring the default). No eligible profile →
+        // surface a hint instead of a silent no-op.
+        if self.commands.hotkey_toggle.swap(false, Ordering::Relaxed) {
+            let decision = {
+                let s = self.state.lock();
+                match s.status.as_ref() {
+                    Some(snap) if snap.manual_global_active.is_some() => {
+                        Some(Request::DisableManualGlobalGameMode)
+                    }
+                    Some(snap) => {
+                        let default_id = &snap.policy.default_profile;
+                        snap.policy
+                            .profiles
+                            .values()
+                            .find(|p| p.manual_global_eligible && &p.id == default_id)
+                            .or_else(|| {
+                                snap.policy
+                                    .profiles
+                                    .values()
+                                    .find(|p| p.manual_global_eligible)
+                            })
+                            .map(|p| Request::EnableManualGlobalGameMode {
+                                profile: p.id.clone(),
+                            })
+                    }
+                    None => None,
+                }
+            };
+            match decision {
+                Some(req) => self.send_admin_request(req, "hotkey game-mode"),
+                None => {
+                    *self.last_action.lock() =
+                        Some("Ctrl+Alt+G: no manual-global-eligible profile".into());
+                }
+            }
         }
         if self
             .commands

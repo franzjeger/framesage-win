@@ -24,10 +24,10 @@
 //!      lines 1416-1420. v0.7.1 default-on-flip PR removes the
 //!      "EDR validation in progress" line per the same section.
 //!   4. **Manual Game Mode hotkey** — brief intro to the manual
-//!      global toggle (item 2.11). For the v0.6 ship the
-//!      hotkey-binding UI itself is a stub ("default Ctrl+Alt+G,
-//!      configure in Settings later") — the manual global path
-//!      is already accessible via CLI and tray menu.
+//!      global toggle (item 2.11). The global Ctrl+Alt+G hotkey is
+//!      registered at startup (crate::hotkey, #6); a custom-binding
+//!      UI is a later item. The manual global path is also reachable
+//!      via CLI and the tray menu.
 //!   5. **Done** — confirmation card, Finish button. Marker file
 //!      is written + policy mutation applied via SetPolicy on
 //!      Finish click.
@@ -626,9 +626,9 @@ fn render_page_manual_hotkey(ui: &mut egui::Ui, next: &mut Option<NextAction>) {
     ui.add_space(8.0);
     ui.label(
         egui::RichText::new(
-            "A global hotkey (default Ctrl+Alt+G) is planned but not yet available — \
-             the hotkey-binding UI is a v0.7 stretch item. Until then, use the entry \
-             points below.",
+            "Press Ctrl+Alt+G anywhere to toggle Manual Global Game Mode. If another \
+             app already owns that combo, the hotkey is disabled (a custom binding UI \
+             is a later item) — use the entry points below instead.",
         )
         .color(theme::TEXT_MUTED),
     );

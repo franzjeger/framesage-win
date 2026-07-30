@@ -271,9 +271,9 @@ framesage game-mode off-global
 
 The session is journaled with a `manual_global` trigger tag, so the Status tab's Recent Sessions view distinguishes script-driven sessions from focus-driven ones.
 
-### Global hotkey (planned)
+### Global hotkey
 
-A global **Ctrl+Alt+G** toggle for Manual Global Game Mode (same effect as the tray-menu toggle) is planned; the hotkey-binding UI is a v0.7 stretch item — see Roadmap. Until it lands, use the tray menu, the Status-tab Quick actions panel, or the CLI verbs above.
+Press **Ctrl+Alt+G** anywhere to toggle Manual Global Game Mode (same effect as the tray-menu toggle). If another application already owns that combo, the hotkey is disabled and the tray logs it; a custom-binding UI is a later item. The tray menu, Status-tab Quick actions panel, and CLI verbs above all reach the same toggle.
 
 ## System requirements (closed-loop measurement)
 
