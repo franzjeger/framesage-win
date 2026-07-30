@@ -249,6 +249,8 @@ fn main() -> Result<()> {
     // If we're launched outside the SCM (e.g. for development), fall back to
     // running the engine inline. Detect "is this an SCM start?" by checking
     // the standard env var Windows sets. On non-Windows we just run inline.
+    // Only read under cfg(windows) below; non-Windows always runs inline.
+    #[cfg_attr(not(windows), allow(unused_variables))]
     let console_mode = std::env::args().any(|a| a == "--console")
         || std::env::var_os("framesage_CONSOLE").is_some();
 
