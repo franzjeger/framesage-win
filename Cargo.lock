@@ -1013,6 +1013,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "framesage-recorder"
+version = "0.5.0"
+dependencies = [
+ "anyhow",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 1.0.69",
+ "tracing",
+ "uuid",
+]
+
+[[package]]
 name = "framesage-service"
 version = "0.5.0"
 dependencies = [

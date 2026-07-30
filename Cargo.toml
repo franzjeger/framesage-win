@@ -19,6 +19,9 @@ members = [
     # v0.7 Group A — ETW kernel-event consumer (Day 1 scaffold).
     # Production crate the service host wires into on Day 5.
     "crates/etw",
+    # v0.7.1 Group C — session recorder (schema + attribution). See
+    # audit/v0.7-architecture.md §2.3 + §2.4 and issue #110.
+    "crates/recorder",
 ]
 
 [workspace.package]
@@ -107,6 +110,7 @@ framesage-sys = { path = "crates/sys" }
 framesage-ipc = { path = "crates/ipc" }
 framesage-engine = { path = "crates/engine" }
 framesage-etw = { path = "crates/etw" }
+framesage-recorder = { path = "crates/recorder" }
 framesage-gamemode = { path = "crates/gamemode" }
 
 # UUIDs for journal session ids
