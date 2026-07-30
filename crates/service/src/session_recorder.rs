@@ -11,13 +11,17 @@
 //! * `Event::GameModeExited` writes `session_end` and closes the
 //!   file, then re-enforces the 1 GB total cap.
 //!
-//! **Honesty about missing data:** until #111 (PresentMon) and the
-//! Group A ETW drain land, sessions carry `presentmon_state:
-//! "disabled"` / `etw_state: "unavailable"`, contain no
-//! `frame_sample` events, and are marked `partial_data: true` per
-//! §2.3. The attribution panel therefore shows "Frame data
-//! unavailable" rather than fabricating a verdict — exactly the
-//! §2.4 disabled-attribution contract.
+//! **Honesty about missing data:** capability state is stamped per
+//! session from [`SessionCapabilities`] — `presentmon_state`/
+//! `etw_state` read "active" only when a real PresentMon.exe is
+//! attached (#111) and the closed-loop ETW drain is running (Group A).
+//! When either source is absent the session carries the honest
+//! "disabled"/"unavailable" state, records no `frame_sample` events
+//! from it, and stays `partial_data: true` per §2.3 — so the
+//! attribution panel shows "Frame data unavailable" rather than
+//! fabricating a verdict (the §2.4 disabled-attribution contract). A
+//! session that captured frame samples with zero drops is non-partial
+//! and the closed loop can actually attribute against it.
 //!
 //! Like the closed-loop tasks, the drain worker is NOT part of the
 //! v0.6 watchdog `select!` — a recorder failure must never take the
@@ -28,6 +32,7 @@ use std::path::PathBuf;
 use std::time::Instant;
 
 use framesage_ipc::Event;
+use framesage_presentmon::FrameStats;
 use framesage_recorder::{
     schema::SystemInfo, SessionEvent, SessionSummary, SessionWriter, SCHEMA_VERSION,
     TOTAL_CAP_BYTES,
@@ -43,11 +48,31 @@ struct ActiveRecording {
     /// 1 Hz cpu_sample tick counter — drives the §2.3 downsampling.
     cpu_ticks: u64,
     kernel_signals: u32,
+    /// #111 — frames actually recorded this session. Drives the
+    /// honest `session_end.partial_data`: a session with zero frame
+    /// samples can't support attribution and stays partial.
+    frame_samples_recorded: u32,
+    /// Cumulative PresentMon `Dropped` count seen this session, folded
+    /// into the partial-data signal.
+    frames_dropped_total: u64,
 }
 
 /// Event-driven session recorder. Platform-independent and IO-light:
 /// all state is the optional in-flight recording; the caller owns the
 /// event source and the policy gate.
+/// #111 — honest capability state stamped into `session_start`. Set
+/// by the service from the closed-loop startup result + whether a
+/// PresentMon frame source is attached. Defaults to "nothing
+/// available" so an unwired recorder tells the truth.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct SessionCapabilities {
+    /// ETW kernel drain is running (closed-loop session active).
+    pub etw_active: bool,
+    /// A PresentMon frame source is attached and will attempt to
+    /// record frame_sample events.
+    pub presentmon_active: bool,
+}
+
 pub struct SessionRecorder {
     dir: PathBuf,
     current: Option<ActiveRecording>,
@@ -55,6 +80,8 @@ pub struct SessionRecorder {
     /// `ForegroundChanged` so `session_start` can name the game that
     /// triggered the Game Mode session.
     last_foreground: Option<(String, u32, Option<u32>)>,
+    /// #111 — capability state stamped into each session_start.
+    caps: SessionCapabilities,
 }
 
 impl SessionRecorder {
@@ -63,7 +90,14 @@ impl SessionRecorder {
             dir,
             current: None,
             last_foreground: None,
+            caps: SessionCapabilities::default(),
         }
+    }
+
+    /// #111 — update the capability state stamped into future
+    /// `session_start` events. In-flight sessions keep their stamp.
+    pub fn set_capabilities(&mut self, caps: SessionCapabilities) {
+        self.caps = caps;
     }
 
     /// Test-only probe; production callers only feed events.
@@ -123,12 +157,22 @@ impl SessionRecorder {
                     profile_id: profile_id.0.clone(),
                     matched_rule_index,
                     system: host_system_info(),
-                    // Honest capability statement for this slice: no
-                    // ETW drain, no PresentMon child yet (#111 /
-                    // Group A follow-ups flip these).
-                    etw_state: "unavailable".into(),
-                    presentmon_state: "disabled".into(),
-                    opcode_table: "unknown".into(),
+                    // #111 — honest capability statement per §2.3.
+                    etw_state: if self.caps.etw_active {
+                        "active".into()
+                    } else {
+                        "unavailable".into()
+                    },
+                    presentmon_state: if self.caps.presentmon_active {
+                        "active".into()
+                    } else {
+                        "disabled".into()
+                    },
+                    opcode_table: if self.caps.etw_active {
+                        "win11_24h2_26200".into()
+                    } else {
+                        "unknown".into()
+                    },
                 };
                 match SessionWriter::create(&self.dir, &session_id, &start) {
                     Ok(mut writer) => {
@@ -154,6 +198,8 @@ impl SessionRecorder {
                             actions_applied: 1,
                             cpu_ticks: 0,
                             kernel_signals: 0,
+                            frame_samples_recorded: 0,
+                            frames_dropped_total: 0,
                         });
                     }
                     Err(e) => {
@@ -282,6 +328,46 @@ impl SessionRecorder {
         }
     }
 
+    /// #111 — append a §2.3 `frame_sample` line from the PresentMon
+    /// aggregator. The aggregator already emits at 1 Hz; downsample
+    /// beyond that per the retention rate, same as cpu_sample. A
+    /// session that records at least one frame sample is no longer
+    /// partial-for-missing-frames.
+    pub fn record_frame_sample(&mut self, stats: &FrameStats) {
+        let Some(rec) = self.current.as_mut() else {
+            return;
+        };
+        // Dropped frames count toward the partial-data signal even if
+        // the sample itself is downsampled away.
+        rec.frames_dropped_total = rec
+            .frames_dropped_total
+            .saturating_add(stats.frames_dropped as u64);
+        let keep_every = match rec.writer.sample_rate() {
+            framesage_recorder::SampleRate::Full1Hz => 1,
+            framesage_recorder::SampleRate::Half => 2,
+            framesage_recorder::SampleRate::Tenth => 10,
+            framesage_recorder::SampleRate::ActionsOnly => return,
+        };
+        // Reuse cpu_ticks-style counter dedicated to frames.
+        rec.frame_samples_recorded = rec.frame_samples_recorded.saturating_add(1);
+        if rec.frame_samples_recorded % keep_every != 0 {
+            return;
+        }
+        let at_ms = rec.started.elapsed().as_millis() as u64;
+        let event = SessionEvent::FrameSample {
+            schema_version: SCHEMA_VERSION,
+            at_ms,
+            frame_count: stats.frame_count,
+            frame_time_us_p50: stats.frame_time_us_p50,
+            frame_time_us_p99: stats.frame_time_us_p99,
+            frames_dropped: stats.frames_dropped,
+        };
+        if let Err(e) = rec.writer.append(&event) {
+            warn!(error = %e, session = %rec.session_id, "frame_sample append failed; dropping recording");
+            self.current = None;
+        }
+    }
+
     fn finish_current(&mut self, reason: &str) {
         let Some(rec) = self.current.take() else {
             return;
@@ -291,10 +377,11 @@ impl SessionRecorder {
             schema_version: SCHEMA_VERSION,
             at_ms,
             reason: reason.to_string(),
-            // §2.3: partial_data is true when PresentMon was
-            // unavailable for any window — which in this slice is the
-            // whole session.
-            partial_data: true,
+            // §2.3: partial_data is true when frame data is missing for
+            // any window (no PresentMon samples) or drops were seen.
+            // A session that recorded frame samples with zero drops is
+            // now non-partial — the closed loop can actually attribute.
+            partial_data: rec.frame_samples_recorded == 0 || rec.frames_dropped_total > 0,
             etw_drops_total: 0,
             presentmon_restarts: 0,
             summary: SessionSummary {
@@ -352,14 +439,18 @@ pub fn spawn(
     engine: std::sync::Arc<framesage_engine::Engine>,
     dir: PathBuf,
     mut kernel_signals: tokio::sync::broadcast::Receiver<framesage_etw::KernelSignal>,
+    mut frame_samples: tokio::sync::mpsc::Receiver<FrameStats>,
+    caps: SessionCapabilities,
 ) -> tokio::task::JoinHandle<()> {
     let mut rx = engine.subscribe();
     tokio::spawn(async move {
         let mut recorder = SessionRecorder::new(dir);
+        recorder.set_capabilities(caps);
         // #7 — 1 Hz cpu_sample tick while a session is recording.
         let mut cpu_interval = tokio::time::interval(std::time::Duration::from_secs(1));
         cpu_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         let mut signals_closed = false;
+        let mut frames_closed = false;
         loop {
             tokio::select! {
                 event = rx.recv() => match event {
@@ -393,6 +484,17 @@ pub fn spawn(
                     if let Some((total, per_core)) = engine.sample_cpu_for_recorder() {
                         recorder.record_cpu_sample(total, per_core);
                     }
+                }
+                frame = frame_samples.recv(), if !frames_closed => match frame {
+                    // #111 — 1 Hz frame_sample buckets from the PresentMon
+                    // manager. record_frame_sample no-ops outside a session,
+                    // so a child that outlives a session drops its tail
+                    // frames harmlessly.
+                    Some(stats) => recorder.record_frame_sample(&stats),
+                    // All PresentMon senders dropped (manager exited): keep
+                    // serving engine events; permanently disarm this arm so
+                    // recv() doesn't busy-resolve.
+                    None => frames_closed = true,
                 }
             }
         }
@@ -558,6 +660,151 @@ mod tests {
             },
             true,
         );
+        assert!(list_sessions(dir.path()).unwrap().is_empty());
+    }
+
+    fn frame_stats(at_ms: u64, p50: u64, p99: u64) -> FrameStats {
+        FrameStats {
+            at_ms,
+            frame_count: 60,
+            frame_time_us_p50: p50,
+            frame_time_us_p99: p99,
+            frames_dropped: 0,
+        }
+    }
+
+    // #111 — capabilities are stamped into session_start honestly.
+    #[test]
+    fn session_start_reflects_capabilities() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut rec = SessionRecorder::new(dir.path().to_path_buf());
+        rec.set_capabilities(SessionCapabilities {
+            etw_active: true,
+            presentmon_active: true,
+        });
+        rec.handle_event(&foreground("g.exe", 7), true);
+        rec.handle_event(&entered("game-x3d"), true);
+        rec.handle_event(&exited("done"), true);
+
+        let entry = &list_sessions(dir.path()).unwrap()[0];
+        let path = dir.path().join(format!("{}.jsonl", entry.session_id));
+        let (events, _) = read_session(&path).unwrap();
+        match events.first().unwrap() {
+            SessionEvent::SessionStart {
+                etw_state,
+                presentmon_state,
+                opcode_table,
+                ..
+            } => {
+                assert_eq!(etw_state, "active");
+                assert_eq!(presentmon_state, "active");
+                assert_eq!(opcode_table, "win11_24h2_26200");
+            }
+            other => panic!("expected session_start, got {other:?}"),
+        }
+    }
+
+    // #111 — a session that records clean frame samples is NOT partial
+    // and yields a real attribution verdict (baseline 0-60s vs
+    // with-rules, per §2.4). This is the closed loop actually working.
+    #[test]
+    fn frame_samples_make_a_session_non_partial_and_attributable() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut rec = SessionRecorder::new(dir.path().to_path_buf());
+        rec.set_capabilities(SessionCapabilities {
+            etw_active: true,
+            presentmon_active: true,
+        });
+        rec.handle_event(&foreground("g.exe", 7), true);
+        rec.handle_event(&entered("game-x3d"), true);
+        // 60 s baseline at 22ms p99, then apply, then 120 s at 19.7ms
+        // p99 (a real improvement).
+        for _ in 0..60 {
+            rec.record_frame_sample(&frame_stats(0, 16_000, 22_000));
+        }
+        rec.handle_event(
+            &Event::ProfileApplied {
+                pid: 7,
+                exe_name: "g.exe".into(),
+                profile_id: ProfileId("game-x3d".into()),
+            },
+            true,
+        );
+        for _ in 0..120 {
+            rec.record_frame_sample(&frame_stats(0, 15_800, 19_700));
+        }
+        rec.handle_event(&exited("foreground_lost"), true);
+
+        let entry = &list_sessions(dir.path()).unwrap()[0];
+        assert!(
+            !entry.partial_data,
+            "clean frame samples must clear the partial flag"
+        );
+    }
+
+    // #111 — dropped frames keep a session partial even with samples.
+    #[test]
+    fn dropped_frames_keep_session_partial() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut rec = SessionRecorder::new(dir.path().to_path_buf());
+        rec.handle_event(&foreground("g.exe", 7), true);
+        rec.handle_event(&entered("game-x3d"), true);
+        let mut s = frame_stats(0, 16_000, 22_000);
+        s.frames_dropped = 5;
+        rec.record_frame_sample(&s);
+        rec.handle_event(&exited("done"), true);
+
+        let entry = &list_sessions(dir.path()).unwrap()[0];
+        assert!(entry.partial_data, "dropped frames mark the session partial");
+    }
+
+    // #7/#8 — cpu_sample + kernel_signal actually land in the file and
+    // count into the session_end summary.
+    #[test]
+    fn cpu_and_kernel_samples_are_recorded_and_summarized() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut rec = SessionRecorder::new(dir.path().to_path_buf());
+        rec.handle_event(&foreground("g.exe", 7), true);
+        rec.handle_event(&entered("game-x3d"), true);
+        rec.record_cpu_sample(47, vec![62, 28, 71, 44]);
+        rec.record_kernel_signal(&framesage_etw::KernelSignal {
+            kind: framesage_etw::KernelEventKind::Dpc,
+            signal: "dpc_spike",
+            rate_per_sec: 14_823,
+            baseline_5min_per_sec: 3200,
+            above_baseline_pct: 363,
+        });
+        rec.handle_event(&exited("done"), true);
+
+        let entry = &list_sessions(dir.path()).unwrap()[0];
+        let path = dir.path().join(format!("{}.jsonl", entry.session_id));
+        let (events, _) = read_session(&path).unwrap();
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, SessionEvent::CpuSample { total_pct: 47, .. })),
+            "cpu_sample must be in the file"
+        );
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, SessionEvent::KernelSignal { .. })),
+            "kernel_signal must be in the file"
+        );
+        match events.last().unwrap() {
+            SessionEvent::SessionEnd { summary, .. } => {
+                assert_eq!(summary.kernel_signals, 1);
+            }
+            other => panic!("expected session_end, got {other:?}"),
+        }
+    }
+
+    // Samples outside a session are dropped, not buffered.
+    #[test]
+    fn frame_samples_outside_a_session_are_ignored() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut rec = SessionRecorder::new(dir.path().to_path_buf());
+        rec.record_frame_sample(&frame_stats(0, 16_000, 22_000));
         assert!(list_sessions(dir.path()).unwrap().is_empty());
     }
 }

@@ -27,6 +27,7 @@ mod acl;
 mod closed_loop;
 #[cfg(windows)]
 mod pipe;
+mod presentmon;
 mod runtime;
 mod session_recorder;
 

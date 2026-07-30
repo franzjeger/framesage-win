@@ -32,6 +32,9 @@ notify = { workspace = true }
 # when both pass.
 framesage-etw = { workspace = true }
 
+# #111 — PresentMon frame-time source for the session recorder.
+framesage-presentmon = { workspace = true }
+
 # v0.7.1 Group C (#110) — sessions read path for the Sessions tab
 # (ListSessions / ReadSession IPC served from the sessions dir).
 framesage-recorder = { workspace = true }
