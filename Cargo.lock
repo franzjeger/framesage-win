@@ -1040,11 +1040,13 @@ dependencies = [
  "framesage-sys",
  "notify",
  "serde_json",
+ "tempfile",
  "tokio",
  "tracing",
  "tracing-appender",
  "tracing-subscriber",
  "tracing-test",
+ "uuid",
  "windows",
  "windows-service",
 ]

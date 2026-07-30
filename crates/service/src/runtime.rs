@@ -137,6 +137,13 @@ pub async fn run(inputs: RuntimeInputs) -> Result<()> {
     // before we start applying new state. This MUST happen before the tick
     // loop launches.
     engine.recover_orphan_journal();
+
+    // #110 drain worker — records Game Mode sessions to the sessions
+    // dir when policy.closed_loop_enabled is on. Not in the watchdog
+    // select! below: recorder death must never take the rule engine
+    // down (same contract as the closed-loop tasks).
+    let _session_recorder = crate::session_recorder::spawn(engine.clone(), paths::sessions_dir());
+
     let tick_engine = engine.clone();
     let mut tick_handle = tokio::spawn(async move {
         let mut interval = tokio::time::interval(Duration::from_millis(300));
