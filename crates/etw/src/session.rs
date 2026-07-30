@@ -619,7 +619,28 @@ mod windows_impl {
         Running(EtwSession<S>),
         /// Session not instantiated. Variant carries the reason so the
         /// service can surface it in logs and (Group C) the UI banner.
+        ///
+        /// Retry policy (M2.3 / A-002): use [`EtwSubsystem::is_retryable`]
+        /// instead of matching the inner [`DegradationMode`] — the mode
+        /// itself owns the start-time retry classification via
+        /// [`DegradationMode::is_start_retryable`].
         Disabled(DegradationMode),
+    }
+
+    impl<S: EtwSysCalls> EtwSubsystem<S> {
+        /// M2.3 / A-002 — can a later `EtwSession::start()` attempt
+        /// succeed without operator/host change?
+        ///
+        /// `Running` returns `false` (there is nothing to retry);
+        /// `Disabled(mode)` defers to
+        /// [`DegradationMode::is_start_retryable`] so callers never
+        /// need to match the inner mode to pick a retry policy.
+        pub fn is_retryable(&self) -> bool {
+            match self {
+                EtwSubsystem::Running(_) => false,
+                EtwSubsystem::Disabled(mode) => mode.is_start_retryable(),
+            }
+        }
     }
 
     // ─── EtwSession (now generic over S) ─────────────────────────────────────
