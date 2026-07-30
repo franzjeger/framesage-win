@@ -22,6 +22,8 @@ members = [
     # v0.7.1 Group C — session recorder (schema + attribution). See
     # audit/v0.7-architecture.md §2.3 + §2.4 and issue #110.
     "crates/recorder",
+    # v0.7.1 Group B — PresentMon subprocess adapter (issue #111).
+    "crates/presentmon",
 ]
 
 [workspace.package]
@@ -111,6 +113,7 @@ framesage-ipc = { path = "crates/ipc" }
 framesage-engine = { path = "crates/engine" }
 framesage-etw = { path = "crates/etw" }
 framesage-recorder = { path = "crates/recorder" }
+framesage-presentmon = { path = "crates/presentmon" }
 framesage-gamemode = { path = "crates/gamemode" }
 
 # UUIDs for journal session ids

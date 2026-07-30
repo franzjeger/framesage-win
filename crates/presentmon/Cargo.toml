@@ -1,0 +1,13 @@
+[package]
+name = "framesage-presentmon"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "v0.7.1 Group B PresentMon subprocess adapter: CSV parsing, 1 Hz frame-sample aggregation, and the rate-limited spawn/reuse policy (architecture §2.2, issue #111)."
+
+[dependencies]
+anyhow = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }

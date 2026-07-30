@@ -66,6 +66,11 @@ const ALLOWED_EDGES: &[(&str, &[&str])] = &[
     // testable everywhere; the service host (drain worker + IPC) and
     // the tray (Sessions tab) will consume it.
     ("framesage-recorder", &[]),
+    // v0.7.1 Group B (issue #111): PresentMon subprocess adapter —
+    // CSV parsing, 1 Hz aggregation, PRE-L-004 spawn policy. Zero
+    // framesage deps; the service host wires it to the drain worker
+    // in the Windows-runtime integration slice.
+    ("framesage-presentmon", &[]),
     // Only the service depends on engine (and on etw, added v0.7).
     (
         "framesage-service",
