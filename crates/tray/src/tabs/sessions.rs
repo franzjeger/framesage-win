@@ -354,6 +354,61 @@ fn render_detail(
         .size(12.0)
         .color(theme::TEXT_MUTED),
     );
+
+    // Data-quality line — surfaces the honesty counters from session_end
+    // (ETW kernel drops, PresentMon restarts, dropped presents) so the
+    // numbers we record are actually visible. Silent when everything is
+    // clean and complete, so a healthy session isn't cluttered.
+    if let Some((partial, etw_drops, restarts, frames_dropped)) =
+        detail.events.iter().rev().find_map(|e| match e {
+            SessionEvent::SessionEnd {
+                partial_data,
+                etw_drops_total,
+                presentmon_restarts,
+                summary,
+                ..
+            } => Some((
+                *partial_data,
+                *etw_drops_total,
+                *presentmon_restarts,
+                summary.frames_dropped,
+            )),
+            _ => None,
+        })
+    {
+        let mut parts: Vec<String> = Vec::new();
+        if etw_drops > 0 {
+            parts.push(format!("{etw_drops} ETW kernel drops"));
+        }
+        if restarts > 0 {
+            parts.push(format!("{restarts} PresentMon restart(s)"));
+        }
+        if frames_dropped > 0 {
+            parts.push(format!("{frames_dropped} frames dropped"));
+        }
+        if partial {
+            // Partial always gets a WARNING-colored line; drops/restarts
+            // detail rides along when present.
+            let detail_txt = if parts.is_empty() {
+                String::new()
+            } else {
+                format!(" — {}", parts.join(" · "))
+            };
+            ui.label(
+                egui::RichText::new(format!("⚠ partial data{detail_txt}"))
+                    .size(11.5)
+                    .color(theme::WARNING),
+            );
+        } else if !parts.is_empty() {
+            // Non-partial but still worth noting (e.g. normal presentation
+            // drops, which don't disable attribution).
+            ui.label(
+                egui::RichText::new(parts.join(" · "))
+                    .size(11.5)
+                    .color(theme::TEXT_MUTED),
+            );
+        }
+    }
     ui.add_space(8.0);
 
     // Compute attribution once so the chart's window shading (S2) uses
