@@ -1664,24 +1664,9 @@ impl FramesageApp {
                 }
             });
 
-            ui.menu_button("View", |ui| {
-                let tabs = [
-                    (Tab::Processes, "Processes"),
-                    (Tab::Status, "Status"),
-                    (Tab::Activity, "Activity"),
-                    (Tab::Sessions, "Sessions"),
-                    (Tab::Rules, "Rules"),
-                    (Tab::Profiles, "Profiles"),
-                    (Tab::Settings, "Settings"),
-                ];
-                for (t, label) in tabs {
-                    let marker = if self.tab == t { "* " } else { "  " };
-                    if ui.button(format!("{marker}{label}")).clicked() {
-                        self.tab = t;
-                        ui.close_menu();
-                    }
-                }
-            });
+            // S3 — the former "View" menu only duplicated the
+            // always-visible tab strip below the menubar; removed to cut
+            // redundant IA. Tabs are one click away in the strip.
 
             ui.menu_button("Tools", |ui| {
                 if ui.button("Open policy file…").clicked() {
@@ -1778,7 +1763,7 @@ impl FramesageApp {
             // when manual mode is actually engaged.
             if manual_active
                 && ui
-                    .button("X Clear manual")
+                    .button("✕ Clear manual")
                     .on_hover_text("Leave manual mode; foreground apply returns to Rules")
                     .clicked()
             {
@@ -1925,6 +1910,12 @@ impl FramesageApp {
                     ..Default::default()
                 });
             }
+            Some(crate::tabs::sessions::SessionsAction::OpenProfileEditor(profile_id)) => {
+                // Q1 — jump to Profiles with the offending profile open
+                // in the editor so a degraded verdict is actionable.
+                self.tab = Tab::Profiles;
+                self.profiles.editing_id = Some(profile_id);
+            }
             None => {}
         }
     }
@@ -2024,7 +2015,7 @@ impl FramesageApp {
         if let Some(manual_id) = &s.manual_override {
             theme::banner(theme::WARNING).show(ui, |ui| {
                 ui.horizontal(|ui| {
-                    ui.colored_label(theme::WARNING, egui::RichText::new("!").strong().size(13.0));
+                    ui.colored_label(theme::WARNING, egui::RichText::new("⚠").strong().size(13.0));
                     ui.label(
                         egui::RichText::new("Manual mode")
                             .strong()
@@ -2056,7 +2047,7 @@ impl FramesageApp {
         if let Some(global_id) = &s.manual_global_active {
             theme::banner(theme::WARNING).show(ui, |ui| {
                 ui.horizontal(|ui| {
-                    ui.colored_label(theme::WARNING, egui::RichText::new("!").strong().size(13.0));
+                    ui.colored_label(theme::WARNING, egui::RichText::new("⚠").strong().size(13.0));
                     ui.label(
                         egui::RichText::new("Manual Global Game Mode")
                             .strong()
@@ -2180,21 +2171,21 @@ impl FramesageApp {
                     "Profiles applied",
                     theme::ACCENT,
                 );
-                ui.add_space(24.0);
+                ui.add_space(theme::SP_XL);
                 tile(
                     ui,
                     stats.probalance_demotions,
                     "ProBalance demotions",
                     theme::WARNING,
                 );
-                ui.add_space(24.0);
+                ui.add_space(theme::SP_XL);
                 tile(
                     ui,
                     stats.probalance_restores,
                     "ProBalance restores",
                     theme::SUCCESS,
                 );
-                ui.add_space(24.0);
+                ui.add_space(theme::SP_XL);
                 tile(
                     ui,
                     stats.game_mode_sessions,
@@ -2691,7 +2682,7 @@ impl FramesageApp {
         if !self.elevated {
             theme::banner(theme::WARNING).show(ui, |ui| {
                 ui.horizontal(|ui| {
-                    ui.colored_label(theme::WARNING, egui::RichText::new("!").strong().size(14.0));
+                    ui.colored_label(theme::WARNING, egui::RichText::new("⚠").strong().size(14.0));
                     ui.label(
                         egui::RichText::new("Read-only mode")
                             .strong()
@@ -3282,7 +3273,7 @@ impl FramesageApp {
         // for a separate Affinity Rules tab. View / delete here; creation
         // happens from the Processes-tab right-click "Remember as rule"
         // toggle, where the user can pick the exact mask in context.
-        ui.add_space(16.0);
+        ui.add_space(theme::SP_LG);
         ui.separator();
         ui.add_space(8.0);
         self.render_affinity_rules_section(ui, &s.policy);
@@ -3365,12 +3356,10 @@ impl FramesageApp {
                         row.col(|ui| {
                             let remove_enabled = self.elevated;
                             if ui
-                                .add_enabled(
-                                    remove_enabled,
-                                    egui::Button::new(
-                                        egui::RichText::new("Remove").color(theme::ERROR),
-                                    ),
-                                )
+                                .add_enabled_ui(remove_enabled, |ui| {
+                                    theme::danger_button(ui, "Remove")
+                                })
+                                .inner
                                 .on_hover_text(
                                     "Delete this affinity rule. Currently-running \
                                      matching processes keep their pin until they exit.",
@@ -3421,7 +3410,7 @@ impl FramesageApp {
         if let Some(manual_id) = &s.manual_override {
             theme::banner(theme::WARNING).show(ui, |ui| {
                 ui.horizontal(|ui| {
-                    ui.colored_label(theme::WARNING, egui::RichText::new("!").strong().size(13.0));
+                    ui.colored_label(theme::WARNING, egui::RichText::new("⚠").strong().size(13.0));
                     ui.label(
                         egui::RichText::new("Manual mode")
                             .strong()

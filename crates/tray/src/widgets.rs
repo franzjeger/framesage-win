@@ -325,15 +325,23 @@ pub(crate) fn render_perf_band(ui: &mut egui::Ui, metrics: &SystemMetrics, histo
         // Sparkline drawn first from the right edge; per-core matrix slots
         // in between the MEM text and the sparkline.
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            let desired = egui::vec2(280.0, 22.0);
-            let (rect, _) = ui.allocate_exact_size(desired, egui::Sense::hover());
+            // S4 — flex the sparkline to the space left after the numeric
+            // readouts (min 120, max 280) instead of a fixed 280, and drop
+            // the per-core matrix on narrow windows so it can't collide
+            // with the MEM readout. The aggregate CPU% hover still carries
+            // the top-core breakdown when the matrix is hidden.
+            let avail = ui.available_width();
+            let spark_w = avail.clamp(120.0, 280.0);
+            let (rect, _) = ui.allocate_exact_size(egui::vec2(spark_w, 22.0), egui::Sense::hover());
             draw_sparkline(ui.painter(), rect, history);
 
             // Per-core matrix between sparkline and MEM. Right-to-left
             // layout means this allocation appears to the *left* of the
             // sparkline. Skipped on first sample (engine hasn't accumulated
-            // two yet) or if the kernel refused per-CPU info.
-            if !metrics.per_core_cpu_percent.is_empty() {
+            // two yet), if the kernel refused per-CPU info, or when the band
+            // is too narrow to fit both the sparkline and the matrix.
+            const MATRIX_MIN_WIDTH: f32 = 520.0;
+            if !metrics.per_core_cpu_percent.is_empty() && avail >= MATRIX_MIN_WIDTH {
                 ui.add_space(12.0);
                 draw_per_core_matrix(ui, &metrics.per_core_cpu_percent);
             }
@@ -404,7 +412,7 @@ pub(crate) fn draw_per_core_matrix(ui: &mut egui::Ui, percents: &[u8]) {
 /// with subtle fills. Same pattern Task Manager / Process Lasso use.
 pub(crate) fn draw_sparkline(painter: &egui::Painter, rect: egui::Rect, history: &[(u8, u8)]) {
     use egui::epaint::PathShape;
-    use egui::{Color32, Stroke};
+    use egui::Stroke;
 
     // Background frame so the line has something to anchor against.
     painter.rect_filled(rect, 3.0, theme::SURFACE);
@@ -428,7 +436,7 @@ pub(crate) fn draw_sparkline(painter: &egui::Painter, rect: egui::Rect, history:
     // CPU line in accent, memory in a muted secondary color. Each gets a
     // subtle fill below the line for visual mass.
     let cpu_stroke = Stroke::new(1.5_f32, theme::ACCENT);
-    let mem_stroke = Stroke::new(1.0_f32, Color32::from_rgb(140, 90, 200));
+    let mem_stroke = Stroke::new(1.0_f32, theme::SERIES_SECONDARY);
 
     // Filled area under the CPU line (the more eye-catching of the two,
     // matching its priority for the user).
@@ -437,7 +445,7 @@ pub(crate) fn draw_sparkline(painter: &egui::Painter, rect: egui::Rect, history:
     cpu_fill.push(egui::pos2(rect.left(), rect.bottom()));
     painter.add(PathShape::convex_polygon(
         cpu_fill,
-        Color32::from_rgba_unmultiplied(50, 130, 246, 30),
+        theme::fill_alpha(theme::ACCENT, 30),
         Stroke::NONE,
     ));
 
@@ -452,7 +460,7 @@ pub(crate) fn draw_sparkline(painter: &egui::Painter, rect: egui::Rect, history:
 /// history for the selected PID.
 pub(crate) fn draw_single_sparkline(painter: &egui::Painter, rect: egui::Rect, history: &[u8]) {
     use egui::epaint::PathShape;
-    use egui::{Color32, Stroke};
+    use egui::Stroke;
 
     painter.rect_filled(rect, 3.0, theme::SURFACE);
 
@@ -476,7 +484,7 @@ pub(crate) fn draw_single_sparkline(painter: &egui::Painter, rect: egui::Rect, h
     fill.push(egui::pos2(rect.left(), rect.bottom()));
     painter.add(PathShape::convex_polygon(
         fill,
-        Color32::from_rgba_unmultiplied(50, 130, 246, 30),
+        theme::fill_alpha(theme::ACCENT, 30),
         Stroke::NONE,
     ));
     painter.add(PathShape::line(points, Stroke::new(1.5_f32, theme::ACCENT)));
@@ -537,7 +545,15 @@ pub(crate) fn render_status_bar(
                 } else {
                     text.to_string()
                 };
-                let color = if text.contains("error") {
+                // Color failures red. Match the failure vocabulary the
+                // service actually emits (error / failed / rejected /
+                // denied) case-insensitively, so a differently-worded
+                // rejection isn't silently shown as a neutral message.
+                let lower = text.to_ascii_lowercase();
+                let is_failure = ["error", "failed", "rejected", "denied", "refused"]
+                    .iter()
+                    .any(|kw| lower.contains(kw));
+                let color = if is_failure {
                     theme::ERROR
                 } else {
                     theme::TEXT_MUTED

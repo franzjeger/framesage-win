@@ -55,8 +55,8 @@ pub(crate) fn render_profile_editor(
     p: &mut Profile,
     discover: &mut DiscoverContext<'_>,
 ) {
-    ui.group(|ui| {
-        ui.heading("Description");
+    theme::card().show(ui, |ui| {
+        ui.label(theme::section_heading("Description"));
         ui.add(
             egui::TextEdit::multiline(&mut p.description)
                 .hint_text("Human description of what this profile does.")
@@ -65,15 +65,15 @@ pub(crate) fn render_profile_editor(
         );
     });
 
-    ui.add_space(4.0);
-    ui.group(|ui| {
-        ui.heading("Anti-cheat behavior");
+    ui.add_space(theme::SP_SM);
+    theme::card().show(ui, |ui| {
+        ui.label(theme::section_heading("Anti-cheat behavior"));
         ac_profile_selector(ui, &mut p.ac_safe_mode_target);
     });
 
-    ui.add_space(4.0);
-    ui.group(|ui| {
-        ui.heading("Per-process (editable)");
+    ui.add_space(theme::SP_SM);
+    theme::card().show(ui, |ui| {
+        ui.label(theme::section_heading("Per-process (editable)"));
         option_combo(
             ui,
             "Power throttling",
@@ -153,16 +153,16 @@ pub(crate) fn render_profile_editor(
         });
     });
 
-    ui.add_space(4.0);
-    ui.group(|ui| {
-        ui.heading("CPU targeting (editable)");
+    ui.add_space(theme::SP_SM);
+    theme::card().show(ui, |ui| {
+        ui.label(theme::section_heading("CPU targeting (editable)"));
         cpu_selector_edit(ui, "CPU sets", &mut p.cpu_sets);
         cpu_selector_edit(ui, "Affinity mask", &mut p.affinity_mask);
     });
 
-    ui.add_space(4.0);
-    ui.group(|ui| {
-        ui.heading("Game Mode (editable)");
+    ui.add_space(theme::SP_SM);
+    theme::card().show(ui, |ui| {
+        ui.label(theme::section_heading("Game Mode (editable)"));
         let mut enabled = p.game_mode.is_some();
         let was_enabled = enabled;
         ui.checkbox(
