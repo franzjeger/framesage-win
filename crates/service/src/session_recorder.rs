@@ -31,7 +31,7 @@
 //! session; the engine is unaffected.
 
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -61,12 +61,11 @@ struct ActiveRecording {
     /// data-quality flag — normal presentation drops must not disable
     /// attribution.
     frames_dropped_total: u64,
-    /// Cumulative ETW *event* drops (kernel-side or our-side) this
-    /// session — the real §2.3 partial-data trigger. No feed wires into
-    /// this yet, so it stays 0; the seam keeps `partial_data` and the
-    /// `session_end.etw_drops_total` field honest once the ETW drain
-    /// reports drops.
-    etw_drops_total: u64,
+    /// Value of the shared ETW-drops counter at session start.
+    /// `session_end.etw_drops_total` is `current - baseline` — the
+    /// kernel-event drops (RealTimeBuffersLost) observed during this
+    /// session's window, the real §2.3 partial-data trigger.
+    etw_drops_baseline: u64,
     /// Value of the shared PresentMon crash-restart counter at session
     /// start. `session_end.presentmon_restarts` is `current - baseline`,
     /// i.e. restarts observed during this session's window.
@@ -104,6 +103,12 @@ pub struct SessionRecorder {
     /// `session_end.presentmon_restarts` reports only this session's
     /// restarts without any cross-task channel.
     presentmon_restarts: Arc<AtomicU32>,
+    /// Group A — process-lifetime ETW kernel-drop counter, shared with
+    /// the closed-loop drop-poll task (it accumulates RealTimeBuffersLost
+    /// deltas). Snapshotted per session, same pattern as
+    /// `presentmon_restarts`, to drive `partial_data` +
+    /// `session_end.etw_drops_total` honestly.
+    etw_drops: Arc<AtomicU64>,
 }
 
 impl SessionRecorder {
@@ -114,7 +119,15 @@ impl SessionRecorder {
             last_foreground: None,
             caps: SessionCapabilities::default(),
             presentmon_restarts: Arc::new(AtomicU32::new(0)),
+            etw_drops: Arc::new(AtomicU64::new(0)),
         }
+    }
+
+    /// Group A — adopt the shared ETW kernel-drop counter the drop-poll
+    /// task accumulates, so `partial_data` and `session_end.etw_drops_total`
+    /// reflect real kernel-event loss. Set before sessions start.
+    pub fn set_etw_drop_counter(&mut self, counter: Arc<AtomicU64>) {
+        self.etw_drops = counter;
     }
 
     /// #111 — update the capability state stamped into future
@@ -231,7 +244,7 @@ impl SessionRecorder {
                             kernel_signals: 0,
                             frame_samples_recorded: 0,
                             frames_dropped_total: 0,
-                            etw_drops_total: 0,
+                            etw_drops_baseline: self.etw_drops.load(Ordering::Relaxed),
                             presentmon_restarts_baseline: self
                                 .presentmon_restarts
                                 .load(Ordering::Relaxed),
@@ -408,6 +421,11 @@ impl SessionRecorder {
             return;
         };
         let at_ms = rec.started.elapsed().as_millis() as u64;
+        // Kernel-event drops observed during this session's window.
+        let etw_drops_total = self
+            .etw_drops
+            .load(Ordering::Relaxed)
+            .saturating_sub(rec.etw_drops_baseline);
         let end = SessionEvent::SessionEnd {
             schema_version: SCHEMA_VERSION,
             at_ms,
@@ -420,8 +438,8 @@ impl SessionRecorder {
             // folding them in would mark nearly every real session
             // partial, permanently disabling attribution. frames_dropped
             // is recorded per sample as a metric, not a quality flag.
-            partial_data: rec.frame_samples_recorded == 0 || rec.etw_drops_total > 0,
-            etw_drops_total: rec.etw_drops_total,
+            partial_data: rec.frame_samples_recorded == 0 || etw_drops_total > 0,
+            etw_drops_total,
             // §2.3 — restarts observed during this session's window.
             presentmon_restarts: self
                 .presentmon_restarts
@@ -486,12 +504,14 @@ pub fn spawn(
     mut frame_samples: tokio::sync::mpsc::Receiver<FrameStats>,
     caps: SessionCapabilities,
     presentmon_restarts: Arc<AtomicU32>,
+    etw_drops: Arc<AtomicU64>,
 ) -> tokio::task::JoinHandle<()> {
     let mut rx = engine.subscribe();
     tokio::spawn(async move {
         let mut recorder = SessionRecorder::new(dir);
         recorder.set_capabilities(caps);
         recorder.set_presentmon_restart_counter(presentmon_restarts);
+        recorder.set_etw_drop_counter(etw_drops);
         // #7 — 1 Hz cpu_sample tick while a session is recording.
         let mut cpu_interval = tokio::time::interval(std::time::Duration::from_secs(1));
         cpu_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -852,6 +872,41 @@ mod tests {
                 *presentmon_restarts, 3,
                 "only in-session restarts count, not the pre-session baseline"
             ),
+            other => panic!("expected session_end, got {other:?}"),
+        }
+    }
+
+    // Group A — ETW kernel-event drops during a session mark it partial
+    // and populate session_end.etw_drops_total, scoped to the session
+    // window (pre-session drops on the shared counter don't count).
+    #[test]
+    fn etw_drops_during_a_session_mark_it_partial_and_are_scoped() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut rec = SessionRecorder::new(dir.path().to_path_buf());
+        let drops = Arc::new(AtomicU64::new(0));
+        rec.set_etw_drop_counter(drops.clone());
+
+        // 7 drops happened BEFORE this session — must not be counted.
+        drops.store(7, Ordering::Relaxed);
+        rec.handle_event(&foreground("g.exe", 7), true);
+        rec.handle_event(&entered("game-x3d"), true);
+        // A clean frame sample would otherwise make the session
+        // non-partial — but an in-session ETW drop overrides that.
+        rec.record_frame_sample(&frame_stats(0, 16_000, 22_000));
+        drops.fetch_add(4, Ordering::Relaxed);
+        rec.handle_event(&exited("done"), true);
+
+        let entry = &list_sessions(dir.path()).unwrap()[0];
+        assert!(
+            entry.partial_data,
+            "in-session ETW drops must mark the session partial"
+        );
+        let path = dir.path().join(format!("{}.jsonl", entry.session_id));
+        let (events, _) = read_session(&path).unwrap();
+        match events.last().unwrap() {
+            SessionEvent::SessionEnd {
+                etw_drops_total, ..
+            } => assert_eq!(*etw_drops_total, 4, "only in-session drops count"),
             other => panic!("expected session_end, got {other:?}"),
         }
     }

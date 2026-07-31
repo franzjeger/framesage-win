@@ -82,11 +82,12 @@ pub enum ClosedLoopStartup {
 pub fn start_closed_loop_if_enabled(
     policy: &Policy,
     kernel_signal_tx: tokio::sync::broadcast::Sender<framesage_etw::KernelSignal>,
+    etw_drops: std::sync::Arc<std::sync::atomic::AtomicU64>,
 ) -> ClosedLoopStartup {
-    // Windows-only consumer; the sender is unused on other hosts and
-    // on every fall-through branch below.
+    // Windows-only consumers; unused on other hosts and on every
+    // fall-through branch below.
     #[cfg(not(windows))]
-    let _ = &kernel_signal_tx;
+    let _ = (&kernel_signal_tx, &etw_drops);
     if !policy.closed_loop_enabled {
         info!(
             reason = "policy_opt_out",
@@ -111,7 +112,7 @@ pub fn start_closed_loop_if_enabled(
     let opts = SessionOptions::default();
     match EtwSession::start(opts) {
         Ok(EtwSubsystem::Running(session)) => {
-            spawn_closed_loop_tasks(session, kernel_signal_tx);
+            spawn_closed_loop_tasks(session, kernel_signal_tx, etw_drops);
             info!(
                 reason = "running",
                 "closed-loop ETW session started + supervisor/drop-poll tasks spawned"
@@ -146,6 +147,7 @@ pub fn start_closed_loop_if_enabled(
 fn spawn_closed_loop_tasks(
     session: EtwSession,
     kernel_signal_tx: tokio::sync::broadcast::Sender<framesage_etw::KernelSignal>,
+    etw_drops: std::sync::Arc<std::sync::atomic::AtomicU64>,
 ) {
     // M1.1 / A-001: decomposition is fallible (one-shot API). A fresh
     // Running session always decomposes; if it somehow doesn't, fall
@@ -207,6 +209,11 @@ fn spawn_closed_loop_tasks(
         // integration once both run against real kernel data.
         let mut signal_detector = framesage_etw::KernelSignalDetector::new();
         let mut second_index: u64 = 0;
+        // RealTimeBuffersLost is cumulative for the ETW session lifetime;
+        // accumulate its per-poll delta into the shared counter so the
+        // recorder can scope drops to each game session. saturating_sub
+        // absorbs a supervisor restart (counter resets to 0).
+        let mut last_buffers_lost: u32 = 0;
         loop {
             interval.tick().await;
             second_index += 1;
@@ -229,7 +236,17 @@ fn spawn_closed_loop_tasks(
                     "ETW degradation event"
                 );
             }) {
-                Ok(_stats) => { /* fine; emission is inside the closure */ }
+                Ok(stats) => {
+                    // Feed the session recorder's etw_drops_total /
+                    // partial_data via the shared counter (§2.3 mode 3).
+                    let delta = stats
+                        .real_time_buffers_lost
+                        .saturating_sub(last_buffers_lost);
+                    if delta > 0 {
+                        etw_drops.fetch_add(delta as u64, std::sync::atomic::Ordering::Relaxed);
+                    }
+                    last_buffers_lost = stats.real_time_buffers_lost;
+                }
                 Err(e) => {
                     // Session is likely gone (supervisor cleaned up
                     // after consumer exit). Log once and exit.
@@ -248,6 +265,7 @@ fn spawn_closed_loop_tasks(
 fn spawn_closed_loop_tasks(
     _session: EtwSession,
     _kernel_signal_tx: tokio::sync::broadcast::Sender<framesage_etw::KernelSignal>,
+    _etw_drops: std::sync::Arc<std::sync::atomic::AtomicU64>,
 ) {
     // Non-Windows stub: EtwSession::start would have bailed before
     // reaching here. This branch exists so the function signature
@@ -279,7 +297,11 @@ mod tests {
             ..Policy::default()
         };
         let (tx, _rx) = tokio::sync::broadcast::channel(4);
-        let result = start_closed_loop_if_enabled(&policy, tx);
+        let result = start_closed_loop_if_enabled(
+            &policy,
+            tx,
+            std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
+        );
         assert!(matches!(result, ClosedLoopStartup::OptedOut));
         // Assert against the structured-field formatting.
         assert!(logs_contain("reason=\"policy_opt_out\""));
@@ -316,7 +338,11 @@ mod tests {
             ..Policy::default()
         };
         let (tx, _rx) = tokio::sync::broadcast::channel(4);
-        let result = start_closed_loop_if_enabled(&policy, tx);
+        let result = start_closed_loop_if_enabled(
+            &policy,
+            tx,
+            std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
+        );
         assert!(
             matches!(
                 result,
