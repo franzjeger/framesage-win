@@ -189,7 +189,11 @@ pub fn render(
 /// (game, profile) pair with its median 1% lows verdict across the
 /// attributable sessions. Silent when there are no attributable trends
 /// yet (a single unusable session shouldn't render an empty card).
-fn render_trends(ui: &mut egui::Ui, trends: &[AggregateAttribution]) {
+fn render_trends(
+    ui: &mut egui::Ui,
+    trends: &[AggregateAttribution],
+    action: &mut Option<SessionsAction>,
+) {
     let attributable: Vec<&AggregateAttribution> = trends
         .iter()
         .filter(|t| t.attributable_sessions > 0)
@@ -208,14 +212,28 @@ fn render_trends(ui: &mut egui::Ui, trends: &[AggregateAttribution]) {
                 DeltaBand::SlightRegression | DeltaBand::Degraded => theme::WARNING,
             };
             let display = t.headline.replace("**", "");
-            let mut txt =
-                egui::RichText::new(format!("{} · {} — {}", t.game_exe, t.profile_id, display))
-                    .size(12.0)
-                    .color(color);
-            if matches!(band, DeltaBand::Degraded | DeltaBand::Improved) {
-                txt = txt.strong();
+            let label = format!("{} · {} — {}", t.game_exe, t.profile_id, display);
+            // A profile that consistently degrades (or regresses across
+            // the sample) gets the same actionable link as a single
+            // degraded verdict — click through to fix it. Improvements /
+            // neutral trends stay plain text.
+            if matches!(band, DeltaBand::Degraded | DeltaBand::SlightRegression) {
+                if ui
+                    .add(egui::Link::new(
+                        egui::RichText::new(label).size(12.0).strong().color(color),
+                    ))
+                    .on_hover_text("Open this profile in the editor to adjust it.")
+                    .clicked()
+                {
+                    *action = Some(SessionsAction::OpenProfileEditor(t.profile_id.clone()));
+                }
+            } else {
+                let mut txt = egui::RichText::new(label).size(12.0).color(color);
+                if band == DeltaBand::Improved {
+                    txt = txt.strong();
+                }
+                ui.label(txt);
             }
-            ui.label(txt);
         }
     });
     ui.add_space(theme::SP_SM);
@@ -233,7 +251,7 @@ fn render_list_and_detail(
 
     // §2.4 trend rollup above the list.
     if let Some(trends) = trends {
-        render_trends(ui, trends);
+        render_trends(ui, trends, &mut action);
     }
 
     let total_bytes: u64 = list.iter().map(|e| e.file_bytes).sum();
