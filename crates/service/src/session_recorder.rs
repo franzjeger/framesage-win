@@ -109,6 +109,11 @@ pub struct SessionRecorder {
     /// `presentmon_restarts`, to drive `partial_data` +
     /// `session_end.etw_drops_total` honestly.
     etw_drops: Arc<AtomicU64>,
+    /// Host system facts stamped into every `session_start`. Defaults to
+    /// the honest-minimum probe (`default_system_info`); the service
+    /// overrides it at spawn with the real CPU brand / CCD / memory once
+    /// the engine topology is known.
+    system_info: SystemInfo,
 }
 
 impl SessionRecorder {
@@ -120,7 +125,14 @@ impl SessionRecorder {
             caps: SessionCapabilities::default(),
             presentmon_restarts: Arc::new(AtomicU32::new(0)),
             etw_drops: Arc::new(AtomicU64::new(0)),
+            system_info: default_system_info(),
         }
+    }
+
+    /// Override the host system facts stamped into future
+    /// `session_start` events. Set once at spawn, before any session.
+    pub fn set_system_info(&mut self, info: SystemInfo) {
+        self.system_info = info;
     }
 
     /// Group A — adopt the shared ETW kernel-drop counter the drop-poll
@@ -200,7 +212,7 @@ impl SessionRecorder {
                     game_pid,
                     profile_id: profile_id.0.clone(),
                     matched_rule_index,
-                    system: host_system_info(),
+                    system: self.system_info.clone(),
                     // #111 — honest capability statement per §2.3.
                     etw_state: if self.caps.etw_active {
                         "active".into()
@@ -477,19 +489,84 @@ fn unix_now_secs() -> u64 {
         .unwrap_or(0)
 }
 
-fn host_system_info() -> SystemInfo {
+/// Honest-minimum system facts, used before the service has wired in
+/// the engine topology (and by the recorder unit tests). Everything we
+/// can't cheaply probe here is left at its zero/empty absence value.
+fn default_system_info() -> SystemInfo {
     SystemInfo {
         // detected_build is cached; None (probe failed / non-Windows)
         // records as 0.
         os_build: framesage_etw::build_gate::detected_build().unwrap_or(0),
-        // CPU brand / CCD topology plumbing lands with the Group B
-        // integration; empty/zero is honest absence, not a claim.
         cpu_brand: String::new(),
         logical_cpus: std::thread::available_parallelism()
             .map(|n| n.get() as u32)
             .unwrap_or(0),
         topology_ccds: 0,
         memory_total_bytes: 0,
+    }
+}
+
+/// Full system facts for `session_start`, built once at spawn from the
+/// engine's detected topology plus a CPUID brand read and a
+/// GlobalMemoryStatusEx total. Replaces the zeros/empty of
+/// [`default_system_info`] with real values so recorded sessions are
+/// useful forensically (which chip, CCD layout, RAM).
+fn host_system_info(topology: &framesage_core::CpuTopology) -> SystemInfo {
+    SystemInfo {
+        os_build: framesage_etw::build_gate::detected_build().unwrap_or(0),
+        cpu_brand: cpu_brand(),
+        logical_cpus: topology.count() as u32,
+        topology_ccds: topology.ccds().count() as u32,
+        memory_total_bytes: total_physical_memory_bytes(),
+    }
+}
+
+/// Total physical RAM in bytes via the sys layer's `GlobalMemoryStatusEx`
+/// wrapper. 0 off Windows or on probe failure (honest absence).
+fn total_physical_memory_bytes() -> u64 {
+    #[cfg(windows)]
+    {
+        framesage_sys::process::memory_status()
+            .map(|(total, _avail)| total)
+            .unwrap_or(0)
+    }
+    #[cfg(not(windows))]
+    {
+        0
+    }
+}
+
+/// CPU brand string via the CPUID extended leaves (0x8000_0002..=4),
+/// e.g. "AMD Ryzen 9 9950X3D 16-Core Processor". Empty on non-x86_64 or
+/// when the leaves aren't supported.
+fn cpu_brand() -> String {
+    #[cfg(target_arch = "x86_64")]
+    {
+        use std::arch::x86_64::__cpuid;
+        // __cpuid is safe on x86_64 (CPUID is always available); leaf
+        // 0x8000_0000 reports the highest extended leaf available.
+        let max_ext = __cpuid(0x8000_0000).eax;
+        if max_ext < 0x8000_0004 {
+            return String::new();
+        }
+        let mut bytes = Vec::with_capacity(48);
+        for leaf in [0x8000_0002u32, 0x8000_0003, 0x8000_0004] {
+            let r = __cpuid(leaf);
+            for reg in [r.eax, r.ebx, r.ecx, r.edx] {
+                bytes.extend_from_slice(&reg.to_le_bytes());
+            }
+        }
+        // The brand string is NUL-padded; trim at the first NUL and
+        // collapse the interior padding spaces Intel/AMD leave.
+        let end = bytes.iter().position(|&b| b == 0).unwrap_or(bytes.len());
+        String::from_utf8_lossy(&bytes[..end])
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ")
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        String::new()
     }
 }
 
@@ -512,6 +589,9 @@ pub fn spawn(
         recorder.set_capabilities(caps);
         recorder.set_presentmon_restart_counter(presentmon_restarts);
         recorder.set_etw_drop_counter(etw_drops);
+        // Stamp real host facts (CPU brand, CCD count, RAM) from the
+        // engine's detected topology, replacing the honest-zero default.
+        recorder.set_system_info(host_system_info(&engine.topology_snapshot()));
         // #7 — 1 Hz cpu_sample tick while a session is recording.
         let mut cpu_interval = tokio::time::interval(std::time::Duration::from_secs(1));
         cpu_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -874,6 +954,33 @@ mod tests {
             ),
             other => panic!("expected session_end, got {other:?}"),
         }
+    }
+
+    // host_system_info counts logical CPUs and distinct CCDs from the
+    // engine topology (not zeros), and cpu_brand() never panics.
+    #[test]
+    fn host_system_info_reports_real_topology_facts() {
+        use framesage_core::{CoreKind, CpuTopology, LogicalCpu};
+        let mut cpus = Vec::new();
+        for core in 0..4u32 {
+            let ccd = if core < 2 { 0 } else { 1 };
+            cpus.push(LogicalCpu {
+                index: core,
+                physical_core: core,
+                ccd,
+                kind: CoreKind::Cache,
+                cppc_rank: None,
+                l3_cache_bytes: None,
+                is_smt_sibling: false,
+            });
+        }
+        let topo = CpuTopology { cpus };
+        let info = host_system_info(&topo);
+        assert_eq!(info.logical_cpus, 4);
+        assert_eq!(info.topology_ccds, 2, "two distinct CCDs");
+        // cpu_brand is host-dependent; just assert the probe is total
+        // (no panic) — it's exercised for coverage.
+        let _ = cpu_brand();
     }
 
     // Group A — ETW kernel-event drops during a session mark it partial
