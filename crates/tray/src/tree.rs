@@ -48,9 +48,9 @@ pub fn classify_row(p: &ProcessSnapshot, foreground_pid: Option<u32>) -> RowStat
 /// (default rows stay clean so the colored rows pop visually).
 pub fn row_marker_color(state: RowState) -> Option<egui::Color32> {
     match state {
-        RowState::Foreground => Some(theme::ACCENT),
-        RowState::Restrained => Some(theme::WARNING),
-        RowState::Managed => Some(theme::SUCCESS),
+        RowState::Foreground => Some(theme::p().accent),
+        RowState::Restrained => Some(theme::p().warning),
+        RowState::Managed => Some(theme::p().success),
         RowState::Default => None,
     }
 }
@@ -61,9 +61,9 @@ pub fn row_marker_color(state: RowState) -> Option<egui::Color32> {
 /// the name on every managed row makes the list feel screamy.
 pub fn row_exe_color(state: RowState) -> egui::Color32 {
     match state {
-        RowState::Foreground => theme::ACCENT,
-        RowState::Restrained => theme::WARNING,
-        RowState::Managed | RowState::Default => theme::TEXT,
+        RowState::Foreground => theme::p().accent,
+        RowState::Restrained => theme::p().warning,
+        RowState::Managed | RowState::Default => theme::p().text,
     }
 }
 

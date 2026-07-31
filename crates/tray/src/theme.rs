@@ -4,48 +4,136 @@
 //! Style spacing, and TextStyle font sizes into something that reads as a
 //! polished desktop utility rather than an immediate-mode debug window.
 //!
-//! Palette is a dark navy/charcoal with a cyan-blue accent — chosen to feel
-//! performance/tooling-coded without being aggressively gamer-RGB. All
-//! semantic colors (success/warning/error/muted) are exported so the rest
-//! of the UI can stop hand-rolling Color32::from_rgb everywhere.
+//! **Theme-aware palette (Round 3 renovation).** Colors are no longer
+//! bare consts — they live on a [`Palette`] selected by [`Theme`]. The
+//! active palette is a process-global set once per [`apply`] call; UI
+//! code reads a `Copy` snapshot via [`p`] (`theme::p().accent`, etc.).
+//! The dark palette is the original navy/charcoal + cyan; the light
+//! palette derives from the same hues (GitHub Primer light) so semantic
+//! green/amber/red stay legible on white.
 
 use eframe::egui;
 use egui::{Color32, FontFamily, FontId, Rounding, Stroke, TextStyle, Visuals};
+use serde::{Deserialize, Serialize};
+use std::sync::RwLock;
 
-// ─── Palette ─────────────────────────────────────────────────────────────────
+/// Which theme the UI is painted in. Persisted per-user in tray-prefs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub enum Theme {
+    #[default]
+    Dark,
+    Light,
+}
 
-pub const BG: Color32 = Color32::from_rgb(0x0e, 0x11, 0x18);
-pub const SURFACE: Color32 = Color32::from_rgb(0x16, 0x1b, 0x22);
-pub const SURFACE_HOVER: Color32 = Color32::from_rgb(0x21, 0x27, 0x33);
-pub const SURFACE_ACTIVE: Color32 = Color32::from_rgb(0x2a, 0x30, 0x3d);
-pub const BORDER: Color32 = Color32::from_rgb(0x30, 0x36, 0x3d);
+impl Theme {
+    pub fn palette(self) -> Palette {
+        match self {
+            Theme::Dark => Palette::DARK,
+            Theme::Light => Palette::LIGHT,
+        }
+    }
+}
 
-pub const TEXT: Color32 = Color32::from_rgb(0xc9, 0xd1, 0xd9);
-pub const TEXT_MUTED: Color32 = Color32::from_rgb(0x8b, 0x94, 0x9e);
-#[allow(dead_code)] // available for future "(stub)" / footnote rendering
-pub const TEXT_DIM: Color32 = Color32::from_rgb(0x6e, 0x76, 0x81);
+/// The full semantic color set for one theme. `Copy` (17 × `Color32` =
+/// 68 bytes) so `theme::p()` snapshots are free at every call site.
+#[derive(Debug, Clone, Copy)]
+pub struct Palette {
+    pub bg: Color32,
+    pub surface: Color32,
+    pub surface_hover: Color32,
+    pub surface_active: Color32,
+    pub border: Color32,
+    pub border_muted: Color32,
+    pub text: Color32,
+    pub text_muted: Color32,
+    pub text_dim: Color32,
+    pub accent: Color32,
+    pub accent_hover: Color32,
+    pub success: Color32,
+    pub warning: Color32,
+    pub error: Color32,
+    /// Secondary data-series color (memory sparkline, second chart line).
+    pub series_secondary: Color32,
+    /// Foreground for text/glyphs painted on an `accent`-filled surface
+    /// (primary buttons, the tab-index badge). NOT `bg` — in light mode
+    /// `bg` is near-white and would vanish on the accent fill.
+    pub on_accent: Color32,
+    /// Chart gridlines / faint separators — between `border_muted` and
+    /// `bg`. Consumed by the Sessions chart-restyle slice; defined here
+    /// with the rest of the palette so both themes carry it.
+    #[allow(dead_code)]
+    pub grid: Color32,
+    /// egui `extreme_bg_color` (text-edit wells, deepest recess).
+    pub extreme_bg: Color32,
+    /// egui `code_bg_color`.
+    pub code_bg: Color32,
+}
 
-pub const ACCENT: Color32 = Color32::from_rgb(0x58, 0xa6, 0xff);
-pub const ACCENT_HOVER: Color32 = Color32::from_rgb(0x79, 0xb8, 0xff);
+impl Palette {
+    /// Original dark navy/charcoal + cyan accent.
+    pub const DARK: Palette = Palette {
+        bg: Color32::from_rgb(0x0e, 0x11, 0x18),
+        surface: Color32::from_rgb(0x16, 0x1b, 0x22),
+        surface_hover: Color32::from_rgb(0x21, 0x27, 0x33),
+        surface_active: Color32::from_rgb(0x2a, 0x30, 0x3d),
+        border: Color32::from_rgb(0x30, 0x36, 0x3d),
+        border_muted: Color32::from_rgb(0x26, 0x2b, 0x33),
+        text: Color32::from_rgb(0xc9, 0xd1, 0xd9),
+        text_muted: Color32::from_rgb(0x8b, 0x94, 0x9e),
+        text_dim: Color32::from_rgb(0x6e, 0x76, 0x81),
+        accent: Color32::from_rgb(0x58, 0xa6, 0xff),
+        accent_hover: Color32::from_rgb(0x79, 0xb8, 0xff),
+        success: Color32::from_rgb(0x3f, 0xb9, 0x50),
+        warning: Color32::from_rgb(0xd2, 0x99, 0x22),
+        error: Color32::from_rgb(0xf8, 0x51, 0x49),
+        series_secondary: Color32::from_rgb(0x8c, 0x5a, 0xc8),
+        on_accent: Color32::from_rgb(0x0e, 0x11, 0x18),
+        grid: Color32::from_rgb(0x1c, 0x22, 0x2b),
+        extreme_bg: Color32::from_rgb(0x08, 0x0b, 0x10),
+        code_bg: Color32::from_rgb(0x0a, 0x0e, 0x14),
+    };
 
-pub const SUCCESS: Color32 = Color32::from_rgb(0x3f, 0xb9, 0x50);
-pub const WARNING: Color32 = Color32::from_rgb(0xd2, 0x99, 0x22);
-pub const ERROR: Color32 = Color32::from_rgb(0xf8, 0x51, 0x49);
+    /// Light palette (GitHub Primer light) — same hues, darker semantic
+    /// colors so success/warning/error text stays legible on white.
+    pub const LIGHT: Palette = Palette {
+        bg: Color32::from_rgb(0xf6, 0xf8, 0xfa),
+        surface: Color32::from_rgb(0xff, 0xff, 0xff),
+        surface_hover: Color32::from_rgb(0xef, 0xf2, 0xf5),
+        surface_active: Color32::from_rgb(0xea, 0xee, 0xf2),
+        border: Color32::from_rgb(0xd0, 0xd7, 0xde),
+        border_muted: Color32::from_rgb(0xea, 0xee, 0xf2),
+        text: Color32::from_rgb(0x1f, 0x23, 0x28),
+        text_muted: Color32::from_rgb(0x65, 0x6d, 0x76),
+        text_dim: Color32::from_rgb(0x83, 0x8d, 0x97),
+        accent: Color32::from_rgb(0x09, 0x69, 0xda),
+        accent_hover: Color32::from_rgb(0x08, 0x60, 0xca),
+        success: Color32::from_rgb(0x1a, 0x7f, 0x37),
+        warning: Color32::from_rgb(0x9a, 0x67, 0x00),
+        error: Color32::from_rgb(0xcf, 0x22, 0x2e),
+        series_secondary: Color32::from_rgb(0x82, 0x50, 0xdf),
+        on_accent: Color32::from_rgb(0xff, 0xff, 0xff),
+        grid: Color32::from_rgb(0xea, 0xee, 0xf2),
+        extreme_bg: Color32::from_rgb(0xea, 0xee, 0xf2),
+        code_bg: Color32::from_rgb(0xf6, 0xf8, 0xfa),
+    };
+}
 
-/// Secondary data-series color (memory sparkline, second line on a chart).
-/// A muted violet that reads as distinct from the cyan [`ACCENT`] without
-/// competing with the semantic success/warning/error hues.
-pub const SERIES_SECONDARY: Color32 = Color32::from_rgb(0x8c, 0x5a, 0xc8);
+/// The active palette, swapped by [`apply`]. The UI runs single-threaded
+/// but background IPC threads also reference `theme::p()` for status
+/// coloring, so guard it with an `RwLock` (reads are uncontended).
+static ACTIVE: RwLock<Palette> = RwLock::new(Palette::DARK);
 
-/// Neutral border for unselected cards / radio tiles — quieter than
-/// [`BORDER`] would read when it needs to recede behind a selected accent
-/// sibling.
-pub const BORDER_MUTED: Color32 = Color32::from_rgb(0x26, 0x2b, 0x33);
+/// A `Copy` snapshot of the active palette. Call at render time:
+/// `theme::p().accent`, `theme::p().text_muted`, …
+pub fn p() -> Palette {
+    *ACTIVE.read().expect("theme palette lock poisoned")
+}
 
 // ─── Spacing scale ─────────────────────────────────────────────────────────────
 //
 // One vertical-rhythm scale so section gaps align to a grid instead of a
-// scatter of magic `add_space` numbers. Prefer these over literals.
+// scatter of magic `add_space` numbers. Theme-independent. Prefer these
+// over literals.
 
 pub const SP_XS: f32 = 4.0;
 pub const SP_SM: f32 = 8.0;
@@ -62,58 +150,65 @@ pub fn fill_alpha(color: Color32, alpha: u8) -> Color32 {
 
 // ─── Apply ───────────────────────────────────────────────────────────────────
 
-/// Install the framesage theme on this egui context. Idempotent — calling
-/// it more than once just re-applies the same values.
-pub fn apply(ctx: &egui::Context) {
-    let mut visuals = Visuals::dark();
+/// Install the framesage theme on this egui context for `theme`. Sets the
+/// process-global active palette, then builds egui `Visuals` from it.
+/// Idempotent — safe to call on every theme toggle.
+pub fn apply(ctx: &egui::Context, theme: Theme) {
+    let pal = theme.palette();
+    *ACTIVE.write().expect("theme palette lock poisoned") = pal;
 
-    visuals.override_text_color = Some(TEXT);
-    visuals.panel_fill = BG;
-    visuals.window_fill = SURFACE;
-    visuals.window_stroke = Stroke::new(1.0_f32, BORDER);
+    let mut visuals = match theme {
+        Theme::Dark => Visuals::dark(),
+        Theme::Light => Visuals::light(),
+    };
+
+    visuals.override_text_color = Some(pal.text);
+    visuals.panel_fill = pal.bg;
+    visuals.window_fill = pal.surface;
+    visuals.window_stroke = Stroke::new(1.0_f32, pal.border);
     visuals.window_rounding = Rounding::same(6.0);
 
-    visuals.extreme_bg_color = Color32::from_rgb(0x08, 0x0b, 0x10);
-    visuals.faint_bg_color = SURFACE;
-    visuals.code_bg_color = Color32::from_rgb(0x0a, 0x0e, 0x14);
+    visuals.extreme_bg_color = pal.extreme_bg;
+    visuals.faint_bg_color = pal.surface;
+    visuals.code_bg_color = pal.code_bg;
 
-    visuals.selection.bg_fill = Color32::from_rgba_premultiplied(0x58, 0xa6, 0xff, 0x55);
-    visuals.selection.stroke = Stroke::new(1.0_f32, ACCENT);
+    visuals.selection.bg_fill = fill_alpha(pal.accent, 0x55);
+    visuals.selection.stroke = Stroke::new(1.0_f32, pal.accent);
 
-    visuals.hyperlink_color = ACCENT;
-    visuals.warn_fg_color = WARNING;
-    visuals.error_fg_color = ERROR;
+    visuals.hyperlink_color = pal.accent;
+    visuals.warn_fg_color = pal.warning;
+    visuals.error_fg_color = pal.error;
 
     // Widgets baseline. Egui 0.28 calls the field `rounding`, not `corner_radius`.
     let widgets = &mut visuals.widgets;
-    widgets.noninteractive.bg_fill = SURFACE;
-    widgets.noninteractive.weak_bg_fill = SURFACE;
-    widgets.noninteractive.bg_stroke = Stroke::new(1.0_f32, BORDER);
-    widgets.noninteractive.fg_stroke = Stroke::new(1.0_f32, TEXT);
+    widgets.noninteractive.bg_fill = pal.surface;
+    widgets.noninteractive.weak_bg_fill = pal.surface;
+    widgets.noninteractive.bg_stroke = Stroke::new(1.0_f32, pal.border);
+    widgets.noninteractive.fg_stroke = Stroke::new(1.0_f32, pal.text);
     widgets.noninteractive.rounding = Rounding::same(4.0);
 
-    widgets.inactive.bg_fill = SURFACE;
-    widgets.inactive.weak_bg_fill = SURFACE;
-    widgets.inactive.bg_stroke = Stroke::new(1.0_f32, BORDER);
-    widgets.inactive.fg_stroke = Stroke::new(1.0_f32, TEXT);
+    widgets.inactive.bg_fill = pal.surface;
+    widgets.inactive.weak_bg_fill = pal.surface;
+    widgets.inactive.bg_stroke = Stroke::new(1.0_f32, pal.border);
+    widgets.inactive.fg_stroke = Stroke::new(1.0_f32, pal.text);
     widgets.inactive.rounding = Rounding::same(4.0);
 
-    widgets.hovered.bg_fill = SURFACE_HOVER;
-    widgets.hovered.weak_bg_fill = SURFACE_HOVER;
-    widgets.hovered.bg_stroke = Stroke::new(1.0_f32, ACCENT);
-    widgets.hovered.fg_stroke = Stroke::new(1.0_f32, TEXT);
+    widgets.hovered.bg_fill = pal.surface_hover;
+    widgets.hovered.weak_bg_fill = pal.surface_hover;
+    widgets.hovered.bg_stroke = Stroke::new(1.0_f32, pal.accent);
+    widgets.hovered.fg_stroke = Stroke::new(1.0_f32, pal.text);
     widgets.hovered.rounding = Rounding::same(4.0);
 
-    widgets.active.bg_fill = SURFACE_ACTIVE;
-    widgets.active.weak_bg_fill = SURFACE_ACTIVE;
-    widgets.active.bg_stroke = Stroke::new(1.0_f32, ACCENT_HOVER);
-    widgets.active.fg_stroke = Stroke::new(1.5_f32, TEXT);
+    widgets.active.bg_fill = pal.surface_active;
+    widgets.active.weak_bg_fill = pal.surface_active;
+    widgets.active.bg_stroke = Stroke::new(1.0_f32, pal.accent_hover);
+    widgets.active.fg_stroke = Stroke::new(1.5_f32, pal.text);
     widgets.active.rounding = Rounding::same(4.0);
 
-    widgets.open.bg_fill = SURFACE_ACTIVE;
-    widgets.open.weak_bg_fill = SURFACE_ACTIVE;
-    widgets.open.bg_stroke = Stroke::new(1.0_f32, BORDER);
-    widgets.open.fg_stroke = Stroke::new(1.0_f32, TEXT);
+    widgets.open.bg_fill = pal.surface_active;
+    widgets.open.weak_bg_fill = pal.surface_active;
+    widgets.open.bg_stroke = Stroke::new(1.0_f32, pal.border);
+    widgets.open.fg_stroke = Stroke::new(1.0_f32, pal.text);
     widgets.open.rounding = Rounding::same(4.0);
 
     ctx.set_visuals(visuals);
@@ -155,9 +250,10 @@ pub fn apply(ctx: &egui::Context) {
 /// Standard card frame: surface background, subtle border, rounded corners,
 /// generous inner padding. Use for the discrete "blocks" of UI inside a tab.
 pub fn card() -> egui::Frame {
+    let pal = p();
     egui::Frame::none()
-        .fill(SURFACE)
-        .stroke(Stroke::new(1.0_f32, BORDER))
+        .fill(pal.surface)
+        .stroke(Stroke::new(1.0_f32, pal.border))
         .rounding(Rounding::same(6.0))
         .inner_margin(egui::Margin::symmetric(14.0, 10.0))
 }
@@ -166,20 +262,20 @@ pub fn card() -> egui::Frame {
 /// summary at the top of the Status tab. Bigger inner padding than `card()`
 /// so the headline reads first.
 pub fn hero() -> egui::Frame {
+    let pal = p();
     egui::Frame::none()
-        .fill(SURFACE_ACTIVE)
-        .stroke(Stroke::new(1.0_f32, BORDER))
+        .fill(pal.surface_active)
+        .stroke(Stroke::new(1.0_f32, pal.border))
         .rounding(Rounding::same(8.0))
         .inner_margin(egui::Margin::symmetric(16.0, 12.0))
 }
 
 /// Banner frame for stateful warnings / persistent overrides (manual mode,
 /// admin-required, paused engine). Fill picks up the accent color at low
-/// opacity; stroke is full-opacity for legibility against the dark panel.
+/// opacity; stroke is full-opacity for legibility against the panel.
 pub fn banner(color: Color32) -> egui::Frame {
-    let bg = Color32::from_rgba_premultiplied(color.r(), color.g(), color.b(), 0x1f);
     egui::Frame::none()
-        .fill(bg)
+        .fill(fill_alpha(color, 0x1f))
         .stroke(Stroke::new(1.0_f32, color))
         .rounding(Rounding::same(6.0))
         .inner_margin(egui::Margin::symmetric(12.0, 8.0))
@@ -188,9 +284,8 @@ pub fn banner(color: Color32) -> egui::Frame {
 /// Pill-shaped status badge — small rounded frame with a colored background
 /// at low opacity and a matching foreground stroke.
 pub fn status_badge(color: Color32) -> egui::Frame {
-    let bg = Color32::from_rgba_premultiplied(color.r(), color.g(), color.b(), 0x33);
     egui::Frame::none()
-        .fill(bg)
+        .fill(fill_alpha(color, 0x33))
         .stroke(Stroke::new(1.0_f32, color))
         .rounding(Rounding::same(10.0))
         .inner_margin(egui::Margin::symmetric(8.0, 2.0))
@@ -202,31 +297,33 @@ pub fn section_heading(text: &str) -> egui::RichText {
     egui::RichText::new(text.to_uppercase())
         .small()
         .strong()
-        .color(TEXT_MUTED)
+        .color(p().text_muted)
         .extra_letter_spacing(1.0)
 }
 
-/// Primary call-to-action button — filled accent, dark text — so
+/// Primary call-to-action button — filled accent, on-accent text — so
 /// Continue / Finish / Save read as *the* action on a surface instead of
 /// being signalled by accent-colored text on a default fill. Returns the
 /// click response.
 pub fn primary_button(ui: &mut egui::Ui, label: &str) -> egui::Response {
-    let text = egui::RichText::new(label).color(BG).strong();
+    let pal = p();
+    let text = egui::RichText::new(label).color(pal.on_accent).strong();
     ui.add(
         egui::Button::new(text)
-            .fill(ACCENT)
-            .stroke(Stroke::new(1.0_f32, ACCENT_HOVER)),
+            .fill(pal.accent)
+            .stroke(Stroke::new(1.0_f32, pal.accent_hover)),
     )
 }
 
 /// Destructive button — error-tinted fill + stroke — so Remove / Delete
 /// reads as dangerous rather than identical to a neutral secondary button.
 pub fn danger_button(ui: &mut egui::Ui, label: &str) -> egui::Response {
-    let text = egui::RichText::new(label).color(ERROR).strong();
+    let pal = p();
+    let text = egui::RichText::new(label).color(pal.error).strong();
     ui.add(
         egui::Button::new(text)
-            .fill(fill_alpha(ERROR, 0x22))
-            .stroke(Stroke::new(1.0_f32, ERROR)),
+            .fill(fill_alpha(pal.error, 0x22))
+            .stroke(Stroke::new(1.0_f32, pal.error)),
     )
 }
 
@@ -240,10 +337,11 @@ pub fn danger_button(ui: &mut egui::Ui, label: &str) -> egui::Response {
 /// * **hovered**    — surface-hover fill, muted underline
 /// * **idle**       — transparent, muted text
 pub fn tab_button(ui: &mut egui::Ui, label: &str, selected: bool) -> egui::Response {
+    let pal = p();
     let text = if selected {
-        egui::RichText::new(label).strong().color(TEXT)
+        egui::RichText::new(label).strong().color(pal.text)
     } else {
-        egui::RichText::new(label).color(TEXT_MUTED)
+        egui::RichText::new(label).color(pal.text_muted)
     };
     let galley = egui::WidgetText::RichText(text).into_galley(
         ui,
@@ -257,21 +355,21 @@ pub fn tab_button(ui: &mut egui::Ui, label: &str, selected: bool) -> egui::Respo
 
     let painter = ui.painter();
     if selected {
-        painter.rect_filled(rect, Rounding::same(0.0), SURFACE_ACTIVE);
+        painter.rect_filled(rect, Rounding::same(0.0), pal.surface_active);
     } else if response.hovered() {
-        painter.rect_filled(rect, Rounding::same(0.0), SURFACE_HOVER);
+        painter.rect_filled(rect, Rounding::same(0.0), pal.surface_hover);
     }
 
     // Centre the label inside the slot.
     let text_pos = rect.center() - galley.size() * 0.5;
-    painter.galley(text_pos, galley, TEXT);
+    painter.galley(text_pos, galley, pal.text);
 
     if selected {
         let underline = egui::Rect::from_min_max(
             egui::pos2(rect.left(), rect.bottom() - 2.0),
             egui::pos2(rect.right(), rect.bottom()),
         );
-        painter.rect_filled(underline, Rounding::same(0.0), ACCENT);
+        painter.rect_filled(underline, Rounding::same(0.0), pal.accent);
     }
 
     response

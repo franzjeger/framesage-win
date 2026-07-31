@@ -145,7 +145,8 @@ pub fn render(
         ui.add_space(40.0);
         ui.vertical_centered(|ui| {
             ui.label(
-                egui::RichText::new("Connecting to FrameSage service…").color(theme::TEXT_MUTED),
+                egui::RichText::new("Connecting to FrameSage service…")
+                    .color(theme::p().text_muted),
             );
         });
         return None;
@@ -164,7 +165,7 @@ pub fn render(
             ui.vertical_centered(|ui| {
                 ui.horizontal(|ui| {
                     ui.spinner();
-                    ui.label(egui::RichText::new("Loading sessions…").color(theme::TEXT_MUTED));
+                    ui.label(egui::RichText::new("Loading sessions…").color(theme::p().text_muted));
                 });
             });
             if fetch_pending {
@@ -207,9 +208,9 @@ fn render_trends(
         for t in attributable {
             let band = t.band.unwrap_or(DeltaBand::NoEffect);
             let color = match band {
-                DeltaBand::Improved => theme::SUCCESS,
-                DeltaBand::ModestImprovement | DeltaBand::NoEffect => theme::TEXT_MUTED,
-                DeltaBand::SlightRegression | DeltaBand::Degraded => theme::WARNING,
+                DeltaBand::Improved => theme::p().success,
+                DeltaBand::ModestImprovement | DeltaBand::NoEffect => theme::p().text_muted,
+                DeltaBand::SlightRegression | DeltaBand::Degraded => theme::p().warning,
             };
             let display = t.headline.replace("**", "");
             let label = format!("{} · {} — {}", t.game_exe, t.profile_id, display);
@@ -263,7 +264,7 @@ fn render_list_and_detail(
                 if list.len() == 1 { "" } else { "s" },
                 total_bytes as f64 / (1024.0 * 1024.0)
             ))
-            .color(theme::TEXT_MUTED),
+            .color(theme::p().text_muted),
         );
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
             if ui
@@ -303,11 +304,11 @@ fn render_list_and_detail(
                             ui.with_layout(
                                 egui::Layout::right_to_left(egui::Align::Center),
                                 |ui| {
-                                    theme::status_badge(theme::WARNING).show(ui, |ui| {
+                                    theme::status_badge(theme::p().warning).show(ui, |ui| {
                                         ui.label(
                                             egui::RichText::new("⚠ partial data")
                                                 .size(11.0)
-                                                .color(theme::WARNING),
+                                                .color(theme::p().warning),
                                         );
                                     });
                                 },
@@ -330,14 +331,14 @@ fn render_list_and_detail(
             if fetch_pending {
                 ui.horizontal(|ui| {
                     ui.spinner();
-                    ui.label(egui::RichText::new("Loading session…").color(theme::TEXT_MUTED));
+                    ui.label(egui::RichText::new("Loading session…").color(theme::p().text_muted));
                 });
             } else {
                 ui.label(
                     egui::RichText::new(
                         "Select a session to see the \"Did it help?\" attribution.",
                     )
-                    .color(theme::TEXT_MUTED),
+                    .color(theme::p().text_muted),
                 );
             }
         }
@@ -381,7 +382,7 @@ fn render_detail(
             ui.label(
                 egui::RichText::new(&detail.session_id)
                     .size(10.0)
-                    .color(theme::TEXT_DIM),
+                    .color(theme::p().text_dim),
             );
         }
         None => {
@@ -415,7 +416,7 @@ fn render_detail(
             }
         ))
         .size(12.0)
-        .color(theme::TEXT_MUTED),
+        .color(theme::p().text_muted),
     );
 
     // Data-quality line — surfaces the honesty counters from session_end
@@ -460,7 +461,7 @@ fn render_detail(
             ui.label(
                 egui::RichText::new(format!("⚠ partial data{detail_txt}"))
                     .size(11.5)
-                    .color(theme::WARNING),
+                    .color(theme::p().warning),
             );
         } else if !parts.is_empty() {
             // Non-partial but still worth noting (e.g. normal presentation
@@ -468,7 +469,7 @@ fn render_detail(
             ui.label(
                 egui::RichText::new(parts.join(" · "))
                     .size(11.5)
-                    .color(theme::TEXT_MUTED),
+                    .color(theme::p().text_muted),
             );
         }
     }
@@ -514,7 +515,7 @@ fn render_detail(
         } => {
             ui.label(
                 egui::RichText::new(format!("Attribution disabled: {}", reason.message()))
-                    .color(theme::WARNING),
+                    .color(theme::p().warning),
             );
             if let Some(summary) = computed_anyway {
                 ui.checkbox(
@@ -538,9 +539,9 @@ fn render_attribution_summary(
     // §2.4 band colors: green only above the conservative +8% claim
     // threshold; the degraded banner is loud by design.
     let color = match summary.band {
-        DeltaBand::Improved => theme::SUCCESS,
-        DeltaBand::ModestImprovement | DeltaBand::NoEffect => theme::TEXT_MUTED,
-        DeltaBand::SlightRegression | DeltaBand::Degraded => theme::WARNING,
+        DeltaBand::Improved => theme::p().success,
+        DeltaBand::ModestImprovement | DeltaBand::NoEffect => theme::p().text_muted,
+        DeltaBand::SlightRegression | DeltaBand::Degraded => theme::p().warning,
     };
     // The stored headline carries the **degraded** emphasis marker
     // asserted by the honesty-contract tests; render it as bold text
@@ -567,7 +568,7 @@ fn render_attribution_summary(
                 summary.avg_frame_time_delta_pct, summary.variance_delta_pct
             ))
             .size(11.5)
-            .color(theme::TEXT_MUTED),
+            .color(theme::p().text_muted),
         );
     });
     ui.label(
@@ -579,7 +580,7 @@ fn render_attribution_summary(
             summary.with_rules_window_ms.1 / 1000
         ))
         .size(11.0)
-        .color(theme::TEXT_MUTED),
+        .color(theme::p().text_muted),
     );
 
     // Q1 / §2.4 — a degraded verdict means this profile made things
@@ -595,7 +596,7 @@ fn render_attribution_summary(
                 .add(egui::Link::new(
                     egui::RichText::new(format!("→ Review the “{profile}” profile"))
                         .size(12.0)
-                        .color(theme::ACCENT),
+                        .color(theme::p().accent),
                 ))
                 .on_hover_text("Opens this profile in the Profiles editor so you can adjust it.")
                 .clicked()
@@ -624,7 +625,7 @@ fn render_unsupported_build(ui: &mut egui::Ui) {
         ui.label(
             egui::RichText::new(UNSUPPORTED_BUILD_BODY)
                 .size(13.0)
-                .color(theme::TEXT_MUTED),
+                .color(theme::p().text_muted),
         );
         ui.add_space(16.0);
 
@@ -655,7 +656,7 @@ fn render_unsupported_build(ui: &mut egui::Ui) {
                 ui.label(
                     egui::RichText::new(WHY_REQUIREMENT_BODY)
                         .size(12.0)
-                        .color(theme::TEXT_MUTED),
+                        .color(theme::p().text_muted),
                 );
             });
     });
@@ -683,7 +684,7 @@ fn render_no_sessions_yet(
         ui.label(
             egui::RichText::new(NO_SESSIONS_BODY)
                 .size(13.0)
-                .color(theme::TEXT_MUTED),
+                .color(theme::p().text_muted),
         );
         ui.add_space(16.0);
 
@@ -699,10 +700,14 @@ fn render_no_sessions_yet(
                         ui.label(
                             egui::RichText::new("ON · waiting for first session")
                                 .strong()
-                                .color(theme::SUCCESS),
+                                .color(theme::p().success),
                         );
                     } else {
-                        ui.label(egui::RichText::new("OFF").strong().color(theme::TEXT_MUTED));
+                        ui.label(
+                            egui::RichText::new("OFF")
+                                .strong()
+                                .color(theme::p().text_muted),
+                        );
                         ui.add_space(8.0);
                         if ui
                             .button("Enable…")
@@ -723,7 +728,7 @@ fn render_no_sessions_yet(
         ui.label(
             egui::RichText::new(NO_SESSIONS_PRIVACY_FOOTER)
                 .size(12.0)
-                .color(theme::TEXT_MUTED),
+                .color(theme::p().text_muted),
         );
     });
 }
@@ -759,7 +764,7 @@ fn render_frame_time_chart(
         ui.label(
             egui::RichText::new("no frame data recorded for this session")
                 .size(11.0)
-                .color(theme::TEXT_MUTED),
+                .color(theme::p().text_muted),
         );
         return;
     }
@@ -783,7 +788,7 @@ fn render_frame_time_chart(
     let x = |t: u64| rect.left() + (t - min_t) as f32 / span_t * rect.width();
     let y = |ms: f32| rect.bottom() - (ms / max_ms) * rect.height();
 
-    painter.rect_filled(rect, 2.0, theme::SURFACE);
+    painter.rect_filled(rect, 2.0, theme::p().surface);
 
     // S2 — shade the baseline and with-rules windows behind the line so
     // the eye can see which spans produced the verdict. Clamped to the
@@ -811,8 +816,8 @@ fn render_frame_time_chart(
         };
         // Baseline in muted neutral, with-rules in accent — the two
         // spans the attribution compares.
-        shade(baseline.0, baseline.1, theme::TEXT_MUTED, "baseline");
-        shade(with_rules.0, with_rules.1, theme::ACCENT, "with rules");
+        shade(baseline.0, baseline.1, theme::p().text_muted, "baseline");
+        shade(with_rules.0, with_rules.1, theme::p().accent, "with rules");
     }
 
     // p99 shaded band (baseline 0 → p99).
@@ -826,7 +831,7 @@ fn render_frame_time_chart(
         ];
         painter.add(egui::Shape::convex_polygon(
             poly,
-            theme::ACCENT.gamma_multiply(0.18),
+            theme::p().accent.gamma_multiply(0.18),
             egui::Stroke::NONE,
         ));
     }
@@ -837,7 +842,7 @@ fn render_frame_time_chart(
                 egui::pos2(x(w[0].0), y(w[0].1)),
                 egui::pos2(x(w[1].0), y(w[1].1)),
             ],
-            egui::Stroke::new(1.5_f32, theme::ACCENT),
+            egui::Stroke::new(1.5_f32, theme::p().accent),
         );
     }
     // Game Mode enter marker.
@@ -848,7 +853,7 @@ fn render_frame_time_chart(
                     egui::pos2(x(t), rect.top()),
                     egui::pos2(x(t), rect.bottom()),
                 ],
-                egui::Stroke::new(1.0_f32, theme::WARNING),
+                egui::Stroke::new(1.0_f32, theme::p().warning),
             );
         }
     }
@@ -857,7 +862,7 @@ fn render_frame_time_chart(
             "p50 line · p99 shaded · peak {max_ms:.1} ms · orange = Game Mode entered"
         ))
         .size(10.0)
-        .color(theme::TEXT_MUTED),
+        .color(theme::p().text_muted),
     );
 }
 
@@ -893,7 +898,7 @@ fn render_cpu_heatmap(ui: &mut egui::Ui, events: &[SessionEvent]) {
             ui.label(
                 egui::RichText::new("100%")
                     .size(9.0)
-                    .color(theme::TEXT_MUTED),
+                    .color(theme::p().text_muted),
             );
             let (lg, _r) = ui.allocate_exact_size(egui::vec2(60.0, 8.0), egui::Sense::hover());
             let p = ui.painter_at(lg);
@@ -904,15 +909,19 @@ fn render_cpu_heatmap(ui: &mut egui::Ui, events: &[SessionEvent]) {
                     egui::pos2(lg.left() + f * lg.width(), lg.top()),
                     egui::vec2(lg.width() / steps as f32 + 1.0, lg.height()),
                 );
-                p.rect_filled(cell, 0.0, theme::ACCENT.gamma_multiply(0.15 + f * 0.85));
+                p.rect_filled(cell, 0.0, theme::p().accent.gamma_multiply(0.15 + f * 0.85));
             }
-            ui.label(egui::RichText::new("0%").size(9.0).color(theme::TEXT_MUTED));
+            ui.label(
+                egui::RichText::new("0%")
+                    .size(9.0)
+                    .color(theme::p().text_muted),
+            );
         });
     });
     ui.label(
         egui::RichText::new("cores ↓   ·   time →")
             .size(9.0)
-            .color(theme::TEXT_DIM),
+            .color(theme::p().text_dim),
     );
     let row_h = 6.0_f32;
     let (rect, _resp) = ui.allocate_exact_size(
@@ -920,7 +929,7 @@ fn render_cpu_heatmap(ui: &mut egui::Ui, events: &[SessionEvent]) {
         egui::Sense::hover(),
     );
     let painter = ui.painter_at(rect);
-    painter.rect_filled(rect, 2.0, theme::SURFACE);
+    painter.rect_filled(rect, 2.0, theme::p().surface);
     let cell_w = rect.width() / samples.len() as f32;
     for (col, sample) in samples.iter().enumerate() {
         for core in 0..cores {
@@ -928,7 +937,7 @@ fn render_cpu_heatmap(ui: &mut egui::Ui, events: &[SessionEvent]) {
             // Blue→green→yellow→red-ish via accent gamma; cheap and
             // theme-consistent (a full perceptual colormap is the
             // Group D polish item).
-            let color = theme::ACCENT.gamma_multiply(0.15 + pct * 0.85);
+            let color = theme::p().accent.gamma_multiply(0.15 + pct * 0.85);
             let cell = egui::Rect::from_min_size(
                 egui::pos2(
                     rect.left() + col as f32 * cell_w,

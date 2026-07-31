@@ -483,9 +483,11 @@ struct FramesageApp {
 
 impl FramesageApp {
     fn new(cc: &eframe::CreationContext<'_>, commands: TrayCommands, elevated: bool) -> Self {
-        // Install our custom dark theme before the first frame renders so
-        // the user never sees the egui-default flash.
-        theme::apply(&cc.egui_ctx);
+        // Load per-user prefs first so the persisted light/dark choice is
+        // applied before the first frame renders (no egui-default flash,
+        // no dark-then-light flip on startup).
+        let tray_prefs = tray_prefs::TrayPrefs::load();
+        theme::apply(&cc.egui_ctx, tray_prefs.theme);
 
         let state = Arc::new(Mutex::new(AppState::default()));
 
@@ -631,7 +633,7 @@ impl FramesageApp {
             #[cfg(windows)]
             last_tray_tooltip: String::new(),
             _hotkey_guard: hotkey_guard,
-            tray_prefs: tray_prefs::TrayPrefs::load(),
+            tray_prefs,
         }
     }
 
@@ -940,9 +942,9 @@ impl eframe::App for FramesageApp {
         egui::TopBottomPanel::top("framesage-menubar")
             .frame(
                 egui::Frame::none()
-                    .fill(theme::SURFACE)
+                    .fill(theme::p().surface)
                     .inner_margin(egui::Margin::symmetric(8.0, 4.0))
-                    .stroke(egui::Stroke::new(1.0_f32, theme::BORDER)),
+                    .stroke(egui::Stroke::new(1.0_f32, theme::p().border)),
             )
             .show(ctx, |ui| {
                 self.render_menubar(ui, connected, paused);
@@ -956,9 +958,9 @@ impl eframe::App for FramesageApp {
         egui::TopBottomPanel::top("framesage-toolbar")
             .frame(
                 egui::Frame::none()
-                    .fill(theme::BG)
+                    .fill(theme::p().bg)
                     .inner_margin(egui::Margin::symmetric(8.0, 4.0))
-                    .stroke(egui::Stroke::new(1.0_f32, theme::BORDER)),
+                    .stroke(egui::Stroke::new(1.0_f32, theme::p().border)),
             )
             .show(ctx, |ui| {
                 self.render_toolbar(ui, paused, manual_override.is_some());
@@ -970,14 +972,14 @@ impl eframe::App for FramesageApp {
         egui::TopBottomPanel::top("framesage-tab-strip")
             .frame(
                 egui::Frame::none()
-                    .fill(theme::BG)
+                    .fill(theme::p().bg)
                     .inner_margin(egui::Margin {
                         left: 8.0,
                         right: 8.0,
                         top: 0.0,
                         bottom: 0.0,
                     })
-                    .stroke(egui::Stroke::new(1.0_f32, theme::BORDER)),
+                    .stroke(egui::Stroke::new(1.0_f32, theme::p().border)),
             )
             .show(ctx, |ui| {
                 self.render_tab_strip(ui);
@@ -989,7 +991,7 @@ impl eframe::App for FramesageApp {
         egui::TopBottomPanel::top("framesage-perf-band")
             .frame(
                 egui::Frame::none()
-                    .fill(theme::SURFACE)
+                    .fill(theme::p().surface)
                     .inner_margin(egui::Margin::symmetric(12.0, 6.0)),
             )
             .show(ctx, |ui| {
@@ -1004,9 +1006,9 @@ impl eframe::App for FramesageApp {
         egui::TopBottomPanel::bottom("framesage-status-bar")
             .frame(
                 egui::Frame::none()
-                    .fill(theme::SURFACE)
+                    .fill(theme::p().surface)
                     .inner_margin(egui::Margin::symmetric(10.0, 3.0))
-                    .stroke(egui::Stroke::new(1.0_f32, theme::BORDER)),
+                    .stroke(egui::Stroke::new(1.0_f32, theme::p().border)),
             )
             .show(ctx, |ui| {
                 render_status_bar(
@@ -1026,7 +1028,7 @@ impl eframe::App for FramesageApp {
         egui::TopBottomPanel::bottom("framesage-activity-strip")
             .frame(
                 egui::Frame::none()
-                    .fill(theme::SURFACE)
+                    .fill(theme::p().surface)
                     .inner_margin(egui::Margin::symmetric(12.0, 5.0)),
             )
             .show(ctx, |ui| {
@@ -1044,12 +1046,12 @@ impl eframe::App for FramesageApp {
                 let first = lines.next().unwrap_or_default();
                 let rest: Vec<&str> = lines.collect();
                 if rest.is_empty() {
-                    ui.colored_label(theme::ERROR, err);
+                    ui.colored_label(theme::p().error, err);
                 } else {
-                    ui.colored_label(theme::ERROR, first);
+                    ui.colored_label(theme::p().error, first);
                     egui::CollapsingHeader::new(
                         egui::RichText::new(format!("details ({} more)", rest.len()))
-                            .color(theme::ERROR),
+                            .color(theme::p().error),
                     )
                     .id_source("last-error-details")
                     .default_open(false)
@@ -1059,7 +1061,7 @@ impl eframe::App for FramesageApp {
                             .max_height(160.0_f32)
                             .show(ui, |ui| {
                                 for line in &rest {
-                                    ui.colored_label(theme::ERROR, *line);
+                                    ui.colored_label(theme::p().error, *line);
                                 }
                             });
                     });
@@ -1157,7 +1159,7 @@ impl FramesageApp {
                     );
                 } else {
                     ui.colored_label(
-                        theme::WARNING,
+                        theme::p().warning,
                         "No foreground process detected — Apply won't fire \
                          (Engine's apply_once needs a foreground).",
                     );
@@ -1184,7 +1186,7 @@ impl FramesageApp {
                                 egui::Button::new(
                                     egui::RichText::new("Apply to foreground")
                                         .strong()
-                                        .color(theme::ACCENT),
+                                        .color(theme::p().accent),
                                 ),
                             )
                             .on_hover_text(
@@ -1197,7 +1199,7 @@ impl FramesageApp {
                         }
                         if !self.elevated {
                             ui.colored_label(
-                                theme::TEXT_MUTED,
+                                theme::p().text_muted,
                                 "Relaunch as administrator to apply.",
                             );
                         }
@@ -1308,7 +1310,7 @@ impl FramesageApp {
             .show(ctx, |ui| {
                 ui.add_space(4.0);
                 ui.colored_label(
-                    theme::ERROR,
+                    theme::p().error,
                     egui::RichText::new("This is a hard kill.").strong(),
                 );
                 ui.add_space(2.0);
@@ -1326,7 +1328,7 @@ impl FramesageApp {
                     if ui
                         .add(egui::Button::new(
                             egui::RichText::new("Terminate")
-                                .color(theme::ERROR)
+                                .color(theme::p().error)
                                 .strong(),
                         ))
                         .clicked()
@@ -1398,7 +1400,7 @@ impl FramesageApp {
                 ui.label(format!("{exe_name} (pid {pid})"));
                 ui.add_space(4.0);
                 ui.colored_label(
-                    theme::TEXT_MUTED,
+                    theme::p().text_muted,
                     "Toggle individual CPUs. Highlighted column = likely X3D CCD.",
                 );
                 ui.add_space(8.0);
@@ -1462,7 +1464,7 @@ impl FramesageApp {
                             let mut on = new_mask & bit != 0;
                             let in_x3d = i >= x3d_lo && i < x3d_hi;
                             let label = if in_x3d {
-                                egui::RichText::new(format!("{i}")).color(theme::ACCENT)
+                                egui::RichText::new(format!("{i}")).color(theme::p().accent)
                             } else {
                                 egui::RichText::new(format!("{i}"))
                             };
@@ -1498,7 +1500,7 @@ impl FramesageApp {
                 // that, so deletion is never accidental).
                 let save_label = if save_as_rule {
                     egui::RichText::new(format!("✓ Save as rule for {exe_name}"))
-                        .color(theme::ACCENT)
+                        .color(theme::p().accent)
                         .strong()
                 } else {
                     egui::RichText::new(format!("Save as rule for {exe_name}"))
@@ -1522,14 +1524,16 @@ impl FramesageApp {
                     let apply_btn = ui.add_enabled(
                         apply_enabled,
                         egui::Button::new(
-                            egui::RichText::new("Apply").color(theme::ACCENT).strong(),
+                            egui::RichText::new("Apply")
+                                .color(theme::p().accent)
+                                .strong(),
                         ),
                     );
                     if apply_btn.clicked() {
                         do_apply = true;
                     }
                     if !apply_enabled {
-                        ui.colored_label(theme::ERROR, "Pick at least one CPU.");
+                        ui.colored_label(theme::p().error, "Pick at least one CPU.");
                     }
 
                     // Remove rule — only visible when a rule existed at
@@ -1540,7 +1544,7 @@ impl FramesageApp {
                     if rule_existed_at_open {
                         ui.add_space(20.0);
                         if ui
-                            .button(egui::RichText::new("Remove rule").color(theme::ERROR))
+                            .button(egui::RichText::new("Remove rule").color(theme::p().error))
                             .on_hover_text(
                                 "Delete the persistent affinity rule for \
                                  this exe. The live process keeps its \
@@ -1703,9 +1707,9 @@ impl FramesageApp {
             // Brand mark + connection badge on the right side of the bar.
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 let (color, text) = if connected {
-                    (theme::SUCCESS, "Connected")
+                    (theme::p().success, "Connected")
                 } else {
-                    (theme::ERROR, "Disconnected")
+                    (theme::p().error, "Disconnected")
                 };
                 theme::status_badge(color).show(ui, |ui| {
                     ui.colored_label(color, text);
@@ -1713,7 +1717,7 @@ impl FramesageApp {
                 ui.add_space(8.0);
                 ui.label(
                     egui::RichText::new("FrameSage")
-                        .color(theme::ACCENT)
+                        .color(theme::p().accent)
                         .strong(),
                 );
             });
@@ -1730,7 +1734,11 @@ impl FramesageApp {
             // egui's default font doesn't have triangle / pause-bar glyphs
             // (they render as empty boxes), and the verb alone is clear.
             let pause_label = if paused { "Resume" } else { "Pause" };
-            let pause_color = if paused { theme::WARNING } else { theme::TEXT };
+            let pause_color = if paused {
+                theme::p().warning
+            } else {
+                theme::p().text
+            };
             if ui
                 .add(egui::Button::new(
                     egui::RichText::new(pause_label).color(pause_color),
@@ -2023,7 +2031,7 @@ impl FramesageApp {
         let Some(s) = status else {
             ui.add_space(40.0);
             ui.vertical_centered(|ui| {
-                ui.colored_label(theme::TEXT_MUTED, "Waiting for the service to respond…");
+                ui.colored_label(theme::p().text_muted, "Waiting for the service to respond…");
             });
             return;
         };
@@ -2034,21 +2042,24 @@ impl FramesageApp {
 
         // ─── Manual-mode banner (only when active) ──────────────────────
         if let Some(manual_id) = &s.manual_override {
-            theme::banner(theme::WARNING).show(ui, |ui| {
+            theme::banner(theme::p().warning).show(ui, |ui| {
                 ui.horizontal(|ui| {
-                    ui.colored_label(theme::WARNING, egui::RichText::new("⚠").strong().size(13.0));
+                    ui.colored_label(
+                        theme::p().warning,
+                        egui::RichText::new("⚠").strong().size(13.0),
+                    );
                     ui.label(
                         egui::RichText::new("Manual mode")
                             .strong()
-                            .color(theme::TEXT),
+                            .color(theme::p().text),
                     );
-                    ui.colored_label(theme::TEXT_MUTED, "·");
+                    ui.colored_label(theme::p().text_muted, "·");
                     ui.label(
                         egui::RichText::new(display_profile_id(&manual_id.0))
                             .strong()
-                            .color(theme::WARNING),
+                            .color(theme::p().warning),
                     );
-                    ui.colored_label(theme::TEXT_MUTED, "is pinned to every foreground app");
+                    ui.colored_label(theme::p().text_muted, "is pinned to every foreground app");
                     if self.elevated {
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                             if ui.button("Exit manual mode").clicked() {
@@ -2066,22 +2077,25 @@ impl FramesageApp {
 
         // ─── Manual Global Game Mode banner (item 2.11) ─────────────────
         if let Some(global_id) = &s.manual_global_active {
-            theme::banner(theme::WARNING).show(ui, |ui| {
+            theme::banner(theme::p().warning).show(ui, |ui| {
                 ui.horizontal(|ui| {
-                    ui.colored_label(theme::WARNING, egui::RichText::new("⚠").strong().size(13.0));
+                    ui.colored_label(
+                        theme::p().warning,
+                        egui::RichText::new("⚠").strong().size(13.0),
+                    );
                     ui.label(
                         egui::RichText::new("Manual Global Game Mode")
                             .strong()
-                            .color(theme::TEXT),
+                            .color(theme::p().text),
                     );
-                    ui.colored_label(theme::TEXT_MUTED, "·");
+                    ui.colored_label(theme::p().text_muted, "·");
                     ui.label(
                         egui::RichText::new(display_profile_id(&global_id.0))
                             .strong()
-                            .color(theme::WARNING),
+                            .color(theme::p().warning),
                     );
                     ui.colored_label(
-                        theme::TEXT_MUTED,
+                        theme::p().text_muted,
                         "is applied system-wide (auto reconcile paused)",
                     );
                     if self.elevated {
@@ -2112,7 +2126,7 @@ impl FramesageApp {
                 match &s.foreground {
                     Some(fg) => render_foreground_summary(ui, fg),
                     None => {
-                        ui.colored_label(theme::TEXT_MUTED, "No foreground process detected.");
+                        ui.colored_label(theme::p().text_muted, "No foreground process detected.");
                     }
                 }
             });
@@ -2183,35 +2197,35 @@ impl FramesageApp {
                                 .size(20.0)
                                 .color(color),
                         );
-                        ui.colored_label(theme::TEXT_MUTED, label);
+                        ui.colored_label(theme::p().text_muted, label);
                     });
                 };
                 tile(
                     ui,
                     stats.profiles_applied,
                     "Profiles applied",
-                    theme::ACCENT,
+                    theme::p().accent,
                 );
                 ui.add_space(theme::SP_XL);
                 tile(
                     ui,
                     stats.probalance_demotions,
                     "ProBalance demotions",
-                    theme::WARNING,
+                    theme::p().warning,
                 );
                 ui.add_space(theme::SP_XL);
                 tile(
                     ui,
                     stats.probalance_restores,
                     "ProBalance restores",
-                    theme::SUCCESS,
+                    theme::p().success,
                 );
                 ui.add_space(theme::SP_XL);
                 tile(
                     ui,
                     stats.game_mode_sessions,
                     "Game Mode sessions",
-                    theme::ACCENT,
+                    theme::p().accent,
                 );
             });
         });
@@ -2235,9 +2249,9 @@ impl FramesageApp {
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     let cfg = &s.policy.probalance;
                     let (color, text) = if cfg.enabled {
-                        (theme::SUCCESS, "Enabled")
+                        (theme::p().success, "Enabled")
                     } else {
-                        (theme::TEXT_MUTED, "Disabled")
+                        (theme::p().text_muted, "Disabled")
                     };
                     theme::status_badge(color).show(ui, |ui| {
                         ui.colored_label(color, text);
@@ -2248,18 +2262,18 @@ impl FramesageApp {
 
             let cfg = s.policy.probalance.clone();
             ui.horizontal(|ui| {
-                ui.colored_label(theme::TEXT_MUTED, "Currently restraining:");
+                ui.colored_label(theme::p().text_muted, "Currently restraining:");
                 let color = if restrained_now > 0 {
-                    theme::WARNING
+                    theme::p().warning
                 } else {
-                    theme::TEXT_MUTED
+                    theme::p().text_muted
                 };
                 ui.colored_label(color, format!("{restrained_now} processes"));
             });
             ui.horizontal(|ui| {
-                ui.colored_label(theme::TEXT_MUTED, "Trigger:");
+                ui.colored_label(theme::p().text_muted, "Trigger:");
                 ui.colored_label(
-                    theme::TEXT,
+                    theme::p().text,
                     format!(
                         "system CPU >= {}% AND non-foreground hog >= {}% of one core",
                         cfg.system_cpu_threshold_percent, cfg.hog_cpu_threshold_percent
@@ -2267,9 +2281,9 @@ impl FramesageApp {
                 );
             });
             ui.horizontal(|ui| {
-                ui.colored_label(theme::TEXT_MUTED, "Dwell:");
+                ui.colored_label(theme::p().text_muted, "Dwell:");
                 ui.colored_label(
-                    theme::TEXT,
+                    theme::p().text,
                     format!(
                         "{} ms before any restraint can be released",
                         cfg.min_restrain_ms
@@ -2299,7 +2313,7 @@ impl FramesageApp {
                 }
             } else {
                 ui.colored_label(
-                    theme::TEXT_MUTED,
+                    theme::p().text_muted,
                     "Relaunch FrameSage as administrator to toggle ProBalance.",
                 );
             }
@@ -2314,7 +2328,7 @@ impl FramesageApp {
         let Some(s) = status else {
             ui.add_space(40.0);
             ui.vertical_centered(|ui| {
-                ui.colored_label(theme::TEXT_MUTED, "Waiting for the service to respond…");
+                ui.colored_label(theme::p().text_muted, "Waiting for the service to respond…");
             });
             return;
         };
@@ -2334,6 +2348,33 @@ impl FramesageApp {
         });
         ui.add_space(10.0);
 
+        // ─── Appearance: light/dark theme (persisted per-user) ────────
+        theme::card().show(ui, |ui| {
+            ui.label(theme::section_heading("Appearance"));
+            ui.add_space(6.0);
+            let mut dark = self.tray_prefs.theme == theme::Theme::Dark;
+            if ui.checkbox(&mut dark, "Dark theme").changed() {
+                self.tray_prefs.theme = if dark {
+                    theme::Theme::Dark
+                } else {
+                    theme::Theme::Light
+                };
+                // Re-install visuals immediately so the switch is live,
+                // then persist the choice.
+                theme::apply(ui.ctx(), self.tray_prefs.theme);
+                self.tray_prefs.save();
+            }
+            ui.label(
+                egui::RichText::new(
+                    "Light mode uses the same hues with darker semantic colors \
+                     for legibility on white. Saved per-user.",
+                )
+                .size(11.0)
+                .color(theme::p().text_muted),
+            );
+        });
+        ui.add_space(10.0);
+
         // ─── Processes-tab columns (#2, tray-prefs, persisted) ────────
         theme::card().show(ui, |ui| {
             ui.label(theme::section_heading("Processes columns"));
@@ -2343,7 +2384,7 @@ impl FramesageApp {
                     "Hide optional columns in the Processes tab. Saved per-user;                      PID / CPU / Memory / Process / Profile / Status are always shown.",
                 )
                 .size(11.0)
-                .color(theme::TEXT_MUTED),
+                .color(theme::p().text_muted),
             );
             ui.add_space(4.0);
             let c = &mut self.tray_prefs.processes_columns;
@@ -2387,9 +2428,9 @@ impl FramesageApp {
                 ui.label(theme::section_heading("ProBalance"));
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     let (color, text) = if s.policy.probalance.enabled {
-                        (theme::SUCCESS, "Enabled")
+                        (theme::p().success, "Enabled")
                     } else {
-                        (theme::TEXT_MUTED, "Disabled")
+                        (theme::p().text_muted, "Disabled")
                     };
                     theme::status_badge(color).show(ui, |ui| {
                         ui.colored_label(color, text);
@@ -2459,7 +2500,9 @@ impl FramesageApp {
                     let apply_btn = ui.add_enabled(
                         self.elevated && changed,
                         egui::Button::new(
-                            egui::RichText::new("Apply").strong().color(theme::ACCENT),
+                            egui::RichText::new("Apply")
+                                .strong()
+                                .color(theme::p().accent),
                         ),
                     );
                     if apply_btn.clicked() {
@@ -2467,17 +2510,17 @@ impl FramesageApp {
                     }
                     if !self.elevated {
                         ui.colored_label(
-                            theme::TEXT_MUTED,
+                            theme::p().text_muted,
                             "Relaunch as administrator to edit ProBalance settings.",
                         );
                     } else if !changed {
-                        ui.colored_label(theme::TEXT_MUTED, "No changes to apply.");
+                        ui.colored_label(theme::p().text_muted, "No changes to apply.");
                     }
                 }
                 #[cfg(not(windows))]
                 {
                     let _ = changed;
-                    ui.colored_label(theme::TEXT_MUTED, "ProBalance is Windows-only.");
+                    ui.colored_label(theme::p().text_muted, "ProBalance is Windows-only.");
                 }
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     if ui.button("Revert").clicked() {
@@ -2539,7 +2582,9 @@ impl FramesageApp {
                     let apply_btn = ui.add_enabled(
                         self.elevated && changed,
                         egui::Button::new(
-                            egui::RichText::new("Apply").strong().color(theme::ACCENT),
+                            egui::RichText::new("Apply")
+                                .strong()
+                                .color(theme::p().accent),
                         ),
                     );
                     if apply_btn.clicked() {
@@ -2547,17 +2592,17 @@ impl FramesageApp {
                     }
                     if !self.elevated {
                         ui.colored_label(
-                            theme::TEXT_MUTED,
+                            theme::p().text_muted,
                             "Relaunch as administrator to edit the tick interval.",
                         );
                     } else if !changed {
-                        ui.colored_label(theme::TEXT_MUTED, "No changes to apply.");
+                        ui.colored_label(theme::p().text_muted, "No changes to apply.");
                     }
                 }
                 #[cfg(not(windows))]
                 {
                     let _ = changed;
-                    ui.colored_label(theme::TEXT_MUTED, "Tick interval edit is Windows-only.");
+                    ui.colored_label(theme::p().text_muted, "Tick interval edit is Windows-only.");
                 }
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     if ui.button("Revert").clicked() {
@@ -2598,8 +2643,8 @@ impl FramesageApp {
                  PowerShell and run:",
             );
             ui.add_space(2.0);
-            ui.colored_label(theme::ACCENT, "  framesage policy export <path>");
-            ui.colored_label(theme::ACCENT, "  framesage policy import <path>");
+            ui.colored_label(theme::p().accent, "  framesage policy export <path>");
+            ui.colored_label(theme::p().accent, "  framesage policy import <path>");
             ui.add_space(8.0);
             #[cfg(windows)]
             {
@@ -2607,7 +2652,7 @@ impl FramesageApp {
                     self.elevated,
                     egui::Button::new(
                         egui::RichText::new("Reset policy to defaults")
-                            .color(theme::ERROR)
+                            .color(theme::p().error)
                             .strong(),
                     ),
                 );
@@ -2616,7 +2661,7 @@ impl FramesageApp {
                 }
                 if !self.elevated {
                     ui.colored_label(
-                        theme::TEXT_MUTED,
+                        theme::p().text_muted,
                         "Relaunch as administrator to reset the policy.",
                     );
                 }
@@ -2646,7 +2691,7 @@ impl FramesageApp {
             .show(ctx, |ui| {
                 ui.add_space(4.0);
                 ui.colored_label(
-                    theme::ERROR,
+                    theme::p().error,
                     egui::RichText::new("This replaces your entire policy.").strong(),
                 );
                 ui.add_space(2.0);
@@ -2665,7 +2710,9 @@ impl FramesageApp {
                     ui.add_space(4.0);
                     if ui
                         .add(egui::Button::new(
-                            egui::RichText::new("Reset").color(theme::ERROR).strong(),
+                            egui::RichText::new("Reset")
+                                .color(theme::p().error)
+                                .strong(),
                         ))
                         .clicked()
                     {
@@ -2701,16 +2748,19 @@ impl FramesageApp {
         status: &StatusSnapshot,
     ) {
         if !self.elevated {
-            theme::banner(theme::WARNING).show(ui, |ui| {
+            theme::banner(theme::p().warning).show(ui, |ui| {
                 ui.horizontal(|ui| {
-                    ui.colored_label(theme::WARNING, egui::RichText::new("⚠").strong().size(14.0));
+                    ui.colored_label(
+                        theme::p().warning,
+                        egui::RichText::new("⚠").strong().size(14.0),
+                    );
                     ui.label(
                         egui::RichText::new("Read-only mode")
                             .strong()
-                            .color(theme::TEXT),
+                            .color(theme::p().text),
                     );
                     ui.colored_label(
-                        theme::TEXT_MUTED,
+                        theme::p().text_muted,
                         "— Pause, Resume, and Game Mode controls need admin.",
                     );
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -2791,8 +2841,8 @@ impl FramesageApp {
                 ui.add_space(4.0);
                 if let Some(active) = &status.manual_global_active {
                     ui.horizontal(|ui| {
-                        ui.colored_label(theme::TEXT_MUTED, "Active:");
-                        ui.colored_label(theme::WARNING, display_profile_id(&active.0));
+                        ui.colored_label(theme::p().text_muted, "Active:");
+                        ui.colored_label(theme::p().warning, display_profile_id(&active.0));
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                             if ui.button("Exit Manual Game Mode").clicked() {
                                 self.send_admin_request(
@@ -2805,7 +2855,7 @@ impl FramesageApp {
                 } else {
                     ui.horizontal_wrapped(|ui| {
                         ui.colored_label(
-                            theme::TEXT_MUTED,
+                            theme::p().text_muted,
                             "Enter a profile's environment actions system-wide:",
                         );
                     });
@@ -2882,7 +2932,7 @@ impl FramesageApp {
             }
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 let total = events.len();
-                ui.colored_label(theme::TEXT_MUTED, format!("{total} events"));
+                ui.colored_label(theme::p().text_muted, format!("{total} events"));
                 if ui.button("Clear log").clicked() {
                     self.state.lock().recent.clear();
                 }
@@ -2912,7 +2962,7 @@ impl FramesageApp {
 
         if filtered.is_empty() {
             ui.colored_label(
-                theme::TEXT_MUTED,
+                theme::p().text_muted,
                 if events.is_empty() {
                     "No events yet. Activity will appear here as the engine reconciles."
                 } else {
@@ -3072,8 +3122,8 @@ impl FramesageApp {
             }
 
             if dirty {
-                theme::status_badge(theme::WARNING).show(ui, |ui| {
-                    ui.colored_label(theme::WARNING, "unsaved");
+                theme::status_badge(theme::p().warning).show(ui, |ui| {
+                    ui.colored_label(theme::p().warning, "unsaved");
                 });
             }
         });
@@ -3315,13 +3365,13 @@ impl FramesageApp {
                  The engine re-applies them on every spawn and re-asserts every ~2 s \
                  to defeat games that override their own affinity at startup.",
             )
-            .color(theme::TEXT_MUTED),
+            .color(theme::p().text_muted),
         );
         ui.add_space(6.0);
 
         if policy.affinity_rules.is_empty() {
             ui.colored_label(
-                theme::TEXT_MUTED,
+                theme::p().text_muted,
                 "No affinity rules yet. To create one, open the Processes tab, \
                  right-click a process, tick 'Remember as rule' in the 'Set CPU \
                  affinity' submenu, then pick a target (X3D CCD, Non-X3D, or Custom…).",
@@ -3369,7 +3419,7 @@ impl FramesageApp {
                         });
                         row.col(|ui| {
                             if rule.note.is_empty() {
-                                ui.colored_label(theme::TEXT_MUTED, "—");
+                                ui.colored_label(theme::p().text_muted, "—");
                             } else {
                                 ui.label(&rule.note);
                             }
@@ -3418,7 +3468,7 @@ impl FramesageApp {
         // Section caption — sets context once, doesn't repeat the hero's
         // policy summary (that's in Status tab).
         ui.colored_label(
-            theme::TEXT_MUTED,
+            theme::p().text_muted,
             "Profiles auto-apply per foreground app via Rules. \
              \u{201c}Apply to foreground\u{201d} overrides the rule for the current app only. \
              \u{201c}Set as manual mode\u{201d} pins a profile to every foreground app until you exit.",
@@ -3429,21 +3479,24 @@ impl FramesageApp {
         // state reads consistently no matter which tab you land on.
         let mut clear_manual_clicked = false;
         if let Some(manual_id) = &s.manual_override {
-            theme::banner(theme::WARNING).show(ui, |ui| {
+            theme::banner(theme::p().warning).show(ui, |ui| {
                 ui.horizontal(|ui| {
-                    ui.colored_label(theme::WARNING, egui::RichText::new("⚠").strong().size(13.0));
+                    ui.colored_label(
+                        theme::p().warning,
+                        egui::RichText::new("⚠").strong().size(13.0),
+                    );
                     ui.label(
                         egui::RichText::new("Manual mode")
                             .strong()
-                            .color(theme::TEXT),
+                            .color(theme::p().text),
                     );
-                    ui.colored_label(theme::TEXT_MUTED, "·");
+                    ui.colored_label(theme::p().text_muted, "·");
                     ui.label(
                         egui::RichText::new(display_profile_id(&manual_id.0))
                             .strong()
-                            .color(theme::WARNING),
+                            .color(theme::p().warning),
                     );
-                    ui.colored_label(theme::TEXT_MUTED, "is pinned to every foreground app");
+                    ui.colored_label(theme::p().text_muted, "is pinned to every foreground app");
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         if ui
                             .add_enabled(self.elevated, egui::Button::new("Exit manual mode"))
@@ -3505,8 +3558,8 @@ impl FramesageApp {
                 self.profiles.new_form = None;
             }
             if dirty {
-                theme::status_badge(theme::WARNING).show(ui, |ui| {
-                    ui.colored_label(theme::WARNING, "unsaved");
+                theme::status_badge(theme::p().warning).show(ui, |ui| {
+                    ui.colored_label(theme::p().warning, "unsaved");
                 });
             }
         });
@@ -3528,7 +3581,7 @@ impl FramesageApp {
                     );
                 });
                 ui.colored_label(
-                    theme::TEXT_MUTED,
+                    theme::p().text_muted,
                     "Lowercase, dashes only — matches what you'd reference from Rules \
                      (e.g. \u{201c}game-poe2\u{201d} becomes \u{201c}Game POE2\u{201d} in the UI).",
                 );
@@ -3546,7 +3599,10 @@ impl FramesageApp {
                         cancel = true;
                     }
                     if id_taken {
-                        ui.colored_label(theme::WARNING, "An profile with this id already exists.");
+                        ui.colored_label(
+                            theme::p().warning,
+                            "An profile with this id already exists.",
+                        );
                     }
                 });
             });
@@ -3634,9 +3690,9 @@ impl FramesageApp {
                     pretty
                 };
                 let header_color = if is_active {
-                    theme::ACCENT
+                    theme::p().accent
                 } else {
-                    theme::TEXT
+                    theme::p().text
                 };
                 let header = egui::RichText::new(header_text).color(header_color);
                 egui::CollapsingHeader::new(header)
@@ -3686,8 +3742,8 @@ impl FramesageApp {
                             let apply_btn = egui::Button::new(
                                 egui::RichText::new("Apply to foreground").strong(),
                             )
-                            .fill(theme::ACCENT)
-                            .stroke(egui::Stroke::new(1.0_f32, theme::ACCENT_HOVER));
+                            .fill(theme::p().accent)
+                            .stroke(egui::Stroke::new(1.0_f32, theme::p().accent_hover));
                             if ui
                                 .add_enabled(apply_enabled, apply_btn)
                                 .on_hover_text(
@@ -3970,29 +4026,32 @@ impl FramesageApp {
             }
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 let count = self.processes.rows.len();
-                ui.colored_label(theme::TEXT_MUTED, format!("{count} processes"))
+                ui.colored_label(theme::p().text_muted, format!("{count} processes"))
                     .on_hover_text(
                         "Total live processes the engine can see, including those whose \
                          exe path it can't open (protected processes still get a row).",
                     );
                 ui.separator();
-                ui.colored_label(theme::TEXT_MUTED, format!("{total_threads} threads"))
+                ui.colored_label(theme::p().text_muted, format!("{total_threads} threads"))
                     .on_hover_text("Sum of OS thread counts across every visible process.");
                 ui.separator();
                 ui.colored_label(
-                    theme::TEXT_MUTED,
+                    theme::p().text_muted,
                     format!("{} mem", format_bytes(total_mem)),
                 )
                 .on_hover_text("Sum of working-set bytes across every visible process.");
                 ui.separator();
-                ui.colored_label(theme::TEXT_MUTED, format!("Total CPU {total_cpu_one_cpu}%"))
-                    .on_hover_text(
-                        "Sum of per-process CPU% in 'percent of one logical CPU' units. \
+                ui.colored_label(
+                    theme::p().text_muted,
+                    format!("Total CPU {total_cpu_one_cpu}%"),
+                )
+                .on_hover_text(
+                    "Sum of per-process CPU% in 'percent of one logical CPU' units. \
                          A 16-thread box maxes at 1600%.",
-                    );
+                );
                 if managed > 0 {
                     ui.separator();
-                    ui.colored_label(theme::ACCENT, format!("{managed} managed"))
+                    ui.colored_label(theme::p().accent, format!("{managed} managed"))
                         .on_hover_text(
                             "Processes that have an active FrameSage profile applied — \
                              matched a rule, manual override, or one-shot ApplyOnce.",
@@ -4000,7 +4059,7 @@ impl FramesageApp {
                 }
                 if restrained > 0 {
                     ui.separator();
-                    ui.colored_label(theme::WARNING, format!("{restrained} restrained"))
+                    ui.colored_label(theme::p().warning, format!("{restrained} restrained"))
                         .on_hover_text(
                             "Processes that ProBalance has temporarily demoted because \
                              they're hogging CPU under contention.",
@@ -4328,7 +4387,7 @@ impl FramesageApp {
                                         let tri = ui.add(
                                             egui::Label::new(
                                                 egui::RichText::new(glyph)
-                                                    .color(theme::TEXT_MUTED)
+                                                    .color(theme::p().text_muted)
                                                     .monospace(),
                                             )
                                             .sense(egui::Sense::click()),
@@ -4386,7 +4445,7 @@ impl FramesageApp {
                                         ui.painter().rect_stroke(
                                             rect,
                                             egui::Rounding::ZERO,
-                                            egui::Stroke::new(1.0_f32, theme::ACCENT),
+                                            egui::Stroke::new(1.0_f32, theme::p().accent),
                                         );
                                     }
                                     if resp.clicked() {
@@ -4530,7 +4589,7 @@ impl FramesageApp {
                                             // armed on next open.
                                             let label = if self.processes.remember_affinity {
                                                 egui::RichText::new("✓ Remember as rule")
-                                                    .color(theme::ACCENT)
+                                                    .color(theme::p().accent)
                                                     .strong()
                                             } else {
                                                 egui::RichText::new("Remember as rule")
@@ -4763,7 +4822,7 @@ impl FramesageApp {
                                         if ui
                                             .add(egui::Button::new(
                                                 egui::RichText::new(terminate_label)
-                                                    .color(theme::ERROR),
+                                                    .color(theme::p().error),
                                             ))
                                             .clicked()
                                         {
@@ -4834,9 +4893,9 @@ impl FramesageApp {
                                             || u.starts_with("Font Driver Host\\");
                                         let label = egui::Label::new(egui::RichText::new(u).color(
                                             if is_system {
-                                                theme::TEXT_MUTED
+                                                theme::p().text_muted
                                             } else {
-                                                theme::TEXT
+                                                theme::p().text
                                             },
                                         ))
                                         .truncate();
@@ -4902,7 +4961,7 @@ impl FramesageApp {
                                     let mask_text = format!("{:#x}", p.affinity_mask);
                                     let cell_text = if has_rule {
                                         egui::RichText::new(format!("📌 {mask_text}"))
-                                            .color(theme::ACCENT)
+                                            .color(theme::p().accent)
                                             .monospace()
                                     } else {
                                         egui::RichText::new(mask_text).monospace()
@@ -4945,7 +5004,7 @@ impl FramesageApp {
                                             && ui
                                                 .button(
                                                     egui::RichText::new("Remove persistent rule")
-                                                        .color(theme::ERROR),
+                                                        .color(theme::p().error),
                                                 )
                                                 .clicked()
                                         {
@@ -4973,7 +5032,7 @@ impl FramesageApp {
                                     } else {
                                         id.clone()
                                     };
-                                    ui.colored_label(theme::ACCENT, label);
+                                    ui.colored_label(theme::p().accent, label);
                                 }
                                 None => {
                                     ui.weak("—");
@@ -4984,7 +5043,7 @@ impl FramesageApp {
                                     // ● prefix calls out ProBalance involvement;
                                     // visually pairs with the WARNING-tinted marker
                                     // bar on the same row.
-                                    ui.colored_label(theme::WARNING, "● ProBalance");
+                                    ui.colored_label(theme::p().warning, "● ProBalance");
                                 } else if let Some(note) = &p.matched_rule_note {
                                     if note.is_empty() {
                                         ui.weak("rule");
@@ -5012,7 +5071,11 @@ impl FramesageApp {
                 egui::Sense::drag(),
             );
             let active = splitter_resp.hovered() || splitter_resp.dragged();
-            let bar_color = if active { theme::ACCENT } else { theme::BORDER };
+            let bar_color = if active {
+                theme::p().accent
+            } else {
+                theme::p().border
+            };
             // Paint a thin centred 1px line so the bar reads as a divider
             // when idle and a target when hovered. The full-height rect
             // catches drag events comfortably even if the user grabs near
@@ -5590,7 +5653,7 @@ fn render_preview_body(
 
     let Some(gm) = &profile.game_mode else {
         ui.colored_label(
-            theme::TEXT_MUTED,
+            theme::p().text_muted,
             "No system-wide Game Mode actions on this profile.",
         );
         return;
@@ -5643,7 +5706,7 @@ fn render_preview_body(
                 ));
             } else {
                 ui.colored_label(
-                    theme::TEXT_MUTED,
+                    theme::p().text_muted,
                     format!("    - {} — none running right now", exe),
                 );
             }

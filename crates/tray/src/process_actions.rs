@@ -161,8 +161,8 @@ pub(crate) fn render_process_detail(
         // Title row: exe name + PID badge + close.
         ui.horizontal(|ui| {
             ui.heading(&p.exe_name);
-            theme::status_badge(theme::TEXT_MUTED).show(ui, |ui| {
-                ui.colored_label(theme::TEXT_MUTED, format!("pid {}", p.pid));
+            theme::status_badge(theme::p().text_muted).show(ui, |ui| {
+                ui.colored_label(theme::p().text_muted, format!("pid {}", p.pid));
             });
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 if ui
@@ -178,7 +178,7 @@ pub(crate) fn render_process_detail(
         // it. Sits directly under the heading so the relationship between
         // exe name and friendly name reads at a glance.
         if let Some(desc) = &p.description {
-            ui.colored_label(theme::TEXT_MUTED, desc);
+            ui.colored_label(theme::p().text_muted, desc);
         }
         ui.add_space(4.0);
 
@@ -343,7 +343,7 @@ pub(crate) fn render_process_detail(
             }
             if ui
                 .add(egui::Button::new(
-                    egui::RichText::new("Terminate…").color(theme::ERROR),
+                    egui::RichText::new("Terminate…").color(theme::p().error),
                 ))
                 .clicked()
             {

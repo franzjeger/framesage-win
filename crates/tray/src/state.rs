@@ -195,11 +195,11 @@ impl EventKind {
 
     pub(crate) fn color(self) -> egui::Color32 {
         match self {
-            EventKind::Foreground => theme::ACCENT,
-            EventKind::Engine => theme::TEXT_MUTED,
-            EventKind::ProBalanceRestrained => theme::WARNING,
-            EventKind::ProBalanceRestored => theme::SUCCESS,
-            EventKind::Other => theme::TEXT,
+            EventKind::Foreground => theme::p().accent,
+            EventKind::Engine => theme::p().text_muted,
+            EventKind::ProBalanceRestrained => theme::p().warning,
+            EventKind::ProBalanceRestored => theme::p().success,
+            EventKind::Other => theme::p().text,
         }
     }
 }
