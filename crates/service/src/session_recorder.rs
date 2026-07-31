@@ -31,6 +31,8 @@
 //! session; the engine is unaffected.
 
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::Arc;
 use std::time::Instant;
 
 use framesage_ipc::Event;
@@ -65,6 +67,10 @@ struct ActiveRecording {
     /// `session_end.etw_drops_total` field honest once the ETW drain
     /// reports drops.
     etw_drops_total: u64,
+    /// Value of the shared PresentMon crash-restart counter at session
+    /// start. `session_end.presentmon_restarts` is `current - baseline`,
+    /// i.e. restarts observed during this session's window.
+    presentmon_restarts_baseline: u32,
 }
 
 /// Event-driven session recorder. Platform-independent and IO-light:
@@ -92,6 +98,12 @@ pub struct SessionRecorder {
     last_foreground: Option<(String, u32, Option<u32>)>,
     /// #111 — capability state stamped into each session_start.
     caps: SessionCapabilities,
+    /// #111 — process-lifetime PresentMon crash-restart counter, shared
+    /// with the PresentMon manager task (the manager increments it on
+    /// each crash-restart). Snapshotted at each session start so
+    /// `session_end.presentmon_restarts` reports only this session's
+    /// restarts without any cross-task channel.
+    presentmon_restarts: Arc<AtomicU32>,
 }
 
 impl SessionRecorder {
@@ -101,6 +113,7 @@ impl SessionRecorder {
             current: None,
             last_foreground: None,
             caps: SessionCapabilities::default(),
+            presentmon_restarts: Arc::new(AtomicU32::new(0)),
         }
     }
 
@@ -108,6 +121,14 @@ impl SessionRecorder {
     /// `session_start` events. In-flight sessions keep their stamp.
     pub fn set_capabilities(&mut self, caps: SessionCapabilities) {
         self.caps = caps;
+    }
+
+    /// #111 — adopt the shared PresentMon crash-restart counter the
+    /// manager task increments, so `session_end.presentmon_restarts` is
+    /// honest. Must be set before sessions start; in-flight sessions use
+    /// whatever counter was current when they began.
+    pub fn set_presentmon_restart_counter(&mut self, counter: Arc<AtomicU32>) {
+        self.presentmon_restarts = counter;
     }
 
     /// Test-only probe; production callers only feed events.
@@ -211,6 +232,9 @@ impl SessionRecorder {
                             frame_samples_recorded: 0,
                             frames_dropped_total: 0,
                             etw_drops_total: 0,
+                            presentmon_restarts_baseline: self
+                                .presentmon_restarts
+                                .load(Ordering::Relaxed),
                         });
                     }
                     Err(e) => {
@@ -398,7 +422,11 @@ impl SessionRecorder {
             // is recorded per sample as a metric, not a quality flag.
             partial_data: rec.frame_samples_recorded == 0 || rec.etw_drops_total > 0,
             etw_drops_total: rec.etw_drops_total,
-            presentmon_restarts: 0,
+            // §2.3 — restarts observed during this session's window.
+            presentmon_restarts: self
+                .presentmon_restarts
+                .load(Ordering::Relaxed)
+                .saturating_sub(rec.presentmon_restarts_baseline),
             summary: SessionSummary {
                 duration_secs: at_ms / 1000,
                 frame_time_p50_us_baseline: None,
@@ -457,11 +485,13 @@ pub fn spawn(
     mut kernel_signals: tokio::sync::broadcast::Receiver<framesage_etw::KernelSignal>,
     mut frame_samples: tokio::sync::mpsc::Receiver<FrameStats>,
     caps: SessionCapabilities,
+    presentmon_restarts: Arc<AtomicU32>,
 ) -> tokio::task::JoinHandle<()> {
     let mut rx = engine.subscribe();
     tokio::spawn(async move {
         let mut recorder = SessionRecorder::new(dir);
         recorder.set_capabilities(caps);
+        recorder.set_presentmon_restart_counter(presentmon_restarts);
         // #7 — 1 Hz cpu_sample tick while a session is recording.
         let mut cpu_interval = tokio::time::interval(std::time::Duration::from_secs(1));
         cpu_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -790,6 +820,38 @@ mod tests {
             SessionEvent::SessionEnd { summary, .. } => {
                 assert_eq!(summary.frames_dropped, 8, "5 + 3 drops summed");
             }
+            other => panic!("expected session_end, got {other:?}"),
+        }
+    }
+
+    // #111 — session_end.presentmon_restarts reflects only the restarts
+    // the shared counter accrued during this session's window.
+    #[test]
+    fn presentmon_restarts_are_scoped_to_the_session_window() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut rec = SessionRecorder::new(dir.path().to_path_buf());
+        let counter = Arc::new(AtomicU32::new(0));
+        rec.set_presentmon_restart_counter(counter.clone());
+
+        // Two restarts happened BEFORE this session — must not be counted.
+        counter.store(2, Ordering::Relaxed);
+        rec.handle_event(&foreground("g.exe", 7), true);
+        rec.handle_event(&entered("game-x3d"), true);
+        // Three restarts DURING the session.
+        counter.fetch_add(3, Ordering::Relaxed);
+        rec.handle_event(&exited("done"), true);
+
+        let entry = &list_sessions(dir.path()).unwrap()[0];
+        let path = dir.path().join(format!("{}.jsonl", entry.session_id));
+        let (events, _) = read_session(&path).unwrap();
+        match events.last().unwrap() {
+            SessionEvent::SessionEnd {
+                presentmon_restarts,
+                ..
+            } => assert_eq!(
+                *presentmon_restarts, 3,
+                "only in-session restarts count, not the pre-session baseline"
+            ),
             other => panic!("expected session_end, got {other:?}"),
         }
     }

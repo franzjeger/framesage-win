@@ -150,8 +150,12 @@ pub async fn run(inputs: RuntimeInputs) -> Result<()> {
     // is even present on disk, which becomes the recorder's honest
     // presentmon_state capability. Not in the watchdog select! either.
     let (frame_tx, frame_rx) = tokio::sync::mpsc::channel::<framesage_presentmon::FrameStats>(64);
+    // Shared PresentMon crash-restart counter: the manager increments it,
+    // the recorder snapshots it per session for the honest
+    // session_end.presentmon_restarts field.
+    let presentmon_restarts = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
     let (presentmon_available, _presentmon_mgr) =
-        crate::presentmon::spawn(engine.clone(), frame_tx);
+        crate::presentmon::spawn(engine.clone(), frame_tx, presentmon_restarts.clone());
 
     // Honest capability stamp for every session_start: ETW is active when
     // the closed-loop drain actually started; PresentMon is active when a
@@ -174,6 +178,7 @@ pub async fn run(inputs: RuntimeInputs) -> Result<()> {
         kernel_signal_rx,
         frame_rx,
         caps,
+        presentmon_restarts,
     );
 
     let tick_engine = engine.clone();
