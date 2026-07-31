@@ -652,7 +652,8 @@ impl FramesageApp {
                 | Ok(Response::UndoResult { .. })
                 | Ok(Response::UndoLog { .. })
                 | Ok(Response::Sessions { .. })
-                | Ok(Response::SessionDetail { .. }) => {
+                | Ok(Response::SessionDetail { .. })
+                | Ok(Response::SessionTrends { .. }) => {
                     format!("{label}: ok")
                 }
                 Ok(Response::Error { message }) => format!("{label}: error — {message}"),
@@ -1883,6 +1884,7 @@ impl FramesageApp {
                 session_detail,
                 sessions_fetch_pending,
                 session_detail_pending,
+                session_trends,
                 ..
             } = &mut *s;
             crate::tabs::sessions::render(
@@ -1890,6 +1892,7 @@ impl FramesageApp {
                 status.as_ref(),
                 sessions.as_deref(),
                 session_detail.as_mut(),
+                session_trends.as_deref(),
                 *sessions_fetch_pending || *session_detail_pending,
             )
         };
@@ -1934,6 +1937,12 @@ impl FramesageApp {
                 framesage_ipc::PIPE_NAME_STATUS,
                 &Request::ListSessions { limit: 200 },
             );
+            // Trend rollup — fetched in the same thread right after the
+            // list so the Sessions tab has both in one refresh cycle.
+            let trends = crate::ipc_client::send_request_blocking(
+                framesage_ipc::PIPE_NAME_STATUS,
+                &Request::SessionTrends,
+            );
             let mut s = state.lock();
             s.sessions_fetch_pending = false;
             match result {
@@ -1946,6 +1955,18 @@ impl FramesageApp {
                 Ok(_) => {}
                 Err(e) => {
                     s.last_error = Some(format!("list sessions: {e:#}"));
+                }
+            }
+            match trends {
+                Ok(Response::SessionTrends { aggregates }) => {
+                    s.session_trends = Some(aggregates);
+                }
+                Ok(Response::Error { message }) => {
+                    s.last_error = Some(format!("session trends: {message}"));
+                }
+                Ok(_) => {}
+                Err(e) => {
+                    s.last_error = Some(format!("session trends: {e:#}"));
                 }
             }
         });

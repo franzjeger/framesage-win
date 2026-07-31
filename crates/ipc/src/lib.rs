@@ -200,6 +200,10 @@ pub enum Request {
     /// validated server-side against the UUID character set before
     /// any path is touched.
     ReadSession { session_id: String },
+    /// Cross-session attribution rollup (architecture §2.4 trend view):
+    /// reads every recorded session, computes each one's attribution,
+    /// and groups by (game, profile) into medians. Read-only.
+    SessionTrends,
     /// Item 3.7 — manually trigger a CPU topology re-detection.
     /// The engine already refreshes topology automatically on
     /// `SystemEvent::Resume`, but power-plan tweaks (core parking,
@@ -226,7 +230,8 @@ impl Request {
             | Request::ListServices
             | Request::UndoLogList { .. }
             | Request::ListSessions { .. }
-            | Request::ReadSession { .. } => true,
+            | Request::ReadSession { .. }
+            | Request::SessionTrends => true,
             Request::SetPolicy { .. }
             | Request::ApplyOnce { .. }
             | Request::SetManualOverride { .. }
@@ -299,6 +304,11 @@ pub enum Response {
     SessionDetail {
         events: Vec<framesage_recorder::SessionEvent>,
         skipped_lines: u32,
+    },
+    /// Result of `Request::SessionTrends` — per-(game, profile) rollups,
+    /// most-played first.
+    SessionTrends {
+        aggregates: Vec<framesage_recorder::AggregateAttribution>,
     },
     UndoLog {
         entries: Vec<framesage_core::UndoEntry>,

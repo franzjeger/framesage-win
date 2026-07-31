@@ -916,6 +916,25 @@ async fn handle_client(
                 };
                 write_response(&mut write_half, &resp).await?;
             }
+            Request::SessionTrends => {
+                // §2.4 trend view — read every session, compute each
+                // one's attribution, and roll them up per (game, profile).
+                // All filesystem + parsing work, so park it on the
+                // blocking pool.
+                let dir = paths::sessions_dir();
+                let result =
+                    tokio::task::spawn_blocking(move || compute_session_trends(&dir)).await;
+                let resp = match result {
+                    Ok(Ok(aggregates)) => Response::SessionTrends { aggregates },
+                    Ok(Err(e)) => Response::Error {
+                        message: format!("session trends failed: {e:#}"),
+                    },
+                    Err(join_err) => Response::Error {
+                        message: format!("session trends task failed: {join_err}"),
+                    },
+                };
+                write_response(&mut write_half, &resp).await?;
+            }
             Request::RefreshTopology => {
                 // Item 3.7 — manual topology refresh. The engine
                 // logs the outcome internally and falls back to the
@@ -1247,6 +1266,35 @@ fn task_died_msg<T>(
 ///
 /// Extracted out of the SetPolicy handler so it's unit-testable without
 /// spinning up the full IPC stack.
+/// §2.4 trend view — read every recorded session, compute its
+/// attribution, and roll the results up per (game, profile). Sessions
+/// that fail to read are skipped (a torn tail on one file shouldn't
+/// blank the whole trend); their game/profile still counts toward the
+/// group total via the list entry so the "N of M" denominator stays
+/// honest. Blocking (filesystem) — the caller runs it on the blocking
+/// pool.
+fn compute_session_trends(
+    dir: &std::path::Path,
+) -> anyhow::Result<Vec<framesage_recorder::AggregateAttribution>> {
+    let entries = framesage_recorder::list_sessions(dir)?;
+    let mut rows: Vec<framesage_recorder::SessionAttribution> = Vec::with_capacity(entries.len());
+    for entry in entries {
+        let Ok(path) = framesage_recorder::session_file_path(dir, &entry.session_id) else {
+            continue;
+        };
+        let Ok((events, _skipped)) = framesage_recorder::read_session(&path) else {
+            continue;
+        };
+        let attribution = framesage_recorder::compute_attribution_summary(&events);
+        rows.push(framesage_recorder::SessionAttribution {
+            game_exe: entry.game_exe,
+            profile_id: entry.profile_id,
+            attribution,
+        });
+    }
+    Ok(framesage_recorder::compute_aggregates(&rows))
+}
+
 fn validate_policy_against_safe_list(policy: &Policy) -> Vec<String> {
     let safe_list = framesage_gamemode::safe_list::SafeList::bundled();
     let mut denied: Vec<String> = Vec::new();

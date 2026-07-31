@@ -1330,6 +1330,7 @@ async fn send_simple(req: Request) -> Result<()> {
                 events,
                 skipped_lines,
             } => print_session_detail(&events, skipped_lines),
+            Response::SessionTrends { aggregates } => print_session_trends(&aggregates),
             Response::Error { message } => return Err(anyhow!(message)),
         }
     }
@@ -1411,7 +1412,8 @@ async fn print_status() -> Result<()> {
         Response::UndoResult { .. }
         | Response::UndoLog { .. }
         | Response::Sessions { .. }
-        | Response::SessionDetail { .. } => println!("ok"),
+        | Response::SessionDetail { .. }
+        | Response::SessionTrends { .. } => println!("ok"),
         Response::Error { message } => return Err(anyhow!(message)),
     }
     Ok(())
@@ -1437,6 +1439,19 @@ fn print_session_list(sessions: &[framesage_ipc::framesage_recorder::SessionList
             "{:<38}  {:<24}  {:<12}  {:>8}  {}",
             e.session_id, e.game_exe, e.profile_id, dur, flags
         );
+    }
+}
+
+/// Cross-session attribution rollup per (game, profile).
+fn print_session_trends(aggregates: &[framesage_ipc::framesage_recorder::AggregateAttribution]) {
+    if aggregates.is_empty() {
+        println!("no sessions recorded yet");
+        return;
+    }
+    for a in aggregates {
+        // Strip the UI-only **degraded** emphasis markers for the terminal.
+        let headline = a.headline.replace("**", "");
+        println!("{} · {}: {}", a.game_exe, a.profile_id, headline);
     }
 }
 
