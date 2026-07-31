@@ -140,6 +140,12 @@ pub struct SessionSummary {
     pub frame_time_p99_us_with_rules: Option<u64>,
     pub actions_applied: u32,
     pub kernel_signals: u32,
+    /// Total PresentMon `Dropped` presents summed across the session
+    /// (§2.3 `frames_dropped` sum). A metric, not a quality flag —
+    /// presentation drops are normal and do not set `partial_data`.
+    /// `#[serde(default)]` keeps pre-field session files readable.
+    #[serde(default)]
+    pub frames_dropped: u64,
 }
 
 impl SessionEvent {
@@ -218,6 +224,7 @@ mod tests {
                     frame_time_p99_us_with_rules: Some(6240),
                     actions_applied: 1,
                     kernel_signals: 0,
+                    frames_dropped: 0,
                 },
             },
         ];

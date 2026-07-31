@@ -20,8 +20,10 @@
 //! from it, and stays `partial_data: true` per §2.3 — so the
 //! attribution panel shows "Frame data unavailable" rather than
 //! fabricating a verdict (the §2.4 disabled-attribution contract). A
-//! session that captured frame samples with zero drops is non-partial
-//! and the closed loop can actually attribute against it.
+//! session that captured frame samples is non-partial and the closed
+//! loop can attribute against it; `partial_data` tracks *data-quality*
+//! loss (no samples, or ETW event drops), never normal presentation
+//! frame-drops.
 //!
 //! Like the closed-loop tasks, the drain worker is NOT part of the
 //! v0.6 watchdog `select!` — a recorder failure must never take the
@@ -52,9 +54,17 @@ struct ActiveRecording {
     /// honest `session_end.partial_data`: a session with zero frame
     /// samples can't support attribution and stays partial.
     frame_samples_recorded: u32,
-    /// Cumulative PresentMon `Dropped` count seen this session, folded
-    /// into the partial-data signal.
+    /// Cumulative PresentMon `Dropped` present count this session.
+    /// Recorded as a metric (per §2.3 `frames_dropped` sum); NOT a
+    /// data-quality flag — normal presentation drops must not disable
+    /// attribution.
     frames_dropped_total: u64,
+    /// Cumulative ETW *event* drops (kernel-side or our-side) this
+    /// session — the real §2.3 partial-data trigger. No feed wires into
+    /// this yet, so it stays 0; the seam keeps `partial_data` and the
+    /// `session_end.etw_drops_total` field honest once the ETW drain
+    /// reports drops.
+    etw_drops_total: u64,
 }
 
 /// Event-driven session recorder. Platform-independent and IO-light:
@@ -200,6 +210,7 @@ impl SessionRecorder {
                             kernel_signals: 0,
                             frame_samples_recorded: 0,
                             frames_dropped_total: 0,
+                            etw_drops_total: 0,
                         });
                     }
                     Err(e) => {
@@ -377,12 +388,16 @@ impl SessionRecorder {
             schema_version: SCHEMA_VERSION,
             at_ms,
             reason: reason.to_string(),
-            // §2.3: partial_data is true when frame data is missing for
-            // any window (no PresentMon samples) or drops were seen.
-            // A session that recorded frame samples with zero drops is
-            // now non-partial — the closed loop can actually attribute.
-            partial_data: rec.frame_samples_recorded == 0 || rec.frames_dropped_total > 0,
-            etw_drops_total: 0,
+            // §2.3: partial_data means the frame/kernel data is
+            // untrustworthy for a window — no PresentMon samples at all,
+            // or ETW *event* drops (etw_drops_total). It is deliberately
+            // NOT triggered by PresentMon *frame* drops: composed-away /
+            // never-displayed presents are normal for many titles, and
+            // folding them in would mark nearly every real session
+            // partial, permanently disabling attribution. frames_dropped
+            // is recorded per sample as a metric, not a quality flag.
+            partial_data: rec.frame_samples_recorded == 0 || rec.etw_drops_total > 0,
+            etw_drops_total: rec.etw_drops_total,
             presentmon_restarts: 0,
             summary: SessionSummary {
                 duration_secs: at_ms / 1000,
@@ -392,6 +407,7 @@ impl SessionRecorder {
                 frame_time_p99_us_with_rules: None,
                 actions_applied: rec.actions_applied,
                 kernel_signals: rec.kernel_signals,
+                frames_dropped: rec.frames_dropped_total,
             },
         };
         let session_id = rec.session_id.clone();
@@ -742,9 +758,13 @@ mod tests {
         );
     }
 
-    // #111 — dropped frames keep a session partial even with samples.
+    // #111 — PresentMon frame drops are a normal metric, NOT a
+    // data-quality flag: they are summed into the summary but must not
+    // mark the session partial (§2.3 partial_data = no samples or ETW
+    // *event* drops). Folding presentation drops into partial_data would
+    // disable attribution on nearly every real session.
     #[test]
-    fn dropped_frames_keep_session_partial() {
+    fn dropped_frames_are_summed_but_do_not_mark_a_session_partial() {
         let dir = tempfile::tempdir().unwrap();
         let mut rec = SessionRecorder::new(dir.path().to_path_buf());
         rec.handle_event(&foreground("g.exe", 7), true);
@@ -752,13 +772,26 @@ mod tests {
         let mut s = frame_stats(0, 16_000, 22_000);
         s.frames_dropped = 5;
         rec.record_frame_sample(&s);
+        let mut s2 = frame_stats(0, 16_000, 22_000);
+        s2.frames_dropped = 3;
+        rec.record_frame_sample(&s2);
         rec.handle_event(&exited("done"), true);
 
         let entry = &list_sessions(dir.path()).unwrap()[0];
         assert!(
-            entry.partial_data,
-            "dropped frames mark the session partial"
+            !entry.partial_data,
+            "presentation frame drops must NOT mark the session partial"
         );
+
+        // …but the drop total rides along in the summary as a metric.
+        let path = dir.path().join(format!("{}.jsonl", entry.session_id));
+        let (events, _) = read_session(&path).unwrap();
+        match events.last().unwrap() {
+            SessionEvent::SessionEnd { summary, .. } => {
+                assert_eq!(summary.frames_dropped, 8, "5 + 3 drops summed");
+            }
+            other => panic!("expected session_end, got {other:?}"),
+        }
     }
 
     // #7/#8 — cpu_sample + kernel_signal actually land in the file and
