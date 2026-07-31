@@ -37,7 +37,8 @@
 
 use eframe::egui;
 use framesage_ipc::framesage_recorder::{
-    compute_attribution_summary, Attribution, DeltaBand, SessionEvent, SessionListEntry,
+    compute_attribution_summary, AggregateAttribution, Attribution, DeltaBand, SessionEvent,
+    SessionListEntry,
 };
 use framesage_ipc::StatusSnapshot;
 
@@ -133,6 +134,7 @@ pub fn render(
     status: Option<&StatusSnapshot>,
     sessions: Option<&[SessionListEntry]>,
     detail: Option<&mut SessionDetailState>,
+    trends: Option<&[AggregateAttribution]>,
     fetch_pending: bool,
 ) -> Option<SessionsAction> {
     let Some(snap) = status else {
@@ -178,8 +180,45 @@ pub fn render(
             render_no_sessions_yet(ui, snap.policy.closed_loop_enabled, &mut action);
             action
         }
-        Some(list) => render_list_and_detail(ui, list, detail, fetch_pending),
+        Some(list) => render_list_and_detail(ui, list, detail, trends, fetch_pending),
     }
+}
+
+/// §2.4 trend rollup — the "does this profile help *in general*?"
+/// summary card(s) above the session list. Each row is one
+/// (game, profile) pair with its median 1% lows verdict across the
+/// attributable sessions. Silent when there are no attributable trends
+/// yet (a single unusable session shouldn't render an empty card).
+fn render_trends(ui: &mut egui::Ui, trends: &[AggregateAttribution]) {
+    let attributable: Vec<&AggregateAttribution> = trends
+        .iter()
+        .filter(|t| t.attributable_sessions > 0)
+        .collect();
+    if attributable.is_empty() {
+        return;
+    }
+    theme::card().show(ui, |ui| {
+        ui.label(theme::section_heading("Trends — does this profile help?"));
+        ui.add_space(theme::SP_XS);
+        for t in attributable {
+            let band = t.band.unwrap_or(DeltaBand::NoEffect);
+            let color = match band {
+                DeltaBand::Improved => theme::SUCCESS,
+                DeltaBand::ModestImprovement | DeltaBand::NoEffect => theme::TEXT_MUTED,
+                DeltaBand::SlightRegression | DeltaBand::Degraded => theme::WARNING,
+            };
+            let display = t.headline.replace("**", "");
+            let mut txt =
+                egui::RichText::new(format!("{} · {} — {}", t.game_exe, t.profile_id, display))
+                    .size(12.0)
+                    .color(color);
+            if matches!(band, DeltaBand::Degraded | DeltaBand::Improved) {
+                txt = txt.strong();
+            }
+            ui.label(txt);
+        }
+    });
+    ui.add_space(theme::SP_SM);
 }
 
 /// §2.4 list view (top) + detail pane (bottom).
@@ -187,9 +226,15 @@ fn render_list_and_detail(
     ui: &mut egui::Ui,
     list: &[SessionListEntry],
     detail: Option<&mut SessionDetailState>,
+    trends: Option<&[AggregateAttribution]>,
     fetch_pending: bool,
 ) -> Option<SessionsAction> {
     let mut action = None;
+
+    // §2.4 trend rollup above the list.
+    if let Some(trends) = trends {
+        render_trends(ui, trends);
+    }
 
     let total_bytes: u64 = list.iter().map(|e| e.file_bytes).sum();
     ui.horizontal(|ui| {

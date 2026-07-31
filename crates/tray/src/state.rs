@@ -58,6 +58,9 @@ pub(crate) struct AppState {
     pub(crate) session_detail: Option<SessionDetailState>,
     /// True while a ReadSession fetch thread is in flight.
     pub(crate) session_detail_pending: bool,
+    /// §2.4 trend view — cross-session (game, profile) rollups. `None`
+    /// until the first fetch completes; fetched alongside the list.
+    pub(crate) session_trends: Option<Vec<framesage_ipc::framesage_recorder::AggregateAttribution>>,
 }
 
 /// #110 — one fetched session's full event stream plus derived bits

@@ -18,10 +18,12 @@
 //! on top of these types; nothing here depends on Windows, so the
 //! whole crate is testable on any host.
 
+pub mod aggregate_attribution;
 pub mod attribution;
 pub mod schema;
 pub mod store;
 
+pub use aggregate_attribution::{compute_aggregates, AggregateAttribution, SessionAttribution};
 pub use attribution::{
     compute_attribution_summary, Attribution, AttributionSummary, DeltaBand, DisabledReason,
 };

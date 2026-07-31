@@ -63,7 +63,7 @@ impl DisabledReason {
 
 /// The asymmetric delta band for the headline 1% lows number (§2.4
 /// "Delta reporting rules — ASYMMETRIC").
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum DeltaBand {
     /// delta < -8% — "improved by N%" (green)
     Improved,
