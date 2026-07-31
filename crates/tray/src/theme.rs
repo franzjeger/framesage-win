@@ -32,6 +32,34 @@ pub const SUCCESS: Color32 = Color32::from_rgb(0x3f, 0xb9, 0x50);
 pub const WARNING: Color32 = Color32::from_rgb(0xd2, 0x99, 0x22);
 pub const ERROR: Color32 = Color32::from_rgb(0xf8, 0x51, 0x49);
 
+/// Secondary data-series color (memory sparkline, second line on a chart).
+/// A muted violet that reads as distinct from the cyan [`ACCENT`] without
+/// competing with the semantic success/warning/error hues.
+pub const SERIES_SECONDARY: Color32 = Color32::from_rgb(0x8c, 0x5a, 0xc8);
+
+/// Neutral border for unselected cards / radio tiles — quieter than
+/// [`BORDER`] would read when it needs to recede behind a selected accent
+/// sibling.
+pub const BORDER_MUTED: Color32 = Color32::from_rgb(0x26, 0x2b, 0x33);
+
+// ─── Spacing scale ─────────────────────────────────────────────────────────────
+//
+// One vertical-rhythm scale so section gaps align to a grid instead of a
+// scatter of magic `add_space` numbers. Prefer these over literals.
+
+pub const SP_XS: f32 = 4.0;
+pub const SP_SM: f32 = 8.0;
+pub const SP_MD: f32 = 12.0;
+pub const SP_LG: f32 = 16.0;
+pub const SP_XL: f32 = 24.0;
+
+/// A translucent fill of `color` at the given alpha — the one place we
+/// derive low-opacity accent/series fills, so callers stop hand-rolling
+/// `Color32::from_rgba_premultiplied` inline.
+pub fn fill_alpha(color: Color32, alpha: u8) -> Color32 {
+    Color32::from_rgba_premultiplied(color.r(), color.g(), color.b(), alpha)
+}
+
 // ─── Apply ───────────────────────────────────────────────────────────────────
 
 /// Install the framesage theme on this egui context. Idempotent — calling
@@ -176,6 +204,30 @@ pub fn section_heading(text: &str) -> egui::RichText {
         .strong()
         .color(TEXT_MUTED)
         .extra_letter_spacing(1.0)
+}
+
+/// Primary call-to-action button — filled accent, dark text — so
+/// Continue / Finish / Save read as *the* action on a surface instead of
+/// being signalled by accent-colored text on a default fill. Returns the
+/// click response.
+pub fn primary_button(ui: &mut egui::Ui, label: &str) -> egui::Response {
+    let text = egui::RichText::new(label).color(BG).strong();
+    ui.add(
+        egui::Button::new(text)
+            .fill(ACCENT)
+            .stroke(Stroke::new(1.0_f32, ACCENT_HOVER)),
+    )
+}
+
+/// Destructive button — error-tinted fill + stroke — so Remove / Delete
+/// reads as dangerous rather than identical to a neutral secondary button.
+pub fn danger_button(ui: &mut egui::Ui, label: &str) -> egui::Response {
+    let text = egui::RichText::new(label).color(ERROR).strong();
+    ui.add(
+        egui::Button::new(text)
+            .fill(fill_alpha(ERROR, 0x22))
+            .stroke(Stroke::new(1.0_f32, ERROR)),
+    )
 }
 
 /// Process Lasso–style tab button. Renders a chunky labelled rectangle with a

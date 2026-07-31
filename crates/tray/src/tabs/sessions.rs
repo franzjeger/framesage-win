@@ -56,6 +56,11 @@ pub enum SessionsAction {
     /// page's EDR-implications disclosure) before flipping the
     /// policy toggle.
     OpenClosedLoopOptIn,
+    /// Q1 / §2.4 — jump to the Profiles tab with this profile open in
+    /// the editor. Surfaced from a **degraded** attribution verdict so
+    /// the user has a path to fix the profile that hurt them, per the
+    /// architecture's "YELLOW + link to profile editor" spec.
+    OpenProfileEditor(String),
 }
 
 // ─── Load-bearing string constants — DO NOT EDIT WITHOUT UPDATING TESTS ──
@@ -155,7 +160,10 @@ pub fn render(
         None => {
             ui.add_space(40.0);
             ui.vertical_centered(|ui| {
-                ui.label(egui::RichText::new("Loading sessions…").color(theme::TEXT_MUTED));
+                ui.horizontal(|ui| {
+                    ui.spinner();
+                    ui.label(egui::RichText::new("Loading sessions…").color(theme::TEXT_MUTED));
+                });
             });
             if fetch_pending {
                 None
@@ -206,9 +214,14 @@ fn render_list_and_detail(
     ui.separator();
 
     let selected_id = detail.as_ref().map(|d| d.session_id.clone());
+    // S1 — adaptive split: when no session is open the list gets the
+    // room (nothing below competes); once a detail pane is showing, the
+    // list yields most of the height so the charts + attribution aren't
+    // cramped.
+    let list_fraction = if detail.is_some() { 0.32 } else { 0.85 };
     egui::ScrollArea::vertical()
         .id_source("sessions-list")
-        .max_height(ui.available_height() * 0.45)
+        .max_height(ui.available_height() * list_fraction)
         .show(ui, |ui| {
             for entry in list {
                 let is_selected = selected_id.as_deref() == Some(entry.session_id.as_str());
@@ -216,11 +229,30 @@ fn render_list_and_detail(
                     Some(secs) => format!("{}m{:02}s", secs / 60, secs % 60),
                     None => "in progress / crashed".to_string(),
                 };
-                let mut label = format!("🎮 {} · {} · {}", entry.game_exe, entry.profile_id, dur);
-                if entry.partial_data {
-                    label.push_str("  ⚠ partial data");
-                }
-                let resp = ui.selectable_label(is_selected, label);
+                let label = format!("🎮 {} · {} · {}", entry.game_exe, entry.profile_id, dur);
+                let resp = ui
+                    .horizontal(|ui| {
+                        let resp = ui.selectable_label(is_selected, label);
+                        // Q2 — partial-data as a themed WARNING pill,
+                        // right-aligned, instead of appended raw text —
+                        // it's a load-bearing honesty signal.
+                        if entry.partial_data {
+                            ui.with_layout(
+                                egui::Layout::right_to_left(egui::Align::Center),
+                                |ui| {
+                                    theme::status_badge(theme::WARNING).show(ui, |ui| {
+                                        ui.label(
+                                            egui::RichText::new("⚠ partial data")
+                                                .size(11.0)
+                                                .color(theme::WARNING),
+                                        );
+                                    });
+                                },
+                            );
+                        }
+                        resp
+                    })
+                    .inner;
                 if resp.clicked() && !is_selected {
                     action = Some(SessionsAction::OpenDetail(entry.session_id.clone()));
                 }
@@ -229,17 +261,22 @@ fn render_list_and_detail(
 
     ui.separator();
     match detail {
-        Some(d) => render_detail(ui, d),
+        Some(d) => render_detail(ui, d, &mut action),
         None => {
             ui.add_space(8.0);
-            ui.label(
-                egui::RichText::new(if fetch_pending {
-                    "Loading session…"
-                } else {
-                    "Select a session to see the \"Did it help?\" attribution."
-                })
-                .color(theme::TEXT_MUTED),
-            );
+            if fetch_pending {
+                ui.horizontal(|ui| {
+                    ui.spinner();
+                    ui.label(egui::RichText::new("Loading session…").color(theme::TEXT_MUTED));
+                });
+            } else {
+                ui.label(
+                    egui::RichText::new(
+                        "Select a session to see the \"Did it help?\" attribution.",
+                    )
+                    .color(theme::TEXT_MUTED),
+                );
+            }
         }
     }
     action
@@ -248,12 +285,50 @@ fn render_list_and_detail(
 /// Detail pane: event summary + the §2.4 honest-attribution panel.
 /// Charts (frame-time timeline, per-core heatmap) are Group D polish
 /// and intentionally absent from this slice.
-fn render_detail(ui: &mut egui::Ui, detail: &mut SessionDetailState) {
-    ui.label(
-        egui::RichText::new(format!("Session {}", detail.session_id))
-            .strong()
-            .size(14.0),
-    );
+fn render_detail(
+    ui: &mut egui::Ui,
+    detail: &mut SessionDetailState,
+    action: &mut Option<SessionsAction>,
+) {
+    // Q3 — humanized header derived STRICTLY from the recorded events
+    // (never invented): "<game.exe> · <profile> · <duration>". Falls
+    // back to the raw id when the session_start line is missing.
+    let start = detail.events.iter().find_map(|e| match e {
+        SessionEvent::SessionStart {
+            game_exe,
+            profile_id,
+            ..
+        } => Some((game_exe.clone(), profile_id.clone())),
+        _ => None,
+    });
+    let duration_secs = detail.events.iter().rev().find_map(|e| match e {
+        SessionEvent::SessionEnd { at_ms, .. } => Some(*at_ms / 1000),
+        _ => None,
+    });
+    match &start {
+        Some((game_exe, profile_id)) => {
+            let dur = duration_secs
+                .map(|s| format!(" · {}m{:02}s", s / 60, s % 60))
+                .unwrap_or_default();
+            ui.label(
+                egui::RichText::new(format!("{game_exe} · {profile_id}{dur}"))
+                    .strong()
+                    .size(14.0),
+            );
+            ui.label(
+                egui::RichText::new(&detail.session_id)
+                    .size(10.0)
+                    .color(theme::TEXT_DIM),
+            );
+        }
+        None => {
+            ui.label(
+                egui::RichText::new(format!("Session {}", detail.session_id))
+                    .strong()
+                    .size(14.0),
+            );
+        }
+    }
     let frame_samples = detail
         .events
         .iter()
@@ -281,10 +356,25 @@ fn render_detail(ui: &mut egui::Ui, detail: &mut SessionDetailState) {
     );
     ui.add_space(8.0);
 
+    // Compute attribution once so the chart's window shading (S2) uses
+    // exactly the same baseline / with-rules bounds the verdict does.
+    // Windows are present only when there's a summary (computed, or
+    // computed-anyway on partial data); otherwise we shade nothing —
+    // never inventing a region the data can't support.
+    let attribution = compute_attribution_summary(&detail.events);
+    let windows: Option<((u64, u64), (u64, u64))> = match &attribution {
+        Attribution::Computed(s) => Some((s.baseline_window_ms, s.with_rules_window_ms)),
+        Attribution::Disabled {
+            computed_anyway: Some(s),
+            ..
+        } => Some((s.baseline_window_ms, s.with_rules_window_ms)),
+        _ => None,
+    };
+
     // #3 — frame-time timeline (p50 line, p99 shaded) with the
     // Game Mode enter marker. Drawn from the session's frame_sample
     // events; absent-frame-data sessions show a hint instead.
-    render_frame_time_chart(ui, &detail.events);
+    render_frame_time_chart(ui, &detail.events, windows);
     // #1 — per-core CPU heatmap from the session's cpu_sample events.
     render_cpu_heatmap(ui, &detail.events);
     ui.add_space(8.0);
@@ -295,8 +385,11 @@ fn render_detail(ui: &mut egui::Ui, detail: &mut SessionDetailState) {
             .size(13.0),
     );
     ui.add_space(4.0);
-    match compute_attribution_summary(&detail.events) {
-        Attribution::Computed(summary) => render_attribution_summary(ui, &summary),
+    let session_profile = start.as_ref().map(|(_, p)| p.clone());
+    match attribution {
+        Attribution::Computed(summary) => {
+            render_attribution_summary(ui, &summary, session_profile.as_deref(), action)
+        }
         Attribution::Disabled {
             reason,
             computed_anyway,
@@ -311,7 +404,7 @@ fn render_detail(ui: &mut egui::Ui, detail: &mut SessionDetailState) {
                     "Show anyway (partial data — treat with caution)",
                 );
                 if detail.show_partial_anyway {
-                    render_attribution_summary(ui, &summary);
+                    render_attribution_summary(ui, &summary, session_profile.as_deref(), action);
                 }
             }
         }
@@ -321,6 +414,8 @@ fn render_detail(ui: &mut egui::Ui, detail: &mut SessionDetailState) {
 fn render_attribution_summary(
     ui: &mut egui::Ui,
     summary: &framesage_ipc::framesage_recorder::AttributionSummary,
+    session_profile: Option<&str>,
+    action: &mut Option<SessionsAction>,
 ) {
     // §2.4 band colors: green only above the conservative +8% claim
     // threshold; the degraded banner is loud by design.
@@ -338,15 +433,25 @@ fn render_attribution_summary(
         text = text.strong();
     }
     ui.label(text);
-    ui.add_space(4.0);
-    ui.label(
-        egui::RichText::new(format!(
-            "1% lows: {:+.1}%   ·   avg frame time: {:+.1}%   ·   variance: {:+.1}%",
-            summary.p99_delta_pct, summary.avg_frame_time_delta_pct, summary.variance_delta_pct
-        ))
-        .size(12.0)
-        .color(theme::TEXT_MUTED),
-    );
+    ui.add_space(theme::SP_XS);
+    // Q4 — 1% lows is the primary metric (§2.4); render it at body size
+    // in the band color, with avg/variance de-emphasized beside it.
+    ui.horizontal(|ui| {
+        ui.label(
+            egui::RichText::new(format!("1% lows {:+.1}%", summary.p99_delta_pct))
+                .size(13.0)
+                .strong()
+                .color(color),
+        );
+        ui.label(
+            egui::RichText::new(format!(
+                "· avg frame time {:+.1}%  · variance {:+.1}%",
+                summary.avg_frame_time_delta_pct, summary.variance_delta_pct
+            ))
+            .size(11.5)
+            .color(theme::TEXT_MUTED),
+        );
+    });
     ui.label(
         egui::RichText::new(format!(
             "baseline {}s–{}s · with rules {}s–{}s",
@@ -358,6 +463,29 @@ fn render_attribution_summary(
         .size(11.0)
         .color(theme::TEXT_MUTED),
     );
+
+    // Q1 / §2.4 — a degraded verdict means this profile made things
+    // worse. Give the user the spec'd path to act on it: a link that
+    // opens the offending profile in the editor.
+    if matches!(
+        summary.band,
+        DeltaBand::Degraded | DeltaBand::SlightRegression
+    ) {
+        if let Some(profile) = session_profile {
+            ui.add_space(theme::SP_XS);
+            if ui
+                .add(egui::Link::new(
+                    egui::RichText::new(format!("→ Review the “{profile}” profile"))
+                        .size(12.0)
+                        .color(theme::ACCENT),
+                ))
+                .on_hover_text("Opens this profile in the Profiles editor so you can adjust it.")
+                .clicked()
+            {
+                *action = Some(SessionsAction::OpenProfileEditor(profile.to_string()));
+            }
+        }
+    }
 }
 
 fn render_unsupported_build(ui: &mut egui::Ui) {
@@ -486,7 +614,11 @@ fn render_no_sessions_yet(
 /// with a vertical marker at the first apply/enter action. µs → ms on
 /// the axis. No frame samples → an honest "no frame data" hint (the
 /// session was recorded without PresentMon).
-fn render_frame_time_chart(ui: &mut egui::Ui, events: &[SessionEvent]) {
+fn render_frame_time_chart(
+    ui: &mut egui::Ui,
+    events: &[SessionEvent],
+    windows: Option<((u64, u64), (u64, u64))>,
+) {
     let samples: Vec<(u64, f32, f32)> = events
         .iter()
         .filter_map(|e| match e {
@@ -534,6 +666,37 @@ fn render_frame_time_chart(ui: &mut egui::Ui, events: &[SessionEvent]) {
     let y = |ms: f32| rect.bottom() - (ms / max_ms) * rect.height();
 
     painter.rect_filled(rect, 2.0, theme::SURFACE);
+
+    // S2 — shade the baseline and with-rules windows behind the line so
+    // the eye can see which spans produced the verdict. Clamped to the
+    // sample range; only drawn when attribution actually has windows.
+    if let Some((baseline, with_rules)) = windows {
+        let clamp = |t: u64| t.clamp(min_t, max_t);
+        let shade = |lo: u64, hi: u64, color: egui::Color32, label: &str| {
+            if hi <= lo {
+                return;
+            }
+            let (xl, xr) = (x(clamp(lo)), x(clamp(hi)));
+            if xr <= xl {
+                return;
+            }
+            let band =
+                egui::Rect::from_min_max(egui::pos2(xl, rect.top()), egui::pos2(xr, rect.bottom()));
+            painter.rect_filled(band, 0.0, theme::fill_alpha(color, 0x14));
+            painter.text(
+                egui::pos2(xl + 3.0, rect.top() + 2.0),
+                egui::Align2::LEFT_TOP,
+                label,
+                egui::FontId::proportional(9.0),
+                color,
+            );
+        };
+        // Baseline in muted neutral, with-rules in accent — the two
+        // spans the attribution compares.
+        shade(baseline.0, baseline.1, theme::TEXT_MUTED, "baseline");
+        shade(with_rules.0, with_rules.1, theme::ACCENT, "with rules");
+    }
+
     // p99 shaded band (baseline 0 → p99).
     for w in samples.windows(2) {
         let (a, b) = (w[0], w[1]);
@@ -600,10 +763,38 @@ fn render_cpu_heatmap(ui: &mut egui::Ui, events: &[SessionEvent]) {
         return;
     }
     ui.add_space(6.0);
+    // U3 — title + a 0→100% brightness legend so the heatmap reads as
+    // data, not decoration.
+    ui.horizontal(|ui| {
+        ui.label(
+            egui::RichText::new(format!("Per-core CPU ({cores} cores)"))
+                .size(12.0)
+                .strong(),
+        );
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            ui.label(
+                egui::RichText::new("100%")
+                    .size(9.0)
+                    .color(theme::TEXT_MUTED),
+            );
+            let (lg, _r) = ui.allocate_exact_size(egui::vec2(60.0, 8.0), egui::Sense::hover());
+            let p = ui.painter_at(lg);
+            let steps = 24;
+            for i in 0..steps {
+                let f = i as f32 / (steps - 1) as f32;
+                let cell = egui::Rect::from_min_size(
+                    egui::pos2(lg.left() + f * lg.width(), lg.top()),
+                    egui::vec2(lg.width() / steps as f32 + 1.0, lg.height()),
+                );
+                p.rect_filled(cell, 0.0, theme::ACCENT.gamma_multiply(0.15 + f * 0.85));
+            }
+            ui.label(egui::RichText::new("0%").size(9.0).color(theme::TEXT_MUTED));
+        });
+    });
     ui.label(
-        egui::RichText::new(format!("Per-core CPU ({cores} cores)"))
-            .size(12.0)
-            .strong(),
+        egui::RichText::new("cores ↓   ·   time →")
+            .size(9.0)
+            .color(theme::TEXT_DIM),
     );
     let row_h = 6.0_f32;
     let (rect, _resp) = ui.allocate_exact_size(

@@ -237,12 +237,15 @@ pub fn render(ctx: &egui::Context, state: &mut OnboardingState) -> OnboardingRes
         .resizable(false)
         .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
         .default_width(580.0)
-        .show(ctx, |ui| match state.page {
-            0 => render_page_intro(ui, &mut next_action),
-            1 => render_page_level(ui, state, &mut next_action),
-            2 => render_page_closed_loop(ui, state, &mut next_action),
-            3 => render_page_manual_hotkey(ui, &mut next_action),
-            _ => render_page_done(ui, state, &mut next_action),
+        .show(ctx, |ui| {
+            render_step_indicator(ui, state.page);
+            match state.page {
+                0 => render_page_intro(ui, &mut next_action),
+                1 => render_page_level(ui, state, &mut next_action),
+                2 => render_page_closed_loop(ui, state, &mut next_action),
+                3 => render_page_manual_hotkey(ui, &mut next_action),
+                _ => render_page_done(ui, state, &mut next_action),
+            }
         });
 
     match next_action {
@@ -279,6 +282,36 @@ enum NextAction {
     Finish,
 }
 
+/// U1 — "Step N of 5" label plus a row of progress dots so the user can
+/// see how long the wizard is and where they are in it. Purely
+/// informational; it never changes the page or pre-selects anything.
+fn render_step_indicator(ui: &mut egui::Ui, page: u8) {
+    let total = LAST_PAGE_INDEX + 1;
+    ui.horizontal(|ui| {
+        ui.label(
+            egui::RichText::new(format!("Step {} of {}", page + 1, total))
+                .small()
+                .color(theme::TEXT_MUTED),
+        );
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            for i in (0..total).rev() {
+                let color = if i == page {
+                    theme::ACCENT
+                } else if i < page {
+                    theme::TEXT_MUTED
+                } else {
+                    theme::BORDER_MUTED
+                };
+                let (rect, _) = ui.allocate_exact_size(egui::vec2(9.0, 9.0), egui::Sense::hover());
+                ui.painter().circle_filled(rect.center(), 3.5, color);
+            }
+        });
+    });
+    ui.add_space(theme::SP_SM);
+    ui.separator();
+    ui.add_space(theme::SP_XS);
+}
+
 fn render_page_intro(ui: &mut egui::Ui, next: &mut Option<NextAction>) {
     ui.add_space(4.0);
     ui.label(theme::section_heading("Welcome to FrameSage"));
@@ -304,14 +337,7 @@ fn render_page_intro(ui: &mut egui::Ui, next: &mut Option<NextAction>) {
     ui.add_space(14.0);
     ui.horizontal(|ui| {
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            if ui
-                .add(egui::Button::new(
-                    egui::RichText::new("Continue")
-                        .strong()
-                        .color(theme::ACCENT),
-                ))
-                .clicked()
-            {
+            if theme::primary_button(ui, "Continue").clicked() {
                 *next = Some(NextAction::Forward);
             }
         });
@@ -369,11 +395,8 @@ fn render_page_level(
             if ui
                 .add_enabled(
                     continue_enabled,
-                    egui::Button::new(
-                        egui::RichText::new("Continue")
-                            .strong()
-                            .color(theme::ACCENT),
-                    ),
+                    egui::Button::new(egui::RichText::new("Continue").strong().color(theme::BG))
+                        .fill(theme::ACCENT),
                 )
                 .clicked()
             {
@@ -396,7 +419,7 @@ fn radio_card(
     let border = if selected {
         theme::ACCENT
     } else {
-        theme::TEXT_MUTED
+        theme::BORDER_MUTED
     };
     egui::Frame::none()
         .stroke(egui::Stroke::new(1.0_f32, border))
@@ -465,68 +488,70 @@ fn render_page_closed_loop(
     );
     ui.add_space(10.0);
 
-    ui.label(egui::RichText::new("What it does:").strong().size(13.0));
-    ui.label(
-        egui::RichText::new(
-            "  • Reads kernel events via ETW (the same Windows API PerfView, \
-             xperf, LatencyMon, and GPU-Z use).",
-        )
-        .size(12.5)
-        .color(theme::TEXT_MUTED),
-    );
-    ui.label(
-        egui::RichText::new(
-            "  • Spawns Intel PresentMon when a game launches (bundled, \
-             open-source MIT — visible at C:\\Program Files\\FrameSage\\PresentMon\\).",
-        )
-        .size(12.5)
-        .color(theme::TEXT_MUTED),
-    );
-    ui.label(
-        egui::RichText::new(
-            "  • Writes session recordings to C:\\ProgramData\\framesage\\sessions\\. \
-             Nothing leaves your machine.",
-        )
-        .size(12.5)
-        .color(theme::TEXT_MUTED),
-    );
+    // U2 — the two disclosure blocks as distinct cards so "What it
+    // does" and the load-bearing "When NOT to enable" caveats don't
+    // blur into one wall of muted text. A small bullet helper keeps
+    // each line consistent.
+    let bullet = |ui: &mut egui::Ui, text: &str| {
+        ui.label(
+            egui::RichText::new(format!("• {text}"))
+                .size(12.5)
+                .color(theme::TEXT_MUTED),
+        );
+    };
 
-    ui.add_space(10.0);
-    ui.label(
-        egui::RichText::new("When NOT to enable:")
-            .strong()
-            .size(13.0),
-    );
-    ui.label(
-        egui::RichText::new(
-            "  • Corporate laptop running enterprise EDR (Defender ATP, \
+    theme::card().show(ui, |ui| {
+        ui.label(theme::section_heading("What it does"));
+        ui.add_space(theme::SP_XS);
+        bullet(
+            ui,
+            "Reads kernel events via ETW (the same Windows API PerfView, \
+             xperf, LatencyMon, and GPU-Z use).",
+        );
+        bullet(
+            ui,
+            "Spawns Intel PresentMon when a game launches (bundled, \
+             open-source MIT — visible at C:\\Program Files\\FrameSage\\PresentMon\\).",
+        );
+        bullet(
+            ui,
+            "Writes session recordings to C:\\ProgramData\\framesage\\sessions\\. \
+             Nothing leaves your machine.",
+        );
+    });
+
+    ui.add_space(theme::SP_SM);
+    theme::card().show(ui, |ui| {
+        ui.label(theme::section_heading("When NOT to enable"));
+        ui.add_space(theme::SP_XS);
+        bullet(
+            ui,
+            "Corporate laptop running enterprise EDR (Defender ATP, \
              CrowdStrike, SentinelOne). ETW kernel consumption may trigger \
              alerts in your SOC. We've tested against all three on clean \
              Windows but corporate policy may differ.",
-        )
-        .size(12.5)
-        .color(theme::TEXT_MUTED),
-    );
-    ui.label(
-        egui::RichText::new(
-            "  • Privacy-sensitive workflows. The recorder stores game exe \
+        );
+        bullet(
+            ui,
+            "Privacy-sensitive workflows. The recorder stores game exe \
              names + frame times + CPU samples on disk for up to 1 GB total.",
-        )
-        .size(12.5)
-        .color(theme::TEXT_MUTED),
-    );
+        );
+    });
 
-    ui.add_space(10.0);
+    ui.add_space(theme::SP_SM);
     // CLOSED_LOOP_PAGE_EDR_DISCLOSURE is the load-bearing
     // required-substring per Group C acceptance criterion. Do not
-    // paraphrase without updating the inline test below.
-    ui.label(
-        egui::RichText::new(CLOSED_LOOP_PAGE_EDR_DISCLOSURE)
-            .color(theme::WARNING)
-            .size(12.5),
-    );
+    // paraphrase without updating the inline test below. Rendered in a
+    // WARNING banner so the caveat reads as a caveat.
+    theme::banner(theme::WARNING).show(ui, |ui| {
+        ui.label(
+            egui::RichText::new(CLOSED_LOOP_PAGE_EDR_DISCLOSURE)
+                .color(theme::WARNING)
+                .size(12.5),
+        );
+    });
 
-    ui.add_space(12.0);
+    ui.add_space(theme::SP_MD);
 
     // Radio options. No default — Continue stays disabled until one
     // is picked per architecture §"First-run onboarding" line 1410:
@@ -560,11 +585,8 @@ fn render_page_closed_loop(
             if ui
                 .add_enabled(
                     continue_enabled,
-                    egui::Button::new(
-                        egui::RichText::new("Continue")
-                            .strong()
-                            .color(theme::ACCENT),
-                    ),
+                    egui::Button::new(egui::RichText::new("Continue").strong().color(theme::BG))
+                        .fill(theme::ACCENT),
                 )
                 .clicked()
             {
@@ -588,7 +610,7 @@ fn closed_loop_radio_card(
     let border = if selected {
         theme::ACCENT
     } else {
-        theme::TEXT_MUTED
+        theme::BORDER_MUTED
     };
     egui::Frame::none()
         .stroke(egui::Stroke::new(1.0_f32, border))
@@ -654,14 +676,7 @@ fn render_page_manual_hotkey(ui: &mut egui::Ui, next: &mut Option<NextAction>) {
             *next = Some(NextAction::Back);
         }
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            if ui
-                .add(egui::Button::new(
-                    egui::RichText::new("Continue")
-                        .strong()
-                        .color(theme::ACCENT),
-                ))
-                .clicked()
-            {
+            if theme::primary_button(ui, "Continue").clicked() {
                 *next = Some(NextAction::Forward);
             }
         });
@@ -700,12 +715,7 @@ fn render_page_done(ui: &mut egui::Ui, state: &OnboardingState, next: &mut Optio
             *next = Some(NextAction::Back);
         }
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            if ui
-                .add(egui::Button::new(
-                    egui::RichText::new("Finish").strong().color(theme::SUCCESS),
-                ))
-                .clicked()
-            {
+            if theme::primary_button(ui, "Finish").clicked() {
                 *next = Some(NextAction::Finish);
             }
         });
