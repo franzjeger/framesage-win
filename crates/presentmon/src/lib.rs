@@ -46,16 +46,18 @@ mod pipeline_tests {
         let mut out: Vec<FrameStats> = Vec::new();
 
         parser
-            .feed_line("Application,ProcessID,msBetweenPresents")
+            .feed_line("Application,ProcessID,Dropped,msBetweenPresents")
             .unwrap();
-        // Two seconds of 60 fps.
+        // Two seconds of 60 fps; every 30th present is dropped.
         let mut at_ms = 0u64;
-        for _ in 0..120 {
+        for i in 0..120 {
+            let dropped = if i % 30 == 0 { "1" } else { "0" };
             let row = parser
-                .feed_line("game.exe,42,16.667")
+                .feed_line(&format!("game.exe,42,{dropped},16.667"))
                 .unwrap()
                 .expect("row");
-            if let Some(stats) = agg.push(at_ms, row.frame_time_us) {
+            assert_eq!(row.dropped, i % 30 == 0);
+            if let Some(stats) = agg.push(at_ms, row.frame_time_us, row.dropped) {
                 out.push(stats);
             }
             at_ms += 16;
@@ -67,5 +69,10 @@ mod pipeline_tests {
         assert_eq!(out.len(), 2, "two 1 Hz buckets for ~1.9 s of frames");
         assert!(out.iter().all(|s| s.frame_time_us_p50 == 16_667));
         assert!(out.iter().all(|s| s.frame_count >= 56));
+        // The Dropped column flowed through to the aggregated stats.
+        assert!(
+            out.iter().any(|s| s.frames_dropped > 0),
+            "dropped presents must surface in frame_sample stats"
+        );
     }
 }

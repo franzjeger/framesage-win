@@ -12,6 +12,10 @@
 //! * `ProcessID` — same, by PID (preferred filter when known).
 //! * `msBetweenPresents` — the frame time. This is the load-bearing
 //!   number; a header without it is a hard error.
+//! * `Dropped` — 1 if this present was dropped (composed away / not
+//!   displayed), 0 otherwise. Optional: older PresentMon builds or
+//!   trimmed column sets may omit it, in which case drops read as
+//!   honest absence (0), never a fabricated claim.
 
 use thiserror::Error;
 
@@ -31,6 +35,10 @@ pub struct PresentRow {
     /// Frame time in microseconds (converted from the CSV's
     /// milliseconds-as-float).
     pub frame_time_us: u64,
+    /// This present was dropped (PresentMon `Dropped == 1`). `false`
+    /// when the column is absent or unparseable — honest absence, not
+    /// a claim the frame displayed.
+    pub dropped: bool,
 }
 
 /// Streaming line parser. Feed lines as they arrive from the child's
@@ -48,6 +56,7 @@ struct Columns {
     application: Option<usize>,
     process_id: Option<usize>,
     ms_between_presents: usize,
+    dropped: Option<usize>,
 }
 
 impl CsvParser {
@@ -73,6 +82,7 @@ impl CsvParser {
                 application: find("Application"),
                 process_id: find("ProcessID"),
                 ms_between_presents,
+                dropped: find("Dropped"),
             });
             return Ok(None);
         };
@@ -100,6 +110,13 @@ impl CsvParser {
                 .and_then(|i| fields.get(i))
                 .and_then(|s| s.parse().ok()),
             frame_time_us: (ms * 1000.0).round() as u64,
+            // PresentMon writes the flag as 0/1; some builds emit
+            // "True"/"False". Accept both; anything else → not dropped.
+            dropped: cols
+                .dropped
+                .and_then(|i| fields.get(i))
+                .map(|s| matches!(s.trim(), "1" | "true" | "True" | "TRUE"))
+                .unwrap_or(false),
         }))
     }
 }
@@ -124,16 +141,40 @@ mod tests {
         assert_eq!(row.application.as_deref(), Some("Attila.exe"));
         assert_eq!(row.process_id, Some(16444));
         assert_eq!(row.frame_time_us, 16_667);
+        assert!(!row.dropped, "Dropped=0 present is not dropped");
+    }
+
+    #[test]
+    fn dropped_column_is_parsed_by_name() {
+        let mut p = CsvParser::new();
+        p.feed_line(HEADER).unwrap();
+        // Same row but Dropped=1 (the 9th field, index 8).
+        let row = p
+            .feed_line("Attila.exe,16444,0x1,DXGI,1,0,0,Composed,1,12.5,0.2,16.667,14.1,18.0")
+            .unwrap()
+            .expect("data row parses");
+        assert!(row.dropped, "Dropped=1 present is dropped");
+    }
+
+    #[test]
+    fn dropped_absent_from_header_reads_as_not_dropped() {
+        let mut p = CsvParser::new();
+        // A trimmed header without a Dropped column is valid.
+        p.feed_line("ProcessID,Application,msBetweenPresents")
+            .unwrap();
+        let row = p.feed_line("42,game.exe,16.0").unwrap().unwrap();
+        assert!(!row.dropped, "no Dropped column → honest absence (false)");
     }
 
     #[test]
     fn column_order_does_not_matter() {
         let mut p = CsvParser::new();
-        p.feed_line("msBetweenPresents,ProcessID,Application")
+        p.feed_line("msBetweenPresents,Dropped,ProcessID,Application")
             .unwrap();
-        let row = p.feed_line("8.333,42,game.exe").unwrap().unwrap();
+        let row = p.feed_line("8.333,1,42,game.exe").unwrap().unwrap();
         assert_eq!(row.frame_time_us, 8_333);
         assert_eq!(row.process_id, Some(42));
+        assert!(row.dropped, "Dropped resolves by name regardless of order");
     }
 
     #[test]
