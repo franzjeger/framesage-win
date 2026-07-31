@@ -116,9 +116,18 @@ pub async fn run(inputs: RuntimeInputs) -> Result<()> {
     // future consumers (UI banner) can tap in without re-plumbing.
     let (kernel_signal_tx, kernel_signal_rx) =
         tokio::sync::broadcast::channel::<framesage_etw::KernelSignal>(64);
+    // Group A — shared ETW kernel-drop counter: the closed-loop drop-poll
+    // task accumulates RealTimeBuffersLost deltas; the recorder snapshots
+    // it per session for honest partial_data / etw_drops_total.
+    let etw_drops = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
     let closed_loop_policy = policy.clone();
+    let closed_loop_etw_drops = etw_drops.clone();
     let closed_loop_startup = tokio::task::spawn_blocking(move || {
-        crate::closed_loop::start_closed_loop_if_enabled(&closed_loop_policy, kernel_signal_tx)
+        crate::closed_loop::start_closed_loop_if_enabled(
+            &closed_loop_policy,
+            kernel_signal_tx,
+            closed_loop_etw_drops,
+        )
     })
     .await
     .unwrap_or_else(
@@ -179,6 +188,7 @@ pub async fn run(inputs: RuntimeInputs) -> Result<()> {
         frame_rx,
         caps,
         presentmon_restarts,
+        etw_drops,
     );
 
     let tick_engine = engine.clone();
