@@ -3877,6 +3877,20 @@ impl FramesageApp {
     fn render_processes_tab(&mut self, ui: &mut egui::Ui, status: &Option<StatusSnapshot>) {
         use egui_extras::{Column, TableBuilder};
 
+        // Lowercased set of exes the user has excluded from ProBalance —
+        // drives the per-row "Exclude / Include" context-menu toggle.
+        let probalance_excluded: std::collections::HashSet<String> = status
+            .as_ref()
+            .map(|s| {
+                s.policy
+                    .probalance
+                    .ignore_processes
+                    .iter()
+                    .map(|e| e.to_ascii_lowercase())
+                    .collect()
+            })
+            .unwrap_or_default();
+
         // ─── Toolbar: filter, summary stats, row count ─────────────────────
         // Aggregate totals across the snapshot — gives the "what's the box
         // doing right now" answer right above the table. CPU is summed in
@@ -4464,6 +4478,47 @@ impl FramesageApp {
                                                 }
                                             }
                                         });
+                                        // ProBalance user-ignore toggle. Dedupe
+                                        // targets by exe; the label direction
+                                        // follows whether every unique exe is
+                                        // already excluded.
+                                        let unique_exes: Vec<String> = {
+                                            let mut seen = std::collections::HashSet::new();
+                                            targets
+                                                .iter()
+                                                .filter(|(_, e)| {
+                                                    seen.insert(e.to_ascii_lowercase())
+                                                })
+                                                .map(|(_, e)| e.clone())
+                                                .collect()
+                                        };
+                                        let all_excluded = unique_exes.iter().all(|e| {
+                                            probalance_excluded.contains(&e.to_ascii_lowercase())
+                                        });
+                                        let menu_label = if all_excluded {
+                                            "Include in ProBalance"
+                                        } else {
+                                            "Exclude from ProBalance"
+                                        };
+                                        if ui
+                                            .button(menu_label)
+                                            .on_hover_text(
+                                                "ProBalance never restrains excluded \
+                                                 processes, even under CPU contention. \
+                                                 Persists across restarts.",
+                                            )
+                                            .clicked()
+                                        {
+                                            for e in &unique_exes {
+                                                action_queue.push(
+                                                    ProcessAction::SetProBalanceExclusion {
+                                                        exe_name: e.clone(),
+                                                        exclude: !all_excluded,
+                                                    },
+                                                );
+                                            }
+                                            ui.close_menu();
+                                        }
                                         ui.menu_button("Set CPU affinity", |ui| {
                                             // ── Remember toggle ─────────────────
                                             // Session-sticky checkbox at the top of
@@ -5214,6 +5269,19 @@ impl FramesageApp {
                         Request::DeleteAffinityRule { exe_name },
                         "delete affinity rule",
                     );
+                }
+                ProcessAction::SetProBalanceExclusion { exe_name, exclude } => {
+                    if exclude {
+                        self.send_admin_request(
+                            Request::AddProBalanceExclusion { exe_name },
+                            "exclude from ProBalance",
+                        );
+                    } else {
+                        self.send_admin_request(
+                            Request::RemoveProBalanceExclusion { exe_name },
+                            "include in ProBalance",
+                        );
+                    }
                 }
                 ProcessAction::RequestAffinityPicker { pid, exe_name } => {
                     // Pre-populate the picker with the most useful starting

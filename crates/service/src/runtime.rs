@@ -967,6 +967,16 @@ async fn handle_client(
                     }
                 }
             }
+            Request::AddProBalanceExclusion { exe_name } => {
+                engine.add_probalance_exclusion(&exe_name);
+                let resp = persist_after_policy_mutation(&engine, "AddProBalanceExclusion");
+                write_response(&mut write_half, &resp).await?;
+            }
+            Request::RemoveProBalanceExclusion { exe_name } => {
+                engine.remove_probalance_exclusion(&exe_name);
+                let resp = persist_after_policy_mutation(&engine, "RemoveProBalanceExclusion");
+                write_response(&mut write_half, &resp).await?;
+            }
             Request::SetPolicy { policy } => {
                 // Server-side safe-list intersection: reject the entire
                 // SetPolicy if any profile requests stopping a denylisted
@@ -1266,6 +1276,29 @@ fn task_died_msg<T>(
 ///
 /// Extracted out of the SetPolicy handler so it's unit-testable without
 /// spinning up the full IPC stack.
+/// Persist the engine's current policy after an in-memory mutation
+/// (ProBalance exclusion add/remove), returning the IPC response. A save
+/// failure — typically the service running unelevated against a
+/// SYSTEM-owned policy.json — surfaces as an error so the change isn't
+/// silently lost on restart, mirroring the SetAffinityRule contract.
+#[cfg(windows)]
+fn persist_after_policy_mutation(engine: &Arc<Engine>, what: &str) -> Response {
+    let snapshot = engine.policy_snapshot();
+    match snapshot.save(&paths::policy_path()) {
+        Ok(()) => Response::Ok,
+        Err(e) => {
+            warn!(error = %e, op = %what, "policy save after mutation failed");
+            Response::Error {
+                message: format!(
+                    "policy.json save failed after {what}: {e}. Change applied in \
+                     memory but will be lost on service restart. Install the service \
+                     elevated so it can write the policy file."
+                ),
+            }
+        }
+    }
+}
+
 /// §2.4 trend view — read every recorded session, compute its
 /// attribution, and roll the results up per (game, profile). Sessions
 /// that fail to read are skipped (a torn tail on one file shouldn't
