@@ -139,6 +139,7 @@ pub const SP_XS: f32 = 4.0;
 pub const SP_SM: f32 = 8.0;
 pub const SP_MD: f32 = 12.0;
 pub const SP_LG: f32 = 16.0;
+#[allow(dead_code)] // part of the spacing scale; currently unreferenced
 pub const SP_XL: f32 = 24.0;
 
 /// A translucent fill of `color` at the given alpha — the one place we

@@ -61,9 +61,8 @@ use ipc_client::{
 use process_actions::{render_process_detail, ProcessAction, PRIORITY_CHOICES};
 use state::{AppState, EventKind, RecentEvent};
 use widgets::{
-    format_local_hms, render_active_profile_summary, render_activity_strip,
-    render_foreground_summary, render_perf_band, render_profile_body, render_readonly_banner,
-    render_recent_activity, render_status_bar, render_status_hero,
+    format_local_hms, render_activity_strip, render_perf_band, render_profile_body,
+    render_readonly_banner, render_status_bar, render_status_hero,
 };
 
 use formatters::{
@@ -2037,7 +2036,69 @@ impl FramesageApp {
         };
 
         // ─── Hero: engine state at a glance ─────────────────────────────
-        render_status_hero(ui, s);
+        // Green "Game Mode active" hero when a game-mode profile is
+        // applied (design Round 3 §3a); otherwise the neutral Running/
+        // Paused hero. Counts come from the active profile's configured
+        // actions (real data — what the profile does); the engine
+        // doesn't expose live stopped-counts/duration, so those are
+        // omitted rather than invented.
+        let game_mode_profile = s.active_profile.as_ref().filter(|p| p.game_mode.is_some());
+        if let Some(profile) = game_mode_profile {
+            let gm = profile.game_mode.as_ref().expect("filtered to Some");
+            let exe = s
+                .foreground
+                .as_ref()
+                .map(|f| f.exe_name.clone())
+                .unwrap_or_else(|| "foreground app".into());
+            let profile_name = display_profile_id(&profile.id.0);
+            theme::banner(theme::p().success).show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    ui.colored_label(
+                        theme::p().success,
+                        egui::RichText::new("\u{25cf}").size(14.0),
+                    );
+                    ui.vertical(|ui| {
+                        ui.label(
+                            egui::RichText::new(format!("Game Mode active — {exe}"))
+                                .size(16.0)
+                                .strong()
+                                .color(theme::p().text),
+                        );
+                        ui.horizontal(|ui| {
+                            ui.colored_label(theme::p().text_muted, "Profile");
+                            ui.label(
+                                egui::RichText::new(&profile_name)
+                                    .color(theme::p().accent)
+                                    .strong(),
+                            );
+                            ui.colored_label(
+                                theme::p().text_muted,
+                                format!(
+                                    "· stops {} service{} · suspends {} process{}",
+                                    gm.stop_services.len(),
+                                    if gm.stop_services.len() == 1 { "" } else { "s" },
+                                    gm.suspend_processes.len(),
+                                    if gm.suspend_processes.len() == 1 {
+                                        ""
+                                    } else {
+                                        "es"
+                                    },
+                                ),
+                            );
+                        });
+                    });
+                    if self.elevated {
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            if theme::danger_button(ui, "Exit Game Mode").clicked() {
+                                self.send_admin_request(Request::GameModeOff, "exit game mode");
+                            }
+                        });
+                    }
+                });
+            });
+        } else {
+            render_status_hero(ui, s);
+        }
         ui.add_space(10.0);
 
         // ─── Manual-mode banner (only when active) ──────────────────────
@@ -2113,43 +2174,112 @@ impl FramesageApp {
             ui.add_space(10.0);
         }
 
-        // ─── Side-by-side: Active profile · Foreground ──────────────────
-        ui.columns(2, |cols| {
-            theme::card().show(&mut cols[0], |ui| {
-                ui.label(theme::section_heading("Active profile"));
-                ui.add_space(6.0);
-                render_active_profile_summary(ui, s);
-            });
-            theme::card().show(&mut cols[1], |ui| {
-                ui.label(theme::section_heading("Foreground"));
-                ui.add_space(6.0);
-                match &s.foreground {
-                    Some(fg) => render_foreground_summary(ui, fg),
-                    None => {
-                        ui.colored_label(theme::p().text_muted, "No foreground process detected.");
-                    }
-                }
-            });
-        });
-
-        ui.add_space(10.0);
-
-        // ─── ProBalance card ────────────────────────────────────────────
-        // Live state for the dynamic-priority manager. We aggregate the
-        // restraint count from the latest `Processes` snapshot (already
-        // refreshed at 1 Hz by the same poller that backs the Processes
-        // tab) so this card is always in step with the table view.
+        // ─── Three stat cards (design Round 3 §3a) ──────────────────────
+        // ACTIVE PROFILE · PROBALANCE · LAST 24 HOURS. Restraint count
+        // comes from the 1 Hz Processes snapshot; the 24 h counts from the
+        // hydrated activity ring.
         let restrained_now = self
             .processes
             .rows
             .iter()
             .filter(|p| p.restrained_by_probalance)
             .count();
-        self.render_probalance_card(ui, s, restrained_now);
+        let session_stats = {
+            let st = self.state.lock();
+            crate::state::SessionStats::from_recent(&st.recent, std::time::SystemTime::now())
+        };
 
+        let stat_card =
+            |ui: &mut egui::Ui, heading: &str, value: egui::RichText, detail: String| {
+                theme::card().show(ui, |ui| {
+                    ui.label(theme::section_heading(heading));
+                    ui.add_space(5.0);
+                    ui.label(value.size(15.0).strong());
+                    ui.add_space(5.0);
+                    ui.label(
+                        egui::RichText::new(detail)
+                            .size(12.0)
+                            .color(theme::p().text_muted),
+                    );
+                });
+            };
+
+        // ACTIVE PROFILE detail from real profile knobs (no fabrication).
+        let (profile_value, profile_detail) = match &s.active_profile {
+            Some(p) => {
+                let mut parts: Vec<String> = Vec::new();
+                if let Some(pri) = p.priority_class {
+                    parts.push(pri.to_string());
+                }
+                if let Some(pt) = p.power_throttling {
+                    parts.push(pt.to_string());
+                }
+                if p.game_mode.is_some() {
+                    parts.push("Game Mode".into());
+                }
+                let detail = if parts.is_empty() {
+                    "pinning only".into()
+                } else {
+                    parts.join(" · ")
+                };
+                (
+                    egui::RichText::new(display_profile_id(&p.id.0)).color(theme::p().accent),
+                    detail,
+                )
+            }
+            None => (
+                egui::RichText::new("None").color(theme::p().text_muted),
+                "No profile applied".into(),
+            ),
+        };
+        let pb_enabled = s.policy.probalance.enabled;
+        let (pb_value, pb_color) = if pb_enabled {
+            ("On", theme::p().success)
+        } else {
+            ("Off", theme::p().text_muted)
+        };
+
+        ui.columns(3, |cols| {
+            stat_card(
+                &mut cols[0],
+                "Active profile",
+                profile_value,
+                profile_detail,
+            );
+            stat_card(
+                &mut cols[1],
+                "ProBalance",
+                egui::RichText::new(pb_value).color(pb_color),
+                format!(
+                    "{restrained_now} restrained · {} demotions / 24 h",
+                    session_stats.probalance_demotions
+                ),
+            );
+            stat_card(
+                &mut cols[2],
+                "Last 24 hours",
+                egui::RichText::new(format!(
+                    "{} profiles applied",
+                    session_stats.profiles_applied
+                ))
+                .color(theme::p().text),
+                format!(
+                    "{} Game Mode session{} · {} rules",
+                    session_stats.game_mode_sessions,
+                    if session_stats.game_mode_sessions == 1 {
+                        ""
+                    } else {
+                        "s"
+                    },
+                    s.policy.rules.len()
+                ),
+            );
+        });
         ui.add_space(10.0);
 
         // ─── Quick actions ──────────────────────────────────────────────
+        // Kept on the Status tab for now; the design folds these into the
+        // top toolbar in the later global-chrome slice.
         #[cfg(windows)]
         {
             let paused = s.paused;
@@ -2162,28 +2292,45 @@ impl FramesageApp {
             ui.add_space(10.0);
         }
 
-        // ─── Session stats (item 4.15) ──────────────────────────────────
-        // Trailing 24-hour counts of significant events. The
-        // activity log is hydrated into AppState.recent at startup
-        // so the card carries an answer even on a fresh tray launch
-        // (subject to the on-disk log having entries — empty on
-        // first run).
-        let session_stats = {
-            let s = self.state.lock();
-            crate::state::SessionStats::from_recent(&s.recent, std::time::SystemTime::now())
-        };
-        self.render_session_stats_card(ui, &session_stats);
+        // ─── ProBalance control card ────────────────────────────────────
+        // Retains the enable/disable toggle + threshold summary. The stat
+        // card above shows status at a glance; this card is the control
+        // surface until the Settings slice absorbs it.
+        self.render_probalance_card(ui, s, restrained_now);
         ui.add_space(10.0);
 
-        // ─── Recent activity ────────────────────────────────────────────
-        ui.label(theme::section_heading("Recent activity"));
-        ui.add_space(4.0);
-        render_recent_activity(ui, recent);
+        // ─── Compact activity card with a link to the full log ──────────
+        theme::card().show(ui, |ui| {
+            ui.horizontal(|ui| {
+                ui.label(theme::section_heading("Activity"));
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if ui
+                        .add(egui::Link::new(
+                            egui::RichText::new("Full log →")
+                                .size(12.0)
+                                .color(theme::p().accent),
+                        ))
+                        .clicked()
+                    {
+                        self.tab = Tab::Activity;
+                    }
+                });
+            });
+            ui.add_space(6.0);
+            if recent.is_empty() {
+                ui.colored_label(theme::p().text_muted, "No events yet.");
+            } else {
+                for line in recent.iter().rev().take(5) {
+                    ui.label(egui::RichText::new(line).size(12.5).color(theme::p().text));
+                }
+            }
+        });
     }
 
     /// Item 4.15 — Session stats card. Four numeric tiles aggregated
     /// from the in-memory activity ring (which is hydrated from
     /// activity.jsonl at startup). 24-hour sliding window.
+    #[allow(dead_code)] // superseded by the Round-3 "Last 24 hours" stat card
     fn render_session_stats_card(&mut self, ui: &mut egui::Ui, stats: &crate::state::SessionStats) {
         theme::card().show(ui, |ui| {
             ui.label(theme::section_heading("Session stats (last 24 h)"));

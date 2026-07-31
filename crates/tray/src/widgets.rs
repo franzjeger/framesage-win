@@ -147,6 +147,9 @@ pub(crate) fn render_status_hero(ui: &mut egui::Ui, s: &StatusSnapshot) {
 
 /// Single-card summary of the active profile: name, description, and the
 /// three knobs the user cares about most at a glance.
+// Superseded by the Round-3 Status stat cards (design renovation);
+// retained for reuse by later renovation slices.
+#[allow(dead_code)]
 pub(crate) fn render_active_profile_summary(ui: &mut egui::Ui, s: &StatusSnapshot) {
     let Some(p) = &s.active_profile else {
         ui.colored_label(theme::p().text_muted, "No profile applied yet.");
@@ -195,6 +198,7 @@ pub(crate) fn render_active_profile_summary(ui: &mut egui::Ui, s: &StatusSnapsho
 }
 
 /// Single-card summary of the currently-foregrounded process.
+#[allow(dead_code)] // superseded by Round-3 Status hero; retained for reuse
 pub(crate) fn render_foreground_summary(ui: &mut egui::Ui, fg: &ForegroundSnapshot) {
     ui.label(
         egui::RichText::new(&fg.exe_name)
@@ -243,6 +247,7 @@ pub(crate) fn render_readonly_banner(ui: &mut egui::Ui, body: &str) {
 /// Truncate long paths for display — keep the drive letter and the final
 /// two components, ellipsise the middle. Avoids the path field exploding
 /// the card width on deep installs.
+#[allow(dead_code)] // used only by render_foreground_summary (retained)
 pub(crate) fn short_path(path: &str) -> String {
     if path.len() <= 60 {
         return path.to_owned();
@@ -615,6 +620,7 @@ pub(crate) fn render_activity_strip(ui: &mut egui::Ui, recent: &[String]) {
 
 /// Recent activity feed. Treats consecutive identical lines as one (with a
 /// "× N" suffix) so the user sees signal not noise. Most recent first.
+#[allow(dead_code)] // superseded by the Round-3 compact activity card; retained
 pub(crate) fn render_recent_activity(ui: &mut egui::Ui, recent: &[String]) {
     if recent.is_empty() {
         ui.colored_label(theme::p().text_muted, "No activity yet.");
