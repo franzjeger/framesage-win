@@ -38,10 +38,10 @@ pub fn format_bytes(b: u64) -> String {
 /// so the table and the band speak the same color language.
 pub fn cpu_percent_color(cpu: u16) -> egui::Color32 {
     match cpu {
-        0..=10 => theme::TEXT_MUTED,
-        11..=50 => theme::TEXT,
-        51..=80 => theme::WARNING,
-        _ => theme::ERROR,
+        0..=10 => theme::p().text_muted,
+        11..=50 => theme::p().text,
+        51..=80 => theme::p().warning,
+        _ => theme::p().error,
     }
 }
 

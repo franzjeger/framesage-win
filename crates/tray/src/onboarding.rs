@@ -291,16 +291,16 @@ fn render_step_indicator(ui: &mut egui::Ui, page: u8) {
         ui.label(
             egui::RichText::new(format!("Step {} of {}", page + 1, total))
                 .small()
-                .color(theme::TEXT_MUTED),
+                .color(theme::p().text_muted),
         );
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
             for i in (0..total).rev() {
                 let color = if i == page {
-                    theme::ACCENT
+                    theme::p().accent
                 } else if i < page {
-                    theme::TEXT_MUTED
+                    theme::p().text_muted
                 } else {
-                    theme::BORDER_MUTED
+                    theme::p().border_muted
                 };
                 let (rect, _) = ui.allocate_exact_size(egui::vec2(9.0, 9.0), egui::Sense::hover());
                 ui.painter().circle_filled(rect.center(), 3.5, color);
@@ -331,7 +331,7 @@ fn render_page_intro(ui: &mut egui::Ui, next: &mut Option<NextAction>) {
             "If you'd rather a gentle optimizer, this isn't the right tool. Process Lasso's \
              ProBalance-only mode or Windows' built-in Game Mode are better fits for that.",
         )
-        .color(theme::TEXT_MUTED)
+        .color(theme::p().text_muted)
         .size(13.0),
     );
     ui.add_space(14.0);
@@ -353,7 +353,7 @@ fn render_page_level(
     ui.label(theme::section_heading("Choose your level"));
     ui.add_space(4.0);
     ui.colored_label(
-        theme::TEXT_MUTED,
+        theme::p().text_muted,
         "Applies to BF6, Fortnite, and any user-added games. Valorant always uses AC-Safe \
          mode (Vanguard track record) regardless of your choice — your aggression \
          preference still controls the environment around it (services, processes, power).",
@@ -395,15 +395,19 @@ fn render_page_level(
             if ui
                 .add_enabled(
                     continue_enabled,
-                    egui::Button::new(egui::RichText::new("Continue").strong().color(theme::BG))
-                        .fill(theme::ACCENT),
+                    egui::Button::new(
+                        egui::RichText::new("Continue")
+                            .strong()
+                            .color(theme::p().bg),
+                    )
+                    .fill(theme::p().accent),
                 )
                 .clicked()
             {
                 *next = Some(NextAction::Forward);
             }
             if !continue_enabled {
-                ui.colored_label(theme::TEXT_MUTED, "Pick a level first.");
+                ui.colored_label(theme::p().text_muted, "Pick a level first.");
             }
         });
     });
@@ -417,9 +421,9 @@ fn radio_card(
 ) {
     let selected = state.choice == Some(level);
     let border = if selected {
-        theme::ACCENT
+        theme::p().accent
     } else {
-        theme::BORDER_MUTED
+        theme::p().border_muted
     };
     egui::Frame::none()
         .stroke(egui::Stroke::new(1.0_f32, border))
@@ -436,9 +440,13 @@ fn radio_card(
                         egui::RichText::new(level.label())
                             .strong()
                             .size(14.0)
-                            .color(if selected { theme::ACCENT } else { theme::TEXT }),
+                            .color(if selected {
+                                theme::p().accent
+                            } else {
+                                theme::p().text
+                            }),
                     );
-                    ui.colored_label(theme::TEXT_MUTED, level.subtitle());
+                    ui.colored_label(theme::p().text_muted, level.subtitle());
                     ui.add_space(4.0);
                     ui.label(egui::RichText::new(description).size(12.5));
                 });
@@ -496,7 +504,7 @@ fn render_page_closed_loop(
         ui.label(
             egui::RichText::new(format!("• {text}"))
                 .size(12.5)
-                .color(theme::TEXT_MUTED),
+                .color(theme::p().text_muted),
         );
     };
 
@@ -543,10 +551,10 @@ fn render_page_closed_loop(
     // required-substring per Group C acceptance criterion. Do not
     // paraphrase without updating the inline test below. Rendered in a
     // WARNING banner so the caveat reads as a caveat.
-    theme::banner(theme::WARNING).show(ui, |ui| {
+    theme::banner(theme::p().warning).show(ui, |ui| {
         ui.label(
             egui::RichText::new(CLOSED_LOOP_PAGE_EDR_DISCLOSURE)
-                .color(theme::WARNING)
+                .color(theme::p().warning)
                 .size(12.5),
         );
     });
@@ -585,15 +593,19 @@ fn render_page_closed_loop(
             if ui
                 .add_enabled(
                     continue_enabled,
-                    egui::Button::new(egui::RichText::new("Continue").strong().color(theme::BG))
-                        .fill(theme::ACCENT),
+                    egui::Button::new(
+                        egui::RichText::new("Continue")
+                            .strong()
+                            .color(theme::p().bg),
+                    )
+                    .fill(theme::p().accent),
                 )
                 .clicked()
             {
                 *next = Some(NextAction::Forward);
             }
             if !continue_enabled {
-                ui.colored_label(theme::TEXT_MUTED, "Pick one to continue.");
+                ui.colored_label(theme::p().text_muted, "Pick one to continue.");
             }
         });
     });
@@ -608,9 +620,9 @@ fn closed_loop_radio_card(
 ) {
     let selected = state.closed_loop_choice == Some(choice);
     let border = if selected {
-        theme::ACCENT
+        theme::p().accent
     } else {
-        theme::BORDER_MUTED
+        theme::p().border_muted
     };
     egui::Frame::none()
         .stroke(egui::Stroke::new(1.0_f32, border))
@@ -627,7 +639,11 @@ fn closed_loop_radio_card(
                         egui::RichText::new(label)
                             .strong()
                             .size(14.0)
-                            .color(if selected { theme::ACCENT } else { theme::TEXT }),
+                            .color(if selected {
+                                theme::p().accent
+                            } else {
+                                theme::p().text
+                            }),
                     );
                     ui.add_space(4.0);
                     ui.label(egui::RichText::new(description).size(12.5));
@@ -652,22 +668,24 @@ fn render_page_manual_hotkey(ui: &mut egui::Ui, next: &mut Option<NextAction>) {
              app already owns that combo, the hotkey is disabled (a custom binding UI \
              is a later item) — use the entry points below instead.",
         )
-        .color(theme::TEXT_MUTED),
+        .color(theme::p().text_muted),
     );
     ui.add_space(6.0);
     ui.label(
-        egui::RichText::new("You can also enter Manual Game Mode from:").color(theme::TEXT_MUTED),
+        egui::RichText::new("You can also enter Manual Game Mode from:")
+            .color(theme::p().text_muted),
     );
     ui.label(
         egui::RichText::new("  • the tray menu (right-click → \"Enter Manual Game Mode\")")
-            .color(theme::TEXT_MUTED),
+            .color(theme::p().text_muted),
     );
     ui.label(
-        egui::RichText::new("  • the Status-tab \"Quick actions\" panel").color(theme::TEXT_MUTED),
+        egui::RichText::new("  • the Status-tab \"Quick actions\" panel")
+            .color(theme::p().text_muted),
     );
     ui.label(
         egui::RichText::new("  • `framesage game-mode on <profile>` (CLI)")
-            .color(theme::TEXT_MUTED),
+            .color(theme::p().text_muted),
     );
 
     ui.add_space(14.0);
@@ -695,7 +713,7 @@ fn render_page_done(ui: &mut egui::Ui, state: &OnboardingState, next: &mut Optio
         ));
         ui.add_space(4.0);
         ui.colored_label(
-            theme::TEXT_MUTED,
+            theme::p().text_muted,
             "You can change this later in the Profiles tab. The Status tab shows what's \
              happening live; the Recent activity card surfaces every action FrameSage \
              takes with a timestamp.",
@@ -705,7 +723,7 @@ fn render_page_done(ui: &mut egui::Ui, state: &OnboardingState, next: &mut Optio
         // choice (Continue is disabled on Page 2 without one).
         // Render a sensible fallback anyway.
         ui.colored_label(
-            theme::ERROR,
+            theme::p().error,
             "Internal error: reached the Done page without a choice.",
         );
     }

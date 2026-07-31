@@ -38,7 +38,7 @@ pub(crate) fn detail_kv(ui: &mut egui::Ui, key: &str, value: String) {
             egui::RichText::new(key.to_uppercase())
                 .small()
                 .strong()
-                .color(theme::TEXT_MUTED)
+                .color(theme::p().text_muted)
                 .extra_letter_spacing(1.0),
         );
         ui.label(value);
@@ -107,9 +107,9 @@ pub(crate) fn render_status_hero(ui: &mut egui::Ui, s: &StatusSnapshot) {
     theme::hero().show(ui, |ui| {
         ui.horizontal(|ui| {
             let (dot_color, headline) = if s.paused {
-                (theme::WARNING, "Paused")
+                (theme::p().warning, "Paused")
             } else {
-                (theme::SUCCESS, "Running")
+                (theme::p().success, "Running")
             };
             // Engine state with a coloured dot.
             ui.label(egui::RichText::new("\u{25cf}").color(dot_color).size(14.0));
@@ -117,28 +117,28 @@ pub(crate) fn render_status_hero(ui: &mut egui::Ui, s: &StatusSnapshot) {
                 egui::RichText::new(headline)
                     .size(18.0)
                     .strong()
-                    .color(theme::TEXT),
+                    .color(theme::p().text),
             );
             ui.add_space(12.0);
             ui.separator();
             ui.add_space(12.0);
             ui.label(
                 egui::RichText::new(format!("{} rules", s.policy.rules.len()))
-                    .color(theme::TEXT_MUTED),
+                    .color(theme::p().text_muted),
             );
-            ui.label(egui::RichText::new("·").color(theme::TEXT_MUTED));
+            ui.label(egui::RichText::new("·").color(theme::p().text_muted));
             ui.label(
                 egui::RichText::new(format!(
                     "default: {}",
                     display_profile_id(&s.policy.default_profile.0)
                 ))
-                .color(theme::TEXT_MUTED),
+                .color(theme::p().text_muted),
             );
             if let Some(bg) = &s.policy.background_profile {
-                ui.label(egui::RichText::new("·").color(theme::TEXT_MUTED));
+                ui.label(egui::RichText::new("·").color(theme::p().text_muted));
                 ui.label(
                     egui::RichText::new(format!("background: {}", display_profile_id(&bg.0)))
-                        .color(theme::TEXT_MUTED),
+                        .color(theme::p().text_muted),
                 );
             }
         });
@@ -149,18 +149,18 @@ pub(crate) fn render_status_hero(ui: &mut egui::Ui, s: &StatusSnapshot) {
 /// three knobs the user cares about most at a glance.
 pub(crate) fn render_active_profile_summary(ui: &mut egui::Ui, s: &StatusSnapshot) {
     let Some(p) = &s.active_profile else {
-        ui.colored_label(theme::TEXT_MUTED, "No profile applied yet.");
+        ui.colored_label(theme::p().text_muted, "No profile applied yet.");
         return;
     };
     ui.label(
         egui::RichText::new(display_profile_id(&p.id.0))
             .size(17.0)
             .strong()
-            .color(theme::ACCENT),
+            .color(theme::p().accent),
     );
     if !p.description.is_empty() {
         ui.add_space(2.0);
-        ui.colored_label(theme::TEXT_MUTED, &p.description);
+        ui.colored_label(theme::p().text_muted, &p.description);
     }
     ui.add_space(8.0);
     egui::Grid::new("active-profile-grid")
@@ -200,11 +200,11 @@ pub(crate) fn render_foreground_summary(ui: &mut egui::Ui, fg: &ForegroundSnapsh
         egui::RichText::new(&fg.exe_name)
             .size(17.0)
             .strong()
-            .color(theme::TEXT),
+            .color(theme::p().text),
     );
     ui.add_space(2.0);
     if !fg.title.is_empty() {
-        ui.colored_label(theme::TEXT_MUTED, &fg.title);
+        ui.colored_label(theme::p().text_muted, &fg.title);
         ui.add_space(8.0);
     } else {
         ui.add_space(8.0);
@@ -224,15 +224,18 @@ pub(crate) fn render_foreground_summary(ui: &mut egui::Ui, fg: &ForegroundSnapsh
 /// tray isn't elevated. Matches the Status tab's quick-actions banner so the
 /// "you need admin to edit this" signal reads the same everywhere.
 pub(crate) fn render_readonly_banner(ui: &mut egui::Ui, body: &str) {
-    theme::banner(theme::WARNING).show(ui, |ui| {
+    theme::banner(theme::p().warning).show(ui, |ui| {
         ui.horizontal(|ui| {
-            ui.colored_label(theme::WARNING, egui::RichText::new("⚠").strong().size(14.0));
+            ui.colored_label(
+                theme::p().warning,
+                egui::RichText::new("⚠").strong().size(14.0),
+            );
             ui.label(
                 egui::RichText::new("Read-only mode")
                     .strong()
-                    .color(theme::TEXT),
+                    .color(theme::p().text),
             );
-            ui.colored_label(theme::TEXT_MUTED, format!("— {body}"));
+            ui.colored_label(theme::p().text_muted, format!("— {body}"));
         });
     });
 }
@@ -256,7 +259,11 @@ pub(crate) fn short_path(path: &str) -> String {
 /// Compact KV row inside an egui::Grid. Caller is responsible for ending
 /// each row with `ui.end_row()` — this helper does it.
 pub(crate) fn kv_grid_row(ui: &mut egui::Ui, key: &str, value: String) {
-    ui.label(egui::RichText::new(key).color(theme::TEXT_MUTED).size(12.0));
+    ui.label(
+        egui::RichText::new(key)
+            .color(theme::p().text_muted)
+            .size(12.0),
+    );
     ui.label(value);
     ui.end_row();
 }
@@ -272,7 +279,7 @@ pub(crate) fn render_perf_band(ui: &mut egui::Ui, metrics: &SystemMetrics, histo
         // read the number.
         ui.label(
             egui::RichText::new("CPU")
-                .color(theme::TEXT_MUTED)
+                .color(theme::p().text_muted)
                 .size(11.0),
         );
         let cpu_color = cpu_percent_color(metrics.cpu_percent as u16);
@@ -296,15 +303,15 @@ pub(crate) fn render_perf_band(ui: &mut egui::Ui, metrics: &SystemMetrics, histo
         };
         ui.label(
             egui::RichText::new("MEM")
-                .color(theme::TEXT_MUTED)
+                .color(theme::p().text_muted)
                 .size(11.0),
         );
         let mem_color = if mem_percent > 90 {
-            theme::ERROR
+            theme::p().error
         } else if mem_percent > 75 {
-            theme::WARNING
+            theme::p().warning
         } else {
-            theme::TEXT
+            theme::p().text
         };
         ui.label(
             egui::RichText::new(format!("{}%", mem_percent))
@@ -313,7 +320,7 @@ pub(crate) fn render_perf_band(ui: &mut egui::Ui, metrics: &SystemMetrics, histo
                 .size(15.0),
         );
         ui.colored_label(
-            theme::TEXT_MUTED,
+            theme::p().text_muted,
             format!(
                 " {} / {}",
                 format_bytes(metrics.memory_used_bytes),
@@ -369,7 +376,7 @@ pub(crate) fn draw_per_core_matrix(ui: &mut egui::Ui, percents: &[u8]) {
 
     // Background tray for the bars — visual anchor so bars at 0% still
     // appear inside a "well" rather than floating against the band.
-    painter.rect_filled(rect, 3.0, theme::SURFACE);
+    painter.rect_filled(rect, 3.0, theme::p().surface);
 
     let pad_y = 2.0;
     let max_h = rect.height() - pad_y * 2.0;
@@ -415,7 +422,7 @@ pub(crate) fn draw_sparkline(painter: &egui::Painter, rect: egui::Rect, history:
     use egui::Stroke;
 
     // Background frame so the line has something to anchor against.
-    painter.rect_filled(rect, 3.0, theme::SURFACE);
+    painter.rect_filled(rect, 3.0, theme::p().surface);
 
     if history.len() < 2 {
         return;
@@ -435,8 +442,8 @@ pub(crate) fn draw_sparkline(painter: &egui::Painter, rect: egui::Rect, history:
 
     // CPU line in accent, memory in a muted secondary color. Each gets a
     // subtle fill below the line for visual mass.
-    let cpu_stroke = Stroke::new(1.5_f32, theme::ACCENT);
-    let mem_stroke = Stroke::new(1.0_f32, theme::SERIES_SECONDARY);
+    let cpu_stroke = Stroke::new(1.5_f32, theme::p().accent);
+    let mem_stroke = Stroke::new(1.0_f32, theme::p().series_secondary);
 
     // Filled area under the CPU line (the more eye-catching of the two,
     // matching its priority for the user).
@@ -445,7 +452,7 @@ pub(crate) fn draw_sparkline(painter: &egui::Painter, rect: egui::Rect, history:
     cpu_fill.push(egui::pos2(rect.left(), rect.bottom()));
     painter.add(PathShape::convex_polygon(
         cpu_fill,
-        theme::fill_alpha(theme::ACCENT, 30),
+        theme::fill_alpha(theme::p().accent, 30),
         Stroke::NONE,
     ));
 
@@ -462,7 +469,7 @@ pub(crate) fn draw_single_sparkline(painter: &egui::Painter, rect: egui::Rect, h
     use egui::epaint::PathShape;
     use egui::Stroke;
 
-    painter.rect_filled(rect, 3.0, theme::SURFACE);
+    painter.rect_filled(rect, 3.0, theme::p().surface);
 
     if history.len() < 2 {
         return;
@@ -484,10 +491,13 @@ pub(crate) fn draw_single_sparkline(painter: &egui::Painter, rect: egui::Rect, h
     fill.push(egui::pos2(rect.left(), rect.bottom()));
     painter.add(PathShape::convex_polygon(
         fill,
-        theme::fill_alpha(theme::ACCENT, 30),
+        theme::fill_alpha(theme::p().accent, 30),
         Stroke::NONE,
     ));
-    painter.add(PathShape::line(points, Stroke::new(1.5_f32, theme::ACCENT)));
+    painter.add(PathShape::line(
+        points,
+        Stroke::new(1.5_f32, theme::p().accent),
+    ));
 }
 
 /// One-line status bar at the very bottom of the window. Shows engine state,
@@ -505,13 +515,13 @@ pub(crate) fn render_status_bar(
     ui.horizontal(|ui| {
         // Engine state — anchors the bar on the left.
         let (state_color, state_text) = if !connected {
-            (theme::ERROR, "Disconnected")
+            (theme::p().error, "Disconnected")
         } else if paused {
-            (theme::WARNING, "Paused")
+            (theme::p().warning, "Paused")
         } else if manual_override.is_some() {
-            (theme::ACCENT, "Manual")
+            (theme::p().accent, "Manual")
         } else {
-            (theme::SUCCESS, "Running")
+            (theme::p().success, "Running")
         };
         ui.colored_label(
             state_color,
@@ -519,24 +529,27 @@ pub(crate) fn render_status_bar(
         );
 
         if let Some(id) = manual_override {
-            ui.colored_label(theme::TEXT_MUTED, "·");
-            ui.colored_label(theme::TEXT_MUTED, format!("override: {}", id.0));
+            ui.colored_label(theme::p().text_muted, "·");
+            ui.colored_label(theme::p().text_muted, format!("override: {}", id.0));
         }
 
-        ui.colored_label(theme::TEXT_MUTED, "·");
+        ui.colored_label(theme::p().text_muted, "·");
         let managed_str = if managed_count > 0 {
             format!("{process_count} processes ({managed_count} managed)")
         } else {
             format!("{process_count} processes")
         };
-        ui.colored_label(theme::TEXT_MUTED, managed_str);
+        ui.colored_label(theme::p().text_muted, managed_str);
 
         // Last action echo on the right; trims long messages so a noisy
         // error doesn't break the layout. Version anchors the far right.
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            ui.colored_label(theme::TEXT_MUTED, format!("v{}", env!("CARGO_PKG_VERSION")));
+            ui.colored_label(
+                theme::p().text_muted,
+                format!("v{}", env!("CARGO_PKG_VERSION")),
+            );
             if let Some(text) = last_action {
-                ui.colored_label(theme::TEXT_MUTED, "·");
+                ui.colored_label(theme::p().text_muted, "·");
                 let max_chars = 80;
                 let trimmed = if text.chars().count() > max_chars {
                     let mut t: String = text.chars().take(max_chars - 1).collect();
@@ -554,9 +567,9 @@ pub(crate) fn render_status_bar(
                     .iter()
                     .any(|kw| lower.contains(kw));
                 let color = if is_failure {
-                    theme::ERROR
+                    theme::p().error
                 } else {
-                    theme::TEXT_MUTED
+                    theme::p().text_muted
                 };
                 ui.colored_label(color, trimmed);
             }
@@ -571,13 +584,13 @@ pub(crate) fn render_activity_strip(ui: &mut egui::Ui, recent: &[String]) {
     ui.horizontal(|ui| {
         ui.label(
             egui::RichText::new("ACTIVITY")
-                .color(theme::TEXT_MUTED)
+                .color(theme::p().text_muted)
                 .size(10.0)
                 .strong(),
         );
         ui.add_space(8.0);
         if recent.is_empty() {
-            ui.colored_label(theme::TEXT_MUTED, "no events yet");
+            ui.colored_label(theme::p().text_muted, "no events yet");
             return;
         }
         egui::ScrollArea::horizontal()
@@ -585,14 +598,14 @@ pub(crate) fn render_activity_strip(ui: &mut egui::Ui, recent: &[String]) {
             .show(ui, |ui| {
                 for (i, line) in recent.iter().enumerate() {
                     if i > 0 {
-                        ui.colored_label(theme::TEXT_MUTED, "·");
+                        ui.colored_label(theme::p().text_muted, "·");
                     }
                     let color = if line.contains("probalance") {
-                        theme::WARNING
+                        theme::p().warning
                     } else if line.contains("game-x3d") {
-                        theme::ACCENT
+                        theme::p().accent
                     } else {
-                        theme::TEXT
+                        theme::p().text
                     };
                     ui.colored_label(color, line);
                 }
@@ -604,7 +617,7 @@ pub(crate) fn render_activity_strip(ui: &mut egui::Ui, recent: &[String]) {
 /// "× N" suffix) so the user sees signal not noise. Most recent first.
 pub(crate) fn render_recent_activity(ui: &mut egui::Ui, recent: &[String]) {
     if recent.is_empty() {
-        ui.colored_label(theme::TEXT_MUTED, "No activity yet.");
+        ui.colored_label(theme::p().text_muted, "No activity yet.");
         return;
     }
     theme::card().show(ui, |ui| {
@@ -638,11 +651,15 @@ pub(crate) fn render_recent_activity(ui: &mut egui::Ui, recent: &[String]) {
                         ui.add_space(2.0);
                     }
                     ui.horizontal(|ui| {
-                        ui.label(egui::RichText::new("›").color(theme::TEXT_DIM).monospace());
+                        ui.label(
+                            egui::RichText::new("›")
+                                .color(theme::p().text_dim)
+                                .monospace(),
+                        );
                         ui.label(*label);
                         if *n > 1 {
                             ui.colored_label(
-                                theme::TEXT_MUTED,
+                                theme::p().text_muted,
                                 egui::RichText::new(format!("× {n}")).small(),
                             );
                         }
@@ -657,7 +674,7 @@ pub(crate) fn render_recent_activity(ui: &mut egui::Ui, recent: &[String]) {
 /// behind admin gating) and by the Status-tab profile preview.
 pub(crate) fn render_profile_body(ui: &mut egui::Ui, p: &Profile) {
     if !p.description.is_empty() {
-        ui.colored_label(theme::TEXT_MUTED, &p.description);
+        ui.colored_label(theme::p().text_muted, &p.description);
         ui.add_space(8.0);
     }
 
@@ -753,7 +770,10 @@ pub(crate) fn render_profile_body(ui: &mut egui::Ui, p: &Profile) {
                 );
             });
     } else {
-        ui.colored_label(theme::TEXT_DIM, "Game Mode not requested by this profile.");
+        ui.colored_label(
+            theme::p().text_dim,
+            "Game Mode not requested by this profile.",
+        );
     }
 }
 

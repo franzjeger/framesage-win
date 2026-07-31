@@ -42,6 +42,11 @@ pub struct TrayPrefs {
     pub schema_version: u32,
     #[serde(default)]
     pub processes_columns: ProcessesColumns,
+    /// Light/dark theme choice. `#[serde(default)]` → existing prefs
+    /// files (which predate the field) load as `Theme::Dark`, preserving
+    /// the current look until the user opts into light.
+    #[serde(default)]
+    pub theme: crate::theme::Theme,
 }
 
 impl Default for TrayPrefs {
@@ -49,6 +54,7 @@ impl Default for TrayPrefs {
         Self {
             schema_version: 1,
             processes_columns: ProcessesColumns::default(),
+            theme: crate::theme::Theme::default(),
         }
     }
 }
@@ -105,13 +111,15 @@ mod tests {
                 affinity: false,
                 ..Default::default()
             },
+            theme: crate::theme::Theme::Light,
         };
         let json = serde_json::to_string(&prefs).unwrap();
         let back: TrayPrefs = serde_json::from_str(&json).unwrap();
         assert_eq!(prefs, back);
 
-        // Missing processes_columns → defaults (backwards-compatible).
+        // Missing processes_columns / theme → defaults (backwards-compatible).
         let minimal: TrayPrefs = serde_json::from_str(r#"{"schema_version":1}"#).unwrap();
         assert_eq!(minimal.processes_columns, ProcessesColumns::default());
+        assert_eq!(minimal.theme, crate::theme::Theme::Dark);
     }
 }

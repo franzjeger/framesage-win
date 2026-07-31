@@ -255,7 +255,7 @@ fn discover_processes_section(
 
         if candidates.is_empty() {
             ui.colored_label(
-                theme::TEXT_MUTED,
+                theme::p().text_muted,
                 "No candidate background processes right now. Run a heavy app \
                  and reopen this view to see hogs.",
             );
@@ -263,7 +263,7 @@ fn discover_processes_section(
         }
 
         ui.colored_label(
-            theme::TEXT_MUTED,
+            theme::p().text_muted,
             "Top 30 background processes by CPU%. Tick the ones you want \
              this profile to suspend during its session, then click Add.",
         );
@@ -343,7 +343,7 @@ fn discover_processes_section(
                 egui::Button::new(
                     egui::RichText::new(format!("Add {} selected to suspend list", n))
                         .strong()
-                        .color(theme::ACCENT),
+                        .color(theme::p().accent),
                 ),
             );
             if add_btn.clicked() {
@@ -363,7 +363,7 @@ fn discover_processes_section(
             }
             if n == 0 {
                 ui.colored_label(
-                    theme::TEXT_MUTED,
+                    theme::p().text_muted,
                     "Tick at least one process to enable Add.",
                 );
             }
@@ -416,7 +416,7 @@ fn discover_services_section(
                     *refresh_requested = true;
                 }
                 ui.colored_label(
-                    theme::TEXT_MUTED,
+                    theme::p().text_muted,
                     if services.is_empty() {
                         "Click Load services to enumerate every Win32 service.".to_owned()
                     } else {
@@ -444,7 +444,7 @@ fn discover_services_section(
 
             if candidates.is_empty() {
                 ui.colored_label(
-                    theme::TEXT_MUTED,
+                    theme::p().text_muted,
                     "Every Win32 service is either already on this profile's stop \
                  list or on the bundled denylist. Nothing to add.",
                 );
@@ -502,13 +502,13 @@ fn discover_services_section(
                             row.col(|ui| {
                                 let (color, label) = match svc.status {
                                     framesage_ipc::ServiceStatusKindIpc::Running => {
-                                        (theme::SUCCESS, "Running")
+                                        (theme::p().success, "Running")
                                     }
                                     framesage_ipc::ServiceStatusKindIpc::Stopped => {
-                                        (theme::TEXT_MUTED, "Stopped")
+                                        (theme::p().text_muted, "Stopped")
                                     }
                                     framesage_ipc::ServiceStatusKindIpc::Pending => {
-                                        (theme::WARNING, "Pending")
+                                        (theme::p().warning, "Pending")
                                     }
                                 };
                                 ui.colored_label(color, label);
@@ -527,7 +527,7 @@ fn discover_services_section(
                     egui::Button::new(
                         egui::RichText::new(format!("Add {} selected to stop list", n))
                             .strong()
-                            .color(theme::ACCENT),
+                            .color(theme::p().accent),
                     ),
                 );
                 if add_btn.clicked() {
@@ -546,7 +546,7 @@ fn discover_services_section(
                 }
                 if n == 0 {
                     ui.colored_label(
-                        theme::TEXT_MUTED,
+                        theme::p().text_muted,
                         "Tick at least one service to enable Add.",
                     );
                 }
@@ -600,7 +600,7 @@ pub(crate) fn game_mode_editor(ui: &mut egui::Ui, gm: &mut GameModeActions) {
             false,
             egui::Label::new(
                 egui::RichText::new("disabled — no documented Windows API")
-                    .color(theme::TEXT_MUTED),
+                    .color(theme::p().text_muted),
             ),
         );
     });
@@ -696,31 +696,31 @@ pub(crate) fn safe_list_aware_list_edit(
                 let (color, status) = match kind {
                     ListKind::Service => match safe_list.check_service(entry) {
                         ServiceVerdict::Denied(reason) => {
-                            (theme::ERROR, format!("Blocked: {reason}"))
+                            (theme::p().error, format!("Blocked: {reason}"))
                         }
                         ServiceVerdict::Allowed(_) => {
-                            (theme::SUCCESS, "OK (in curated allowlist)".to_owned())
+                            (theme::p().success, "OK (in curated allowlist)".to_owned())
                         }
                         ServiceVerdict::Unlisted => (
-                            theme::TEXT_MUTED,
+                            theme::p().text_muted,
                             "unknown — accepted, but verify before stopping".to_owned(),
                         ),
                     },
                     ListKind::Process => match safe_list.check_process(entry) {
                         ProcessVerdict::Denied(reason) => {
-                            (theme::ERROR, format!("Blocked: {reason}"))
+                            (theme::p().error, format!("Blocked: {reason}"))
                         }
                         ProcessVerdict::Allowed(_) => {
-                            (theme::SUCCESS, "OK (in curated allowlist)".to_owned())
+                            (theme::p().success, "OK (in curated allowlist)".to_owned())
                         }
                         ProcessVerdict::Unlisted => (
-                            theme::TEXT_MUTED,
+                            theme::p().text_muted,
                             "unknown — accepted, but verify before suspending".to_owned(),
                         ),
                     },
                 };
                 ui.horizontal(|ui| {
-                    ui.colored_label(theme::TEXT, egui::RichText::new(entry).monospace());
+                    ui.colored_label(theme::p().text, egui::RichText::new(entry).monospace());
                     ui.colored_label(color, status);
                 });
             }
@@ -809,8 +809,11 @@ pub(crate) fn ac_profile_selector(ui: &mut egui::Ui, target: &mut AntiCheatProfi
             if resp.clicked() {
                 *target = variant;
             }
-            ui.colored_label(theme::TEXT_MUTED, egui::RichText::new(explainer).size(11.5))
-                .on_hover_text(format!("Variant: {variant:?}"));
+            ui.colored_label(
+                theme::p().text_muted,
+                egui::RichText::new(explainer).size(11.5),
+            )
+            .on_hover_text(format!("Variant: {variant:?}"));
         });
     }
 }

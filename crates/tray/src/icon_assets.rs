@@ -51,8 +51,8 @@ pub(crate) fn framesage_logo_rgba() -> (Vec<u8>, u32, u32) {
     let center = (s - 1.0) / 2.0;
 
     // Palette pulled from theme so the icon reads as part of the same UI.
-    let bg = [0x16u8, 0x1b, 0x22]; // theme::SURFACE
-    let ring = [0x58u8, 0xa6, 0xff]; // theme::ACCENT
+    let bg = [0x16u8, 0x1b, 0x22]; // theme::p().surface
+    let ring = [0x58u8, 0xa6, 0xff]; // theme::p().accent
     let f_color = [0x9bu8, 0xca, 0xff]; // bright cyan/white for legibility
 
     // Geometric parameters. All in pixel space; tuned by eye.
