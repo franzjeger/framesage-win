@@ -125,7 +125,7 @@ mod windows_impl {
                 let line = line?;
                 if let Some(row) = parser.feed_line(&line)? {
                     let at_ms = self.started.elapsed().as_millis() as u64;
-                    if let Some(stats) = agg.push(at_ms, row.frame_time_us) {
+                    if let Some(stats) = agg.push(at_ms, row.frame_time_us, row.dropped) {
                         sink(stats);
                     }
                 }

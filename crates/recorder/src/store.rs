@@ -375,6 +375,7 @@ mod tests {
                 frame_time_p99_us_with_rules: None,
                 actions_applied: 0,
                 kernel_signals: 0,
+                frames_dropped: 0,
             },
         }
     }

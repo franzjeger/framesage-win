@@ -367,6 +367,7 @@ mod tests {
                 frame_time_p99_us_with_rules: Some(rules_p99),
                 actions_applied: 1,
                 kernel_signals: 0,
+                frames_dropped: 0,
             },
         });
         events
