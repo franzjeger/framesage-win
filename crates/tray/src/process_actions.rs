@@ -78,6 +78,14 @@ pub(crate) enum ProcessAction {
     DeleteAffinityRule {
         exe_name: String,
     },
+    /// Add / remove `exe_name` from the ProBalance user-ignore list so the
+    /// engine never restrains it. `exclude` picks the direction (the
+    /// context menu shows whichever the current state calls for). Persists
+    /// via the service so it survives a restart.
+    SetProBalanceExclusion {
+        exe_name: String,
+        exclude: bool,
+    },
     /// Opens the custom-mask affinity picker modal for `pid`. The modal's
     /// Apply button is what fires the actual `SetAffinity` IPC with the
     /// user-built mask. `existing_rule_selector` pre-loads the picker mask

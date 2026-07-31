@@ -160,6 +160,13 @@ pub enum Request {
     /// Lasso's behavior — clearing a rule for next launch should not
     /// surprise the user by yanking the current session's pin.
     DeleteAffinityRule { exe_name: String },
+    /// Add `exe_name` to `probalance.ignore_processes` so ProBalance
+    /// never restrains it, and persist the policy. Mutating — admin pipe
+    /// only. Idempotent (case-insensitive).
+    AddProBalanceExclusion { exe_name: String },
+    /// Remove `exe_name` from `probalance.ignore_processes` and persist.
+    /// Mutating — admin pipe only.
+    RemoveProBalanceExclusion { exe_name: String },
     /// Item 2.11 — Manual Global Game Mode. Enter `profile`'s
     /// `game_mode` actions system-wide regardless of what's
     /// foregrounded. The profile must have `manual_global_eligible
@@ -249,6 +256,8 @@ impl Request {
             | Request::TrimWorkingSet { .. }
             | Request::SetAffinityRule { .. }
             | Request::DeleteAffinityRule { .. }
+            | Request::AddProBalanceExclusion { .. }
+            | Request::RemoveProBalanceExclusion { .. }
             | Request::EnableManualGlobalGameMode { .. }
             | Request::DisableManualGlobalGameMode
             | Request::Undo

@@ -928,6 +928,49 @@ impl Engine {
         removed
     }
 
+    /// Add `exe_name` to the ProBalance user-ignore list so the engine
+    /// never restrains it, and refresh the cached lowercased set that the
+    /// 1 Hz sample loop consults. Case-insensitive + idempotent: returns
+    /// `false` when the exe is already excluded (no policy change). The
+    /// caller persists `policy_snapshot()` after a `true`.
+    pub fn add_probalance_exclusion(&self, exe_name: &str) -> bool {
+        let mut s = self.state.write();
+        if s.policy
+            .probalance
+            .ignore_processes
+            .iter()
+            .any(|e| e.eq_ignore_ascii_case(exe_name))
+        {
+            return false;
+        }
+        s.policy
+            .probalance
+            .ignore_processes
+            .push(exe_name.to_string());
+        s.user_ignore_exes = Arc::new(build_user_ignore_exes(&s.policy));
+        info!(exe = %exe_name, "add_probalance_exclusion");
+        true
+    }
+
+    /// Remove `exe_name` from the ProBalance user-ignore list (case-
+    /// insensitive) and refresh the cached set. Returns `false` if it
+    /// wasn't excluded. The caller persists `policy_snapshot()` after a
+    /// `true`.
+    pub fn remove_probalance_exclusion(&self, exe_name: &str) -> bool {
+        let mut s = self.state.write();
+        let before = s.policy.probalance.ignore_processes.len();
+        s.policy
+            .probalance
+            .ignore_processes
+            .retain(|e| !e.eq_ignore_ascii_case(exe_name));
+        let removed = s.policy.probalance.ignore_processes.len() != before;
+        if removed {
+            s.user_ignore_exes = Arc::new(build_user_ignore_exes(&s.policy));
+            info!(exe = %exe_name, "remove_probalance_exclusion");
+        }
+        removed
+    }
+
     /// Item 3.5 — read-only view of the undo log, newest entry
     /// first, capped at `limit`. Used by `framesage undo list` and
     /// the tray's Undo panel (follow-up PR).
@@ -4646,6 +4689,32 @@ mod tests {
             framesage_gamemode::safe_list::SafeList::bundled(),
             Journal::at_default_path(),
         ))
+    }
+
+    #[test]
+    fn probalance_exclusion_add_remove_is_idempotent_and_case_insensitive() {
+        let engine = test_engine();
+        // Add is reported as a change; re-adding (any case) is a no-op.
+        assert!(engine.add_probalance_exclusion("OBS64.exe"));
+        assert!(!engine.add_probalance_exclusion("obs64.exe"));
+        let snap = engine.policy_snapshot();
+        assert_eq!(snap.probalance.ignore_processes.len(), 1);
+        assert!(snap
+            .probalance
+            .ignore_processes
+            .iter()
+            .any(|e| e.eq_ignore_ascii_case("obs64.exe")));
+        // The cached lowercased set the sample loop consults is refreshed.
+        assert!(engine.state.read().user_ignore_exes.contains("obs64.exe"));
+        // Remove is case-insensitive; a second remove reports no change.
+        assert!(engine.remove_probalance_exclusion("OBS64.EXE"));
+        assert!(engine
+            .policy_snapshot()
+            .probalance
+            .ignore_processes
+            .is_empty());
+        assert!(!engine.remove_probalance_exclusion("obs64.exe"));
+        assert!(engine.state.read().user_ignore_exes.is_empty());
     }
 
     // ─── Item 3.1 — first deterministic test using injected SysApi + Clock ──
