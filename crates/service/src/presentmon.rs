@@ -73,10 +73,11 @@ pub fn desired_target(
 pub fn spawn(
     engine: std::sync::Arc<framesage_engine::Engine>,
     frame_tx: tokio::sync::mpsc::Sender<FrameStats>,
+    restarts: std::sync::Arc<std::sync::atomic::AtomicU32>,
 ) -> (bool, tokio::task::JoinHandle<()>) {
     let exe = framesage_core::paths::presentmon_exe_path();
     let available = exe.as_ref().is_some_and(|p| p.exists());
-    let handle = tokio::spawn(windows_impl::run(engine, frame_tx, exe));
+    let handle = tokio::spawn(windows_impl::run(engine, frame_tx, exe, restarts));
     (available, handle)
 }
 
@@ -88,6 +89,7 @@ pub fn spawn(
 pub fn spawn(
     _engine: std::sync::Arc<framesage_engine::Engine>,
     _frame_tx: tokio::sync::mpsc::Sender<FrameStats>,
+    _restarts: std::sync::Arc<std::sync::atomic::AtomicU32>,
 ) -> (bool, tokio::task::JoinHandle<()>) {
     let handle = tokio::spawn(async {});
     (false, handle)
@@ -98,6 +100,8 @@ mod windows_impl {
     use std::path::PathBuf;
     use std::sync::Arc;
     use std::time::{Duration, Instant};
+
+    use std::sync::atomic::{AtomicU32, Ordering};
 
     use framesage_engine::Engine;
     use framesage_presentmon::{FrameStats, SpawnDecision, SpawnPolicy};
@@ -126,6 +130,7 @@ mod windows_impl {
         engine: Arc<Engine>,
         frame_tx: mpsc::Sender<FrameStats>,
         exe: Option<PathBuf>,
+        restarts: Arc<AtomicU32>,
     ) {
         let Some(exe) = exe else {
             info!("PresentMon.exe path could not be resolved; frame capture disabled");
@@ -156,6 +161,13 @@ mod windows_impl {
                 let _ = a.join.await;
                 let clean = a.child.wait().unwrap_or(false);
                 policy.note_exited(!clean);
+                if !clean {
+                    // Unexpected death — the next reconcile re-attaches if
+                    // the game is still foreground. Count it as a restart
+                    // (§2.3 session_end.presentmon_restarts); the recorder
+                    // reads this shared counter per session.
+                    restarts.fetch_add(1, Ordering::Relaxed);
+                }
                 info!(exe = %a.target_exe, clean, "PresentMon child exited on its own");
             }
 
@@ -179,13 +191,27 @@ mod windows_impl {
                     if !want.exe_name.eq_ignore_ascii_case(&a.target_exe) {
                         // Foreground switched to a different game — swap.
                         detach(attached.take().unwrap(), &mut policy).await;
-                        try_attach(&exe, &want, &mut policy, &mut attached, &frame_tx);
+                        try_attach(
+                            &exe,
+                            &want,
+                            &mut policy,
+                            &mut attached,
+                            &frame_tx,
+                            &restarts,
+                        );
                     }
                     // Same game already measured — leave it (Reuse).
                 }
                 // Want a target, nothing attached — try to bring one up.
                 (Some(want), None) => {
-                    try_attach(&exe, &want, &mut policy, &mut attached, &frame_tx);
+                    try_attach(
+                        &exe,
+                        &want,
+                        &mut policy,
+                        &mut attached,
+                        &frame_tx,
+                        &restarts,
+                    );
                 }
             }
         }
@@ -200,6 +226,7 @@ mod windows_impl {
         policy: &mut SpawnPolicy,
         attached: &mut Option<Attached>,
         frame_tx: &mpsc::Sender<FrameStats>,
+        restarts: &AtomicU32,
     ) {
         match policy.decide(&want.exe_name, Instant::now()) {
             SpawnDecision::Spawn => {}
@@ -227,9 +254,11 @@ mod windows_impl {
             Err(e) => {
                 warn!(error = %e, pid = want.pid, "PresentMon spawn failed");
                 // A failed spawn counts as a crash against the budget so
-                // a persistently-failing PresentMon eventually gives up.
+                // a persistently-failing PresentMon eventually gives up,
+                // and against the session's restart count.
                 policy.note_spawned(&want.exe_name, Instant::now());
                 policy.note_exited(true);
+                restarts.fetch_add(1, Ordering::Relaxed);
                 return;
             }
         };
