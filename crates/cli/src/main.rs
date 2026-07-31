@@ -102,7 +102,9 @@ enum Cmd {
     ClosedLoop(ClosedLoopCmd),
     /// v0.7.1 Group C (#110) — inspect recorded sessions. `list`
     /// shows stored sessions newest first; `show <session-id>` prints
-    /// the session's attribution verdict plus an event-count summary.
+    /// the session's attribution verdict plus an event-count summary;
+    /// `trends` prints the median per-(game, profile) verdict across
+    /// all sessions.
     #[command(subcommand)]
     Sessions(SessionsCmd),
 }
@@ -124,6 +126,9 @@ enum SessionsCmd {
         #[arg(long)]
         json: bool,
     },
+    /// Cross-session trends: the median "did it help?" verdict per
+    /// (game, profile) across all recorded sessions.
+    Trends,
 }
 
 #[derive(Subcommand, Debug)]
@@ -281,6 +286,7 @@ fn main() -> Result<()> {
             SessionsCmd::Show { session_id, json } => {
                 tokio_block(async { sessions_show(session_id, json).await })
             }
+            SessionsCmd::Trends => tokio_block(async { send_simple(Request::SessionTrends).await }),
         },
     }
 }
