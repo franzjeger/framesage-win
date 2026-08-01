@@ -994,59 +994,68 @@ impl eframe::App for FramesageApp {
                 );
             });
 
-        egui::CentralPanel::default().show(ctx, |ui| {
-            if let Some(err) = &last_error {
-                // M1.8 / F-003 — SetPolicy rejections arrive as multi-line
-                // strings (one \n-joined rationale per denylisted entry).
-                // A single colored_label renders them as a wall of red;
-                // show the first line + an expandable, scrollable details
-                // section so 5+ rejections stay readable.
-                let mut lines = err.lines();
-                let first = lines.next().unwrap_or_default();
-                let rest: Vec<&str> = lines.collect();
-                if rest.is_empty() {
-                    ui.colored_label(theme::p().error, err);
-                } else {
-                    ui.colored_label(theme::p().error, first);
-                    egui::CollapsingHeader::new(
-                        egui::RichText::new(format!("details ({} more)", rest.len()))
-                            .color(theme::p().error),
-                    )
-                    .id_source("last-error-details")
-                    .default_open(false)
-                    .show(ui, |ui| {
-                        egui::ScrollArea::vertical()
-                            .id_source("last-error-scroll")
-                            .max_height(160.0_f32)
-                            .show(ui, |ui| {
-                                for line in &rest {
-                                    ui.colored_label(theme::p().error, *line);
-                                }
-                            });
-                    });
+        // PAGE_PAD (EGUI_SPEC §1) on every tab body — egui's default
+        // central-panel margin is 8/8, which let cards sit closer to the
+        // window edge than to each other.
+        egui::CentralPanel::default()
+            .frame(
+                egui::Frame::none()
+                    .fill(theme::p().bg)
+                    .inner_margin(egui::Margin::same(theme::Metrics::PAGE_PAD)),
+            )
+            .show(ctx, |ui| {
+                if let Some(err) = &last_error {
+                    // M1.8 / F-003 — SetPolicy rejections arrive as multi-line
+                    // strings (one \n-joined rationale per denylisted entry).
+                    // A single colored_label renders them as a wall of red;
+                    // show the first line + an expandable, scrollable details
+                    // section so 5+ rejections stay readable.
+                    let mut lines = err.lines();
+                    let first = lines.next().unwrap_or_default();
+                    let rest: Vec<&str> = lines.collect();
+                    if rest.is_empty() {
+                        ui.colored_label(theme::p().error, err);
+                    } else {
+                        ui.colored_label(theme::p().error, first);
+                        egui::CollapsingHeader::new(
+                            egui::RichText::new(format!("details ({} more)", rest.len()))
+                                .color(theme::p().error),
+                        )
+                        .id_source("last-error-details")
+                        .default_open(false)
+                        .show(ui, |ui| {
+                            egui::ScrollArea::vertical()
+                                .id_source("last-error-scroll")
+                                .max_height(160.0_f32)
+                                .show(ui, |ui| {
+                                    for line in &rest {
+                                        ui.colored_label(theme::p().error, *line);
+                                    }
+                                });
+                        });
+                    }
                 }
-            }
 
-            // Cap content width so the UI doesn't stretch into a single
-            // 3440-pixel line of widgets on ultrawides. The earlier attempt
-            // wrapped the body in a horizontal layout for centering, but a
-            // horizontal sizes vertically to its content — that clipped any
-            // tab whose list scrolled past the initial height (Rules,
-            // Profiles). `set_max_width` keeps the vertical layout intact;
-            // wide windows just leave empty space on the right.
-            //
-            // Item 4.2 — Processes tab is the one exception: its table
-            // wants every pixel on ultrawides to keep column widths
-            // (especially the description/path columns) readable
-            // without truncation. Other tabs (Status / Rules / Profiles
-            // / Settings) stay capped where the cap improves
-            // line-length comfort.
-            const MAX_CONTENT_WIDTH: f32 = 980.0;
-            if !matches!(self.tab, Tab::Processes) {
-                ui.set_max_width(MAX_CONTENT_WIDTH);
-            }
-            self.render_active_tab(ctx, ui, &status_snapshot, &recent_events);
-        });
+                // Cap content width so the UI doesn't stretch into a single
+                // 3440-pixel line of widgets on ultrawides. The earlier attempt
+                // wrapped the body in a horizontal layout for centering, but a
+                // horizontal sizes vertically to its content — that clipped any
+                // tab whose list scrolled past the initial height (Rules,
+                // Profiles). `set_max_width` keeps the vertical layout intact;
+                // wide windows just leave empty space on the right.
+                //
+                // Item 4.2 — Processes tab is the one exception: its table
+                // wants every pixel on ultrawides to keep column widths
+                // (especially the description/path columns) readable
+                // without truncation. Other tabs (Status / Rules / Profiles
+                // / Settings) stay capped where the cap improves
+                // line-length comfort.
+                const MAX_CONTENT_WIDTH: f32 = 1180.0;
+                if !matches!(self.tab, Tab::Processes) {
+                    ui.set_max_width(MAX_CONTENT_WIDTH);
+                }
+                self.render_active_tab(ctx, ui, &status_snapshot, &recent_events);
+            });
 
         // Modal: Terminate confirmation. Renders on top of every panel; the
         // surrounding UI keeps drawing so the user can still see the row
@@ -2021,22 +2030,20 @@ impl FramesageApp {
         // one wraps its detail line onto two rows.
         let stat_card =
             |ui: &mut egui::Ui, heading: &str, value: egui::RichText, detail: String| {
-                theme::card().show(ui, |ui| {
-                    // Cards are laid out by `ui.columns`, which hands each
-                    // one an equal slice of the row — but a Frame only
-                    // paints as wide as its content, so without this the
-                    // three cards shrink-wrap their text and scatter across
-                    // the row instead of tiling it.
-                    ui.set_min_width(ui.available_width());
+                // `card_full` claims the column's width — a bare Frame
+                // shrink-wraps its content, which is what made the three
+                // cards scatter across the row instead of tiling it
+                // (EGUI_SPEC §2.1 / §5.2).
+                theme::card_full(ui, |ui| {
                     ui.set_min_height(64.0);
                     ui.vertical(|ui| {
                         ui.label(theme::section_heading(heading));
                         ui.add_space(6.0);
-                        ui.label(value.size(17.0).strong());
+                        ui.label(value.size(theme::Metrics::TEXT_CARD_VALUE).strong());
                         ui.add_space(6.0);
                         ui.label(
                             egui::RichText::new(detail)
-                                .size(12.0)
+                                .size(theme::Metrics::TEXT_TINY)
                                 .color(theme::p().text_muted),
                         );
                     });
@@ -2265,12 +2272,17 @@ impl FramesageApp {
 
         frame.show(ui, |ui| {
             ui.horizontal(|ui| {
-                theme::dot(ui, dot_color, 9.0);
-                ui.add_space(8.0);
+                // Live states get the glow; idle doesn't (EGUI_SPEC §2.8).
+                if matches!(action, HeroAction::EnterManualGlobal) {
+                    theme::dot(ui, dot_color, theme::Metrics::HERO_DOT);
+                } else {
+                    theme::dot_glow(ui, dot_color, theme::Metrics::HERO_DOT);
+                }
+                ui.add_space(theme::SP_SM);
                 ui.vertical(|ui| {
                     ui.label(
                         egui::RichText::new(title)
-                            .size(19.0)
+                            .size(theme::Metrics::TEXT_HERO)
                             .strong()
                             .color(theme::p().text),
                     );
@@ -2437,16 +2449,28 @@ impl FramesageApp {
         // Right column is everything that edits policy through the admin
         // pipe. Grouping by "does this touch the service" also happens to
         // match the mockup's shape.
-        ui.spacing_mut().item_spacing.x = theme::SP_MD;
-        ui.columns(2, |cols| {
-            self.render_settings_display_card(&mut cols[0]);
-
-            let right = &mut cols[1];
-            self.render_settings_probalance_card(right, s);
-            right.add_space(theme::SP_MD);
-            self.render_settings_tick_card(right, s);
-            right.add_space(theme::SP_MD);
-            self.render_settings_policy_card(right, s);
+        // 42/58 split (EGUI_SPEC §4) rather than even halves: the right
+        // column carries the slider rows, which need
+        // SLIDER_W + DragValue + label before they start collapsing.
+        let gap = theme::Metrics::CARD_GAP;
+        let left_w = ((ui.available_width() - gap) * 0.42).max(240.0);
+        ui.horizontal_top(|ui| {
+            ui.allocate_ui_with_layout(
+                egui::vec2(left_w, ui.available_height()),
+                egui::Layout::top_down(egui::Align::LEFT),
+                |ui| {
+                    ui.set_width(left_w);
+                    self.render_settings_display_card(ui);
+                },
+            );
+            ui.add_space(gap);
+            ui.vertical(|ui| {
+                self.render_settings_probalance_card(ui, s);
+                ui.add_space(gap);
+                self.render_settings_tick_card(ui, s);
+                ui.add_space(gap);
+                self.render_settings_policy_card(ui, s);
+            });
         });
 
         // ─── Confirm modal for Reset (rendered last so it overlays) ──
@@ -2457,8 +2481,7 @@ impl FramesageApp {
     /// tray-local preferences. Compact mode and theme are one section;
     /// the optional Processes columns are the second.
     fn render_settings_display_card(&mut self, ui: &mut egui::Ui) {
-        theme::card().show(ui, |ui| {
-            ui.set_min_width(ui.available_width());
+        theme::card_full(ui, |ui| {
             ui.label(theme::section_heading("Display"));
             ui.add_space(theme::SP_SM);
 
@@ -2521,8 +2544,7 @@ impl FramesageApp {
     /// the Status tab, but the values here are bound to a draft and
     /// Apply commits via SetPolicy.
     fn render_settings_probalance_card(&mut self, ui: &mut egui::Ui, s: &StatusSnapshot) {
-        theme::card().show(ui, |ui| {
-            ui.set_min_width(ui.available_width());
+        theme::card_full(ui, |ui| {
             ui.horizontal(|ui| {
                 ui.label(theme::section_heading("ProBalance"));
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -2575,45 +2597,46 @@ impl FramesageApp {
             // self-method calls below — `self.send_admin_request`
             // needs `&self` and conflicts with the draft &mut.
             let (changed, apply_payload) = {
-                // egui's default slider width is a fixed 100 px that
-                // doesn't shrink — in the §3g two-column grid the track
-                // got squeezed to nothing and the cards rendered as a
-                // lone handle next to a number box. Size it from the
-                // column instead, leaving room for the value box + label.
-                ui.spacing_mut().slider_width = (ui.available_width() - 210.0).clamp(90.0, 260.0);
                 let draft = self
                     .settings
                     .probalance_draft
                     .get_or_insert_with(|| s.policy.probalance.clone());
 
-                ui.add(
-                    egui::Slider::new(&mut draft.system_cpu_threshold_percent, 30..=95)
-                        .text("System CPU threshold (%)"),
+                theme::labeled_slider(
+                    ui,
+                    &mut draft.system_cpu_threshold_percent,
+                    30..=95,
+                    "System CPU threshold (%)",
                 )
                 .on_hover_text(
                     "System-wide CPU% above which the box is considered 'under \
                      contention' and ProBalance becomes eligible to restrain hogs.",
                 );
-                ui.add(
-                    egui::Slider::new(&mut draft.hog_cpu_threshold_percent, 20..=400)
-                        .text("Hog CPU threshold (% of one core)"),
+                theme::labeled_slider(
+                    ui,
+                    &mut draft.hog_cpu_threshold_percent,
+                    20..=400,
+                    "Hog CPU threshold (% of one core)",
                 )
                 .on_hover_text(
                     "Per-process CPU% above which a non-foreground process is \
                      considered a hog. 100 = one fully busy core.",
                 );
-                ui.add(
-                    egui::Slider::new(&mut draft.min_restrain_ms, 500..=10_000)
-                        .text("Min restrain dwell (ms)")
-                        .step_by(100.0),
+                theme::labeled_slider(
+                    ui,
+                    &mut draft.min_restrain_ms,
+                    500..=10_000,
+                    "Min restrain dwell (ms)",
                 )
                 .on_hover_text(
                     "Minimum time a restrained process stays demoted before it can \
                      be restored. Prevents priority ping-pong.",
                 );
-                ui.add(
-                    egui::Slider::new(&mut draft.min_restrain_samples, 1..=10)
-                        .text("Hysteresis samples"),
+                theme::labeled_slider(
+                    ui,
+                    &mut draft.min_restrain_samples,
+                    1..=10,
+                    "Hysteresis samples",
                 )
                 .on_hover_text(
                     "How many consecutive samples a process must read as a hog \
@@ -2688,21 +2711,14 @@ impl FramesageApp {
     /// SetPolicy. Lower tick = more reactive foreground reconcile +
     /// more CPU spent in the engine itself.
     fn render_settings_tick_card(&mut self, ui: &mut egui::Ui, s: &StatusSnapshot) {
-        theme::card().show(ui, |ui| {
-            ui.set_min_width(ui.available_width());
+        theme::card_full(ui, |ui| {
             ui.label(theme::section_heading("Tick interval"));
             ui.add_space(6.0);
             // Edit in a scoped borrow, then drop before calling
             // self methods (see ProBalance card above for rationale).
             let (changed, draft_val) = {
-                ui.spacing_mut().slider_width = (ui.available_width() - 210.0).clamp(90.0, 260.0);
                 let draft = self.settings.tick_ms_draft.get_or_insert(s.policy.tick_ms);
-                ui.add(
-                    egui::Slider::new(draft, 100..=2_000)
-                        .text("Tick interval (ms)")
-                        .step_by(50.0),
-                )
-                .on_hover_text(
+                theme::labeled_slider(ui, draft, 100..=2_000, "Tick interval (ms)").on_hover_text(
                     "How often the engine re-evaluates the foreground. Lower = more \
                      reactive, more CPU spent in the engine. 300ms is the default \
                      and a good balance.",
@@ -2772,8 +2788,7 @@ impl FramesageApp {
     /// the CLI verbs for file-based export / import (item 4.3 part 1
     /// already shipped those in PR #56).
     fn render_settings_policy_card(&mut self, ui: &mut egui::Ui, _s: &StatusSnapshot) {
-        theme::card().show(ui, |ui| {
-            ui.set_min_width(ui.available_width());
+        theme::card_full(ui, |ui| {
             ui.label(theme::section_heading("Policy actions"));
             ui.add_space(theme::SP_SM);
             #[cfg(windows)]
@@ -3009,10 +3024,11 @@ impl FramesageApp {
             .striped(true)
             .resizable(true)
             .cell_layout(egui::Layout::left_to_right(egui::Align::Center))
-            .column(Column::initial(95.0).at_least(80.0))
-            .column(Column::initial(180.0).at_least(120.0))
+            // EGUI_SPEC §4: TIME 72 (mono) | KIND 110 | EVENT remainder.
+            .column(Column::initial(72.0).at_least(64.0))
+            .column(Column::initial(110.0).at_least(90.0))
             .column(Column::remainder().at_least(160.0))
-            .header(22.0, |mut header| {
+            .header(theme::Metrics::HEADER_H, |mut header| {
                 header.col(|ui| {
                     ui.label(theme::section_heading("Time"));
                 });
@@ -3024,7 +3040,7 @@ impl FramesageApp {
                 });
             })
             .body(|body| {
-                body.rows(20.0, rows.len(), |mut row| {
+                body.rows(theme::Metrics::ROW_H, rows.len(), |mut row| {
                     let (e, n) = rows[row.index()];
                     row.col(|ui| {
                         ui.label(
@@ -3181,9 +3197,7 @@ impl FramesageApp {
                     self.policy_draft = None;
                     self.rules.form = None;
                 }
-                theme::status_badge(theme::p().warning).show(ui, |ui| {
-                    ui.colored_label(theme::p().warning, "unsaved");
-                });
+                theme::pill(ui, theme::p().warning, "unsaved");
             }
 
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -3355,11 +3369,13 @@ impl FramesageApp {
                 TableBuilder::new(ui)
                     .vscroll(false)
                     .cell_layout(egui::Layout::left_to_right(egui::Align::Center))
+                    // EGUI_SPEC §4: EXECUTABLE 220 | PROFILE 140 | NOTE
+                    // remainder | actions.
                     .column(Column::initial(220.0).at_least(140.0))
-                    .column(Column::initial(150.0).at_least(100.0))
+                    .column(Column::initial(140.0).at_least(100.0))
                     .column(Column::remainder().at_least(120.0))
                     .column(Column::exact(120.0))
-                    .header(22.0, |mut header| {
+                    .header(theme::Metrics::HEADER_H, |mut header| {
                         header.col(|ui| {
                             ui.label(theme::section_heading("Executable"));
                         });
@@ -3372,7 +3388,7 @@ impl FramesageApp {
                         header.col(|_ui| {});
                     })
                     .body(|body| {
-                        body.rows(26.0, rules.len(), |mut row| {
+                        body.rows(theme::Metrics::ROW_H_RULES, rules.len(), |mut row| {
                             let i = row.index();
                             let rule = &rules[i];
                             let (kind, value) = match &rule.r#match {
@@ -3714,9 +3730,7 @@ impl FramesageApp {
                     self.profiles.editing_id = None;
                     self.profiles.new_form = None;
                 }
-                theme::status_badge(theme::p().warning).show(ui, |ui| {
-                    ui.colored_label(theme::p().warning, "unsaved");
-                });
+                theme::pill(ui, theme::p().warning, "unsaved");
             }
 
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -3859,10 +3873,9 @@ impl FramesageApp {
                 // headline knobs on the second. The old CollapsingHeader
                 // hid all of that behind a disclosure triangle, so the tab
                 // read as a list of names.
-                theme::card().show(ui, |ui| {
-                    ui.set_min_width(ui.available_width());
+                theme::card_full(ui, |ui| {
                     ui.horizontal(|ui| {
-                        ui.spacing_mut().item_spacing.x = 6.0;
+                        ui.spacing_mut().item_spacing.x = theme::SP_SM;
                         ui.label(
                             egui::RichText::new(&pretty)
                                 .size(14.0)
@@ -3870,22 +3883,10 @@ impl FramesageApp {
                                 .color(theme::p().accent),
                         );
                         if is_active {
-                            theme::status_badge(theme::p().success).show(ui, |ui| {
-                                ui.label(
-                                    egui::RichText::new("active")
-                                        .size(11.0)
-                                        .color(theme::p().success),
-                                );
-                            });
+                            theme::pill(ui, theme::p().success, "active");
                         }
                         if is_editing {
-                            theme::status_badge(theme::p().warning).show(ui, |ui| {
-                                ui.label(
-                                    egui::RichText::new("editing")
-                                        .size(11.0)
-                                        .color(theme::p().warning),
-                                );
-                            });
+                            theme::pill(ui, theme::p().warning, "editing");
                         }
 
                         // Actions pin to the right edge. Right-to-left
@@ -4264,7 +4265,7 @@ impl FramesageApp {
                     // "microsoft" search lights up every Microsoft-
                     // published process.
                     .hint_text("Search process, description, company …")
-                    .desired_width(300.0),
+                    .desired_width(theme::Metrics::SEARCH_W),
             );
             if ctrl_f_pressed {
                 filter_resp.request_focus();
@@ -4591,9 +4592,9 @@ impl FramesageApp {
                         let row_h = if self.settings.compact_mode {
                             16.0
                         } else if two_line {
-                            34.0
+                            theme::Metrics::ROW_H_2LINE
                         } else {
-                            22.0
+                            theme::Metrics::ROW_H
                         };
                         body.rows(row_h, visible.len(), |mut row| {
                             let tr = visible[row.index()];
@@ -5164,8 +5165,8 @@ impl FramesageApp {
                                                 ui.add(
                                                     egui::Label::new(
                                                         egui::RichText::new(sub)
-                                                            .size(11.0)
-                                                            .color(theme::p().text_dim),
+                                                            .size(theme::Metrics::TEXT_TINY)
+                                                            .color(theme::p().text_muted),
                                                     )
                                                     .truncate(),
                                                 );
@@ -5245,11 +5246,18 @@ impl FramesageApp {
                                 // Color tracks intensity — green idle, amber
                                 // moderate, red hot — so a busy process is
                                 // findable without reading a single number.
-                                let color = cpu_percent_color(p.cpu_percent);
-                                let full = ui.available_width();
-                                let bar_w = (full - 42.0).clamp(20.0, 140.0);
+                                // EGUI_SPEC §2.7: fixed 34×5 bar, accent
+                                // below 50 %, warning at or above it.
+                                let color = if p.cpu_percent >= 50 {
+                                    theme::p().warning
+                                } else {
+                                    theme::p().accent
+                                };
                                 let (rect, _) = ui.allocate_exact_size(
-                                    egui::vec2(bar_w, 4.0),
+                                    egui::vec2(
+                                        theme::Metrics::CPU_BAR_W,
+                                        theme::Metrics::CPU_BAR_H,
+                                    ),
                                     egui::Sense::hover(),
                                 );
                                 let painter = ui.painter();
@@ -5273,7 +5281,10 @@ impl FramesageApp {
                                 ui.with_layout(
                                     egui::Layout::right_to_left(egui::Align::Center),
                                     |ui| {
-                                        ui.colored_label(color, format!("{}%", p.cpu_percent));
+                                        ui.colored_label(
+                                            cpu_percent_color(p.cpu_percent),
+                                            format!("{}%", p.cpu_percent),
+                                        );
                                     },
                                 );
                             });
@@ -5411,15 +5422,7 @@ impl FramesageApp {
                                 };
                                 match badge {
                                     Some((text, color)) => {
-                                        let resp = theme::status_badge(color)
-                                            .show(ui, |ui| {
-                                                ui.label(
-                                                    egui::RichText::new(text)
-                                                        .size(11.0)
-                                                        .color(color),
-                                                );
-                                            })
-                                            .response;
+                                        let resp = theme::pill(ui, color, text);
                                         if let Some(note) =
                                             p.matched_rule_note.as_ref().filter(|n| !n.is_empty())
                                         {

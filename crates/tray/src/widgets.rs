@@ -151,7 +151,10 @@ pub(crate) fn render_perf_readout(
     metrics: &SystemMetrics,
     history: &[(u8, u8)],
 ) {
-    let (rect, _) = ui.allocate_exact_size(egui::vec2(120.0, 18.0), egui::Sense::hover());
+    let (rect, _) = ui.allocate_exact_size(
+        egui::vec2(theme::Metrics::SPARKLINE_W, theme::Metrics::SPARKLINE_H),
+        egui::Sense::hover(),
+    );
     draw_sparkline(ui.painter(), rect, history);
     ui.add_space(4.0);
 

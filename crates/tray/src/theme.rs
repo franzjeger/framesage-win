@@ -142,6 +142,78 @@ pub const SP_LG: f32 = 16.0;
 #[allow(dead_code)] // part of the spacing scale; currently unreferenced
 pub const SP_XL: f32 = 24.0;
 
+// ─── Metrics (design Round 3, EGUI_SPEC §1) ──────────────────────────────────
+//
+// Every size the renovation specifies, in logical points. Call sites use
+// these instead of literals so the same primitive is the same size on
+// every tab — the spec's §5.3 "per-site drift" failure mode.
+
+pub struct Metrics;
+
+#[allow(dead_code)] // full scale carried; not every constant has a call site yet
+impl Metrics {
+    // Type scale
+    pub const TEXT_BODY: f32 = 13.0;
+    pub const TEXT_SMALL: f32 = 12.5;
+    pub const TEXT_TINY: f32 = 12.0;
+    pub const TEXT_SECTION: f32 = 10.5;
+    pub const TEXT_CARD_VALUE: f32 = 15.0;
+    pub const TEXT_HERO: f32 = 16.0;
+    pub const TEXT_MONO: f32 = 12.0;
+    pub const TEXT_PILL: f32 = 11.0;
+
+    // Radii
+    pub const R_CARD: f32 = 8.0;
+    pub const R_BUTTON: f32 = 6.0;
+    pub const R_PILL: f32 = 10.0;
+
+    // Card geometry
+    pub const CARD_PAD_X: f32 = 12.0;
+    pub const CARD_PAD_Y: f32 = 10.0;
+    pub const HERO_PAD_X: f32 = 14.0;
+    pub const HERO_PAD_Y: f32 = 12.0;
+    pub const CARD_GAP: f32 = 10.0;
+    pub const PAGE_PAD: f32 = 12.0;
+
+    // Chrome
+    pub const TAB_PAD_X: f32 = 10.0;
+    pub const TAB_PAD_Y: f32 = 8.0;
+    pub const TAB_UNDERLINE: f32 = 2.0;
+    pub const SPARKLINE_W: f32 = 90.0;
+    pub const SPARKLINE_H: f32 = 18.0;
+
+    // Table
+    pub const ROW_H: f32 = 26.0;
+    pub const ROW_H_2LINE: f32 = 34.0;
+    pub const ROW_H_RULES: f32 = 30.0;
+    pub const HEADER_H: f32 = 24.0;
+    pub const GUTTER_W: f32 = 4.0;
+    pub const CPU_BAR_W: f32 = 34.0;
+    pub const CPU_BAR_H: f32 = 5.0;
+
+    // Controls
+    pub const BTN_PAD: egui::Vec2 = egui::vec2(12.0, 6.0);
+    pub const CHIP_PAD: egui::Vec2 = egui::vec2(10.0, 3.0);
+    pub const PILL_PAD: egui::Vec2 = egui::vec2(8.0, 2.0);
+    pub const SEARCH_W: f32 = 300.0;
+    pub const DOT: f32 = 6.0;
+    pub const HERO_DOT: f32 = 9.0;
+    pub const SLIDER_W: f32 = 140.0;
+    pub const DRAG_VALUE: egui::Vec2 = egui::vec2(52.0, 22.0);
+
+    // Sessions
+    pub const SESSION_LIST_W: f32 = 280.0;
+    pub const CHART_H: f32 = 140.0;
+
+    /// Tint ratio for pill / chip fills (EGUI_SPEC §2.3 writes this as
+    /// `color.gamma_multiply(0.13)`). We feed it to [`mix`] instead so the
+    /// light palette gets a *lighter* tint rather than a dark blob —
+    /// gamma_multiply always darkens, which is only right on dark.
+    pub const TINT_PILL: f32 = 0.13;
+    /// Same idea for the hero wash.
+    pub const TINT_HERO: f32 = 0.07;
+}
+
 /// A translucent fill of `color` at the given alpha — the one place we
 /// derive low-opacity accent/series fills, so callers stop hand-rolling
 /// alpha math inline.
@@ -187,6 +259,18 @@ pub fn dot(ui: &mut egui::Ui, color: Color32, diameter: f32) -> egui::Response {
         ui.allocate_exact_size(egui::vec2(diameter, diameter), egui::Sense::hover());
     ui.painter()
         .circle_filled(rect.center(), diameter / 2.0, color);
+    response
+}
+
+/// Hero status dot with the glow the mockup gives live states
+/// (EGUI_SPEC §2.8): the solid dot plus a wider disc at 30 % alpha.
+/// Idle heroes call [`dot`] instead — no glow when nothing is running.
+pub fn dot_glow(ui: &mut egui::Ui, color: Color32, diameter: f32) -> egui::Response {
+    let (rect, response) =
+        ui.allocate_exact_size(egui::vec2(diameter, diameter), egui::Sense::hover());
+    let painter = ui.painter();
+    painter.circle_filled(rect.center(), diameter * 0.9, fill_alpha(color, 0x4d));
+    painter.circle_filled(rect.center(), diameter / 2.0, color);
     response
 }
 
@@ -296,8 +380,26 @@ pub fn card() -> egui::Frame {
     egui::Frame::none()
         .fill(pal.surface)
         .stroke(Stroke::new(1.0_f32, pal.border))
-        .rounding(Rounding::same(6.0))
-        .inner_margin(egui::Margin::symmetric(14.0, 10.0))
+        .rounding(Rounding::same(Metrics::R_CARD))
+        .inner_margin(egui::Margin::symmetric(
+            Metrics::CARD_PAD_X,
+            Metrics::CARD_PAD_Y,
+        ))
+}
+
+/// `card()` plus the width claim (EGUI_SPEC §2.1). A bare `Frame`
+/// shrink-wraps its content, which is the root of the "zero-width
+/// text / scattered cards" bug class: a card in a sized column paints
+/// only as wide as its longest line, and any right-aligned sibling
+/// inside it gets nothing to align against. Prefer this over `card()`
+/// wherever the card sits in a column or a grid.
+pub fn card_full<R>(ui: &mut egui::Ui, add: impl FnOnce(&mut egui::Ui) -> R) -> R {
+    card()
+        .show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            add(ui)
+        })
+        .inner
 }
 
 /// Hero strip: full-width, slightly stronger fill, used for the at-a-glance
@@ -306,10 +408,13 @@ pub fn card() -> egui::Frame {
 pub fn hero() -> egui::Frame {
     let pal = p();
     egui::Frame::none()
-        .fill(pal.surface_active)
+        .fill(pal.surface)
         .stroke(Stroke::new(1.0_f32, pal.border))
-        .rounding(Rounding::same(8.0))
-        .inner_margin(egui::Margin::symmetric(16.0, 12.0))
+        .rounding(Rounding::same(Metrics::R_CARD))
+        .inner_margin(egui::Margin::symmetric(
+            Metrics::HERO_PAD_X,
+            Metrics::HERO_PAD_Y,
+        ))
 }
 
 /// Hero frame tinted by a semantic color — the Status tab's headline
@@ -321,10 +426,13 @@ pub fn hero() -> egui::Frame {
 pub fn hero_tinted(color: Color32) -> egui::Frame {
     let pal = p();
     egui::Frame::none()
-        .fill(mix(color, pal.bg, 0.10))
+        .fill(mix(color, pal.bg, Metrics::TINT_HERO))
         .stroke(Stroke::new(1.0_f32, mix(color, pal.bg, 0.45)))
-        .rounding(Rounding::same(8.0))
-        .inner_margin(egui::Margin::symmetric(16.0, 12.0))
+        .rounding(Rounding::same(Metrics::R_CARD))
+        .inner_margin(egui::Margin::symmetric(
+            Metrics::HERO_PAD_X,
+            Metrics::HERO_PAD_Y,
+        ))
 }
 
 /// Banner frame for stateful warnings / persistent overrides (manual mode,
@@ -342,17 +450,35 @@ pub fn banner(color: Color32) -> egui::Frame {
 /// at low opacity and a matching foreground stroke.
 pub fn status_badge(color: Color32) -> egui::Frame {
     egui::Frame::none()
-        .fill(mix(color, p().surface, 0.18))
+        .fill(mix(color, p().surface, Metrics::TINT_PILL))
         .stroke(Stroke::new(1.0_f32, color))
-        .rounding(Rounding::same(10.0))
-        .inner_margin(egui::Margin::symmetric(8.0, 2.0))
+        .rounding(Rounding::same(Metrics::R_PILL))
+        .inner_margin(egui::Margin::symmetric(
+            Metrics::PILL_PAD.x,
+            Metrics::PILL_PAD.y,
+        ))
+}
+
+/// Status pill, complete (EGUI_SPEC §2.3). Text is the state color at
+/// full alpha on the 13 %-tinted fill — never muted text inside a
+/// colored pill (§5.4).
+pub fn pill(ui: &mut egui::Ui, color: Color32, text: &str) -> egui::Response {
+    status_badge(color)
+        .show(ui, |ui| {
+            ui.label(
+                egui::RichText::new(text)
+                    .size(Metrics::TEXT_PILL)
+                    .color(color),
+            );
+        })
+        .response
 }
 
 /// Small uppercase section heading — quiet, used to label groups of fields
 /// inside a card without competing visually with the actual values.
 pub fn section_heading(text: &str) -> egui::RichText {
     egui::RichText::new(text.to_uppercase())
-        .small()
+        .size(Metrics::TEXT_SECTION)
         .strong()
         .color(p().text_muted)
         .extra_letter_spacing(1.0)
@@ -390,25 +516,62 @@ pub fn danger_button(ui: &mut egui::Ui, label: &str) -> egui::Response {
 /// selection semantics (exclusive on Processes, multi on Activity).
 pub fn chip(ui: &mut egui::Ui, label: &str, active: bool) -> egui::Response {
     let pal = p();
-    let (fill, stroke, color) = if active {
+    let text = if active {
+        egui::RichText::new(label)
+            .size(Metrics::TEXT_TINY)
+            .color(pal.accent)
+            .strong()
+    } else {
+        egui::RichText::new(label)
+            .size(Metrics::TEXT_TINY)
+            .color(pal.text_muted)
+    };
+    let (fill, stroke) = if active {
         (
-            mix(pal.accent, pal.bg, 0.16),
+            mix(pal.accent, pal.bg, Metrics::TINT_PILL),
             Stroke::new(1.0_f32, pal.accent),
-            pal.text,
         )
     } else {
-        (
-            pal.surface,
-            Stroke::new(1.0_f32, pal.border),
-            pal.text_muted,
-        )
+        (pal.surface, Stroke::new(1.0_f32, pal.border))
     };
-    ui.add(
-        egui::Button::new(egui::RichText::new(label).size(12.0).color(color))
+    let prev = ui.spacing().button_padding;
+    ui.spacing_mut().button_padding = Metrics::CHIP_PAD;
+    let resp = ui.add(
+        egui::Button::new(text)
             .fill(fill)
             .stroke(stroke)
-            .rounding(Rounding::same(10.0)),
-    )
+            .rounding(Rounding::same(Metrics::R_PILL)),
+    );
+    ui.spacing_mut().button_padding = prev;
+    resp
+}
+
+/// Slider row (EGUI_SPEC §2.5): fixed-width accent-filled track, then a
+/// DragValue box, then the label — all on one line. The stock
+/// `Slider::text()` form is what produced the detached-handle rows in
+/// Settings: egui's default `slider_width` is a fixed 100 pt that
+/// doesn't shrink, so in a narrow column the track collapses and leaves
+/// the handle floating beside the number.
+pub fn labeled_slider<N: egui::emath::Numeric>(
+    ui: &mut egui::Ui,
+    value: &mut N,
+    range: std::ops::RangeInclusive<N>,
+    label: &str,
+) -> egui::Response {
+    ui.horizontal(|ui| {
+        let pal = p();
+        ui.spacing_mut().slider_width = Metrics::SLIDER_W;
+        ui.visuals_mut().selection.bg_fill = pal.accent;
+        let mut resp = ui.add(egui::Slider::new(value, range).show_value(false));
+        resp |= ui.add_sized(Metrics::DRAG_VALUE, egui::DragValue::new(value));
+        ui.label(
+            egui::RichText::new(label)
+                .size(Metrics::TEXT_SMALL)
+                .color(pal.text_muted),
+        );
+        resp
+    })
+    .inner
 }
 
 /// Process Lasso–style tab button. Renders a chunky labelled rectangle with a
@@ -433,7 +596,7 @@ pub fn tab_button(ui: &mut egui::Ui, label: &str, selected: bool) -> egui::Respo
         f32::INFINITY,
         egui::TextStyle::Button,
     );
-    let padding = egui::vec2(12.0, 8.0);
+    let padding = egui::vec2(Metrics::TAB_PAD_X, Metrics::TAB_PAD_Y);
     let desired = galley.size() + padding * 2.0;
     let (rect, response) = ui.allocate_exact_size(desired, egui::Sense::click());
 
@@ -450,7 +613,7 @@ pub fn tab_button(ui: &mut egui::Ui, label: &str, selected: bool) -> egui::Respo
 
     if selected {
         let underline = egui::Rect::from_min_max(
-            egui::pos2(rect.left(), rect.bottom() - 2.0),
+            egui::pos2(rect.left(), rect.bottom() - Metrics::TAB_UNDERLINE),
             egui::pos2(rect.right(), rect.bottom()),
         );
         painter.rect_filled(underline, Rounding::same(0.0), pal.accent);

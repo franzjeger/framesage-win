@@ -363,9 +363,7 @@ fn session_card(ui: &mut egui::Ui, entry: &SessionListEntry, selected: bool) -> 
                     .color(pal.text),
             );
             if entry.partial_data {
-                theme::status_badge(pal.warning).show(ui, |ui| {
-                    ui.label(egui::RichText::new("partial").size(10.5).color(pal.warning));
-                });
+                theme::pill(ui, pal.warning, "partial");
             }
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 ui.label(
