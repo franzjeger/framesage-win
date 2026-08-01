@@ -24,12 +24,16 @@ pub struct ProcessesColumns {
 
 impl Default for ProcessesColumns {
     fn default() -> Self {
-        // All optional columns on by default — the current behavior,
-        // so an upgrade changes nothing until the user hides one.
+        // Design Round 3 §3b reduces the default column set: Description,
+        // Company, and User come off, because the process cell now carries
+        // "Description · Company" as its second line and User is rarely
+        // what you're scanning for. All three stay one checkbox away in
+        // Settings. Existing prefs files keep whatever the user chose —
+        // this only changes what a fresh install starts with.
         Self {
-            description: true,
-            company: true,
-            user: true,
+            description: false,
+            company: false,
+            user: false,
             threads: true,
             priority: true,
             affinity: true,
@@ -96,10 +100,16 @@ impl TrayPrefs {
 mod tests {
     use super::*;
 
+    /// Design Round 3 §3b: a fresh install starts with the reduced
+    /// column set. Description and Company move into the process cell's
+    /// second line, User is off; the numeric/state columns stay.
     #[test]
-    fn defaults_show_every_optional_column() {
+    fn defaults_match_the_round_3_reduced_column_set() {
         let c = ProcessesColumns::default();
-        assert!(c.description && c.company && c.user && c.threads && c.priority && c.affinity);
+        assert!(!c.description, "Description column defaults off");
+        assert!(!c.company, "Company column defaults off");
+        assert!(!c.user, "User column defaults off");
+        assert!(c.threads && c.priority && c.affinity);
     }
 
     #[test]

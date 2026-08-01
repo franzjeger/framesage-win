@@ -278,72 +278,131 @@ fn render_list_and_detail(
     ui.separator();
 
     let selected_id = detail.as_ref().map(|d| d.session_id.clone());
-    // S1 — adaptive split: when no session is open the list gets the
-    // room (nothing below competes); once a detail pane is showing, the
-    // list yields most of the height so the charts + attribution aren't
-    // cramped.
-    let list_fraction = if detail.is_some() { 0.32 } else { 0.85 };
-    egui::ScrollArea::vertical()
-        .id_source("sessions-list")
-        .max_height(ui.available_height() * list_fraction)
-        .show(ui, |ui| {
-            for entry in list {
-                let is_selected = selected_id.as_deref() == Some(entry.session_id.as_str());
-                let dur = match entry.duration_secs {
-                    Some(secs) => format!("{}m{:02}s", secs / 60, secs % 60),
-                    None => "in progress / crashed".to_string(),
-                };
-                let label = format!("🎮 {} · {} · {}", entry.game_exe, entry.profile_id, dur);
-                let resp = ui
-                    .horizontal(|ui| {
-                        let resp = ui.selectable_label(is_selected, label);
-                        // Q2 — partial-data as a themed WARNING pill,
-                        // right-aligned, instead of appended raw text —
-                        // it's a load-bearing honesty signal.
-                        if entry.partial_data {
-                            ui.with_layout(
-                                egui::Layout::right_to_left(egui::Align::Center),
-                                |ui| {
-                                    theme::status_badge(theme::p().warning).show(ui, |ui| {
-                                        ui.label(
-                                            egui::RichText::new("⚠ partial data")
-                                                .size(11.0)
-                                                .color(theme::p().warning),
-                                        );
-                                    });
-                                },
-                            );
+
+    // Two-pane split (design §3d): a fixed 280 px session list on the
+    // left, detail filling the rest. The previous list-above-detail stack
+    // meant the attribution card and charts started halfway down the
+    // window and the list shrank every time you opened one.
+    const LIST_W: f32 = 280.0;
+    ui.horizontal_top(|ui| {
+        ui.allocate_ui_with_layout(
+            egui::vec2(LIST_W, ui.available_height()),
+            egui::Layout::top_down(egui::Align::LEFT),
+            |ui| {
+                ui.set_width(LIST_W);
+                ui.label(theme::section_heading("Sessions"));
+                ui.add_space(theme::SP_SM);
+                egui::ScrollArea::vertical()
+                    .id_source("sessions-list")
+                    .show(ui, |ui| {
+                        for entry in list {
+                            let is_selected =
+                                selected_id.as_deref() == Some(entry.session_id.as_str());
+                            if session_card(ui, entry, is_selected).clicked() && !is_selected {
+                                action = Some(SessionsAction::OpenDetail(entry.session_id.clone()));
+                            }
+                            ui.add_space(theme::SP_SM);
                         }
-                        resp
-                    })
-                    .inner;
-                if resp.clicked() && !is_selected {
-                    action = Some(SessionsAction::OpenDetail(entry.session_id.clone()));
+                    });
+            },
+        );
+
+        ui.add_space(theme::SP_MD);
+        ui.vertical(|ui| match detail {
+            Some(d) => render_detail(ui, d, &mut action),
+            None => {
+                ui.add_space(8.0);
+                if fetch_pending {
+                    ui.horizontal(|ui| {
+                        ui.spinner();
+                        ui.label(
+                            egui::RichText::new("Loading session…").color(theme::p().text_muted),
+                        );
+                    });
+                } else {
+                    ui.label(
+                        egui::RichText::new(
+                            "Select a session to see the \"Did it help?\" attribution.",
+                        )
+                        .color(theme::p().text_muted),
+                    );
                 }
             }
         });
-
-    ui.separator();
-    match detail {
-        Some(d) => render_detail(ui, d, &mut action),
-        None => {
-            ui.add_space(8.0);
-            if fetch_pending {
-                ui.horizontal(|ui| {
-                    ui.spinner();
-                    ui.label(egui::RichText::new("Loading session…").color(theme::p().text_muted));
-                });
-            } else {
-                ui.label(
-                    egui::RichText::new(
-                        "Select a session to see the \"Did it help?\" attribution.",
-                    )
-                    .color(theme::p().text_muted),
-                );
-            }
-        }
-    }
+    });
     action
+}
+
+/// One session card in the left pane (§3d): exe bold with the start time
+/// right-aligned, then a muted "profile · duration" line. Selected gets
+/// an accent border; partial-data sessions carry the warning pill,
+/// because that flag is the difference between "this measurement means
+/// something" and "this measurement has holes in it".
+fn session_card(ui: &mut egui::Ui, entry: &SessionListEntry, selected: bool) -> egui::Response {
+    let pal = theme::p();
+    let frame = egui::Frame::none()
+        .fill(if selected {
+            theme::mix(pal.accent, pal.surface, 0.10)
+        } else {
+            pal.surface
+        })
+        .stroke(egui::Stroke::new(
+            1.0_f32,
+            if selected { pal.accent } else { pal.border },
+        ))
+        .rounding(egui::Rounding::same(6.0))
+        .inner_margin(egui::Margin::symmetric(10.0, 8.0));
+
+    let inner = frame.show(ui, |ui| {
+        ui.set_width(ui.available_width());
+        ui.horizontal(|ui| {
+            ui.spacing_mut().item_spacing.x = 5.0;
+            ui.label(
+                egui::RichText::new(&entry.game_exe)
+                    .strong()
+                    .color(pal.text),
+            );
+            if entry.partial_data {
+                theme::status_badge(pal.warning).show(ui, |ui| {
+                    ui.label(egui::RichText::new("partial").size(10.5).color(pal.warning));
+                });
+            }
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                ui.label(
+                    egui::RichText::new(crate::widgets::format_local_hms(
+                        std::time::UNIX_EPOCH
+                            + std::time::Duration::from_secs(entry.started_at_unix_secs),
+                    ))
+                    .size(11.0)
+                    .color(pal.text_dim),
+                );
+            });
+        });
+        ui.add_space(2.0);
+        let dur = match entry.duration_secs {
+            Some(secs) if secs >= 3600 => {
+                format!("{} h {:02} min", secs / 3600, (secs % 3600) / 60)
+            }
+            Some(secs) => format!("{} min {:02} s", secs / 60, secs % 60),
+            None => "in progress / crashed".to_string(),
+        };
+        ui.label(
+            egui::RichText::new(format!(
+                "{} · {dur}",
+                crate::formatters::display_profile_id(&entry.profile_id)
+            ))
+            .size(11.5)
+            .color(pal.text_muted),
+        );
+    });
+
+    // The frame itself isn't clickable; re-sense its rect so the whole
+    // card is the hit target rather than just the label inside it.
+    ui.interact(
+        inner.response.rect,
+        ui.id().with(("session-card", &entry.session_id)),
+        egui::Sense::click(),
+    )
 }
 
 /// Detail pane: event summary + the §2.4 honest-attribution panel.

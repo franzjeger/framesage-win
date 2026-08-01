@@ -384,6 +384,33 @@ pub fn danger_button(ui: &mut egui::Ui, label: &str) -> egui::Response {
     )
 }
 
+/// Filter chip — a pill-shaped toggle (design Round 3 §3b/§3c). Active
+/// reads as accent border + tinted fill + full-strength label; inactive
+/// is a quiet outline. Returns the click response so the caller owns the
+/// selection semantics (exclusive on Processes, multi on Activity).
+pub fn chip(ui: &mut egui::Ui, label: &str, active: bool) -> egui::Response {
+    let pal = p();
+    let (fill, stroke, color) = if active {
+        (
+            mix(pal.accent, pal.bg, 0.16),
+            Stroke::new(1.0_f32, pal.accent),
+            pal.text,
+        )
+    } else {
+        (
+            pal.surface,
+            Stroke::new(1.0_f32, pal.border),
+            pal.text_muted,
+        )
+    };
+    ui.add(
+        egui::Button::new(egui::RichText::new(label).size(12.0).color(color))
+            .fill(fill)
+            .stroke(stroke)
+            .rounding(Rounding::same(10.0)),
+    )
+}
+
 /// Process Lasso–style tab button. Renders a chunky labelled rectangle with a
 /// 2-pixel accent underline when selected. Returns the click response so the
 /// caller can drive its own selection state — keeps this widget composable

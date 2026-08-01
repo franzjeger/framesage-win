@@ -62,12 +62,13 @@ use process_actions::{render_process_detail, ProcessAction, PRIORITY_CHOICES};
 use state::{AppState, EventKind, RecentEvent};
 use widgets::{
     format_local_hms, render_perf_readout, render_profile_body, render_readonly_banner,
-    render_status_bar,
+    render_status_bar, yes_no,
 };
 
 use formatters::{
     affinity_selector_label, cpu_percent_color, decode_affinity_mask, display_profile_id,
-    format_bytes, format_tray_tooltip, priority_class_label, truncate_for_echo,
+    format_bytes, format_cpu_selector, format_tray_tooltip, priority_class_label,
+    truncate_for_echo,
 };
 use tree::{
     build_tree_view, classify_row, column_hover_text, compare_snapshots, descendants_of,
@@ -182,6 +183,18 @@ enum Tab {
 /// Live state for the Processes tab. Polled from the engine in the
 /// background thread (along with the existing status poll); rendered by the
 /// UI thread without holding the network for any longer than a clone.
+/// Exclusive state filter behind the Processes tab's chips (design
+/// §3b). `All` is the default so a fresh window shows everything.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+enum ProcessFilter {
+    /// Only processes with a FrameSage profile applied.
+    Managed,
+    /// Only processes ProBalance currently has demoted.
+    Restrained,
+    #[default]
+    All,
+}
+
 struct ProcessesView {
     /// Most recent snapshot from `Request::ListProcesses`. Replaced wholesale
     /// each refresh — no diffing.
@@ -205,6 +218,10 @@ struct ProcessesView {
     /// mode regardless — searching across the whole tree is more useful
     /// than searching within visible subtrees.
     tree_mode: bool,
+    /// Which state chip is active in the filter row (§3b). Composes with
+    /// the substring filter: chip narrows by engine state, text narrows
+    /// by name/description/company/user.
+    state_filter: ProcessFilter,
     /// PIDs whose children are currently hidden in tree mode. Default is
     /// "all expanded" so a fresh session shows the full process forest;
     /// the user opts *out* of detail by collapsing branches they don't
@@ -255,6 +272,7 @@ impl Default for ProcessesView {
             sort_desc: true,
             selected_pid: None,
             tree_mode: true,
+            state_filter: ProcessFilter::default(),
             collapsed: std::collections::HashSet::new(),
             detail_height: None,
             multi_selected: std::collections::HashSet::new(),
@@ -2414,27 +2432,52 @@ impl FramesageApp {
             return;
         };
 
-        // ─── Display preferences (tray-only, no IPC) ───────────────────
-        theme::card().show(ui, |ui| {
-            ui.label(theme::section_heading("Display"));
-            ui.add_space(6.0);
-            ui.horizontal(|ui| {
-                ui.checkbox(&mut self.settings.compact_mode, "Compact mode")
-                    .on_hover_text(
-                        "Smaller body font + tighter row height in the Processes \
-                         tab — roughly 25% more rows visible per scroll. Tray-only \
-                         display preference; not persisted across launches.",
-                    );
-            });
-        });
-        ui.add_space(10.0);
+        // Two-column card grid (design Round 3 §3g). Left column is the
+        // tray's own display preferences — no IPC, no admin, instant.
+        // Right column is everything that edits policy through the admin
+        // pipe. Grouping by "does this touch the service" also happens to
+        // match the mockup's shape.
+        ui.spacing_mut().item_spacing.x = theme::SP_MD;
+        ui.columns(2, |cols| {
+            self.render_settings_display_card(&mut cols[0]);
 
-        // ─── Appearance: light/dark theme (persisted per-user) ────────
+            let right = &mut cols[1];
+            self.render_settings_probalance_card(right, s);
+            right.add_space(theme::SP_MD);
+            self.render_settings_tick_card(right, s);
+            right.add_space(theme::SP_MD);
+            self.render_settings_policy_card(right, s);
+        });
+
+        // ─── Confirm modal for Reset (rendered last so it overlays) ──
+        self.render_settings_reset_confirm(ui.ctx(), s);
+    }
+
+    /// Left column of §3g: DISPLAY + PROCESSES COLUMNS in one card, both
+    /// tray-local preferences. Compact mode and theme are one section;
+    /// the optional Processes columns are the second.
+    fn render_settings_display_card(&mut self, ui: &mut egui::Ui) {
         theme::card().show(ui, |ui| {
-            ui.label(theme::section_heading("Appearance"));
-            ui.add_space(6.0);
+            ui.set_min_width(ui.available_width());
+            ui.label(theme::section_heading("Display"));
+            ui.add_space(theme::SP_SM);
+
+            ui.checkbox(&mut self.settings.compact_mode, "Compact mode")
+                .on_hover_text(
+                    "Smaller body font + tighter row height in the Processes \
+                     tab — roughly 25% more rows visible per scroll. Tray-only \
+                     display preference; not persisted across launches.",
+                );
+
             let mut dark = self.tray_prefs.theme == theme::Theme::Dark;
-            if ui.checkbox(&mut dark, "Dark theme").changed() {
+            if ui
+                .checkbox(&mut dark, "Dark theme")
+                .on_hover_text(
+                    "Light mode uses the same hues with darker semantic colors \
+                     for legibility on white. Saved per-user.",
+                )
+                .changed()
+            {
                 self.tray_prefs.theme = if dark {
                     theme::Theme::Dark
                 } else {
@@ -2445,29 +2488,10 @@ impl FramesageApp {
                 theme::apply(ui.ctx(), self.tray_prefs.theme);
                 self.tray_prefs.save();
             }
-            ui.label(
-                egui::RichText::new(
-                    "Light mode uses the same hues with darker semantic colors \
-                     for legibility on white. Saved per-user.",
-                )
-                .size(11.0)
-                .color(theme::p().text_muted),
-            );
-        });
-        ui.add_space(10.0);
 
-        // ─── Processes-tab columns (#2, tray-prefs, persisted) ────────
-        theme::card().show(ui, |ui| {
+            ui.add_space(theme::SP_MD);
             ui.label(theme::section_heading("Processes columns"));
-            ui.add_space(6.0);
-            ui.label(
-                egui::RichText::new(
-                    "Hide optional columns in the Processes tab. Saved per-user;                      PID / CPU / Memory / Process / Profile / Status are always shown.",
-                )
-                .size(11.0)
-                .color(theme::p().text_muted),
-            );
-            ui.add_space(4.0);
+            ui.add_space(theme::SP_SM);
             let c = &mut self.tray_prefs.processes_columns;
             let mut changed = false;
             ui.horizontal_wrapped(|ui| {
@@ -2481,23 +2505,16 @@ impl FramesageApp {
             if changed {
                 self.tray_prefs.save();
             }
+            ui.add_space(theme::SP_XS);
+            ui.label(
+                egui::RichText::new(
+                    "Process / PID / CPU / Memory / Profile / Status are always shown. \
+                     Saved per-user.",
+                )
+                .size(11.0)
+                .color(theme::p().text_muted),
+            );
         });
-        ui.add_space(10.0);
-
-        // ─── ProBalance editor (admin-gated commit) ───────────────────
-        self.render_settings_probalance_card(ui, s);
-        ui.add_space(10.0);
-
-        // ─── Tick interval (admin-gated commit) ───────────────────────
-        self.render_settings_tick_card(ui, s);
-        ui.add_space(10.0);
-
-        // ─── Policy actions (Reset + CLI pointer) ─────────────────────
-        self.render_settings_policy_card(ui, s);
-        ui.add_space(10.0);
-
-        // ─── Confirm modal for Reset (rendered last so it overlays) ──
-        self.render_settings_reset_confirm(ui.ctx(), s);
     }
 
     /// Editable ProBalance thresholds. Mirrors the read-only card on
@@ -2505,6 +2522,7 @@ impl FramesageApp {
     /// Apply commits via SetPolicy.
     fn render_settings_probalance_card(&mut self, ui: &mut egui::Ui, s: &StatusSnapshot) {
         theme::card().show(ui, |ui| {
+            ui.set_min_width(ui.available_width());
             ui.horizontal(|ui| {
                 ui.label(theme::section_heading("ProBalance"));
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -2557,6 +2575,12 @@ impl FramesageApp {
             // self-method calls below — `self.send_admin_request`
             // needs `&self` and conflicts with the draft &mut.
             let (changed, apply_payload) = {
+                // egui's default slider width is a fixed 100 px that
+                // doesn't shrink — in the §3g two-column grid the track
+                // got squeezed to nothing and the cards rendered as a
+                // lone handle next to a number box. Size it from the
+                // column instead, leaving room for the value box + label.
+                ui.spacing_mut().slider_width = (ui.available_width() - 210.0).clamp(90.0, 260.0);
                 let draft = self
                     .settings
                     .probalance_draft
@@ -2665,11 +2689,13 @@ impl FramesageApp {
     /// more CPU spent in the engine itself.
     fn render_settings_tick_card(&mut self, ui: &mut egui::Ui, s: &StatusSnapshot) {
         theme::card().show(ui, |ui| {
+            ui.set_min_width(ui.available_width());
             ui.label(theme::section_heading("Tick interval"));
             ui.add_space(6.0);
             // Edit in a scoped borrow, then drop before calling
             // self methods (see ProBalance card above for rationale).
             let (changed, draft_val) = {
+                ui.spacing_mut().slider_width = (ui.available_width() - 210.0).clamp(90.0, 260.0);
                 let draft = self.settings.tick_ms_draft.get_or_insert(s.policy.tick_ms);
                 ui.add(
                     egui::Slider::new(draft, 100..=2_000)
@@ -2747,36 +2773,56 @@ impl FramesageApp {
     /// already shipped those in PR #56).
     fn render_settings_policy_card(&mut self, ui: &mut egui::Ui, _s: &StatusSnapshot) {
         theme::card().show(ui, |ui| {
+            ui.set_min_width(ui.available_width());
             ui.label(theme::section_heading("Policy actions"));
-            ui.add_space(6.0);
-            ui.label(
-                "File-based export / import lives in the CLI for now — open a \
-                 PowerShell and run:",
-            );
-            ui.add_space(2.0);
-            ui.colored_label(theme::p().accent, "  framesage policy export <path>");
-            ui.colored_label(theme::p().accent, "  framesage policy import <path>");
-            ui.add_space(8.0);
+            ui.add_space(theme::SP_SM);
             #[cfg(windows)]
             {
-                let reset_btn = ui.add_enabled(
-                    self.elevated,
-                    egui::Button::new(
-                        egui::RichText::new("Reset policy to defaults")
-                            .color(theme::p().error)
-                            .strong(),
-                    ),
-                );
-                if reset_btn.clicked() {
-                    self.settings.reset_confirm_visible = true;
-                }
-                if !self.elevated {
+                // Destructive: outlined in error color in every state
+                // (§3g), not just when hovered.
+                if self.elevated {
+                    if theme::danger_button(ui, "Reset policy to defaults")
+                        .on_hover_text(
+                            "Replace policy.json with the shipped defaults. \
+                             Rules, profile edits, and ProBalance tuning are lost.",
+                        )
+                        .clicked()
+                    {
+                        self.settings.reset_confirm_visible = true;
+                    }
+                } else {
+                    ui.add_enabled(
+                        false,
+                        egui::Button::new(
+                            egui::RichText::new("Reset policy to defaults")
+                                .color(theme::p().text_dim),
+                        ),
+                    );
                     ui.colored_label(
                         theme::p().text_muted,
                         "Relaunch as administrator to reset the policy.",
                     );
                 }
             }
+            ui.add_space(theme::SP_MD);
+            ui.label(
+                egui::RichText::new("Export / import lives in the CLI:")
+                    .size(11.0)
+                    .color(theme::p().text_muted),
+            );
+            ui.add_space(2.0);
+            ui.label(
+                egui::RichText::new("framesage policy export <path>")
+                    .monospace()
+                    .size(11.0)
+                    .color(theme::p().accent),
+            );
+            ui.label(
+                egui::RichText::new("framesage policy import <path>")
+                    .monospace()
+                    .size(11.0)
+                    .color(theme::p().accent),
+            );
         });
     }
 
@@ -2870,39 +2916,48 @@ impl FramesageApp {
                 .collect()
         };
 
-        // Filter UI — kind chips + substring search.
+        // Filter row (design §3c): substring field, then kind chips,
+        // then a right-aligned Clear log. Chips replace the checkbox
+        // row — same multi-select semantics, less visual noise.
         ui.horizontal(|ui| {
-            ui.label("Show:");
-            ui.checkbox(&mut self.activity.show_foreground, "Foreground");
-            ui.checkbox(&mut self.activity.show_engine, "Engine");
-            ui.checkbox(
-                &mut self.activity.show_probalance_restrain,
-                "ProBalance demote",
-            );
-            ui.checkbox(
-                &mut self.activity.show_probalance_restore,
-                "ProBalance restore",
-            );
-            ui.checkbox(&mut self.activity.show_other, "Other");
-            ui.add_space(8.0);
-            ui.label("Find:");
             ui.add(
                 egui::TextEdit::singleline(&mut self.activity.filter)
-                    .hint_text("substring (case-insensitive)")
-                    .desired_width(220.0),
+                    .hint_text("Filter events…")
+                    .desired_width(260.0),
             );
-            if ui.button("Clear").clicked() {
-                self.activity.filter.clear();
+            ui.add_space(theme::SP_SM);
+            let chips: [(&str, &mut bool); 5] = [
+                ("Foreground", &mut self.activity.show_foreground),
+                ("Engine", &mut self.activity.show_engine),
+                (
+                    "ProBalance demote",
+                    &mut self.activity.show_probalance_restrain,
+                ),
+                (
+                    "ProBalance restore",
+                    &mut self.activity.show_probalance_restore,
+                ),
+                ("Other", &mut self.activity.show_other),
+            ];
+            for (label, flag) in chips {
+                if theme::chip(ui, label, *flag).clicked() {
+                    *flag = !*flag;
+                }
             }
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                let total = events.len();
-                ui.colored_label(theme::p().text_muted, format!("{total} events"));
-                if ui.button("Clear log").clicked() {
+                if ui
+                    .button("Clear log")
+                    .on_hover_text(
+                        "Empty the in-memory event buffer (activity.jsonl on disk is untouched).",
+                    )
+                    .clicked()
+                {
                     self.state.lock().recent.clear();
                 }
+                ui.colored_label(theme::p().text_muted, format!("{} events", events.len()));
             });
         });
-        ui.add_space(4.0);
+        ui.add_space(theme::SP_SM);
 
         // Apply filters (in newest-first order so the most recent event
         // sits at the top — opposite of the underlying buffer's append
@@ -2936,7 +2991,20 @@ impl FramesageApp {
             return;
         }
 
-        // Table: Time | Kind | Message. Wide message column on the right.
+        // Coalesce runs of the identical event into one row with a
+        // "× n" suffix (§3c). The engine fires ForegroundChanged on
+        // every focus shift, including self-shifts when popups close,
+        // so an uncoalesced log is mostly the same line repeated. The
+        // kept timestamp is the newest of the run.
+        let mut rows: Vec<(&RecentEvent, usize)> = Vec::with_capacity(filtered.len());
+        for e in filtered {
+            match rows.last_mut() {
+                Some((prev, n)) if prev.kind == e.kind && prev.label == e.label => *n += 1,
+                _ => rows.push((e, 1)),
+            }
+        }
+
+        // Table: TIME | KIND | EVENT. Wide event column on the right.
         TableBuilder::new(ui)
             .striped(true)
             .resizable(true)
@@ -2944,28 +3012,43 @@ impl FramesageApp {
             .column(Column::initial(95.0).at_least(80.0))
             .column(Column::initial(180.0).at_least(120.0))
             .column(Column::remainder().at_least(160.0))
-            .header(20.0, |mut header| {
+            .header(22.0, |mut header| {
                 header.col(|ui| {
-                    ui.label("Time");
+                    ui.label(theme::section_heading("Time"));
                 });
                 header.col(|ui| {
-                    ui.label("Kind");
+                    ui.label(theme::section_heading("Kind"));
                 });
                 header.col(|ui| {
-                    ui.label("Event");
+                    ui.label(theme::section_heading("Event"));
                 });
             })
             .body(|body| {
-                body.rows(18.0, filtered.len(), |mut row| {
-                    let e = filtered[row.index()];
+                body.rows(20.0, rows.len(), |mut row| {
+                    let (e, n) = rows[row.index()];
                     row.col(|ui| {
-                        ui.monospace(format_local_hms(e.at));
+                        ui.label(
+                            egui::RichText::new(format_local_hms(e.at))
+                                .monospace()
+                                .size(11.5)
+                                .color(theme::p().text_dim),
+                        );
                     });
                     row.col(|ui| {
+                        ui.spacing_mut().item_spacing.x = 5.0;
+                        theme::dot(ui, e.kind.color(), 6.0);
                         ui.colored_label(e.kind.color(), e.kind.display());
                     });
                     row.col(|ui| {
-                        ui.label(&e.label);
+                        ui.spacing_mut().item_spacing.x = 6.0;
+                        ui.add(egui::Label::new(&e.label).truncate());
+                        if n > 1 {
+                            ui.label(
+                                egui::RichText::new(format!("× {n}"))
+                                    .size(11.0)
+                                    .color(theme::p().text_dim),
+                            );
+                        }
                     });
                 });
             });
@@ -2999,11 +3082,24 @@ impl FramesageApp {
             ids
         };
 
-        // ─── Toolbar ────────────────────────────────────────────────────────
+        // ─── Toolbar (design §3e) ───────────────────────────────────────────
+        // "+ Add rule" primary, "From foreground (exe)" secondary, and a
+        // right-aligned muted summary. Save changes / Discard only appear
+        // when there's an unsaved draft — the form saves on its own, so in
+        // the common case they'd be two permanently-greyed buttons.
         ui.horizontal(|ui| {
             let add_enabled = self.elevated && self.rules.form.is_none();
             if ui
-                .add_enabled(add_enabled, egui::Button::new("Add rule"))
+                .add_enabled(
+                    add_enabled,
+                    egui::Button::new(
+                        egui::RichText::new("+ Add rule")
+                            .color(theme::p().on_accent)
+                            .strong(),
+                    )
+                    .fill(theme::p().accent)
+                    .stroke(egui::Stroke::new(1.0_f32, theme::p().accent_hover)),
+                )
                 .clicked()
             {
                 let default_profile = profile_ids
@@ -3028,7 +3124,10 @@ impl FramesageApp {
             // pain point during hardware validation.
             let fg_exe = s.foreground.as_ref().map(|fg| fg.exe_name.clone());
             let from_fg_enabled = self.elevated && self.rules.form.is_none() && fg_exe.is_some();
-            let from_fg_btn = egui::Button::new("Add rule for foreground");
+            let from_fg_btn = egui::Button::new(match &fg_exe {
+                Some(exe) => format!("From foreground ({exe})"),
+                None => "From foreground".to_owned(),
+            });
             let resp = ui.add_enabled(from_fg_enabled, from_fg_btn).on_hover_text(
                 "Pre-fill an Add-rule form with the current foreground app's exe name. \
                      You can change the matched profile or the match kind before saving.",
@@ -3066,37 +3165,44 @@ impl FramesageApp {
             // so most users won't even need this button; it's kept for
             // the case where the user makes multiple edits via Edit
             // buttons and wants to batch.
-            let save_enabled = self.elevated && dirty;
-            if ui
-                .add_enabled(save_enabled, egui::Button::new("Save changes"))
-                .clicked()
-            {
-                if let Some(draft) = self.policy_draft.take() {
-                    self.send_admin_request(Request::SetPolicy { policy: draft }, "save policy");
-                }
-            }
-
-            let discard_enabled = dirty;
-            if ui
-                .add_enabled(discard_enabled, egui::Button::new("Discard"))
-                .clicked()
-            {
-                self.policy_draft = None;
-                self.rules.form = None;
-            }
-
             if dirty {
+                if ui
+                    .add_enabled(self.elevated, egui::Button::new("Save changes"))
+                    .clicked()
+                {
+                    if let Some(draft) = self.policy_draft.take() {
+                        self.send_admin_request(
+                            Request::SetPolicy { policy: draft },
+                            "save policy",
+                        );
+                    }
+                }
+                if ui.button("Discard").clicked() {
+                    self.policy_draft = None;
+                    self.rules.form = None;
+                }
                 theme::status_badge(theme::p().warning).show(ui, |ui| {
                     ui.colored_label(theme::p().warning, "unsaved");
                 });
             }
+
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                ui.colored_label(
+                    theme::p().text_muted,
+                    format!(
+                        "{} rule{} · default profile: {}",
+                        displayed_policy.rules.len(),
+                        if displayed_policy.rules.len() == 1 {
+                            ""
+                        } else {
+                            "s"
+                        },
+                        display_profile_id(&displayed_policy.default_profile.0),
+                    ),
+                );
+            });
         });
-
-        if let Some(msg) = self.last_action.lock().as_ref() {
-            ui.small(msg);
-        }
-
-        ui.separator();
+        ui.add_space(theme::SP_SM);
 
         // ─── Inline form (add or edit) ──────────────────────────────────────
         if let Some(form) = &mut self.rules.form {
@@ -3229,52 +3335,121 @@ impl FramesageApp {
             ui.separator();
         }
 
-        // ─── Rule list ──────────────────────────────────────────────────────
+        // ─── Rule list (design §3e) ─────────────────────────────────────────
+        // EXECUTABLE (bold) | PROFILE (accent) | NOTE (muted) | Remove.
+        // The match kind rides along as a muted prefix on non-exe matches
+        // so "path~" / "title~" rules stay distinguishable without a
+        // fourth column.
         let rules = displayed_policy.rules.clone();
         if rules.is_empty() {
-            ui.label("(no rules — add one to map a foreground app to a profile)");
+            ui.colored_label(
+                theme::p().text_muted,
+                "No rules yet — add one to map a foreground app to a profile.",
+            );
         } else {
-            egui::ScrollArea::vertical().show(ui, |ui| {
-                let mut delete_index: Option<usize> = None;
-                let mut edit_index: Option<usize> = None;
-                for (i, rule) in rules.iter().enumerate() {
-                    ui.horizontal(|ui| {
-                        let (kind, value) = match &rule.r#match {
-                            AppMatch::ExeName(s) => ("exe", s.as_str()),
-                            AppMatch::PathContains(s) => ("path~", s.as_str()),
-                            AppMatch::WindowTitleContains(s) => ("title~", s.as_str()),
-                        };
-                        ui.label(format!(
-                            "{:6}  {}  ->  {}{}",
-                            kind,
-                            value,
-                            rule.profile,
-                            if rule.note.is_empty() {
-                                String::new()
-                            } else {
-                                format!("  ({})", rule.note)
-                            }
-                        ));
-                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                            let actions_enabled = self.elevated && self.rules.form.is_none();
-                            if ui
-                                .add_enabled(actions_enabled, egui::Button::new("Delete"))
-                                .on_hover_text("Delete rule")
-                                .clicked()
-                            {
-                                delete_index = Some(i);
-                            }
-                            if ui
-                                .add_enabled(actions_enabled, egui::Button::new("Edit"))
-                                .on_hover_text("Edit rule")
-                                .clicked()
-                            {
-                                edit_index = Some(i);
-                            }
+            let mut delete_index: Option<usize> = None;
+            let mut edit_index: Option<usize> = None;
+            let actions_enabled = self.elevated && self.rules.form.is_none();
+            {
+                use egui_extras::{Column, TableBuilder};
+                TableBuilder::new(ui)
+                    .vscroll(false)
+                    .cell_layout(egui::Layout::left_to_right(egui::Align::Center))
+                    .column(Column::initial(220.0).at_least(140.0))
+                    .column(Column::initial(150.0).at_least(100.0))
+                    .column(Column::remainder().at_least(120.0))
+                    .column(Column::exact(120.0))
+                    .header(22.0, |mut header| {
+                        header.col(|ui| {
+                            ui.label(theme::section_heading("Executable"));
+                        });
+                        header.col(|ui| {
+                            ui.label(theme::section_heading("Profile"));
+                        });
+                        header.col(|ui| {
+                            ui.label(theme::section_heading("Note"));
+                        });
+                        header.col(|_ui| {});
+                    })
+                    .body(|body| {
+                        body.rows(26.0, rules.len(), |mut row| {
+                            let i = row.index();
+                            let rule = &rules[i];
+                            let (kind, value) = match &rule.r#match {
+                                AppMatch::ExeName(s) => ("", s.as_str()),
+                                AppMatch::PathContains(s) => ("path~ ", s.as_str()),
+                                AppMatch::WindowTitleContains(s) => ("title~ ", s.as_str()),
+                            };
+                            row.col(|ui| {
+                                ui.spacing_mut().item_spacing.x = 0.0;
+                                if !kind.is_empty() {
+                                    ui.label(
+                                        egui::RichText::new(kind)
+                                            .monospace()
+                                            .size(11.0)
+                                            .color(theme::p().text_dim),
+                                    );
+                                }
+                                ui.add(
+                                    egui::Label::new(
+                                        egui::RichText::new(value).strong().color(theme::p().text),
+                                    )
+                                    .truncate(),
+                                );
+                            });
+                            row.col(|ui| {
+                                ui.colored_label(
+                                    theme::p().accent,
+                                    display_profile_id(&rule.profile.0),
+                                );
+                            });
+                            row.col(|ui| {
+                                ui.add(
+                                    egui::Label::new(
+                                        egui::RichText::new(&rule.note)
+                                            .color(theme::p().text_muted),
+                                    )
+                                    .truncate(),
+                                );
+                            });
+                            row.col(|ui| {
+                                ui.with_layout(
+                                    egui::Layout::right_to_left(egui::Align::Center),
+                                    |ui| {
+                                        if ui
+                                            .add_enabled(
+                                                actions_enabled,
+                                                egui::Button::new(
+                                                    egui::RichText::new("Remove")
+                                                        .color(theme::p().error),
+                                                )
+                                                .frame(false),
+                                            )
+                                            .clicked()
+                                        {
+                                            delete_index = Some(i);
+                                        }
+                                        if ui
+                                            .add_enabled(
+                                                actions_enabled,
+                                                egui::Button::new(
+                                                    egui::RichText::new("Edit")
+                                                        .color(theme::p().text_muted),
+                                                )
+                                                .frame(false),
+                                            )
+                                            .clicked()
+                                        {
+                                            edit_index = Some(i);
+                                        }
+                                    },
+                                );
+                            });
                         });
                     });
-                }
+            }
 
+            {
                 if let Some(i) = delete_index {
                     let draft = self.policy_draft.get_or_insert_with(|| s.policy.clone());
                     if i < draft.rules.len() {
@@ -3297,7 +3472,7 @@ impl FramesageApp {
                         });
                     }
                 }
-            });
+            }
         }
 
         // ─── Affinity Rules section ────────────────────────────────────────
@@ -3322,16 +3497,21 @@ impl FramesageApp {
     fn render_affinity_rules_section(&mut self, ui: &mut egui::Ui, policy: &Policy) {
         use egui_extras::{Column, TableBuilder};
 
-        ui.heading("Persistent CPU-Affinity Rules");
+        // §3e's second section. Same uppercase section-heading treatment
+        // as every other group label rather than an egui `heading`, which
+        // was the only 18 px serif-weight text on the tab.
+        ui.label(theme::section_heading("Persistent CPU-affinity rules"));
+        ui.add_space(theme::SP_XS);
         ui.label(
             egui::RichText::new(
                 "Each rule pins a CPU mask onto every process whose exe name matches. \
                  The engine re-applies them on every spawn and re-asserts every ~2 s \
                  to defeat games that override their own affinity at startup.",
             )
+            .size(11.0)
             .color(theme::p().text_muted),
         );
-        ui.add_space(6.0);
+        ui.add_space(theme::SP_SM);
 
         if policy.affinity_rules.is_empty() {
             ui.colored_label(
@@ -3358,25 +3538,27 @@ impl FramesageApp {
             .column(Column::initial(200.0).at_least(120.0)) // Selector
             .column(Column::remainder().at_least(120.0)) // Note
             .column(Column::exact(90.0)) // Remove
-            .header(20.0, |mut header| {
+            .header(22.0, |mut header| {
                 header.col(|ui| {
-                    ui.strong("Exe");
+                    ui.label(theme::section_heading("Executable"));
                 });
                 header.col(|ui| {
-                    ui.strong("Pin");
+                    ui.label(theme::section_heading("Pin"));
                 });
                 header.col(|ui| {
-                    ui.strong("Note");
+                    ui.label(theme::section_heading("Note"));
                 });
-                header.col(|ui| {
-                    ui.strong("");
-                });
+                header.col(|_ui| {});
             })
             .body(|mut body| {
                 for rule in &rules {
-                    body.row(20.0, |mut row| {
+                    body.row(24.0, |mut row| {
                         row.col(|ui| {
-                            ui.monospace(&rule.exe_name);
+                            ui.label(
+                                egui::RichText::new(&rule.exe_name)
+                                    .strong()
+                                    .color(theme::p().text),
+                            );
                         });
                         row.col(|ui| {
                             ui.label(affinity_selector_label(&rule.selector));
@@ -3476,13 +3658,25 @@ impl FramesageApp {
         if clear_manual_clicked {
             self.send_admin_request(Request::ClearManualOverride, "clear manual override");
         }
+        // ─── Toolbar (design §3f) ───────────────────────────────────────────
+        // "+ New profile" primary, right-aligned muted count. Save /
+        // Discard appear only while a draft is dirty.
         ui.horizontal(|ui| {
             let add_enabled = self.elevated
                 && self.profiles.editing_id.is_none()
                 && self.profiles.new_form.is_none()
                 && self.rules.form.is_none();
             if ui
-                .add_enabled(add_enabled, egui::Button::new("Add profile"))
+                .add_enabled(
+                    add_enabled,
+                    egui::Button::new(
+                        egui::RichText::new("+ New profile")
+                            .color(theme::p().on_accent)
+                            .strong(),
+                    )
+                    .fill(theme::p().accent)
+                    .stroke(egui::Stroke::new(1.0_f32, theme::p().accent_hover)),
+                )
                 .on_hover_text(
                     "Create a new profile. After saving, expand the new profile \
                      and click Edit to fill in the per-process knobs and Game Mode.",
@@ -3503,29 +3697,42 @@ impl FramesageApp {
             // policy_draft every frame (via Op::UpdateProfile), so it's
             // safe to persist mid-edit — the user can keep editing
             // afterwards and Save again.
-            let save_enabled = self.elevated && dirty;
-            if ui
-                .add_enabled(save_enabled, egui::Button::new("Save changes"))
-                .clicked()
-            {
-                if let Some(draft) = self.policy_draft.take() {
-                    self.send_admin_request(Request::SetPolicy { policy: draft }, "save policy");
-                }
-            }
-            let discard_enabled = dirty;
-            if ui
-                .add_enabled(discard_enabled, egui::Button::new("Discard"))
-                .clicked()
-            {
-                self.policy_draft = None;
-                self.profiles.editing_id = None;
-                self.profiles.new_form = None;
-            }
             if dirty {
+                if ui
+                    .add_enabled(self.elevated, egui::Button::new("Save changes"))
+                    .clicked()
+                {
+                    if let Some(draft) = self.policy_draft.take() {
+                        self.send_admin_request(
+                            Request::SetPolicy { policy: draft },
+                            "save policy",
+                        );
+                    }
+                }
+                if ui.button("Discard").clicked() {
+                    self.policy_draft = None;
+                    self.profiles.editing_id = None;
+                    self.profiles.new_form = None;
+                }
                 theme::status_badge(theme::p().warning).show(ui, |ui| {
                     ui.colored_label(theme::p().warning, "unsaved");
                 });
             }
+
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                ui.colored_label(
+                    theme::p().text_muted,
+                    format!(
+                        "{} profile{}",
+                        displayed_policy.profiles.len(),
+                        if displayed_policy.profiles.len() == 1 {
+                            ""
+                        } else {
+                            "s"
+                        },
+                    ),
+                );
+            });
         });
 
         // Inline new-profile form. Renders below the toolbar when active.
@@ -3646,84 +3853,96 @@ impl FramesageApp {
                 let is_active = s.active_profile.as_ref().is_some_and(|ap| ap.id == *id);
                 let is_editing = self.profiles.editing_id.as_deref() == Some(id.0.as_str());
                 let pretty = display_profile_id(&id.0);
-                let header_text = if is_editing {
-                    format!("{pretty}  (editing)")
-                } else if is_active {
-                    format!("{pretty}  (active)")
-                } else {
-                    pretty
-                };
-                let header_color = if is_active {
-                    theme::p().accent
-                } else {
-                    theme::p().text
-                };
-                let header = egui::RichText::new(header_text).color(header_color);
-                egui::CollapsingHeader::new(header)
-                    .default_open(is_active || is_editing)
-                    .id_source(("profile-card", id.0.as_str()))
-                    .show(ui, |ui| {
-                        ui.horizontal(|ui| {
-                            let edit_enabled = self.elevated
-                                && self.profiles.editing_id.is_none()
-                                && self.rules.form.is_none();
-                            if !is_editing
-                                && ui
-                                    .add_enabled(edit_enabled, egui::Button::new("Edit"))
-                                    .clicked()
-                            {
-                                ops.push(Op::EnterEdit(id.0.clone()));
-                            }
-                            if is_editing && ui.button("Done").clicked() {
-                                ops.push(Op::ExitEdit);
-                            }
-                            // Item 4.13 — Preview button. Only visible
-                            // in edit mode; shows what THIS profile (in
-                            // its current draft state) would do against
-                            // the current foreground app. No commit;
-                            // the modal's Apply still uses the existing
-                            // save flow.
-                            if is_editing
-                                && ui
-                                    .button("Preview")
-                                    .on_hover_text(
-                                        "Show exactly what this profile would do if applied \
-                                         against the current foreground process. No changes \
-                                         are made until you click Apply in the preview modal.",
-                                    )
-                                    .clicked()
-                            {
-                                ops.push(Op::OpenPreview(id.0.clone(), Box::new(p.clone())));
-                            }
-                            // Apply-now: send ApplyOnce(id) over the admin
-                            // pipe. Disabled in edit mode (the user should
-                            // Save first) and on the already-active profile
-                            // (no-op vs. the normal rule-match path).
-                            let apply_enabled = self.elevated
+                let is_manual = s.manual_override.as_ref().is_some_and(|m| m == id);
+                // One card per profile (design §3f): name + description on
+                // the first row with the actions right-aligned, the four
+                // headline knobs on the second. The old CollapsingHeader
+                // hid all of that behind a disclosure triangle, so the tab
+                // read as a list of names.
+                theme::card().show(ui, |ui| {
+                    ui.set_min_width(ui.available_width());
+                    ui.horizontal(|ui| {
+                        ui.spacing_mut().item_spacing.x = 6.0;
+                        ui.label(
+                            egui::RichText::new(&pretty)
+                                .size(14.0)
+                                .strong()
+                                .color(theme::p().accent),
+                        );
+                        if is_active {
+                            theme::status_badge(theme::p().success).show(ui, |ui| {
+                                ui.label(
+                                    egui::RichText::new("active")
+                                        .size(11.0)
+                                        .color(theme::p().success),
+                                );
+                            });
+                        }
+                        if is_editing {
+                            theme::status_badge(theme::p().warning).show(ui, |ui| {
+                                ui.label(
+                                    egui::RichText::new("editing")
+                                        .size(11.0)
+                                        .color(theme::p().warning),
+                                );
+                            });
+                        }
+
+                        // Actions pin to the right edge. Right-to-left
+                        // layout adds rightmost-first, so this source
+                        // order paints as: Edit · Preview · Apply ·
+                        // manual · Delete.
+                        let is_default = displayed_policy.default_profile == *id;
+                        let is_background = displayed_policy
+                            .background_profile
+                            .as_ref()
+                            .is_some_and(|p| p == id);
+                        let referenced_by_rule =
+                            displayed_policy.rules.iter().any(|r| r.profile == *id);
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            // Delete: destructive, so it sits furthest
+                            // from the benign actions. Disabled while the
+                            // engine still references the profile.
+                            let delete_enabled = self.elevated
                                 && !is_editing
                                 && !is_active
+                                && !is_manual
+                                && !is_default
+                                && !is_background
+                                && !referenced_by_rule
                                 && self.rules.form.is_none();
-                            let apply_btn = egui::Button::new(
-                                egui::RichText::new("Apply to foreground").strong(),
-                            )
-                            .fill(theme::p().accent)
-                            .stroke(egui::Stroke::new(1.0_f32, theme::p().accent_hover));
+                            let hover = if is_default {
+                                "Cannot delete the default profile."
+                            } else if is_background {
+                                "Cannot delete the background profile."
+                            } else if referenced_by_rule {
+                                "Cannot delete: still referenced by one or more rules. \
+                                 Remove or edit those rules first."
+                            } else if is_active || is_manual {
+                                "Cannot delete the currently-applied profile."
+                            } else {
+                                "Delete this profile from the policy."
+                            };
                             if ui
-                                .add_enabled(apply_enabled, apply_btn)
-                                .on_hover_text(
-                                    "Apply this profile to the current foreground app right now. \
-                                     The override holds until you focus a different app, at which \
-                                     point the Rules tab decides what profile to apply next.",
+                                .add_enabled(
+                                    delete_enabled,
+                                    egui::Button::new(egui::RichText::new("Delete").color(
+                                        if delete_enabled {
+                                            theme::p().error
+                                        } else {
+                                            theme::p().text_dim
+                                        },
+                                    ))
+                                    .frame(false),
                                 )
+                                .on_hover_text(hover)
                                 .clicked()
                             {
-                                ops.push(Op::ApplyNow(id.0.clone()));
+                                ops.push(Op::DeleteProfile(id.0.clone()));
                             }
 
-                            // Manual-mode toggle for this profile. If this profile
-                            // is already the manual override, the button becomes an
-                            // exit affordance; otherwise it sets the override.
-                            let is_manual = s.manual_override.as_ref().is_some_and(|m| m == id);
+                            // Manual-mode toggle. Already-manual profiles
+                            // get the exit affordance instead.
                             let manual_label = if is_manual {
                                 "Exit manual mode"
                             } else {
@@ -3732,7 +3951,14 @@ impl FramesageApp {
                             let manual_enabled =
                                 self.elevated && !is_editing && self.rules.form.is_none();
                             if ui
-                                .add_enabled(manual_enabled, egui::Button::new(manual_label))
+                                .add_enabled(
+                                    manual_enabled,
+                                    egui::Button::new(
+                                        egui::RichText::new(manual_label)
+                                            .color(theme::p().text_muted),
+                                    )
+                                    .frame(false),
+                                )
                                 .on_hover_text(
                                     "Manual mode pins this profile across every focus change. \
                                      The Rules tab and default profile are bypassed until you \
@@ -3747,88 +3973,166 @@ impl FramesageApp {
                                 }
                             }
 
-                            // Delete: right-aligned, separated visually since
-                            // it's destructive. Disabled on the active /
-                            // manual / default / background profile to stop
-                            // the user from deleting something the engine is
-                            // currently referencing.
-                            let is_default = displayed_policy.default_profile == *id;
-                            let is_background = displayed_policy
-                                .background_profile
-                                .as_ref()
-                                .is_some_and(|p| p == id);
-                            let referenced_by_rule =
-                                displayed_policy.rules.iter().any(|r| r.profile == *id);
-                            let delete_enabled = self.elevated
+                            // Apply-now: ApplyOnce(id) over the admin pipe.
+                            // Disabled in edit mode (Save first) and on the
+                            // already-active profile (no-op).
+                            let apply_enabled = self.elevated
                                 && !is_editing
                                 && !is_active
-                                && !is_manual
-                                && !is_default
-                                && !is_background
-                                && !referenced_by_rule
                                 && self.rules.form.is_none();
-                            ui.with_layout(
-                                egui::Layout::right_to_left(egui::Align::Center),
-                                |ui| {
-                                    let hover = if is_default {
-                                        "Cannot delete the default profile."
-                                    } else if is_background {
-                                        "Cannot delete the background profile."
-                                    } else if referenced_by_rule {
-                                        "Cannot delete: still referenced by one or more rules. \
-                                         Remove or edit those rules first."
-                                    } else if is_active || is_manual {
-                                        "Cannot delete the currently-applied profile."
-                                    } else {
-                                        "Delete this profile from the policy."
-                                    };
-                                    if ui
-                                        .add_enabled(delete_enabled, egui::Button::new("Delete"))
-                                        .on_hover_text(hover)
-                                        .clicked()
-                                    {
-                                        ops.push(Op::DeleteProfile(id.0.clone()));
-                                    }
-                                },
-                            );
+                            if ui
+                                .add_enabled(
+                                    apply_enabled,
+                                    egui::Button::new(
+                                        egui::RichText::new("Apply to foreground")
+                                            .color(theme::p().accent),
+                                    )
+                                    .frame(false),
+                                )
+                                .on_hover_text(
+                                    "Apply this profile to the current foreground app right now. \
+                                     The override holds until you focus a different app, at which \
+                                     point the Rules tab decides what profile to apply next.",
+                                )
+                                .clicked()
+                            {
+                                ops.push(Op::ApplyNow(id.0.clone()));
+                            }
+
+                            // Item 4.13 — Preview: what this profile (in
+                            // its current draft state) would do against
+                            // the current foreground. Edit mode only.
+                            if is_editing
+                                && ui
+                                    .add(egui::Button::new("Preview").frame(false))
+                                    .on_hover_text(
+                                        "Show exactly what this profile would do if applied \
+                                         against the current foreground process. No changes \
+                                         are made until you click Apply in the preview modal.",
+                                    )
+                                    .clicked()
+                            {
+                                ops.push(Op::OpenPreview(id.0.clone(), Box::new(p.clone())));
+                            }
+
+                            let edit_enabled = self.elevated
+                                && self.profiles.editing_id.is_none()
+                                && self.rules.form.is_none();
+                            if is_editing {
+                                if ui.button("Done").clicked() {
+                                    ops.push(Op::ExitEdit);
+                                }
+                            } else if ui
+                                .add_enabled(
+                                    edit_enabled,
+                                    egui::Button::new(
+                                        egui::RichText::new("Edit").color(theme::p().text_muted),
+                                    )
+                                    .frame(false),
+                                )
+                                .clicked()
+                            {
+                                ops.push(Op::EnterEdit(id.0.clone()));
+                            }
+
+                            // Description last, inside the same
+                            // right-to-left pass: it takes whatever the
+                            // buttons left, so it sits next to the name
+                            // and truncates instead of pushing the
+                            // actions off the card. Added outside this
+                            // closure it got zero width and vanished.
+                            if !p.description.is_empty() {
+                                ui.add(
+                                    egui::Label::new(
+                                        egui::RichText::new(&p.description)
+                                            .color(theme::p().text_muted),
+                                    )
+                                    .truncate(),
+                                );
+                            }
                         });
-                        if is_editing {
-                            let mut edited = p.clone();
-                            // Item 4.13 — pass the discover context
-                            // so the editor can render the discover-
-                            // processes and discover-services
-                            // wizards against live data.
-                            let services_snapshot = self.discover_services_cache.lock().clone();
-                            let mut refresh_services = false;
-                            let mut discover = editors::DiscoverContext {
-                                processes: &self.processes.rows,
-                                services: &services_snapshot,
-                                services_refresh_requested: &mut refresh_services,
-                            };
-                            render_profile_editor(ui, &mut edited, &mut discover);
-                            if refresh_services {
-                                // Fire ListServices in a background
-                                // thread; result populates the cache
-                                // for the next render.
-                                let cache = self.discover_services_cache.clone();
-                                std::thread::spawn(move || {
-                                    if let Ok(framesage_ipc::Response::Services { services }) =
-                                        send_request_blocking(
-                                            framesage_ipc::PIPE_NAME_STATUS,
-                                            &Request::ListServices,
-                                        )
-                                    {
-                                        *cache.lock() = services;
-                                    }
-                                });
-                            }
-                            if edited != *p {
-                                ops.push(Op::UpdateProfile(id.0.clone(), Box::new(edited)));
-                            }
-                        } else {
-                            render_profile_body(ui, p);
-                        }
                     });
+
+                    // Second row: the four knobs the mockup calls out.
+                    ui.add_space(theme::SP_XS);
+                    ui.horizontal_wrapped(|ui| {
+                        ui.spacing_mut().item_spacing.x = 5.0;
+                        let kv = |ui: &mut egui::Ui, k: &str, v: String| {
+                            ui.label(
+                                egui::RichText::new(k)
+                                    .size(12.0)
+                                    .color(theme::p().text_muted),
+                            );
+                            ui.label(egui::RichText::new(v).size(12.0).color(theme::p().text));
+                            ui.add_space(theme::SP_SM);
+                        };
+                        kv(ui, "CPU sets:", format_cpu_selector(p.cpu_sets.as_ref()));
+                        kv(
+                            ui,
+                            "Priority:",
+                            p.priority_class
+                                .map(|v| v.to_string())
+                                .unwrap_or_else(|| "—".into()),
+                        );
+                        kv(ui, "Game Mode:", yes_no(p.game_mode.is_some()).into());
+                        kv(
+                            ui,
+                            "Manual-global:",
+                            yes_no(p.manual_global_eligible).into(),
+                        );
+                    });
+
+                    if is_editing {
+                        let mut edited = p.clone();
+                        // Item 4.13 — pass the discover context
+                        // so the editor can render the discover-
+                        // processes and discover-services
+                        // wizards against live data.
+                        let services_snapshot = self.discover_services_cache.lock().clone();
+                        let mut refresh_services = false;
+                        let mut discover = editors::DiscoverContext {
+                            processes: &self.processes.rows,
+                            services: &services_snapshot,
+                            services_refresh_requested: &mut refresh_services,
+                        };
+                        render_profile_editor(ui, &mut edited, &mut discover);
+                        if refresh_services {
+                            // Fire ListServices in a background
+                            // thread; result populates the cache
+                            // for the next render.
+                            let cache = self.discover_services_cache.clone();
+                            std::thread::spawn(move || {
+                                if let Ok(framesage_ipc::Response::Services { services }) =
+                                    send_request_blocking(
+                                        framesage_ipc::PIPE_NAME_STATUS,
+                                        &Request::ListServices,
+                                    )
+                                {
+                                    *cache.lock() = services;
+                                }
+                            });
+                        }
+                        if edited != *p {
+                            ops.push(Op::UpdateProfile(id.0.clone(), Box::new(edited)));
+                        }
+                    } else {
+                        // Everything the two summary rows don't carry —
+                        // I/O and memory priority, working-set trim, the
+                        // full Game Mode service/process lists — behind a
+                        // disclosure so the card stays two lines tall.
+                        egui::CollapsingHeader::new(
+                            egui::RichText::new("All settings")
+                                .size(11.5)
+                                .color(theme::p().text_muted),
+                        )
+                        .id_source(("profile-detail", id.0.as_str()))
+                        .default_open(false)
+                        .show(ui, |ui| {
+                            render_profile_body(ui, p);
+                        });
+                    }
+                });
+                ui.add_space(theme::SP_SM);
             }
         });
 
@@ -3945,8 +4249,12 @@ impl FramesageApp {
             .ctx()
             .input(|i| i.key_pressed(egui::Key::F) && (i.modifiers.ctrl || i.modifiers.command));
 
+        // Filter row (design §3b): search field, then the state chips,
+        // then a right-aligned Tree view toggle. The five separate
+        // aggregate labels that used to live on the right collapse into
+        // one muted summary string — the status bar already carries the
+        // process/managed counts.
         ui.horizontal(|ui| {
-            ui.label("Filter:");
             let filter_resp = ui.add(
                 egui::TextEdit::singleline(&mut self.processes.filter)
                     // Item 4.2 — broadened scope: filter searches
@@ -3955,8 +4263,8 @@ impl FramesageApp {
                     // expecting exe-only aren't confused when a
                     // "microsoft" search lights up every Microsoft-
                     // published process.
-                    .hint_text("filter by name, description, company, user")
-                    .desired_width(280.0),
+                    .hint_text("Search process, description, company …")
+                    .desired_width(300.0),
             );
             if ctrl_f_pressed {
                 filter_resp.request_focus();
@@ -3967,71 +4275,62 @@ impl FramesageApp {
             if filter_resp.has_focus() && ui.ctx().input(|i| i.key_pressed(egui::Key::Escape)) {
                 self.processes.filter.clear();
             }
-            if ui.button("Clear").clicked() {
-                self.processes.filter.clear();
+            ui.add_space(theme::SP_SM);
+
+            // State chips — exactly one active (§3b). The mockup's third
+            // chip is "Suspended"; the process snapshot has no suspended
+            // flag (suspension is a Game-Mode action against a fixed
+            // list, not per-process state the engine reports), so the
+            // honest equivalent is ProBalance-restrained — the other
+            // state FrameSage puts a process into.
+            let total = self.processes.rows.len();
+            let chips: [(ProcessFilter, String); 3] = [
+                (ProcessFilter::Managed, format!("Managed ({managed})")),
+                (
+                    ProcessFilter::Restrained,
+                    format!("ProBalance ({restrained})"),
+                ),
+                (ProcessFilter::All, format!("All ({total})")),
+            ];
+            for (kind, label) in chips {
+                if theme::chip(ui, &label, self.processes.state_filter == kind).clicked() {
+                    self.processes.state_filter = kind;
+                }
             }
-            ui.separator();
-            // Tree-mode toggle. Disabled when a filter is set — the filter
-            // forces flat mode so search can find hits buried inside
-            // collapsed subtrees. The disabled checkbox communicates that
-            // without being a no-op (hover shows the explanation).
-            let tree_enabled = self.processes.filter.is_empty();
-            let resp = ui
-                .add_enabled(
-                    tree_enabled,
-                    egui::Checkbox::new(&mut self.processes.tree_mode, "Tree"),
-                )
-                .on_disabled_hover_text("Tree mode is disabled while a filter is active");
-            if tree_enabled && resp.clicked() && self.processes.tree_mode {
-                // Re-enable tree → start fully expanded so the user sees
-                // the whole forest rather than wondering why nothing
-                // appeared.
-                self.processes.collapsed.clear();
-            }
+
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                let count = self.processes.rows.len();
-                ui.colored_label(theme::p().text_muted, format!("{count} processes"))
-                    .on_hover_text(
-                        "Total live processes the engine can see, including those whose \
-                         exe path it can't open (protected processes still get a row).",
-                    );
-                ui.separator();
-                ui.colored_label(theme::p().text_muted, format!("{total_threads} threads"))
-                    .on_hover_text("Sum of OS thread counts across every visible process.");
-                ui.separator();
+                // Tree-mode toggle. Disabled when a filter is set — the
+                // filter forces flat mode so search can find hits buried
+                // inside collapsed subtrees.
+                let tree_enabled = self.processes.filter.is_empty();
+                let resp = ui
+                    .add_enabled(
+                        tree_enabled,
+                        egui::Checkbox::new(&mut self.processes.tree_mode, "Tree view"),
+                    )
+                    .on_disabled_hover_text("Tree mode is disabled while a filter is active");
+                if tree_enabled && resp.clicked() && self.processes.tree_mode {
+                    // Re-enable tree → start fully expanded so the user
+                    // sees the whole forest rather than wondering why
+                    // nothing appeared.
+                    self.processes.collapsed.clear();
+                }
+                ui.add_space(theme::SP_MD);
                 ui.colored_label(
                     theme::p().text_muted,
-                    format!("{} mem", format_bytes(total_mem)),
-                )
-                .on_hover_text("Sum of working-set bytes across every visible process.");
-                ui.separator();
-                ui.colored_label(
-                    theme::p().text_muted,
-                    format!("Total CPU {total_cpu_one_cpu}%"),
+                    format!(
+                        "{total_cpu_one_cpu}% CPU · {} · {total_threads} threads",
+                        format_bytes(total_mem)
+                    ),
                 )
                 .on_hover_text(
-                    "Sum of per-process CPU% in 'percent of one logical CPU' units. \
-                         A 16-thread box maxes at 1600%.",
+                    "Totals across every visible process. CPU is summed in \
+                     'percent of one logical CPU' units, so a 16-thread box maxes \
+                     at 1600%. Memory is summed working set.",
                 );
-                if managed > 0 {
-                    ui.separator();
-                    ui.colored_label(theme::p().accent, format!("{managed} managed"))
-                        .on_hover_text(
-                            "Processes that have an active FrameSage profile applied — \
-                             matched a rule, manual override, or one-shot ApplyOnce.",
-                        );
-                }
-                if restrained > 0 {
-                    ui.separator();
-                    ui.colored_label(theme::p().warning, format!("{restrained} restrained"))
-                        .on_hover_text(
-                            "Processes that ProBalance has temporarily demoted because \
-                             they're hogging CPU under contention.",
-                        );
-                }
             });
         });
-        ui.add_space(4.0);
+        ui.add_space(theme::SP_SM);
 
         // ─── Apply filter + sort to a local view ───────────────────────────
         //
@@ -4055,6 +4354,11 @@ impl FramesageApp {
             .processes
             .rows
             .iter()
+            .filter(|p| match self.processes.state_filter {
+                ProcessFilter::Managed => p.managed_profile.is_some(),
+                ProcessFilter::Restrained => p.restrained_by_probalance,
+                ProcessFilter::All => true,
+            })
             .filter(|p| {
                 if filter_lc.is_empty() {
                     return true;
@@ -4275,10 +4579,21 @@ impl FramesageApp {
                         // but applying it inside `body.rows` requires more
                         // surgery; row-height alone delivers most of the
                         // win.
+                        // Two-line rows (§3b): exe name over a muted
+                        // "Description · Company" line. The sub-line only
+                        // carries fields whose dedicated column is hidden
+                        // — with every optional column on it would just
+                        // repeat the cells three to its right. Compact
+                        // mode keeps single-line rows and drops it.
+                        let sub_desc = !cols.description;
+                        let sub_company = !cols.company;
+                        let two_line = !self.settings.compact_mode && (sub_desc || sub_company);
                         let row_h = if self.settings.compact_mode {
-                            14.0
+                            16.0
+                        } else if two_line {
+                            34.0
                         } else {
-                            18.0
+                            22.0
                         };
                         body.rows(row_h, visible.len(), |mut row| {
                             let tr = visible[row.index()];
@@ -4330,251 +4645,259 @@ impl FramesageApp {
                             });
 
                             row.col(|ui| {
-                                ui.horizontal(|ui| {
-                                    ui.spacing_mut().item_spacing.x = 2.0;
-                                    // Tree indent + ▶/▼ toggle. Tree mode
-                                    // only — in flat mode tr.depth is 0
-                                    // and tr.has_children is false, so no
-                                    // indent and no glyph.
-                                    if tr.depth > 0 {
-                                        ui.add_space(tr.depth as f32 * 14.0);
-                                    }
-                                    if tr.has_children {
-                                        let collapsed_now = self.processes.collapsed.contains(&pid);
-                                        // ASCII glyphs — the unicode triangles
-                                        // ▶/▼ render as empty boxes in egui's
-                                        // default font (no glyph coverage),
-                                        // which the user reported as "stupid
-                                        // squares" everywhere. ASCII renders
-                                        // identically on every font.
-                                        let glyph = if collapsed_now { "+" } else { "-" };
-                                        let tri = ui.add(
-                                            egui::Label::new(
-                                                egui::RichText::new(glyph)
-                                                    .color(theme::p().text_muted)
-                                                    .monospace(),
-                                            )
-                                            .sense(egui::Sense::click()),
-                                        );
-                                        if tri.clicked() {
-                                            toggled_pid = Some(pid);
+                                ui.vertical(|ui| {
+                                    ui.spacing_mut().item_spacing.y = 0.0;
+                                    ui.horizontal(|ui| {
+                                        ui.spacing_mut().item_spacing.x = 2.0;
+                                        // Tree indent + ▶/▼ toggle. Tree mode
+                                        // only — in flat mode tr.depth is 0
+                                        // and tr.has_children is false, so no
+                                        // indent and no glyph.
+                                        if tr.depth > 0 {
+                                            ui.add_space(tr.depth as f32 * 14.0);
                                         }
-                                    } else if tr.depth > 0 {
-                                        // Leaf child: reserve the toggle's
-                                        // width so labels of siblings still
-                                        // align under the parent's name.
-                                        ui.add_space(10.0);
-                                    }
+                                        if tr.has_children {
+                                            let collapsed_now =
+                                                self.processes.collapsed.contains(&pid);
+                                            // ASCII glyphs — the unicode triangles
+                                            // ▶/▼ render as empty boxes in egui's
+                                            // default font (no glyph coverage),
+                                            // which the user reported as "stupid
+                                            // squares" everywhere. ASCII renders
+                                            // identically on every font.
+                                            let glyph = if collapsed_now { "+" } else { "-" };
+                                            let tri = ui.add(
+                                                egui::Label::new(
+                                                    egui::RichText::new(glyph)
+                                                        .color(theme::p().text_muted)
+                                                        .monospace(),
+                                                )
+                                                .sense(egui::Sense::click()),
+                                            );
+                                            if tri.clicked() {
+                                                toggled_pid = Some(pid);
+                                            }
+                                        } else if tr.depth > 0 {
+                                            // Leaf child: reserve the toggle's
+                                            // width so labels of siblings still
+                                            // align under the parent's name.
+                                            ui.add_space(10.0);
+                                        }
 
-                                    // Foreground rows get a small right-pointing triangle
-                                    // prefix so the eye picks them out instantly even
-                                    // when the user has scrolled away from the colored
-                                    // marker. ASCII `> ` instead of unicode triangle —
-                                    // egui's default font doesn't include the
-                                    // Geometric Shapes block, and unicode triangles
-                                    // render as empty boxes.
-                                    let label_text = if state == RowState::Foreground {
-                                        format!("> {}", p.exe_name)
-                                    } else {
-                                        p.exe_name.clone()
-                                    };
-                                    // Wrap the label in an explicit
-                                    // `Label::sense(click)` so a single click
-                                    // toggles row selection. The subsequent
-                                    // .context_menu() call attaches the
-                                    // right-click menu to the same response —
-                                    // same widget serves both interactions.
-                                    let label = egui::Label::new(
-                                        egui::RichText::new(label_text).color(row_exe_color(state)),
-                                    )
-                                    .sense(egui::Sense::click());
-                                    let mut resp = ui.add(label);
-                                    // Highlight the currently-selected row by stroking
-                                    // a thin accent border around the cell. Multi-
-                                    // selected rows get a translucent fill so the
-                                    // user can see the bulk-action target set at
-                                    // a glance, distinct from the single "detail"
-                                    // selection's stroke.
-                                    let in_multi = self.processes.multi_selected.contains(&pid);
-                                    if in_multi {
-                                        let rect = ui.max_rect();
-                                        ui.painter().rect_filled(
-                                            rect,
-                                            egui::Rounding::ZERO,
-                                            egui::Color32::from_rgba_unmultiplied(50, 130, 246, 40),
-                                        );
-                                    }
-                                    if selected_pid == Some(pid) {
-                                        let rect = ui.max_rect();
-                                        ui.painter().rect_stroke(
-                                            rect,
-                                            egui::Rounding::ZERO,
-                                            egui::Stroke::new(1.0_f32, theme::p().accent),
-                                        );
-                                    }
-                                    if resp.clicked() {
-                                        clicked_pid = Some(pid);
-                                        resp.mark_changed();
-                                    }
-                                    // Right-click anywhere on the name opens the per-PID
-                                    // context menu — same affordance Process Explorer uses.
-                                    // When the right-clicked row is part of the multi-
-                                    // selection, the menu acts on EVERY selected PID;
-                                    // otherwise it acts only on the right-clicked one
-                                    // (Task Manager / Process Explorer convention).
-                                    let multi = &self.processes.multi_selected;
-                                    let in_multi_now = multi.contains(&pid);
-                                    let targets: Vec<(u32, String)> =
-                                        if in_multi_now && multi.len() > 1 {
-                                            rows.iter()
-                                                .filter(|r| multi.contains(&r.pid))
-                                                .map(|r| (r.pid, r.exe_name.clone()))
-                                                .collect()
+                                        // Foreground rows get a small right-pointing triangle
+                                        // prefix so the eye picks them out instantly even
+                                        // when the user has scrolled away from the colored
+                                        // marker. ASCII `> ` instead of unicode triangle —
+                                        // egui's default font doesn't include the
+                                        // Geometric Shapes block, and unicode triangles
+                                        // render as empty boxes.
+                                        let label_text = if state == RowState::Foreground {
+                                            format!("> {}", p.exe_name)
                                         } else {
-                                            vec![(pid, exe.clone())]
+                                            p.exe_name.clone()
                                         };
-                                    let bulk = targets.len() > 1;
-                                    resp.context_menu(|ui| {
-                                        if bulk {
-                                            ui.label(format!(
-                                                "{} processes selected",
-                                                targets.len()
-                                            ));
-                                        } else {
-                                            ui.label(format!("{} (pid {})", exe, pid));
+                                        // Wrap the label in an explicit
+                                        // `Label::sense(click)` so a single click
+                                        // toggles row selection. The subsequent
+                                        // .context_menu() call attaches the
+                                        // right-click menu to the same response —
+                                        // same widget serves both interactions.
+                                        let label = egui::Label::new(
+                                            egui::RichText::new(label_text)
+                                                .color(row_exe_color(state)),
+                                        )
+                                        .sense(egui::Sense::click());
+                                        let mut resp = ui.add(label);
+                                        // Highlight the currently-selected row by stroking
+                                        // a thin accent border around the cell. Multi-
+                                        // selected rows get a translucent fill so the
+                                        // user can see the bulk-action target set at
+                                        // a glance, distinct from the single "detail"
+                                        // selection's stroke.
+                                        let in_multi = self.processes.multi_selected.contains(&pid);
+                                        if in_multi {
+                                            let rect = ui.max_rect();
+                                            ui.painter().rect_filled(
+                                                rect,
+                                                egui::Rounding::ZERO,
+                                                egui::Color32::from_rgba_unmultiplied(
+                                                    50, 130, 246, 40,
+                                                ),
+                                            );
                                         }
-                                        ui.separator();
-                                        ui.menu_button("Set priority", |ui| {
-                                            for (label, class) in PRIORITY_CHOICES.iter() {
-                                                if ui.button(*label).clicked() {
-                                                    for (t_pid, _) in &targets {
-                                                        action_queue.push(
-                                                            ProcessAction::SetPriority {
-                                                                pid: *t_pid,
-                                                                class: *class,
-                                                            },
-                                                        );
-                                                    }
-                                                    ui.close_menu();
-                                                }
+                                        if selected_pid == Some(pid) {
+                                            let rect = ui.max_rect();
+                                            ui.painter().rect_stroke(
+                                                rect,
+                                                egui::Rounding::ZERO,
+                                                egui::Stroke::new(1.0_f32, theme::p().accent),
+                                            );
+                                        }
+                                        if resp.clicked() {
+                                            clicked_pid = Some(pid);
+                                            resp.mark_changed();
+                                        }
+                                        // Right-click anywhere on the name opens the per-PID
+                                        // context menu — same affordance Process Explorer uses.
+                                        // When the right-clicked row is part of the multi-
+                                        // selection, the menu acts on EVERY selected PID;
+                                        // otherwise it acts only on the right-clicked one
+                                        // (Task Manager / Process Explorer convention).
+                                        let multi = &self.processes.multi_selected;
+                                        let in_multi_now = multi.contains(&pid);
+                                        let targets: Vec<(u32, String)> =
+                                            if in_multi_now && multi.len() > 1 {
+                                                rows.iter()
+                                                    .filter(|r| multi.contains(&r.pid))
+                                                    .map(|r| (r.pid, r.exe_name.clone()))
+                                                    .collect()
+                                            } else {
+                                                vec![(pid, exe.clone())]
+                                            };
+                                        let bulk = targets.len() > 1;
+                                        resp.context_menu(|ui| {
+                                            if bulk {
+                                                ui.label(format!(
+                                                    "{} processes selected",
+                                                    targets.len()
+                                                ));
+                                            } else {
+                                                ui.label(format!("{} (pid {})", exe, pid));
                                             }
-                                        });
-                                        ui.menu_button("Apply profile now", |ui| {
-                                            for pid_name in &profile_ids {
-                                                if ui.button(pid_name).clicked() {
-                                                    // ApplyProfileForeground actually
-                                                    // applies to the FOREGROUND process
-                                                    // (single-shot). For bulk we'd want
-                                                    // per-PID apply — falling back to
-                                                    // foreground apply for the bulk
-                                                    // case until that IPC lands.
-                                                    action_queue.push(
-                                                        ProcessAction::ApplyProfileForeground {
-                                                            profile: pid_name.clone(),
-                                                        },
-                                                    );
-                                                    ui.close_menu();
-                                                }
-                                            }
-                                        });
-                                        ui.menu_button("Create rule for this exe", |ui| {
-                                            for pid_name in &profile_ids {
-                                                if ui.button(pid_name).clicked() {
-                                                    // For bulk, dedupe by exe so we
-                                                    // don't push N identical Create
-                                                    // actions for the same exe name
-                                                    // (every steamwebhelper.exe row
-                                                    // shares the same name).
-                                                    let mut seen = std::collections::HashSet::new();
-                                                    for (_, e) in &targets {
-                                                        let lk = e.to_ascii_lowercase();
-                                                        if seen.insert(lk) {
+                                            ui.separator();
+                                            ui.menu_button("Set priority", |ui| {
+                                                for (label, class) in PRIORITY_CHOICES.iter() {
+                                                    if ui.button(*label).clicked() {
+                                                        for (t_pid, _) in &targets {
                                                             action_queue.push(
-                                                                ProcessAction::CreateRule {
-                                                                    exe_name: e.clone(),
-                                                                    profile: pid_name.clone(),
+                                                                ProcessAction::SetPriority {
+                                                                    pid: *t_pid,
+                                                                    class: *class,
                                                                 },
                                                             );
                                                         }
+                                                        ui.close_menu();
                                                     }
-                                                    ui.close_menu();
                                                 }
-                                            }
-                                        });
-                                        // ProBalance user-ignore toggle. Dedupe
-                                        // targets by exe; the label direction
-                                        // follows whether every unique exe is
-                                        // already excluded.
-                                        let unique_exes: Vec<String> = {
-                                            let mut seen = std::collections::HashSet::new();
-                                            targets
-                                                .iter()
-                                                .filter(|(_, e)| {
-                                                    seen.insert(e.to_ascii_lowercase())
-                                                })
-                                                .map(|(_, e)| e.clone())
-                                                .collect()
-                                        };
-                                        let all_excluded = unique_exes.iter().all(|e| {
-                                            probalance_excluded.contains(&e.to_ascii_lowercase())
-                                        });
-                                        let menu_label = if all_excluded {
-                                            "Include in ProBalance"
-                                        } else {
-                                            "Exclude from ProBalance"
-                                        };
-                                        if ui
-                                            .button(menu_label)
-                                            .on_hover_text(
-                                                "ProBalance never restrains excluded \
+                                            });
+                                            ui.menu_button("Apply profile now", |ui| {
+                                                for pid_name in &profile_ids {
+                                                    if ui.button(pid_name).clicked() {
+                                                        // ApplyProfileForeground actually
+                                                        // applies to the FOREGROUND process
+                                                        // (single-shot). For bulk we'd want
+                                                        // per-PID apply — falling back to
+                                                        // foreground apply for the bulk
+                                                        // case until that IPC lands.
+                                                        action_queue.push(
+                                                            ProcessAction::ApplyProfileForeground {
+                                                                profile: pid_name.clone(),
+                                                            },
+                                                        );
+                                                        ui.close_menu();
+                                                    }
+                                                }
+                                            });
+                                            ui.menu_button("Create rule for this exe", |ui| {
+                                                for pid_name in &profile_ids {
+                                                    if ui.button(pid_name).clicked() {
+                                                        // For bulk, dedupe by exe so we
+                                                        // don't push N identical Create
+                                                        // actions for the same exe name
+                                                        // (every steamwebhelper.exe row
+                                                        // shares the same name).
+                                                        let mut seen =
+                                                            std::collections::HashSet::new();
+                                                        for (_, e) in &targets {
+                                                            let lk = e.to_ascii_lowercase();
+                                                            if seen.insert(lk) {
+                                                                action_queue.push(
+                                                                    ProcessAction::CreateRule {
+                                                                        exe_name: e.clone(),
+                                                                        profile: pid_name.clone(),
+                                                                    },
+                                                                );
+                                                            }
+                                                        }
+                                                        ui.close_menu();
+                                                    }
+                                                }
+                                            });
+                                            // ProBalance user-ignore toggle. Dedupe
+                                            // targets by exe; the label direction
+                                            // follows whether every unique exe is
+                                            // already excluded.
+                                            let unique_exes: Vec<String> = {
+                                                let mut seen = std::collections::HashSet::new();
+                                                targets
+                                                    .iter()
+                                                    .filter(|(_, e)| {
+                                                        seen.insert(e.to_ascii_lowercase())
+                                                    })
+                                                    .map(|(_, e)| e.clone())
+                                                    .collect()
+                                            };
+                                            let all_excluded = unique_exes.iter().all(|e| {
+                                                probalance_excluded
+                                                    .contains(&e.to_ascii_lowercase())
+                                            });
+                                            let menu_label = if all_excluded {
+                                                "Include in ProBalance"
+                                            } else {
+                                                "Exclude from ProBalance"
+                                            };
+                                            if ui
+                                                .button(menu_label)
+                                                .on_hover_text(
+                                                    "ProBalance never restrains excluded \
                                                  processes, even under CPU contention. \
                                                  Persists across restarts.",
-                                            )
-                                            .clicked()
-                                        {
-                                            for e in &unique_exes {
-                                                action_queue.push(
-                                                    ProcessAction::SetProBalanceExclusion {
-                                                        exe_name: e.clone(),
-                                                        exclude: !all_excluded,
-                                                    },
-                                                );
+                                                )
+                                                .clicked()
+                                            {
+                                                for e in &unique_exes {
+                                                    action_queue.push(
+                                                        ProcessAction::SetProBalanceExclusion {
+                                                            exe_name: e.clone(),
+                                                            exclude: !all_excluded,
+                                                        },
+                                                    );
+                                                }
+                                                ui.close_menu();
                                             }
-                                            ui.close_menu();
-                                        }
-                                        ui.menu_button("Set CPU affinity", |ui| {
-                                            // ── Remember toggle ─────────────────
-                                            // Session-sticky checkbox at the top of
-                                            // the submenu. When on, every action
-                                            // below also writes a persistent rule
-                                            // keyed by the targeted exe. Kept
-                                            // visually prominent (colored when on)
-                                            // so the user notices it's still
-                                            // armed on next open.
-                                            let label = if self.processes.remember_affinity {
-                                                egui::RichText::new("✓ Remember as rule")
-                                                    .color(theme::p().accent)
-                                                    .strong()
-                                            } else {
-                                                egui::RichText::new("Remember as rule")
-                                            };
-                                            ui.checkbox(
-                                                &mut self.processes.remember_affinity,
-                                                label,
-                                            )
-                                            .on_hover_text(
-                                                "When checked, the affinity you pick \
+                                            ui.menu_button("Set CPU affinity", |ui| {
+                                                // ── Remember toggle ─────────────────
+                                                // Session-sticky checkbox at the top of
+                                                // the submenu. When on, every action
+                                                // below also writes a persistent rule
+                                                // keyed by the targeted exe. Kept
+                                                // visually prominent (colored when on)
+                                                // so the user notices it's still
+                                                // armed on next open.
+                                                let label = if self.processes.remember_affinity {
+                                                    egui::RichText::new("✓ Remember as rule")
+                                                        .color(theme::p().accent)
+                                                        .strong()
+                                                } else {
+                                                    egui::RichText::new("Remember as rule")
+                                                };
+                                                ui.checkbox(
+                                                    &mut self.processes.remember_affinity,
+                                                    label,
+                                                )
+                                                .on_hover_text(
+                                                    "When checked, the affinity you pick \
                                                  here also saves as a persistent rule \
                                                  keyed by exe name — the same mask is \
                                                  re-applied automatically on every \
                                                  future launch. 'All cores (reset)' \
                                                  also clears any existing rule. Stays \
                                                  on until you uncheck it.",
-                                            );
-                                            ui.separator();
+                                                );
+                                                ui.separator();
 
-                                            let remember = self.processes.remember_affinity;
-                                            let mut affinity_dispatch =
+                                                let remember = self.processes.remember_affinity;
+                                                let mut affinity_dispatch =
                                                 |sel: framesage_core::CpuSelector,
                                                  close: &mut bool| {
                                                     for (t_pid, t_exe) in &targets {
@@ -4593,222 +4916,263 @@ impl FramesageApp {
                                                     }
                                                     *close = true;
                                                 };
-                                            let mut want_close = false;
-                                            if ui.button("X3D CCD (Cache cores)").clicked() {
-                                                affinity_dispatch(
-                                                    framesage_core::CpuSelector::Kind(
-                                                        framesage_core::CoreKind::Cache,
-                                                    ),
-                                                    &mut want_close,
-                                                );
-                                            }
-                                            if ui
-                                                .button("Non-X3D CCD (Performance cores)")
-                                                .clicked()
-                                            {
-                                                affinity_dispatch(
-                                                    framesage_core::CpuSelector::Kind(
-                                                        framesage_core::CoreKind::Performance,
-                                                    ),
-                                                    &mut want_close,
-                                                );
-                                            }
-                                            if ui.button("All cores (reset)").clicked() {
-                                                affinity_dispatch(
-                                                    framesage_core::CpuSelector::All,
-                                                    &mut want_close,
-                                                );
-                                            }
-                                            if ui.button("Custom…").clicked() {
-                                                // The picker is single-PID by design
-                                                // (one mask per process). For bulk
-                                                // custom-mask use, the user picks once
-                                                // then can use Ctrl-click + the X3D /
-                                                // non-X3D presets next time.
-                                                action_queue.push(
-                                                    ProcessAction::RequestAffinityPicker {
-                                                        pid,
-                                                        exe_name: exe.clone(),
-                                                    },
-                                                );
-                                                want_close = true;
-                                            }
-                                            if want_close {
-                                                ui.close_menu();
-                                            }
-                                        });
-
-                                        // ─── Shell + Copy actions ────────────
-                                        // Show in Explorer / Copy submenu — the
-                                        // standard "where does this thing live
-                                        // and how do I tell someone about it"
-                                        // affordances every Windows process
-                                        // viewer ships. Only meaningful for the
-                                        // single-row case; for bulk select they
-                                        // lose meaning.
-                                        if !bulk {
-                                            ui.separator();
-                                            let show_enabled = !p.exe_path.is_empty();
-                                            if ui
-                                                .add_enabled(
-                                                    show_enabled,
-                                                    egui::Button::new("Show in Explorer"),
-                                                )
-                                                .on_hover_text(
-                                                    "Open the folder containing this exe \
-                                                     in Explorer with the file selected.",
-                                                )
-                                                .on_disabled_hover_text(
-                                                    "Engine couldn't resolve the exe path \
-                                                     (protected process or already exited).",
-                                                )
-                                                .clicked()
-                                            {
-                                                action_queue.push(ProcessAction::ShowInExplorer {
-                                                    path: p.exe_path.clone(),
-                                                });
-                                                ui.close_menu();
-                                            }
-                                            ui.menu_button("Copy", |ui| {
-                                                if ui.button(format!("PID  ({pid})")).clicked() {
-                                                    action_queue.push(
-                                                        ProcessAction::CopyToClipboard {
-                                                            text: pid.to_string(),
-                                                        },
+                                                let mut want_close = false;
+                                                if ui.button("X3D CCD (Cache cores)").clicked() {
+                                                    affinity_dispatch(
+                                                        framesage_core::CpuSelector::Kind(
+                                                            framesage_core::CoreKind::Cache,
+                                                        ),
+                                                        &mut want_close,
                                                     );
-                                                    ui.close_menu();
                                                 }
-                                                if ui.button(format!("Exe name  ({exe})")).clicked()
+                                                if ui
+                                                    .button("Non-X3D CCD (Performance cores)")
+                                                    .clicked()
                                                 {
-                                                    action_queue.push(
-                                                        ProcessAction::CopyToClipboard {
-                                                            text: exe.clone(),
-                                                        },
+                                                    affinity_dispatch(
+                                                        framesage_core::CpuSelector::Kind(
+                                                            framesage_core::CoreKind::Performance,
+                                                        ),
+                                                        &mut want_close,
                                                     );
-                                                    ui.close_menu();
                                                 }
-                                                if !p.exe_path.is_empty()
-                                                    && ui.button("Full path").clicked()
-                                                {
+                                                if ui.button("All cores (reset)").clicked() {
+                                                    affinity_dispatch(
+                                                        framesage_core::CpuSelector::All,
+                                                        &mut want_close,
+                                                    );
+                                                }
+                                                if ui.button("Custom…").clicked() {
+                                                    // The picker is single-PID by design
+                                                    // (one mask per process). For bulk
+                                                    // custom-mask use, the user picks once
+                                                    // then can use Ctrl-click + the X3D /
+                                                    // non-X3D presets next time.
                                                     action_queue.push(
-                                                        ProcessAction::CopyToClipboard {
-                                                            text: p.exe_path.clone(),
+                                                        ProcessAction::RequestAffinityPicker {
+                                                            pid,
+                                                            exe_name: exe.clone(),
                                                         },
                                                     );
+                                                    want_close = true;
+                                                }
+                                                if want_close {
                                                     ui.close_menu();
                                                 }
                                             });
-                                        }
 
-                                        // ─── Tree-aware bulk: Suspend tree ───
-                                        // Only meaningful when the parent is
-                                        // actually showing children (tr.has_children
-                                        // implies "this row is a parent in the
-                                        // current snapshot"). Single-PID only —
-                                        // for ctrl-multi-select the existing
-                                        // bulk Suspend handles the same use case.
-                                        if !bulk && tr.has_children {
-                                            ui.separator();
-                                            if ui
-                                                .button("Suspend tree (this + children)")
-                                                .on_hover_text(
-                                                    "Suspend this process plus every \
+                                            // ─── Shell + Copy actions ────────────
+                                            // Show in Explorer / Copy submenu — the
+                                            // standard "where does this thing live
+                                            // and how do I tell someone about it"
+                                            // affordances every Windows process
+                                            // viewer ships. Only meaningful for the
+                                            // single-row case; for bulk select they
+                                            // lose meaning.
+                                            if !bulk {
+                                                ui.separator();
+                                                let show_enabled = !p.exe_path.is_empty();
+                                                if ui
+                                                    .add_enabled(
+                                                        show_enabled,
+                                                        egui::Button::new("Show in Explorer"),
+                                                    )
+                                                    .on_hover_text(
+                                                        "Open the folder containing this exe \
+                                                     in Explorer with the file selected.",
+                                                    )
+                                                    .on_disabled_hover_text(
+                                                        "Engine couldn't resolve the exe path \
+                                                     (protected process or already exited).",
+                                                    )
+                                                    .clicked()
+                                                {
+                                                    action_queue.push(
+                                                        ProcessAction::ShowInExplorer {
+                                                            path: p.exe_path.clone(),
+                                                        },
+                                                    );
+                                                    ui.close_menu();
+                                                }
+                                                ui.menu_button("Copy", |ui| {
+                                                    if ui.button(format!("PID  ({pid})")).clicked()
+                                                    {
+                                                        action_queue.push(
+                                                            ProcessAction::CopyToClipboard {
+                                                                text: pid.to_string(),
+                                                            },
+                                                        );
+                                                        ui.close_menu();
+                                                    }
+                                                    if ui
+                                                        .button(format!("Exe name  ({exe})"))
+                                                        .clicked()
+                                                    {
+                                                        action_queue.push(
+                                                            ProcessAction::CopyToClipboard {
+                                                                text: exe.clone(),
+                                                            },
+                                                        );
+                                                        ui.close_menu();
+                                                    }
+                                                    if !p.exe_path.is_empty()
+                                                        && ui.button("Full path").clicked()
+                                                    {
+                                                        action_queue.push(
+                                                            ProcessAction::CopyToClipboard {
+                                                                text: p.exe_path.clone(),
+                                                            },
+                                                        );
+                                                        ui.close_menu();
+                                                    }
+                                                });
+                                            }
+
+                                            // ─── Tree-aware bulk: Suspend tree ───
+                                            // Only meaningful when the parent is
+                                            // actually showing children (tr.has_children
+                                            // implies "this row is a parent in the
+                                            // current snapshot"). Single-PID only —
+                                            // for ctrl-multi-select the existing
+                                            // bulk Suspend handles the same use case.
+                                            if !bulk && tr.has_children {
+                                                ui.separator();
+                                                if ui
+                                                    .button("Suspend tree (this + children)")
+                                                    .on_hover_text(
+                                                        "Suspend this process plus every \
                                                      descendant reachable via parent-PID. \
                                                      Same primitive as plain Suspend, just \
                                                      applied to the whole subtree.",
-                                                )
-                                                .clicked()
-                                            {
-                                                action_queue.push(ProcessAction::SuspendTree {
-                                                    root_pid: pid,
-                                                });
-                                                ui.close_menu();
+                                                    )
+                                                    .clicked()
+                                                {
+                                                    action_queue.push(ProcessAction::SuspendTree {
+                                                        root_pid: pid,
+                                                    });
+                                                    ui.close_menu();
+                                                }
                                             }
-                                        }
 
-                                        ui.separator();
-                                        let trim_label = if bulk {
-                                            format!(
-                                                "Trim working set on {} processes",
-                                                targets.len()
-                                            )
-                                        } else {
-                                            "Trim working set".to_string()
-                                        };
-                                        if ui
-                                            .button(trim_label)
-                                            .on_hover_text(
-                                                "Release the process's resident pages back \
+                                            ui.separator();
+                                            let trim_label = if bulk {
+                                                format!(
+                                                    "Trim working set on {} processes",
+                                                    targets.len()
+                                                )
+                                            } else {
+                                                "Trim working set".to_string()
+                                            };
+                                            if ui
+                                                .button(trim_label)
+                                                .on_hover_text(
+                                                    "Release the process's resident pages back \
                                                  to the kernel — frees RAM for a heavy launch. \
                                                  The process's working set re-grows on next \
                                                  page-touch, so use as a pre-launch nudge.",
-                                            )
-                                            .clicked()
-                                        {
-                                            for (t_pid, _) in &targets {
-                                                action_queue.push(ProcessAction::TrimWorkingSet {
-                                                    pid: *t_pid,
-                                                });
+                                                )
+                                                .clicked()
+                                            {
+                                                for (t_pid, _) in &targets {
+                                                    action_queue.push(
+                                                        ProcessAction::TrimWorkingSet {
+                                                            pid: *t_pid,
+                                                        },
+                                                    );
+                                                }
+                                                ui.close_menu();
                                             }
-                                            ui.close_menu();
-                                        }
-                                        ui.separator();
-                                        let suspend_label = if bulk {
-                                            format!("Suspend {} processes", targets.len())
-                                        } else {
-                                            "Suspend process".to_string()
-                                        };
-                                        if ui.button(suspend_label).clicked() {
-                                            for (t_pid, _) in &targets {
-                                                action_queue
-                                                    .push(ProcessAction::Suspend { pid: *t_pid });
-                                            }
-                                            ui.close_menu();
-                                        }
-                                        let resume_label = if bulk {
-                                            format!("Resume {} processes", targets.len())
-                                        } else {
-                                            "Resume process".to_string()
-                                        };
-                                        if ui.button(resume_label).clicked() {
-                                            for (t_pid, _) in &targets {
-                                                action_queue
-                                                    .push(ProcessAction::Resume { pid: *t_pid });
-                                            }
-                                            ui.close_menu();
-                                        }
-                                        ui.separator();
-                                        let terminate_label = if bulk {
-                                            format!("Terminate {} processes…", targets.len())
-                                        } else {
-                                            "Terminate process…".to_string()
-                                        };
-                                        if ui
-                                            .add(egui::Button::new(
-                                                egui::RichText::new(terminate_label)
-                                                    .color(theme::p().error),
-                                            ))
-                                            .clicked()
-                                        {
-                                            // Terminate is gated by the confirm modal.
-                                            // For bulk, we push one RequestTerminate
-                                            // per PID — the modal opens for the first,
-                                            // and the next pops up after Cancel/Apply
-                                            // until they're all resolved. (Could be
-                                            // improved to a single multi-target modal
-                                            // in a follow-up.)
-                                            for (t_pid, e_name) in &targets {
-                                                action_queue.push(
-                                                    ProcessAction::RequestTerminate {
+                                            ui.separator();
+                                            let suspend_label = if bulk {
+                                                format!("Suspend {} processes", targets.len())
+                                            } else {
+                                                "Suspend process".to_string()
+                                            };
+                                            if ui.button(suspend_label).clicked() {
+                                                for (t_pid, _) in &targets {
+                                                    action_queue.push(ProcessAction::Suspend {
                                                         pid: *t_pid,
-                                                        exe_name: e_name.clone(),
-                                                    },
-                                                );
+                                                    });
+                                                }
+                                                ui.close_menu();
                                             }
-                                            ui.close_menu();
+                                            let resume_label = if bulk {
+                                                format!("Resume {} processes", targets.len())
+                                            } else {
+                                                "Resume process".to_string()
+                                            };
+                                            if ui.button(resume_label).clicked() {
+                                                for (t_pid, _) in &targets {
+                                                    action_queue.push(ProcessAction::Resume {
+                                                        pid: *t_pid,
+                                                    });
+                                                }
+                                                ui.close_menu();
+                                            }
+                                            ui.separator();
+                                            let terminate_label = if bulk {
+                                                format!("Terminate {} processes…", targets.len())
+                                            } else {
+                                                "Terminate process…".to_string()
+                                            };
+                                            if ui
+                                                .add(egui::Button::new(
+                                                    egui::RichText::new(terminate_label)
+                                                        .color(theme::p().error),
+                                                ))
+                                                .clicked()
+                                            {
+                                                // Terminate is gated by the confirm modal.
+                                                // For bulk, we push one RequestTerminate
+                                                // per PID — the modal opens for the first,
+                                                // and the next pops up after Cancel/Apply
+                                                // until they're all resolved. (Could be
+                                                // improved to a single multi-target modal
+                                                // in a follow-up.)
+                                                for (t_pid, e_name) in &targets {
+                                                    action_queue.push(
+                                                        ProcessAction::RequestTerminate {
+                                                            pid: *t_pid,
+                                                            exe_name: e_name.clone(),
+                                                        },
+                                                    );
+                                                }
+                                                ui.close_menu();
+                                            }
+                                        });
+                                    }); // ui.horizontal (tree indent + name)
+
+                                    // Second line: "Description · Company",
+                                    // the same version-resource strings the
+                                    // optional columns carry — shown here so
+                                    // the default column set can stay narrow
+                                    // without losing the publisher context.
+                                    if two_line {
+                                        let d = p.description.as_deref().filter(|_| sub_desc);
+                                        let c = p.company.as_deref().filter(|_| sub_company);
+                                        let sub = match (d, c) {
+                                            (Some(d), Some(c)) => format!("{d} · {c}"),
+                                            (Some(d), None) => d.to_owned(),
+                                            (None, Some(c)) => c.to_owned(),
+                                            (None, None) => String::new(),
+                                        };
+                                        if !sub.is_empty() {
+                                            ui.horizontal(|ui| {
+                                                if tr.depth > 0 {
+                                                    ui.add_space(tr.depth as f32 * 14.0);
+                                                }
+                                                ui.add(
+                                                    egui::Label::new(
+                                                        egui::RichText::new(sub)
+                                                            .size(11.0)
+                                                            .color(theme::p().text_dim),
+                                                    )
+                                                    .truncate(),
+                                                );
+                                            });
                                         }
-                                    });
-                                }); // ui.horizontal (tree indent + name)
+                                    }
+                                }); // ui.vertical (two-line name cell)
                             });
                             // Description: human-readable label from the
                             // exe's version resource ("Microsoft OneDrive",
@@ -4877,12 +5241,41 @@ impl FramesageApp {
                                 ui.monospace(p.pid.to_string());
                             });
                             row.col(|ui| {
-                                // Color the CPU% column based on intensity: green for
-                                // idle, yellow for moderate, red for hot. Anchors
-                                // attention on the actually-busy processes at a
-                                // glance — same affordance Task Manager / PL use.
+                                // Thin bar + right-aligned percentage (§3b).
+                                // Color tracks intensity — green idle, amber
+                                // moderate, red hot — so a busy process is
+                                // findable without reading a single number.
                                 let color = cpu_percent_color(p.cpu_percent);
-                                ui.colored_label(color, format!("{}", p.cpu_percent));
+                                let full = ui.available_width();
+                                let bar_w = (full - 42.0).clamp(20.0, 140.0);
+                                let (rect, _) = ui.allocate_exact_size(
+                                    egui::vec2(bar_w, 4.0),
+                                    egui::Sense::hover(),
+                                );
+                                let painter = ui.painter();
+                                painter.rect_filled(
+                                    rect,
+                                    egui::Rounding::same(2.0),
+                                    theme::p().surface_active,
+                                );
+                                // Bar scale is one logical CPU = full width;
+                                // a multi-threaded process can exceed 100%,
+                                // so clamp the fill and let the number carry
+                                // the overflow.
+                                let frac = (p.cpu_percent as f32 / 100.0).clamp(0.0, 1.0);
+                                if frac > 0.0 {
+                                    let filled = egui::Rect::from_min_size(
+                                        rect.min,
+                                        egui::vec2(rect.width() * frac, rect.height()),
+                                    );
+                                    painter.rect_filled(filled, egui::Rounding::same(2.0), color);
+                                }
+                                ui.with_layout(
+                                    egui::Layout::right_to_left(egui::Align::Center),
+                                    |ui| {
+                                        ui.colored_label(color, format!("{}%", p.cpu_percent));
+                                    },
+                                );
                             });
                             row.col(|ui| {
                                 let resp = ui.monospace(format_bytes(p.memory_bytes));
@@ -5003,25 +5396,39 @@ impl FramesageApp {
                                 }
                             });
                             row.col(|ui| {
-                                if p.restrained_by_probalance {
-                                    // Painted dot calls out ProBalance
-                                    // involvement; visually pairs with the
-                                    // WARNING-tinted marker bar on the same
-                                    // row. (A "●" glyph would be tofu — the
-                                    // bundled font has no U+25CF.)
-                                    ui.horizontal(|ui| {
-                                        ui.spacing_mut().item_spacing.x = 4.0;
-                                        theme::dot(ui, theme::p().warning, 6.0);
-                                        ui.colored_label(theme::p().warning, "ProBalance");
-                                    });
-                                } else if let Some(note) = &p.matched_rule_note {
-                                    if note.is_empty() {
-                                        ui.weak("rule");
-                                    } else {
-                                        ui.weak(note);
+                                // Status pill (§3b): one badge per engine
+                                // state, colored to match the row's gutter
+                                // bar. Rows FrameSage isn't touching get a
+                                // plain em dash rather than a badge, so the
+                                // column reads as signal not decoration.
+                                let badge = match state {
+                                    RowState::Foreground => Some(("foreground", theme::p().accent)),
+                                    RowState::Restrained => {
+                                        Some(("ProBalance", theme::p().warning))
                                     }
-                                } else {
-                                    ui.weak("—");
+                                    RowState::Managed => Some(("managed", theme::p().success)),
+                                    RowState::Default => None,
+                                };
+                                match badge {
+                                    Some((text, color)) => {
+                                        let resp = theme::status_badge(color)
+                                            .show(ui, |ui| {
+                                                ui.label(
+                                                    egui::RichText::new(text)
+                                                        .size(11.0)
+                                                        .color(color),
+                                                );
+                                            })
+                                            .response;
+                                        if let Some(note) =
+                                            p.matched_rule_note.as_ref().filter(|n| !n.is_empty())
+                                        {
+                                            let _ = resp.on_hover_text(note);
+                                        }
+                                    }
+                                    None => {
+                                        ui.weak("—");
+                                    }
                                 }
                             });
                         });
