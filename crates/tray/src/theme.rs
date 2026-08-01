@@ -144,9 +144,50 @@ pub const SP_XL: f32 = 24.0;
 
 /// A translucent fill of `color` at the given alpha — the one place we
 /// derive low-opacity accent/series fills, so callers stop hand-rolling
-/// `Color32::from_rgba_premultiplied` inline.
+/// alpha math inline.
+///
+/// Uses `from_rgba_unmultiplied`, i.e. straight alpha: `alpha` is the
+/// opacity you'd expect, and egui premultiplies. The previous
+/// `from_rgba_premultiplied` was fed full-strength RGB with a low alpha,
+/// which is the encoding for an almost-opaque *additive* color — so
+/// every "10% tint" in the app (status badges, banners, the selection
+/// fill, the sparkline area) painted as a near-solid block of color.
+/// That, not the palette, is why tinted surfaces read as shouting.
 pub fn fill_alpha(color: Color32, alpha: u8) -> Color32 {
-    Color32::from_rgba_premultiplied(color.r(), color.g(), color.b(), alpha)
+    Color32::from_rgba_unmultiplied(color.r(), color.g(), color.b(), alpha)
+}
+
+/// Opaque blend of `color` over `base` at `t` (0.0–1.0), mixed in sRGB
+/// space — "10% of the accent, 90% of the panel" in the sense a designer
+/// means it.
+///
+/// Why not just a translucent fill: egui's renderer blends in *linear*
+/// space, where a bright accent at 10% alpha over a near-black panel
+/// comes back out at roughly 30% after gamma encoding. The Round-3
+/// paused hero was specified as a 10% amber wash and painted as an olive
+/// block. Mixing ourselves and handing egui an opaque color sidesteps
+/// the blend entirely, and stays correct in the light theme because we
+/// mix over whatever the actual background is.
+pub fn mix(color: Color32, base: Color32, t: f32) -> Color32 {
+    let f = |a: u8, b: u8| (a as f32 * t + b as f32 * (1.0 - t)).clamp(0.0, 255.0) as u8;
+    Color32::from_rgb(
+        f(color.r(), base.r()),
+        f(color.g(), base.g()),
+        f(color.b(), base.b()),
+    )
+}
+
+/// Filled status dot, painted rather than typeset. The bundled font has
+/// no U+25CF glyph, so `RichText::new("●")` renders as a tofu box — the
+/// dots on the hero, the activity rows, and the status bar were all
+/// showing as little squares. Returns the response so callers can
+/// attach hover text.
+pub fn dot(ui: &mut egui::Ui, color: Color32, diameter: f32) -> egui::Response {
+    let (rect, response) =
+        ui.allocate_exact_size(egui::vec2(diameter, diameter), egui::Sense::hover());
+    ui.painter()
+        .circle_filled(rect.center(), diameter / 2.0, color);
+    response
 }
 
 // ─── Apply ───────────────────────────────────────────────────────────────────
@@ -271,12 +312,27 @@ pub fn hero() -> egui::Frame {
         .inner_margin(egui::Margin::symmetric(16.0, 12.0))
 }
 
+/// Hero frame tinted by a semantic color — the Status tab's headline
+/// state card (design Round 3 §3a). Same geometry as [`hero`] but the
+/// fill/stroke pick up `color`: a low-opacity wash plus a ~45%-alpha
+/// border, which reads as "this state is notable" without the
+/// full-strength stroke of [`banner`] (that one is for transient
+/// warnings and would shout next to a 19 px headline).
+pub fn hero_tinted(color: Color32) -> egui::Frame {
+    let pal = p();
+    egui::Frame::none()
+        .fill(mix(color, pal.bg, 0.10))
+        .stroke(Stroke::new(1.0_f32, mix(color, pal.bg, 0.45)))
+        .rounding(Rounding::same(8.0))
+        .inner_margin(egui::Margin::symmetric(16.0, 12.0))
+}
+
 /// Banner frame for stateful warnings / persistent overrides (manual mode,
 /// admin-required, paused engine). Fill picks up the accent color at low
 /// opacity; stroke is full-opacity for legibility against the panel.
 pub fn banner(color: Color32) -> egui::Frame {
     egui::Frame::none()
-        .fill(fill_alpha(color, 0x1f))
+        .fill(mix(color, p().bg, 0.13))
         .stroke(Stroke::new(1.0_f32, color))
         .rounding(Rounding::same(6.0))
         .inner_margin(egui::Margin::symmetric(12.0, 8.0))
@@ -286,7 +342,7 @@ pub fn banner(color: Color32) -> egui::Frame {
 /// at low opacity and a matching foreground stroke.
 pub fn status_badge(color: Color32) -> egui::Frame {
     egui::Frame::none()
-        .fill(fill_alpha(color, 0x33))
+        .fill(mix(color, p().surface, 0.18))
         .stroke(Stroke::new(1.0_f32, color))
         .rounding(Rounding::same(10.0))
         .inner_margin(egui::Margin::symmetric(8.0, 2.0))
@@ -323,7 +379,7 @@ pub fn danger_button(ui: &mut egui::Ui, label: &str) -> egui::Response {
     let text = egui::RichText::new(label).color(pal.error).strong();
     ui.add(
         egui::Button::new(text)
-            .fill(fill_alpha(pal.error, 0x22))
+            .fill(mix(pal.error, pal.surface, 0.14))
             .stroke(Stroke::new(1.0_f32, pal.error)),
     )
 }

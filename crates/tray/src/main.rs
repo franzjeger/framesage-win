@@ -61,8 +61,8 @@ use ipc_client::{
 use process_actions::{render_process_detail, ProcessAction, PRIORITY_CHOICES};
 use state::{AppState, EventKind, RecentEvent};
 use widgets::{
-    format_local_hms, render_activity_strip, render_perf_band, render_profile_body,
-    render_readonly_banner, render_status_bar, render_status_hero,
+    format_local_hms, render_perf_readout, render_profile_body, render_readonly_banner,
+    render_status_bar,
 };
 
 use formatters::{
@@ -862,18 +862,18 @@ impl eframe::App for FramesageApp {
         // Hold the state lock only long enough to copy the snapshot; the
         // edit form needs &mut self.rules which conflicts with a long-held
         // immutable borrow of state.
+        //
+        // `recent_events` is newest-first and carries the whole event
+        // (time + kind + label), not just the label: the Status tab's
+        // activity card renders an `hh:mm:ss` column and a kind-colored
+        // dot per row (design Round 3 §3a).
         let (connected, last_error, status_snapshot, recent_events) = {
             let s = self.state.lock();
             (
                 s.connected,
                 s.last_error.clone(),
                 s.status.clone(),
-                s.recent
-                    .iter()
-                    .rev()
-                    .take(20)
-                    .map(|e| e.label.clone())
-                    .collect::<Vec<_>>(),
+                s.recent.iter().rev().take(16).cloned().collect::<Vec<_>>(),
             )
         };
 
@@ -903,18 +903,12 @@ impl eframe::App for FramesageApp {
             }
         }
 
-        // Pull metrics + activity for the always-visible top/bottom strips.
-        let (system_metrics, system_history, recent_for_strip) = {
+        // Pull metrics for the perf readout in the top bar.
+        let (system_metrics, system_history) = {
             let s = self.state.lock();
             (
                 s.system.clone(),
                 s.system_history.iter().copied().collect::<Vec<_>>(),
-                s.recent
-                    .iter()
-                    .rev()
-                    .take(5)
-                    .map(|e| e.label.clone())
-                    .collect::<Vec<_>>(),
             )
         };
 
@@ -934,74 +928,35 @@ impl eframe::App for FramesageApp {
             .count();
         let last_action_text = self.last_action.lock().clone();
 
-        // ─── Menu bar ──────────────────────────────────────────────────────
-        // File / Engine / View / Tools / Help on the left, FrameSage brand
-        // mark + connection badge on the right. Matches the Process Lasso /
-        // Process Hacker convention for a desktop utility.
-        egui::TopBottomPanel::top("framesage-menubar")
+        // ─── Combined chrome bar (design Round 3 §3a) ──────────────────────
+        // One row replaces the old menubar + toolbar + tab strip + perf
+        // band stack: tabs on the left, live CPU/MEM + sparkline on the
+        // right, every former menu/toolbar command under a single
+        // overflow menu at the far right. That's ~4 rows of chrome
+        // (~120 px) collapsed into ~36 px, all of it given back to the
+        // tab content below.
+        egui::TopBottomPanel::top("framesage-topbar")
             .frame(
                 egui::Frame::none()
                     .fill(theme::p().surface)
-                    .inner_margin(egui::Margin::symmetric(8.0, 4.0))
-                    .stroke(egui::Stroke::new(1.0_f32, theme::p().border)),
-            )
-            .show(ctx, |ui| {
-                self.render_menubar(ui, connected, paused);
-            });
-
-        // ─── Toolbar ───────────────────────────────────────────────────────
-        // Iconic quick actions for the most common one-clicks: pause/resume
-        // the engine, panic-revert Game Mode, open the policy file, jump
-        // into the config folder. Stays light — anything that needs args
-        // belongs in a menu, not here.
-        egui::TopBottomPanel::top("framesage-toolbar")
-            .frame(
-                egui::Frame::none()
-                    .fill(theme::p().bg)
-                    .inner_margin(egui::Margin::symmetric(8.0, 4.0))
-                    .stroke(egui::Stroke::new(1.0_f32, theme::p().border)),
-            )
-            .show(ctx, |ui| {
-                self.render_toolbar(ui, paused, manual_override.is_some());
-            });
-
-        // ─── Tab strip ─────────────────────────────────────────────────────
-        // Chunky bordered tabs with a 2px accent underline on the active one.
-        // Below the toolbar so the visual hierarchy is menu → tools → tabs.
-        egui::TopBottomPanel::top("framesage-tab-strip")
-            .frame(
-                egui::Frame::none()
-                    .fill(theme::p().bg)
                     .inner_margin(egui::Margin {
                         left: 8.0,
-                        right: 8.0,
+                        right: 10.0,
                         top: 0.0,
                         bottom: 0.0,
                     })
                     .stroke(egui::Stroke::new(1.0_f32, theme::p().border)),
             )
             .show(ctx, |ui| {
-                self.render_tab_strip(ui);
-            });
-
-        // ─── Performance band ──────────────────────────────────────────────
-        // CPU% + Mem% + sliding 60s sparkline. Visible on every tab so the
-        // "what is the box doing right now" answer is always one glance away.
-        egui::TopBottomPanel::top("framesage-perf-band")
-            .frame(
-                egui::Frame::none()
-                    .fill(theme::p().surface)
-                    .inner_margin(egui::Margin::symmetric(12.0, 6.0)),
-            )
-            .show(ctx, |ui| {
-                render_perf_band(ui, &system_metrics, &system_history);
+                self.render_top_bar(ui, paused, &system_metrics, &system_history);
             });
 
         // ─── Status bar ────────────────────────────────────────────────────
         // Single thin line at the very bottom: engine state, process count,
-        // app version, last-action echo. Bottom panels stack from the bottom
-        // up by show-order — this one is shown FIRST so it lands on the
-        // window's bottom edge with the activity strip above it.
+        // app version, last-action echo. The activity strip that used to
+        // sit above it is gone — design Round 3 §3a puts activity in
+        // exactly one place per screen (the Status tab's activity card,
+        // with the Activity tab holding the full log).
         egui::TopBottomPanel::bottom("framesage-status-bar")
             .frame(
                 egui::Frame::none()
@@ -1019,19 +974,6 @@ impl eframe::App for FramesageApp {
                     managed_count,
                     last_action_text.as_deref(),
                 );
-            });
-
-        // ─── Activity strip ────────────────────────────────────────────────
-        // Last 5 engine actions, horizontal scroller. Shown AFTER the status
-        // bar so it lands above it.
-        egui::TopBottomPanel::bottom("framesage-activity-strip")
-            .frame(
-                egui::Frame::none()
-                    .fill(theme::p().surface)
-                    .inner_margin(egui::Margin::symmetric(12.0, 5.0)),
-            )
-            .show(ctx, |ui| {
-                render_activity_strip(ui, &recent_for_strip);
             });
 
         egui::CentralPanel::default().show(ctx, |ui| {
@@ -1614,196 +1556,117 @@ impl FramesageApp {
         }
     }
 
-    /// Render the menu bar. Items dispatch to the same `send_admin_request`
-    /// helper the toolbar uses, or to a small set of shell-out helpers
-    /// (`open_in_shell`) for file/folder/URL launches. View → tab items
-    /// duplicate the tab strip below — that's deliberate; menu users and
-    /// click-tab users both expect the option.
-    fn render_menubar(&mut self, ui: &mut egui::Ui, connected: bool, paused: bool) {
-        egui::menu::bar(ui, |ui| {
-            ui.menu_button("File", |ui| {
-                if ui.button("Open policy file…").clicked() {
-                    open_in_shell(&framesage_core::paths::policy_path().to_string_lossy());
-                    ui.close_menu();
-                }
-                if ui.button("Open config folder").clicked() {
-                    open_in_shell(&framesage_core::paths::config_dir().to_string_lossy());
-                    ui.close_menu();
-                }
-                ui.separator();
-                if ui.button("Exit FrameSage").clicked() {
-                    self.commands.exit_requested.store(true, Ordering::Relaxed);
-                    ui.close_menu();
-                }
-            });
+    /// The combined chrome bar (design Round 3 §3a): tabs on the left,
+    /// live CPU / MEM + a 60-second sparkline on the right, and every
+    /// former menubar/toolbar command behind a single "⋯" overflow menu
+    /// at the far right. One ~36 px row where there used to be four
+    /// (menubar, toolbar, tab strip, perf band).
+    fn render_top_bar(
+        &mut self,
+        ui: &mut egui::Ui,
+        paused: bool,
+        metrics: &framesage_ipc::SystemMetrics,
+        history: &[(u8, u8)],
+    ) {
+        ui.horizontal(|ui| {
+            ui.spacing_mut().item_spacing.x = 0.0;
+            self.render_tabs(ui);
 
-            ui.menu_button("Engine", |ui| {
-                let pause_label = if paused { "Resume" } else { "Pause" };
-                if ui.button(pause_label).clicked() {
-                    let req = if paused {
-                        Request::Resume
-                    } else {
-                        Request::Pause
-                    };
-                    self.send_admin_request(req, if paused { "resume" } else { "pause" });
-                    ui.close_menu();
-                }
-                ui.separator();
-                if ui.button("Game Mode off (panic)").clicked() {
-                    self.send_admin_request(Request::GameModeOff, "game-mode off");
-                    ui.close_menu();
-                }
-                if ui.button("Show Game Mode journal").clicked() {
-                    open_in_shell(
-                        &framesage_core::paths::config_dir()
-                            .join("game-mode.journal")
-                            .to_string_lossy(),
-                    );
-                    ui.close_menu();
-                }
-                ui.separator();
-                if ui.button("Clear manual override").clicked() {
-                    self.send_admin_request(Request::ClearManualOverride, "clear manual override");
-                    ui.close_menu();
-                }
-            });
-
-            // S3 — the former "View" menu only duplicated the
-            // always-visible tab strip below the menubar; removed to cut
-            // redundant IA. Tabs are one click away in the strip.
-
-            ui.menu_button("Tools", |ui| {
-                if ui.button("Open policy file…").clicked() {
-                    open_in_shell(&framesage_core::paths::policy_path().to_string_lossy());
-                    ui.close_menu();
-                }
-                if ui.button("Open config folder").clicked() {
-                    open_in_shell(&framesage_core::paths::config_dir().to_string_lossy());
-                    ui.close_menu();
-                }
-                if ui.button("Run topology in terminal").clicked() {
-                    // Run `framesage topology` from the same dir as the tray
-                    // exe, in a new terminal window so the user can read the
-                    // output. Best-effort: ignore failure.
-                    spawn_framesage_subcommand("topology");
-                    ui.close_menu();
-                }
-            });
-
-            ui.menu_button("Help", |ui| {
-                if ui.button("GitHub repository").clicked() {
-                    open_in_shell("https://github.com/franzjeger/framesage-win");
-                    ui.close_menu();
-                }
-                if ui.button("Report an issue").clicked() {
-                    open_in_shell("https://github.com/franzjeger/framesage-win/issues");
-                    ui.close_menu();
-                }
-                ui.separator();
-                ui.label(format!("FrameSage v{}", env!("CARGO_PKG_VERSION")));
-            });
-
-            // Brand mark + connection badge on the right side of the bar.
+            // Right cluster, laid out right-to-left so it pins to the
+            // window's right edge: overflow menu, sparkline, MEM, CPU.
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                let (color, text) = if connected {
-                    (theme::p().success, "Connected")
-                } else {
-                    (theme::p().error, "Disconnected")
-                };
-                theme::status_badge(color).show(ui, |ui| {
-                    ui.colored_label(color, text);
-                });
-                ui.add_space(8.0);
-                ui.label(
-                    egui::RichText::new("FrameSage")
-                        .color(theme::p().accent)
-                        .strong(),
-                );
+                ui.spacing_mut().item_spacing.x = 6.0;
+                self.render_overflow_menu(ui, paused);
+                render_perf_readout(ui, metrics, history);
             });
         });
     }
 
-    /// Quick-action toolbar. Visible regardless of which tab is active.
-    /// Buttons echo the most common menu choices for users who don't want to
-    /// pop a menu just to pause the engine.
-    fn render_toolbar(&mut self, ui: &mut egui::Ui, paused: bool, manual_active: bool) {
-        ui.horizontal(|ui| {
-            // Pause / Resume — text shifts based on engine state so the
-            // button always reads as the next action. Plain ASCII labels —
-            // egui's default font doesn't have triangle / pause-bar glyphs
-            // (they render as empty boxes), and the verb alone is clear.
+    /// Everything that used to live in the menubar (File / Engine /
+    /// Tools / Help) and the toolbar row, grouped by separators behind
+    /// one "⋯" button. Nothing was dropped in the consolidation — the
+    /// chrome just stopped spending three rows advertising it.
+    fn render_overflow_menu(&mut self, ui: &mut egui::Ui, paused: bool) {
+        // "…" (U+2026), not "⋯" (U+22EF): the bundled font covers the
+        // former and renders the latter as a tofu box.
+        ui.menu_button("…", |ui| {
             let pause_label = if paused { "Resume" } else { "Pause" };
-            let pause_color = if paused {
-                theme::p().warning
-            } else {
-                theme::p().text
-            };
-            if ui
-                .add(egui::Button::new(
-                    egui::RichText::new(pause_label).color(pause_color),
-                ))
-                .on_hover_text(if paused {
-                    "Resume the engine — apply profiles on foreground change"
-                } else {
-                    "Pause the engine — stop applying anything until resumed"
-                })
-                .clicked()
-            {
+            if ui.button(pause_label).clicked() {
                 let req = if paused {
                     Request::Resume
                 } else {
                     Request::Pause
                 };
                 self.send_admin_request(req, if paused { "resume" } else { "pause" });
+                ui.close_menu();
             }
-
-            // Game Mode panic button. Always-on; idempotent if no session is
-            // active.
-            if ui
-                .button("🎮 Game Mode off")
-                .on_hover_text("Force-revert any active Game Mode session")
-                .clicked()
-            {
+            ui.separator();
+            if ui.button("Game Mode off (panic)").clicked() {
                 self.send_admin_request(Request::GameModeOff, "game-mode off");
+                ui.close_menu();
             }
-
-            // Clear manual override is conditional — only worth surfacing
-            // when manual mode is actually engaged.
-            if manual_active
-                && ui
-                    .button("✕ Clear manual")
-                    .on_hover_text("Leave manual mode; foreground apply returns to Rules")
-                    .clicked()
-            {
+            if ui.button("Show Game Mode journal").clicked() {
+                open_in_shell(
+                    &framesage_core::paths::config_dir()
+                        .join("game-mode.journal")
+                        .to_string_lossy(),
+                );
+                ui.close_menu();
+            }
+            ui.separator();
+            if ui.button("Clear manual override").clicked() {
                 self.send_admin_request(Request::ClearManualOverride, "clear manual override");
+                ui.close_menu();
             }
 
             ui.separator();
 
-            if ui
-                .button("📂 Open config folder")
-                .on_hover_text("Reveal the FrameSage config directory in Explorer")
-                .clicked()
-            {
+            if ui.button("Open policy file…").clicked() {
+                open_in_shell(&framesage_core::paths::policy_path().to_string_lossy());
+                ui.close_menu();
+            }
+            if ui.button("Open config folder").clicked() {
                 open_in_shell(&framesage_core::paths::config_dir().to_string_lossy());
+                ui.close_menu();
+            }
+            if ui.button("Run topology in terminal").clicked() {
+                // Run `framesage topology` from the same dir as the tray
+                // exe, in a new terminal window so the user can read the
+                // output. Best-effort: ignore failure.
+                spawn_framesage_subcommand("topology");
+                ui.close_menu();
             }
 
-            if ui
-                .button("📝 Edit policy")
-                .on_hover_text("Open policy.json in the system editor")
-                .clicked()
-            {
-                open_in_shell(&framesage_core::paths::policy_path().to_string_lossy());
+            ui.separator();
+
+            if ui.button("GitHub repository").clicked() {
+                open_in_shell("https://github.com/franzjeger/framesage-win");
+                ui.close_menu();
             }
+            if ui.button("Report an issue").clicked() {
+                open_in_shell("https://github.com/franzjeger/framesage-win/issues");
+                ui.close_menu();
+            }
+            ui.separator();
+
+            if ui.button("Exit FrameSage").clicked() {
+                self.commands.exit_requested.store(true, Ordering::Relaxed);
+                ui.close_menu();
+            }
+            ui.label(
+                egui::RichText::new(format!("FrameSage v{}", env!("CARGO_PKG_VERSION")))
+                    .small()
+                    .color(theme::p().text_dim),
+            );
         });
     }
 
-    /// Tab strip below the toolbar. Uses the chunky `theme::tab_button` so
-    /// the active tab reads with a strong visual anchor (filled background
-    /// + accent underline) instead of egui's faint selectable label.
-    fn render_tab_strip(&mut self, ui: &mut egui::Ui) {
-        ui.horizontal(|ui| {
-            ui.spacing_mut().item_spacing.x = 0.0;
+    /// The seven tabs, drawn inline into the caller's horizontal layout
+    /// (the combined top bar). `theme::tab_button` gives the active tab a
+    /// filled slot + 2 px accent underline instead of egui's faint
+    /// selectable label.
+    fn render_tabs(&mut self, ui: &mut egui::Ui) {
+        {
             // Each tab gets a one-line hover-text that names the tab's
             // job, since the labels themselves are deliberately terse.
             let tabs: [(Tab, &str, &str); 7] = [
@@ -1858,7 +1721,7 @@ impl FramesageApp {
                     self.tab = t;
                 }
             }
-        });
+        }
     }
 
     fn render_active_tab(
@@ -1866,7 +1729,7 @@ impl FramesageApp {
         ctx: &egui::Context,
         ui: &mut egui::Ui,
         status: &Option<StatusSnapshot>,
-        recent: &[String],
+        recent: &[RecentEvent],
     ) {
         match self.tab {
             Tab::Status => self.render_status_tab(ctx, ui, status, recent),
@@ -2025,7 +1888,7 @@ impl FramesageApp {
         ctx: &egui::Context,
         ui: &mut egui::Ui,
         status: &Option<StatusSnapshot>,
-        recent: &[String],
+        recent: &[RecentEvent],
     ) {
         let Some(s) = status else {
             ui.add_space(40.0);
@@ -2035,71 +1898,17 @@ impl FramesageApp {
             return;
         };
 
-        // ─── Hero: engine state at a glance ─────────────────────────────
-        // Green "Game Mode active" hero when a game-mode profile is
-        // applied (design Round 3 §3a); otherwise the neutral Running/
-        // Paused hero. Counts come from the active profile's configured
-        // actions (real data — what the profile does); the engine
-        // doesn't expose live stopped-counts/duration, so those are
-        // omitted rather than invented.
-        let game_mode_profile = s.active_profile.as_ref().filter(|p| p.game_mode.is_some());
-        if let Some(profile) = game_mode_profile {
-            let gm = profile.game_mode.as_ref().expect("filtered to Some");
-            let exe = s
-                .foreground
-                .as_ref()
-                .map(|f| f.exe_name.clone())
-                .unwrap_or_else(|| "foreground app".into());
-            let profile_name = display_profile_id(&profile.id.0);
-            theme::banner(theme::p().success).show(ui, |ui| {
-                ui.horizontal(|ui| {
-                    ui.colored_label(
-                        theme::p().success,
-                        egui::RichText::new("\u{25cf}").size(14.0),
-                    );
-                    ui.vertical(|ui| {
-                        ui.label(
-                            egui::RichText::new(format!("Game Mode active — {exe}"))
-                                .size(16.0)
-                                .strong()
-                                .color(theme::p().text),
-                        );
-                        ui.horizontal(|ui| {
-                            ui.colored_label(theme::p().text_muted, "Profile");
-                            ui.label(
-                                egui::RichText::new(&profile_name)
-                                    .color(theme::p().accent)
-                                    .strong(),
-                            );
-                            ui.colored_label(
-                                theme::p().text_muted,
-                                format!(
-                                    "· stops {} service{} · suspends {} process{}",
-                                    gm.stop_services.len(),
-                                    if gm.stop_services.len() == 1 { "" } else { "s" },
-                                    gm.suspend_processes.len(),
-                                    if gm.suspend_processes.len() == 1 {
-                                        ""
-                                    } else {
-                                        "es"
-                                    },
-                                ),
-                            );
-                        });
-                    });
-                    if self.elevated {
-                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                            if theme::danger_button(ui, "Exit Game Mode").clicked() {
-                                self.send_admin_request(Request::GameModeOff, "exit game mode");
-                            }
-                        });
-                    }
-                });
-            });
-        } else {
-            render_status_hero(ui, s);
+        // Elevation banner first when we can't act — it explains why the
+        // hero's action button is missing. Used to live inside the
+        // quick-actions card, which the Round-3 layout drops.
+        #[cfg(windows)]
+        if !self.elevated {
+            self.render_elevation_banner(ctx, ui);
+            ui.add_space(theme::SP_MD);
         }
-        ui.add_space(10.0);
+
+        self.render_status_hero(ui, s);
+        ui.add_space(theme::SP_MD);
 
         // ─── Manual-mode banner (only when active) ──────────────────────
         if let Some(manual_id) = &s.manual_override {
@@ -2189,18 +1998,30 @@ impl FramesageApp {
             crate::state::SessionStats::from_recent(&st.recent, std::time::SystemTime::now())
         };
 
+        // One card: 11px caps label, big value, one muted detail line.
+        // `set_min_height` keeps the three cards a matched set even when
+        // one wraps its detail line onto two rows.
         let stat_card =
             |ui: &mut egui::Ui, heading: &str, value: egui::RichText, detail: String| {
                 theme::card().show(ui, |ui| {
-                    ui.label(theme::section_heading(heading));
-                    ui.add_space(5.0);
-                    ui.label(value.size(15.0).strong());
-                    ui.add_space(5.0);
-                    ui.label(
-                        egui::RichText::new(detail)
-                            .size(12.0)
-                            .color(theme::p().text_muted),
-                    );
+                    // Cards are laid out by `ui.columns`, which hands each
+                    // one an equal slice of the row — but a Frame only
+                    // paints as wide as its content, so without this the
+                    // three cards shrink-wrap their text and scatter across
+                    // the row instead of tiling it.
+                    ui.set_min_width(ui.available_width());
+                    ui.set_min_height(64.0);
+                    ui.vertical(|ui| {
+                        ui.label(theme::section_heading(heading));
+                        ui.add_space(6.0);
+                        ui.label(value.size(17.0).strong());
+                        ui.add_space(6.0);
+                        ui.label(
+                            egui::RichText::new(detail)
+                                .size(12.0)
+                                .color(theme::p().text_muted),
+                        );
+                    });
                 });
             };
 
@@ -2239,6 +2060,7 @@ impl FramesageApp {
             ("Off", theme::p().text_muted)
         };
 
+        ui.spacing_mut().item_spacing.x = theme::SP_MD;
         ui.columns(3, |cols| {
             stat_card(
                 &mut cols[0],
@@ -2275,38 +2097,29 @@ impl FramesageApp {
                 ),
             );
         });
-        ui.add_space(10.0);
+        ui.add_space(theme::SP_MD);
 
-        // ─── Quick actions ──────────────────────────────────────────────
-        // Kept on the Status tab for now; the design folds these into the
-        // top toolbar in the later global-chrome slice.
-        #[cfg(windows)]
-        {
-            let paused = s.paused;
-            let in_game_mode = s
-                .active_profile
-                .as_ref()
-                .map(|p| p.game_mode.is_some())
-                .unwrap_or(false);
-            self.render_quick_actions(ctx, ui, paused, in_game_mode, s);
-            ui.add_space(10.0);
-        }
-
-        // ─── ProBalance control card ────────────────────────────────────
-        // Retains the enable/disable toggle + threshold summary. The stat
-        // card above shows status at a glance; this card is the control
-        // surface until the Settings slice absorbs it.
-        self.render_probalance_card(ui, s, restrained_now);
-        ui.add_space(10.0);
-
-        // ─── Compact activity card with a link to the full log ──────────
+        // ─── Activity card (design Round 3 §3a item 4) ──────────────────
+        // `hh:mm:ss` mono + kind-colored dot + one-line event, newest
+        // first, with a "Full log →" link into the Activity tab. This is
+        // now the *only* activity surface on this screen: the old bottom
+        // strip and the separate Recent Activity section are both gone.
+        //
+        // ProBalance's control card and the quick-actions card that used
+        // to sit above this are gone too — the stat card above reports
+        // ProBalance state, its knobs (including the enable toggle) live
+        // in Settings, and every former quick action is either in the
+        // hero or one click away in the top bar's ⋯ menu.
         theme::card().show(ui, |ui| {
             ui.horizontal(|ui| {
                 ui.label(theme::section_heading("Activity"));
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    // "»" not "→": the bundled font has no U+2192, so an
+                    // arrow renders as a tofu box. Latin-1 guillemet is
+                    // covered and reads the same way.
                     if ui
                         .add(egui::Link::new(
-                            egui::RichText::new("Full log →")
+                            egui::RichText::new("Full log »")
                                 .size(12.0)
                                 .color(theme::p().accent),
                         ))
@@ -2316,154 +2129,275 @@ impl FramesageApp {
                     }
                 });
             });
-            ui.add_space(6.0);
+            ui.add_space(theme::SP_SM);
             if recent.is_empty() {
                 ui.colored_label(theme::p().text_muted, "No events yet.");
-            } else {
-                for line in recent.iter().rev().take(5) {
-                    ui.label(egui::RichText::new(line).size(12.5).color(theme::p().text));
-                }
+                return;
+            }
+            // Fill whatever vertical room the window leaves rather than
+            // parking a fixed six rows above a lake of empty panel. ~21 px
+            // per row at the default text size; clamped so the card stays
+            // a card on a short window and doesn't run away on a tall one.
+            let rows = ((ui.available_height() - 8.0) / 21.0).floor();
+            let rows = (rows as usize).clamp(4, 14);
+
+            // `recent` arrives newest-first; render it in that order.
+            for ev in recent.iter().take(rows) {
+                ui.horizontal(|ui| {
+                    ui.label(
+                        egui::RichText::new(format_local_hms(ev.at))
+                            .monospace()
+                            .size(11.5)
+                            .color(theme::p().text_dim),
+                    );
+                    ui.add_space(4.0);
+                    theme::dot(ui, ev.kind.color(), 6.0);
+                    ui.add_space(4.0);
+                    ui.add(
+                        egui::Label::new(
+                            egui::RichText::new(&ev.label)
+                                .size(12.5)
+                                .color(theme::p().text),
+                        )
+                        .truncate(),
+                    );
+                });
             }
         });
     }
 
-    /// Item 4.15 — Session stats card. Four numeric tiles aggregated
-    /// from the in-memory activity ring (which is hydrated from
-    /// activity.jsonl at startup). 24-hour sliding window.
-    #[allow(dead_code)] // superseded by the Round-3 "Last 24 hours" stat card
-    fn render_session_stats_card(&mut self, ui: &mut egui::Ui, stats: &crate::state::SessionStats) {
-        theme::card().show(ui, |ui| {
-            ui.label(theme::section_heading("Session stats (last 24 h)"));
-            ui.add_space(6.0);
-            ui.horizontal(|ui| {
-                let tile = |ui: &mut egui::Ui, value: u32, label: &str, color: egui::Color32| {
-                    ui.vertical(|ui| {
-                        ui.label(
-                            egui::RichText::new(value.to_string())
-                                .strong()
-                                .size(20.0)
-                                .color(color),
-                        );
-                        ui.colored_label(theme::p().text_muted, label);
-                    });
-                };
-                tile(
-                    ui,
-                    stats.profiles_applied,
-                    "Profiles applied",
-                    theme::p().accent,
-                );
-                ui.add_space(theme::SP_XL);
-                tile(
-                    ui,
-                    stats.probalance_demotions,
-                    "ProBalance demotions",
-                    theme::p().warning,
-                );
-                ui.add_space(theme::SP_XL);
-                tile(
-                    ui,
-                    stats.probalance_restores,
-                    "ProBalance restores",
-                    theme::p().success,
-                );
-                ui.add_space(theme::SP_XL);
-                tile(
-                    ui,
-                    stats.game_mode_sessions,
-                    "Game Mode sessions",
-                    theme::p().accent,
-                );
-            });
-        });
-    }
+    /// Status hero — the one thing worth reading first on this screen
+    /// (design Round 3 §3a item 2). Three states, each with its own
+    /// tint and its own primary action:
+    ///
+    /// * **Game Mode active** — success tint, "Game Mode active —
+    ///   bf6.exe", what the profile does, `Exit Game Mode`.
+    /// * **Paused** — warning tint, `Resume engine`.
+    /// * **Watching** — neutral, names the foreground app and the
+    ///   policy behind it, `Enter Manual Game Mode` when a profile is
+    ///   eligible.
+    ///
+    /// Honesty note: the mockup's hero also carries "24 services
+    /// stopped · 16 processes suspended · 42 min". The engine doesn't
+    /// publish live stopped-counts or a session clock, so we state what
+    /// the active profile is *configured* to do ("stops 28 services")
+    /// rather than inventing a live tally.
+    fn render_status_hero(&mut self, ui: &mut egui::Ui, s: &StatusSnapshot) {
+        let game_mode_profile = s.active_profile.as_ref().filter(|p| p.game_mode.is_some());
 
-    /// ProBalance card — Status-tab summary of the dynamic-priority
-    /// manager. Shows whether it's on, the configured thresholds, and the
-    /// number of processes currently held in restraint. When the engine is
-    /// elevated and we have the admin token, an "Enable" / "Disable" button
-    /// toggles `policy.probalance.enabled` and sends `SetPolicy` so the
-    /// change is persisted to `policy.json` immediately.
-    fn render_probalance_card(
-        &mut self,
-        ui: &mut egui::Ui,
-        s: &StatusSnapshot,
-        restrained_now: usize,
-    ) {
-        theme::card().show(ui, |ui| {
+        // (frame, dot color, title, action)
+        enum HeroAction {
+            ExitGameMode,
+            Resume,
+            EnterManualGlobal,
+        }
+
+        let (frame, dot_color, title, action) = if game_mode_profile.is_some() {
+            let exe = s
+                .foreground
+                .as_ref()
+                .map(|f| f.exe_name.clone())
+                .unwrap_or_else(|| "foreground app".into());
+            (
+                theme::hero_tinted(theme::p().success),
+                theme::p().success,
+                format!("Game Mode active — {exe}"),
+                HeroAction::ExitGameMode,
+            )
+        } else if s.paused {
+            (
+                theme::hero_tinted(theme::p().warning),
+                theme::p().warning,
+                "Engine paused".to_owned(),
+                HeroAction::Resume,
+            )
+        } else {
+            let what = s
+                .foreground
+                .as_ref()
+                .map(|f| format!("Watching — {}", f.exe_name))
+                .unwrap_or_else(|| "Watching — no foreground app".to_owned());
+            (
+                theme::hero(),
+                theme::p().success,
+                what,
+                HeroAction::EnterManualGlobal,
+            )
+        };
+
+        // The one profile the "Enter Manual Game Mode" button would use:
+        // the default profile if it's eligible, else the first eligible
+        // one. `None` hides the button rather than offering a no-op.
+        let manual_target: Option<ProfileId> = if matches!(action, HeroAction::EnterManualGlobal) {
+            let default_id = &s.policy.default_profile;
+            s.policy
+                .profiles
+                .values()
+                .find(|p| p.manual_global_eligible && &p.id == default_id)
+                .or_else(|| {
+                    s.policy
+                        .profiles
+                        .values()
+                        .find(|p| p.manual_global_eligible)
+                })
+                .map(|p| p.id.clone())
+        } else {
+            None
+        };
+
+        frame.show(ui, |ui| {
             ui.horizontal(|ui| {
-                ui.label(theme::section_heading("ProBalance"));
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    let cfg = &s.policy.probalance;
-                    let (color, text) = if cfg.enabled {
-                        (theme::p().success, "Enabled")
-                    } else {
-                        (theme::p().text_muted, "Disabled")
-                    };
-                    theme::status_badge(color).show(ui, |ui| {
-                        ui.colored_label(color, text);
+                theme::dot(ui, dot_color, 9.0);
+                ui.add_space(8.0);
+                ui.vertical(|ui| {
+                    ui.label(
+                        egui::RichText::new(title)
+                            .size(19.0)
+                            .strong()
+                            .color(theme::p().text),
+                    );
+                    ui.add_space(3.0);
+                    ui.horizontal(|ui| {
+                        ui.spacing_mut().item_spacing.x = 5.0;
+                        match game_mode_profile {
+                            Some(profile) => {
+                                let gm = profile.game_mode.as_ref().expect("filtered to Some");
+                                ui.colored_label(theme::p().text_muted, "Profile");
+                                ui.label(
+                                    egui::RichText::new(display_profile_id(&profile.id.0))
+                                        .color(theme::p().accent)
+                                        .strong(),
+                                );
+                                ui.colored_label(
+                                    theme::p().text_muted,
+                                    format!(
+                                        "· stops {} service{} · suspends {} process{}",
+                                        gm.stop_services.len(),
+                                        if gm.stop_services.len() == 1 { "" } else { "s" },
+                                        gm.suspend_processes.len(),
+                                        if gm.suspend_processes.len() == 1 {
+                                            ""
+                                        } else {
+                                            "es"
+                                        },
+                                    ),
+                                );
+                            }
+                            None if s.paused => {
+                                ui.colored_label(
+                                    theme::p().text_muted,
+                                    "No profiles are being applied until you resume.",
+                                );
+                            }
+                            None => {
+                                match &s.active_profile {
+                                    Some(p) => {
+                                        ui.colored_label(theme::p().text_muted, "Profile");
+                                        ui.label(
+                                            egui::RichText::new(display_profile_id(&p.id.0))
+                                                .color(theme::p().accent)
+                                                .strong(),
+                                        );
+                                    }
+                                    None => {
+                                        ui.colored_label(
+                                            theme::p().text_muted,
+                                            "No profile applied",
+                                        );
+                                    }
+                                }
+                                ui.colored_label(
+                                    theme::p().text_muted,
+                                    format!(
+                                        "· {} rule{} · default {}",
+                                        s.policy.rules.len(),
+                                        if s.policy.rules.len() == 1 { "" } else { "s" },
+                                        display_profile_id(&s.policy.default_profile.0),
+                                    ),
+                                );
+                            }
+                        }
                     });
                 });
-            });
-            ui.add_space(6.0);
 
-            let cfg = s.policy.probalance.clone();
-            ui.horizontal(|ui| {
-                ui.colored_label(theme::p().text_muted, "Currently restraining:");
-                let color = if restrained_now > 0 {
-                    theme::p().warning
-                } else {
-                    theme::p().text_muted
-                };
-                ui.colored_label(color, format!("{restrained_now} processes"));
-            });
-            ui.horizontal(|ui| {
-                ui.colored_label(theme::p().text_muted, "Trigger:");
-                ui.colored_label(
-                    theme::p().text,
-                    format!(
-                        "system CPU >= {}% AND non-foreground hog >= {}% of one core",
-                        cfg.system_cpu_threshold_percent, cfg.hog_cpu_threshold_percent
-                    ),
-                );
-            });
-            ui.horizontal(|ui| {
-                ui.colored_label(theme::p().text_muted, "Dwell:");
-                ui.colored_label(
-                    theme::p().text,
-                    format!(
-                        "{} ms before any restraint can be released",
-                        cfg.min_restrain_ms
-                    ),
-                );
-            });
-
-            ui.add_space(8.0);
-
-            // Toggle. Unelevated tray can show the state but can't send
-            // SetPolicy through the admin pipe, so the button is greyed
-            // when we're not running with the admin token.
-            #[cfg(windows)]
-            if self.elevated {
-                let label = if cfg.enabled {
-                    "Disable ProBalance"
-                } else {
-                    "Enable ProBalance"
-                };
-                if ui.button(label).clicked() {
-                    let mut new_policy = s.policy.clone();
-                    new_policy.probalance.enabled = !cfg.enabled;
-                    self.send_admin_request(
-                        Request::SetPolicy { policy: new_policy },
-                        "toggle probalance",
-                    );
+                if !self.elevated {
+                    return;
                 }
-            } else {
+                ui.with_layout(
+                    egui::Layout::right_to_left(egui::Align::Center),
+                    |ui| match action {
+                        HeroAction::ExitGameMode => {
+                            if theme::danger_button(ui, "Exit Game Mode").clicked() {
+                                self.send_admin_request(Request::GameModeOff, "exit game mode");
+                            }
+                        }
+                        HeroAction::Resume => {
+                            if theme::primary_button(ui, "Resume engine").clicked() {
+                                self.send_admin_request(Request::Resume, "resume");
+                            }
+                        }
+                        HeroAction::EnterManualGlobal => {
+                            if let Some(profile) = manual_target {
+                                if theme::primary_button(ui, "Enter Manual Game Mode")
+                                    .on_hover_text(
+                                        "Apply this profile's environment actions system-wide \
+                                         until you exit — independent of what's in the \
+                                         foreground.",
+                                    )
+                                    .clicked()
+                                {
+                                    self.send_admin_request(
+                                        Request::EnableManualGlobalGameMode { profile },
+                                        "enable manual global game mode",
+                                    );
+                                }
+                            }
+                        }
+                    },
+                );
+            });
+        });
+    }
+
+    /// "You're read-only" banner + the UAC relaunch button. Lifted out
+    /// of the old quick-actions card so the Status tab can drop that
+    /// card without losing the one control that gets you out of
+    /// read-only mode.
+    #[cfg(windows)]
+    fn render_elevation_banner(&mut self, ctx: &egui::Context, ui: &mut egui::Ui) {
+        theme::banner(theme::p().warning).show(ui, |ui| {
+            ui.horizontal(|ui| {
+                ui.colored_label(
+                    theme::p().warning,
+                    egui::RichText::new("⚠").strong().size(14.0),
+                );
+                ui.label(
+                    egui::RichText::new("Read-only mode")
+                        .strong()
+                        .color(theme::p().text),
+                );
                 ui.colored_label(
                     theme::p().text_muted,
-                    "Relaunch FrameSage as administrator to toggle ProBalance.",
+                    "— Pause, Resume, and Game Mode controls need admin.",
                 );
-            }
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if ui
+                        .button("Enable controls (UAC)…")
+                        .on_hover_text("Relaunch FrameSage elevated so admin actions go through.")
+                        .clicked()
+                    {
+                        match win32::relaunch_as_admin() {
+                            Ok(()) => {
+                                ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                                self.commands.exit_requested.store(true, Ordering::Relaxed);
+                            }
+                            Err(e) => {
+                                *self.last_action.lock() = Some(format!("relaunch failed: {e}"));
+                            }
+                        }
+                    }
+                });
+            });
         });
     }
 
@@ -2585,6 +2519,36 @@ impl FramesageApp {
                 });
             });
             ui.add_space(6.0);
+
+            // On/off lives here now. It used to be the one control that
+            // kept a whole ProBalance card on the Status tab; the
+            // Round-3 layout reports state there and keeps every knob
+            // together on this card. Committed immediately (it's one
+            // bool, not a slider drag), unlike the thresholds below
+            // which batch into a draft.
+            #[cfg(windows)]
+            {
+                let mut enabled = s.policy.probalance.enabled;
+                if ui
+                    .add_enabled(
+                        self.elevated,
+                        egui::Checkbox::new(&mut enabled, "ProBalance enabled"),
+                    )
+                    .on_hover_text(
+                        "Dynamically demote non-foreground CPU hogs while the system is \
+                         under contention, and restore them afterwards.",
+                    )
+                    .changed()
+                {
+                    let mut new_policy = s.policy.clone();
+                    new_policy.probalance.enabled = enabled;
+                    self.send_admin_request(
+                        Request::SetPolicy { policy: new_policy },
+                        "toggle probalance",
+                    );
+                }
+                ui.add_space(8.0);
+            }
 
             // Lazily clone the live config into the draft on first
             // edit. Subsequent renders edit the draft in place. We
@@ -2880,153 +2844,6 @@ impl FramesageApp {
         } else if do_cancel {
             self.settings.reset_confirm_visible = false;
         }
-    }
-
-    /// Quick-actions strip: elevation prompt when not elevated, or
-    /// Pause/Resume + Game-Mode-off when we are. Wrapped in a card so it
-    /// reads as a distinct section rather than loose buttons.
-    #[cfg(windows)]
-    fn render_quick_actions(
-        &mut self,
-        ctx: &egui::Context,
-        ui: &mut egui::Ui,
-        paused: bool,
-        in_game_mode: bool,
-        status: &StatusSnapshot,
-    ) {
-        if !self.elevated {
-            theme::banner(theme::p().warning).show(ui, |ui| {
-                ui.horizontal(|ui| {
-                    ui.colored_label(
-                        theme::p().warning,
-                        egui::RichText::new("⚠").strong().size(14.0),
-                    );
-                    ui.label(
-                        egui::RichText::new("Read-only mode")
-                            .strong()
-                            .color(theme::p().text),
-                    );
-                    ui.colored_label(
-                        theme::p().text_muted,
-                        "— Pause, Resume, and Game Mode controls need admin.",
-                    );
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        if ui
-                            .button("Enable controls (UAC)…")
-                            .on_hover_text(
-                                "Relaunch FrameSage elevated so admin actions go through.",
-                            )
-                            .clicked()
-                        {
-                            match win32::relaunch_as_admin() {
-                                Ok(()) => {
-                                    ctx.send_viewport_cmd(egui::ViewportCommand::Close);
-                                    self.commands.exit_requested.store(true, Ordering::Relaxed);
-                                }
-                                Err(e) => {
-                                    *self.last_action.lock() =
-                                        Some(format!("relaunch failed: {e}"));
-                                }
-                            }
-                        }
-                    });
-                });
-            });
-            if let Some(msg) = self.last_action.lock().as_ref() {
-                ui.add_space(2.0);
-                ui.small(msg);
-            }
-            return;
-        }
-
-        theme::card().show(ui, |ui| {
-            ui.label(theme::section_heading("Quick actions"));
-            ui.add_space(6.0);
-            ui.horizontal(|ui| {
-                let label = if paused {
-                    "Resume engine"
-                } else {
-                    "Pause engine"
-                };
-                if ui.button(label).clicked() {
-                    if paused {
-                        self.send_admin_request(Request::Resume, "resume");
-                    } else {
-                        self.send_admin_request(Request::Pause, "pause");
-                    }
-                }
-                if ui
-                    .add_enabled(in_game_mode, egui::Button::new("Exit Game Mode"))
-                    .on_hover_text(
-                        "Force any active Game Mode session to revert immediately — restores \
-                         the taskbar, restarts paused services, resumes suspended processes.",
-                    )
-                    .clicked()
-                {
-                    self.send_admin_request(Request::GameModeOff, "game-mode off");
-                }
-            });
-
-            // ─── Manual Global Game Mode launcher (item 2.11) ───────────
-            // Lists every profile marked `manual_global_eligible` so
-            // the user can enter a system-wide quiet-desktop session
-            // independent of foreground. When manual global is
-            // already active, this section collapses to a single
-            // "Exit Manual Game Mode" button so the user has a fast
-            // off-switch without scrolling up to the banner.
-            let eligible: Vec<&framesage_core::Profile> = status
-                .policy
-                .profiles
-                .values()
-                .filter(|p| p.manual_global_eligible)
-                .collect();
-            if !eligible.is_empty() {
-                ui.add_space(6.0);
-                ui.separator();
-                ui.add_space(6.0);
-                ui.label(theme::section_heading("Manual Global Game Mode"));
-                ui.add_space(4.0);
-                if let Some(active) = &status.manual_global_active {
-                    ui.horizontal(|ui| {
-                        ui.colored_label(theme::p().text_muted, "Active:");
-                        ui.colored_label(theme::p().warning, display_profile_id(&active.0));
-                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                            if ui.button("Exit Manual Game Mode").clicked() {
-                                self.send_admin_request(
-                                    Request::DisableManualGlobalGameMode,
-                                    "disable manual global game mode",
-                                );
-                            }
-                        });
-                    });
-                } else {
-                    ui.horizontal_wrapped(|ui| {
-                        ui.colored_label(
-                            theme::p().text_muted,
-                            "Enter a profile's environment actions system-wide:",
-                        );
-                    });
-                    ui.add_space(4.0);
-                    ui.horizontal_wrapped(|ui| {
-                        for profile in &eligible {
-                            let id = profile.id.clone();
-                            let label = format!("Enter {}", display_profile_id(&id.0));
-                            if ui.button(label).clicked() {
-                                self.send_admin_request(
-                                    Request::EnableManualGlobalGameMode { profile: id },
-                                    "enable manual global game mode",
-                                );
-                            }
-                        }
-                    });
-                }
-            }
-
-            if let Some(msg) = self.last_action.lock().as_ref() {
-                ui.add_space(4.0);
-                ui.small(msg);
-            }
-        });
     }
 
     /// Activity Log tab — full history of every engine event the IPC
@@ -5187,10 +5004,16 @@ impl FramesageApp {
                             });
                             row.col(|ui| {
                                 if p.restrained_by_probalance {
-                                    // ● prefix calls out ProBalance involvement;
-                                    // visually pairs with the WARNING-tinted marker
-                                    // bar on the same row.
-                                    ui.colored_label(theme::p().warning, "● ProBalance");
+                                    // Painted dot calls out ProBalance
+                                    // involvement; visually pairs with the
+                                    // WARNING-tinted marker bar on the same
+                                    // row. (A "●" glyph would be tofu — the
+                                    // bundled font has no U+25CF.)
+                                    ui.horizontal(|ui| {
+                                        ui.spacing_mut().item_spacing.x = 4.0;
+                                        theme::dot(ui, theme::p().warning, 6.0);
+                                        ui.colored_label(theme::p().warning, "ProBalance");
+                                    });
                                 } else if let Some(note) = &p.matched_rule_note {
                                     if note.is_empty() {
                                         ui.weak("rule");
