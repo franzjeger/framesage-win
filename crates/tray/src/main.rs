@@ -891,7 +891,7 @@ impl eframe::App for FramesageApp {
                 s.connected,
                 s.last_error.clone(),
                 s.status.clone(),
-                s.recent.iter().rev().take(16).cloned().collect::<Vec<_>>(),
+                s.recent.iter().rev().take(32).cloned().collect::<Vec<_>>(),
             )
         };
 
@@ -2163,8 +2163,8 @@ impl FramesageApp {
             // parking a fixed six rows above a lake of empty panel. ~21 px
             // per row at the default text size; clamped so the card stays
             // a card on a short window and doesn't run away on a tall one.
-            let rows = ((ui.available_height() - 8.0) / 21.0).floor();
-            let rows = (rows as usize).clamp(4, 14);
+            let rows = ((ui.available_height() - 8.0) / 24.0).floor();
+            let rows = (rows as usize).clamp(4, 28);
 
             // `recent` arrives newest-first; render it in that order.
             for ev in recent.iter().take(rows) {

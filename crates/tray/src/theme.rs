@@ -561,8 +561,21 @@ pub fn labeled_slider<N: egui::emath::Numeric>(
     ui.horizontal(|ui| {
         let pal = p();
         ui.spacing_mut().slider_width = Metrics::SLIDER_W;
+        // The rail is painted with `widgets.inactive.bg_fill`, which our
+        // theme sets to `surface` — the same color as the card the slider
+        // sits on, so the track was invisible and the handle looked like a
+        // circle floating next to the value box. That, not the width, was
+        // the detached-handle bug (EGUI_SPEC §5.1). Give the rail its own
+        // color and let `trailing_fill` paint the filled part in accent.
+        ui.visuals_mut().widgets.inactive.bg_fill = pal.surface_active;
+        ui.visuals_mut().widgets.hovered.bg_fill = pal.surface_active;
+        ui.visuals_mut().widgets.active.bg_fill = pal.surface_active;
         ui.visuals_mut().selection.bg_fill = pal.accent;
-        let mut resp = ui.add(egui::Slider::new(value, range).show_value(false));
+        let mut resp = ui.add(
+            egui::Slider::new(value, range)
+                .show_value(false)
+                .trailing_fill(true),
+        );
         resp |= ui.add_sized(Metrics::DRAG_VALUE, egui::DragValue::new(value));
         ui.label(
             egui::RichText::new(label)
