@@ -259,9 +259,10 @@ struct EngineState {
     /// got" — any of the inner `Option<String>` fields can be `None` if
     /// the resource omitted that specific field; an empty `VersionInfo`
     /// (all fields `None`) means the binary has no resource at all. A
-    /// missing key means we haven't tried yet. We never evict — paths are
-    /// stable for the lifetime of an installed binary, and the cache stays
-    /// small (~200 entries × ~150 bytes).
+    /// missing key means we haven't tried yet. Pruned each tick by basename:
+    /// any cached entry whose path's filename doesn't appear in the current
+    /// process snapshot is dropped, avoiding unbounded growth from portable
+    /// apps, temp-path helpers, and upgrade artifacts.
     version_info_cache: HashMap<String, framesage_sys::version_info::VersionInfo>,
     /// Per-PID owner cache. `Some(name)` = SID resolved to a user name;
     /// `None` = the kernel told us about the token but `LookupAccountSidW`
@@ -1429,10 +1430,27 @@ impl Engine {
                 pid_snapshots.iter().map(|p| p.pid).collect();
             s.user_cache.retain(|p, _| live_pids.contains(p));
             // Item 2.1: same prune for exe_path_cache. PID reuse means
-            // tomorrow's PID 1234 may be a different binary than
-            // today's; dropping cached paths on PID-exit avoids
-            // surfacing a stale path on the next reuse.
+            // tomorrow's PID 1434 may be a different binary than
+            // the process running under this exact handle; dropping cached paths
+            // on PID-exit avoids surfacing a stale path on the next reuse.
             s.exe_path_cache.retain(|p, _| live_pids.contains(p));
+
+            // M-12: purge version_info_cache of any cached entry whose base
+            // filename no longer appears in the current process snapshot.
+            // This handles upgrades (old %TEMP%\<uuid>\ framesage-svc.exe
+            // exits) and one-off portable/temp tools that were never meant
+            // to live in memory forever. A known binary like notepad.exe
+            // survives across invocations at different paths because its
+            // basename remains live.
+            let live_basenames: std::collections::HashSet<String> = out
+                .iter()
+                .map(|p| p.exe_name.to_ascii_lowercase())
+                .collect();
+            s.version_info_cache.retain(|path, _| {
+                path.trim_start_matches(r"\\?\").rsplit('\\')
+                    .next()
+                    .is_some_and(|base| live_basenames.contains(&base.to_ascii_lowercase()))
+            });
 
             // ─── System-wide metrics ─────────────────────────────────────
             //
