@@ -49,6 +49,12 @@ runtime batch.
   `docs/syscall-seam-pattern.md`.
 - `crates/spike-etw` removed (M3.4) — findings preserved in
   `spike/`.
+- MSRV corrected to **1.88** (the declared 1.80 was never
+  buildable: locked deps `image 0.25.10`, `time 0.3.47`,
+  `pxfm 0.1.29` require it) and enforced by a new `msrv` CI job
+  (`cargo check --locked` on the Windows target). `__cpuid` calls
+  in `session_recorder.rs` wrapped for the unsafe/safe split across
+  toolchains.
 
 ### Still gated on Windows hardware / external clocks
 

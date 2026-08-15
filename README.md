@@ -202,6 +202,8 @@ Ctrl+C stops it.
 
 Contributor note: all Win32 syscalls sit behind mock-injectable seam traits (`framesage-sys::SysApi`, `framesage-etw::EtwSysCalls`) so the decision logic tests run on any host. New adapters must follow the same shape — see [docs/syscall-seam-pattern.md](docs/syscall-seam-pattern.md).
 
+**Minimum Rust version: 1.88.** The workspace `rust-version` is pinned to 1.88 and a `msrv` CI job enforces it (`cargo check --locked` on the Windows target). The floor is set by locked deps (`image 0.25.10`, `time 0.3.47`, `pxfm 0.1.29`), not by our own code — don't lower it without re-checking those.
+
 ### On Windows
 
 ```pwsh

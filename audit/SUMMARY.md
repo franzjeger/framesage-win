@@ -173,6 +173,15 @@ File:line in each row points to the deeper write-up in the dimension file. Sever
 
 ### Low / Polish (style, future-proofing, minor wins)
 
+> **Status re-audit (2026-08-15):** the following Low items are now **resolved** in the audit-08 follow-up pass (see `08-code-quality.md` Status re-audit block):
+> - **L-26** — MSRV check: `rust-version` corrected to **1.88** (locked deps `image 0.25.10`, `time 0.3.47`/`time-core 0.1.8`, `pxfm 0.1.29` require it) + a `msrv` CI job pinned to `dtolnay/rust-toolchain@1.88` running `cargo check --locked`.
+> - **L-28** — inline tray durations promoted to named constants (`RECONNECT_BACKOFF`, `POLL_INTERVAL_VISIBLE/HIDDEN`, `MAX_RECENT`, `IDLE_REPAINT_INTERVAL`, `SHOW_WINDOW_WATCHER_BACKOFF`).
+> - **L-29** — `MAX_RECENT` promoted to a module-level constant.
+> - **L-30** — service tick interval promoted to `TICK_INTERVAL`.
+> - **L-27** — `pub` → `pub(crate)`: **false positive** (both methods have cross-crate callers in `framesage-service`).
+>
+> Remaining live Low items: **L-23** (`windows-sys` version sprawl — transitive, cosmetic).
+
 | # | Finding | File:line | Dimension |
 |---|---|---|---|
 | L-01 | Service master tick is 300 ms even when nothing's happening; could be coarser intervals on individual loops | `service/runtime.rs:57` | 01-M1 |
