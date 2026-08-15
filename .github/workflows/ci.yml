@@ -35,15 +35,15 @@ jobs:
   # transitive dep's required-version) stops compiling on the declared MSRV.
   # Bump the toolchain ref here *and* rust-version in Cargo.toml together.
   msrv:
-    name: MSRV check (1.85 -> x86_64-pc-windows-gnu)
+    name: MSRV check (1.88 -> x86_64-pc-windows-gnu)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@1.85
+      - uses: dtolnay/rust-toolchain@1.88
         with:
           targets: x86_64-pc-windows-gnu
       - uses: Swatinem/rust-cache@v2
-      - name: cargo check (MSRV 1.85)
+      - name: cargo check (MSRV 1.88)
         run: cargo check --workspace --target x86_64-pc-windows-gnu --all-targets
 
   # Windows-target clippy from Ubuntu: catches Windows-only lint
