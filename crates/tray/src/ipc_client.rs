@@ -33,6 +33,7 @@
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::time::Duration;
 
 use parking_lot::Mutex;
 
@@ -41,6 +42,28 @@ use framesage_ipc::{Event, ProcessSnapshot, Request, Response, StatusSnapshot, S
 
 use crate::activity_log;
 use crate::state::{AppState, EventKind, RecentEvent, SYSTEM_HISTORY_LEN};
+
+// ─── Tuning constants ─────────────────────────────────────────────────────────
+
+/// Back-off between reconnect attempts in [`background_loop`]. 1.5 s is
+/// long enough to avoid hammering a dead service with pipe opens, short
+/// enough that the "reconnecting…" banner disappears quickly once the
+/// service comes back.
+const RECONNECT_BACKOFF: Duration = Duration::from_millis(1500);
+
+/// Poll cadence for `ListProcesses` + `Status` when the window is visible.
+/// 1 Hz matches the engine's own tick interval so the tray never asks for
+/// fresher data than the service produces.
+const POLL_INTERVAL_VISIBLE: Duration = Duration::from_millis(1000);
+
+/// Poll cadence when the window is hidden. 8× less frequent to cut the
+/// idle CPU floor (the user-reported issue that motivated this split).
+const POLL_INTERVAL_HIDDEN: Duration = Duration::from_millis(8000);
+
+/// Cap on the in-memory `AppState::recent` ring buffer. ~5 minutes of
+/// constant foreground flicker; more than enough for the Activity strip
+/// (shows 5) and the Recent Activity panel (shows 20).
+const MAX_RECENT: usize = 1000;
 
 // ─── Event-subscribe loop ────────────────────────────────────────────────────
 
@@ -76,7 +99,7 @@ pub(crate) fn background_loop(state: Arc<Mutex<AppState>>) {
                 s.last_error = Some(format!("{e:#}"));
             }
         }
-        std::thread::sleep(std::time::Duration::from_millis(1500));
+        std::thread::sleep(RECONNECT_BACKOFF);
     }
 }
 
@@ -292,12 +315,7 @@ fn try_connect_and_serve(
                 kind,
                 label,
             });
-            // Cap the event buffer. Without this it grows forever (one
-            // entry per foreground change, every 250 ms in the worst case).
-            // 1000 entries is ~5 minutes of constant flicker — plenty for
-            // any UI consumer (the Activity strip shows 5, the Recent
-            // Activity panel shows 20).
-            const MAX_RECENT: usize = 1000;
+            // Cap the event buffer — see MAX_RECENT for the rationale.
             if s.recent.len() > MAX_RECENT {
                 let drop = s.recent.len() - MAX_RECENT;
                 s.recent.drain(0..drop);
@@ -335,9 +353,9 @@ pub(crate) fn processes_poll_loop(
     // poll 8× less often (and skip the egui repaint wake entirely). The
     // user reported FrameSage burning CPU; this is the largest single
     // contributor — 120-row table render every 1 s × always-on = the
-    // bulk of the idle CPU floor.
-    let visible_interval = std::time::Duration::from_millis(1000);
-    let hidden_interval = std::time::Duration::from_millis(8000);
+    // bulk of the idle CPU floor. See POLL_INTERVAL_* for the values.
+    let visible_interval = POLL_INTERVAL_VISIBLE;
+    let hidden_interval = POLL_INTERVAL_HIDDEN;
     loop {
         let visible = window_visible.load(Ordering::Relaxed);
         match send_processes_and_status_blocking() {

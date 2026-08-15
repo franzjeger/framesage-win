@@ -16,6 +16,15 @@ use framesage_engine::{Engine, EngineDeps, SystemEvent};
 use framesage_gamemode::{journal::Journal, safe_list::SafeList};
 use framesage_ipc::{Event, Request, Response, PIPE_NAME_ADMIN, PIPE_NAME_STATUS};
 
+/// How often the service drives `Engine::tick`. 300 ms is the cadence that
+/// makes foreground changes feel instant. The engine's own ProBalance,
+/// background-scan, and re-assert intervals are all ≥1 s and self-throttle
+/// inside `tick`, so a faster outer loop is free — most ticks only
+/// re-check the foreground and cheap bookkeeping. Slightly coarser than the
+/// tray's 250 ms foreground reporter, which is fine: the reporter is the
+/// trigger, and a ≤300 ms reaction lag is imperceptible.
+const TICK_INTERVAL: Duration = Duration::from_millis(300);
+
 /// Optional input channels into the runtime. Item 2.4 / audit M-02:
 /// the SCM service-control handler dispatches PowerEvent /
 /// SessionChange via `system_events`; in `--console` mode the caller
@@ -193,7 +202,7 @@ pub async fn run(inputs: RuntimeInputs) -> Result<()> {
 
     let tick_engine = engine.clone();
     let mut tick_handle = tokio::spawn(async move {
-        let mut interval = tokio::time::interval(Duration::from_millis(300));
+        let mut interval = tokio::time::interval(TICK_INTERVAL);
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
             interval.tick().await;
