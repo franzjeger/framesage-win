@@ -16,6 +16,13 @@ This document is a **point-in-time snapshot** taken before several of its findin
 - **MED — file-sink logging — RESOLVED.** `crates/service/src/main.rs:221` wires `tracing_appender::rolling::daily` + `non_blocking`.
 - **MED — `sys → gamemode` dep arrow — by design, keep.** `SystemStateQuery` lives in `gamemode` (planner.rs:44) so `sys` can `impl SystemStateQuery for Win32StateQuery` (sys/src/inner/game_mode/query.rs). The inversion is documented in `crates/sys/src/lib.rs:10-18` and `ARCHITECTURE.md`; it is *not* a defect.
 - **LOW/MED — `tracing` in `core` — RESOLVED in this pass.** The dep was unused in `core` source and has been removed from `crates/core/Cargo.toml`. (The body of §1 still lists it as one of `core`'s deps — that line is now stale.)
+- **LOW — No MSRV check (L-26) — RESOLVED, with the declared floor corrected.** The true MSRV is **1.88**, not the previously declared 1.80: locked deps `image 0.25.10`, `time 0.3.47` / `time-core 0.1.8` require rustc 1.88, and `pxfm 0.1.29` requires edition2024 (1.85+). `Cargo.toml` `rust-version` is now `1.88` with an explanatory comment, and a `msrv` CI job (`.github/workflows/ci.yml`) pins `dtolnay/rust-toolchain@1.88` and runs `cargo check --locked` on the Windows target. The §9 "No MSRV check" issue note is now stale.
+- **LOW — Inline tray durations (L-28) — RESOLVED.** The scattered `Duration::from_millis(N)` calls are now named constants: `RECONNECT_BACKOFF`, `POLL_INTERVAL_VISIBLE`, `POLL_INTERVAL_HIDDEN`, `MAX_RECENT` in `tray/src/ipc_client.rs`; `IDLE_REPAINT_INTERVAL`, `SHOW_WINDOW_WATCHER_BACKOFF` in `tray/src/main.rs`.
+- **LOW — `MAX_RECENT` as a local const (L-29) — RESOLVED.** Promoted to a module-level constant in `tray/src/ipc_client.rs` alongside the other timings.
+- **LOW — Service tick interval (L-30) — RESOLVED.** `Duration::from_millis(300)` is now `TICK_INTERVAL` in `service/src/runtime.rs`, with a comment noting it is load-bearing for ProBalance sample math.
+- **Portability — `__cpuid` in `session_recorder.rs` — fixed.** `__cpuid` is `unsafe fn` on Rust ≤1.88 but safe on current stable; the calls are now wrapped in `unsafe {}` with `#[allow(unused_unsafe)]` so the file compiles across both.
+- **L-27 (`pub` → `pub(crate)`) — not a defect.** Both methods have cross-crate callers in `framesage-service`; leaving them `pub` is correct.
+- **§7 `Arc<Policy>` swap-on-write — deferred.** Premature: the per-status `policy.clone()` cost is ~µs, and the change would churn the cross-crate `StatusSnapshot` API for no measurable gain.
 
 The ranked list at the bottom (§ Top-5) reflects the **pre-fix** state; use this block for current status.
 
@@ -264,7 +271,7 @@ The Linux CI job verifies all this stays buildable. **This is the single biggest
 
 ## Top-5 to fix next, ranked
 
-> **Status (2026-08-15):** items 1-5 are **resolved** except the `sys → gamemode` clause of item 5, which is **by design** (see the Status re-audit block above). The remaining live follow-ups are the LOW polish items scattered through the body (inline tray durations, `pub(crate)` visibility, `windows-sys` version sprawl).
+> **Status (2026-08-15):** items 1-5 are **resolved** except the `sys → gamemode` clause of item 5, which is **by design** (see the Status re-audit block above). The inline-tray-durations, `MAX_RECENT`, and service-tick-interval polish items are now **resolved** in the same pass; the `pub(crate)` visibility item (L-27) is a **false positive** (cross-crate callers exist). The only remaining live follow-up is the `windows-sys` version sprawl (L-23), which is transitive and cosmetic.
 
 1. **HIGH — Make `Engine::reconcile` and `Engine::tick` unit-testable.** Introduce a `trait SysApi` for the syscall surface (mirror the `SystemStateQuery` pattern already used by gamemode). Inject an `impl SysApi` plus a `Clock` into `EngineDeps`. Add the missing integration tests. *✅ Resolved — `SysApi` + `FakeClock` in place, 62 engine tests.*
 2. **HIGH — Swap `std::sync::Mutex` for `parking_lot::Mutex` in tray.** Kills 30 `.unwrap()` calls and the panic-cascade failure mode. *✅ Resolved — parking_lot throughout, no `PoisonError` handling.*

@@ -23,6 +23,7 @@
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::time::Duration;
 
 use parking_lot::Mutex;
 
@@ -73,6 +74,19 @@ use tree::{
     build_tree_view, classify_row, column_hover_text, compare_snapshots, descendants_of,
     row_exe_color, row_marker_color, ProcessSortKey, RowState, TreeRow,
 };
+
+// ─── Tuning constants ─────────────────────────────────────────────────────────
+
+/// Idle repaint floor for the egui runtime. Background threads drive the
+/// actually-useful repaints via `ctx.request_repaint()`; this value is the
+/// safety net that catches animation easing and hover-state transitions they
+/// miss. 2 s (down from 500 ms) cuts the idle CPU floor roughly in half
+/// while keeping the UI feeling instant.
+const IDLE_REPAINT_INTERVAL: Duration = Duration::from_secs(2);
+
+/// Sleep after an abandoned/unexpected show-window event wait, so a
+/// misbehaving wait doesn't busy-loop the CPU.
+const SHOW_WINDOW_WATCHER_BACKOFF: Duration = Duration::from_millis(500);
 
 /// Signals raised by the tray icon's menu/click handlers, read by the egui
 /// `update` loop on the next frame.
@@ -573,7 +587,7 @@ impl FramesageApp {
                         Ok(false) => {
                             // Abandoned / unexpected — sleep a moment so a
                             // misbehaving wait doesn't busy-loop the CPU.
-                            std::thread::sleep(std::time::Duration::from_millis(500));
+                            std::thread::sleep(SHOW_WINDOW_WATCHER_BACKOFF);
                         }
                         Err(_) => break,
                     }
@@ -733,16 +747,8 @@ fn selector_to_mask(selector: &framesage_core::CpuSelector, cpu_count: usize) ->
 
 impl eframe::App for FramesageApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        // Idle keep-alive: 2 s instead of 500 ms. Background threads
-        // (processes poller @ 1 Hz, IPC event subscribe on demand) drive
-        // the actually-useful repaints via `ctx.request_repaint()`; this
-        // value is the floor that catches anything those threads miss
-        // (animation easing, hover-state transitions). 500 ms forced a
-        // full table re-render twice a second even when nothing changed,
-        // which on the Processes tab with 120 rows + per-row context_menu
-        // adds up. 2 s leaves the UI feeling instant while cutting the
-        // idle CPU floor roughly in half.
-        ctx.request_repaint_after(std::time::Duration::from_secs(2));
+        // Idle keep-alive — see IDLE_REPAINT_INTERVAL for the rationale.
+        ctx.request_repaint_after(IDLE_REPAINT_INTERVAL);
 
         // Mark window visible for background threads. Cleared when we
         // process a hide-to-tray request below. Background poll threads

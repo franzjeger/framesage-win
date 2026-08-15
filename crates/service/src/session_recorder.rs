@@ -543,15 +543,20 @@ fn cpu_brand() -> String {
     #[cfg(target_arch = "x86_64")]
     {
         use std::arch::x86_64::__cpuid;
-        // __cpuid is safe on x86_64 (CPUID is always available); leaf
-        // 0x8000_0000 reports the highest extended leaf available.
-        let max_ext = __cpuid(0x8000_0000).eax;
+        // `__cpuid` is an `unsafe fn` on the declared MSRV (1.88) but was
+        // re-safed on newer stable; the `unsafe` block + `allow(unused_unsafe)`
+        // keeps it compiling on both. CPUID is always available on x86_64, so
+        // the call is genuinely safe — this is a language-boundary formality.
+        // Leaf 0x8000_0000 reports the highest extended leaf available.
+        #[allow(unused_unsafe)]
+        let max_ext = unsafe { __cpuid(0x8000_0000).eax };
         if max_ext < 0x8000_0004 {
             return String::new();
         }
         let mut bytes = Vec::with_capacity(48);
         for leaf in [0x8000_0002u32, 0x8000_0003, 0x8000_0004] {
-            let r = __cpuid(leaf);
+            #[allow(unused_unsafe)]
+            let r = unsafe { __cpuid(leaf) };
             for reg in [r.eax, r.ebx, r.ecx, r.edx] {
                 bytes.extend_from_slice(&reg.to_le_bytes());
             }
