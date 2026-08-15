@@ -1447,7 +1447,8 @@ impl Engine {
                 .map(|p| p.exe_name.to_ascii_lowercase())
                 .collect();
             s.version_info_cache.retain(|path, _| {
-                path.trim_start_matches(r"\\?\").rsplit('\\')
+                path.trim_start_matches(r"\\?\")
+                    .rsplit('\\')
                     .next()
                     .is_some_and(|base| live_basenames.contains(&base.to_ascii_lowercase()))
             });

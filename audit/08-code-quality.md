@@ -6,6 +6,21 @@ Severity legend: **HIGH** = ship-blocker / silent correctness risk · **MED** = 
 
 ---
 
+## Status re-audit (2026-08-15)
+
+This document is a **point-in-time snapshot** taken before several of its findings were fixed. Verified against the live tree on 2026-08-15:
+
+- **HIGH #1 — testable `Engine` — RESOLVED.** `SysApi` trait + `RealSysApi` landed at `crates/sys/src/api.rs:46`; `EngineDeps` now carries an injectable `Arc<dyn SysApi>` (`crates/engine/src/lib.rs:109`) plus a `Clock` (`crates/engine/src/clock.rs` with a `FakeClock` for tests). Engine test count went from 2 to **62**.
+- **HIGH #2 — `parking_lot::Mutex` in tray — RESOLVED.** `parking_lot::Mutex` is imported at `crates/tray/src/main.rs:27` and `crates/tray/src/ipc_client.rs:37`; all lock sites use the infallible API (no `PoisonError` handling, no `.unwrap()`).
+- **MED — extract tray modules — RESOLVED.** `ipc_client.rs`, `process_actions.rs`, `state.rs`, `widgets.rs`, `formatters.rs`, `tree.rs`, `theme.rs`, `icons.rs`, `win32.rs` are now separate modules.
+- **MED — file-sink logging — RESOLVED.** `crates/service/src/main.rs:221` wires `tracing_appender::rolling::daily` + `non_blocking`.
+- **MED — `sys → gamemode` dep arrow — by design, keep.** `SystemStateQuery` lives in `gamemode` (planner.rs:44) so `sys` can `impl SystemStateQuery for Win32StateQuery` (sys/src/inner/game_mode/query.rs). The inversion is documented in `crates/sys/src/lib.rs:10-18` and `ARCHITECTURE.md`; it is *not* a defect.
+- **LOW/MED — `tracing` in `core` — RESOLVED in this pass.** The dep was unused in `core` source and has been removed from `crates/core/Cargo.toml`. (The body of §1 still lists it as one of `core`'s deps — that line is now stale.)
+
+The ranked list at the bottom (§ Top-5) reflects the **pre-fix** state; use this block for current status.
+
+---
+
 ## 1. Layering — mostly clean, some leaks
 
 **What works well**
@@ -249,8 +264,10 @@ The Linux CI job verifies all this stays buildable. **This is the single biggest
 
 ## Top-5 to fix next, ranked
 
-1. **HIGH — Make `Engine::reconcile` and `Engine::tick` unit-testable.** Introduce a `trait SysApi` for the syscall surface (mirror the `SystemStateQuery` pattern already used by gamemode). Inject an `impl SysApi` plus a `Clock` into `EngineDeps`. Add the missing integration tests. This is the single biggest debt.
-2. **HIGH — Swap `std::sync::Mutex` for `parking_lot::Mutex` in tray.** Kills 30 `.unwrap()` calls and the panic-cascade failure mode.
-3. **MED — Extract the 3 obvious modules from `tray/main.rs`** (IPC client, menu builder, Processes-tab logic). Brings the file from 6 241 LOC to ~2 500.
-4. **MED — File-sink logging (`tracing-appender`) for service + tray.** Without it, post-install diagnostics require console mode.
-5. **LOW/MED — Move `tracing` out of `core`** and `framesage-gamemode` dep out of `sys`. Tightens the dependency arrows.
+> **Status (2026-08-15):** items 1-5 are **resolved** except the `sys → gamemode` clause of item 5, which is **by design** (see the Status re-audit block above). The remaining live follow-ups are the LOW polish items scattered through the body (inline tray durations, `pub(crate)` visibility, `windows-sys` version sprawl).
+
+1. **HIGH — Make `Engine::reconcile` and `Engine::tick` unit-testable.** Introduce a `trait SysApi` for the syscall surface (mirror the `SystemStateQuery` pattern already used by gamemode). Inject an `impl SysApi` plus a `Clock` into `EngineDeps`. Add the missing integration tests. *✅ Resolved — `SysApi` + `FakeClock` in place, 62 engine tests.*
+2. **HIGH — Swap `std::sync::Mutex` for `parking_lot::Mutex` in tray.** Kills 30 `.unwrap()` calls and the panic-cascade failure mode. *✅ Resolved — parking_lot throughout, no `PoisonError` handling.*
+3. **MED — Extract the 3 obvious modules from `tray/main.rs`** (IPC client, menu builder, Processes-tab logic). Brings the file from 6 241 LOC to ~2 500. *✅ Resolved — modules split out.*
+4. **MED — File-sink logging (`tracing-appender`) for service + tray.** Without it, post-install diagnostics require console mode. *✅ Resolved — rolling file appender wired in service.*
+5. **LOW/MED — Move `tracing` out of `core`** and `framesage-gamemode` dep out of `sys`. Tightens the dependency arrows. *✅ `core` dep removed; the `sys → gamemode` arrow is by design and stays.*
