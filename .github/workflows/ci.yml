@@ -28,22 +28,22 @@ jobs:
       - name: cargo check (Windows target)
         run: cargo check --workspace --target x86_64-pc-windows-gnu --all-targets
 
-  # MSRV gate: the workspace declares rust-version = "1.80" (Cargo.toml), but
-  # nothing else pins it — a dependency bump or a stray 1.81+ feature would
+  # MSRV gate: the workspace declares rust-version (Cargo.toml), but nothing
+  # else pins it — a dependency bump or a stray newer-edition feature would
   # otherwise ship silently. This job runs the same check as cross-check but
   # on the exact MSRV toolchain, so the build fails the moment the code (or a
-  # transitive dep's required-version) stops compiling on 1.80. Bump the
-  # toolchain ref here *and* rust-version in Cargo.toml together.
+  # transitive dep's required-version) stops compiling on the declared MSRV.
+  # Bump the toolchain ref here *and* rust-version in Cargo.toml together.
   msrv:
-    name: MSRV check (1.80 -> x86_64-pc-windows-gnu)
+    name: MSRV check (1.85 -> x86_64-pc-windows-gnu)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@1.80
+      - uses: dtolnay/rust-toolchain@1.85
         with:
           targets: x86_64-pc-windows-gnu
       - uses: Swatinem/rust-cache@v2
-      - name: cargo check (MSRV 1.80)
+      - name: cargo check (MSRV 1.85)
         run: cargo check --workspace --target x86_64-pc-windows-gnu --all-targets
 
   # Windows-target clippy from Ubuntu: catches Windows-only lint

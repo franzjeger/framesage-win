@@ -32,7 +32,11 @@ version = "0.5.0"
 license = "Apache-2.0 OR MIT"
 authors = ["Frank Lia <support@sybr.no>"]
 repository = "https://github.com/franzjeger/framesage-win"
-rust-version = "1.80"
+# True minimum: the locked GUI stack (eframe/egui → pxfm 0.1.29) requires
+# `edition2024`, which is stable only from Rust 1.85. The previously declared
+# 1.80 was never buildable against the current Cargo.lock. Enforced by the
+# `msrv` job in .github/workflows/ci.yml — bump both together.
+rust-version = "1.85"
 
 [workspace.dependencies]
 # Errors / utility
