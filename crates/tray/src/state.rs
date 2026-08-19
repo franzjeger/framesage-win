@@ -80,9 +80,14 @@ pub(crate) struct SessionDetailState {
 /// bytes per managed PID for the per-PID variant).
 pub(crate) const SYSTEM_HISTORY_LEN: usize = 60;
 
+/// `Clone` so the egui thread can lift the newest N events out of the
+/// ring under a short lock and render them (time + kind dot + label)
+/// without holding the mutex across the draw — the Status-tab activity
+/// card needs all three fields, not just the label.
+#[derive(Clone)]
 pub(crate) struct RecentEvent {
     /// Wall-clock time the event was received. Rendered as `HH:MM:SS` in
-    /// the Activity Log; the strip + Status-tab recent activity ignore it.
+    /// the Activity Log and the Status tab's activity card.
     pub(crate) at: SystemTime,
     /// Coarse category for filter chips + color-coding. `Other` is the
     /// catch-all so a new IPC event variant doesn't get silently lost.
