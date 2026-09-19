@@ -68,5 +68,5 @@ windows = { workspace = true, features = [
 # install mingw-w64 — gating on cfg(target_os = "windows") and host_os via
 # build.rs keeps that job lean.
 [build-dependencies]
-ico = "0.3"
+ico = "0.5"
 embed-resource = "3"
