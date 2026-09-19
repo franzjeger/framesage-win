@@ -94,7 +94,7 @@ windows-service = "0.7"
 # have a curated set of fields we actually want persisted, the window
 # launches fresh at the default size every time — far better UX than
 # inheriting yesterday's broken state.
-eframe = { version = "0.28", default-features = false, features = ["default_fonts", "glow"] }
+eframe = { version = "0.36", default-features = false, features = ["default_fonts", "glow"] }
 egui = "0.28"
 egui_extras = { version = "0.28", default-features = false }
 # System tray icon (real persistent tray, not just a window)
