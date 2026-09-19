@@ -73,4 +73,4 @@ tracing-test = "0.2"
 # tests stay parallel for fast feedback. Production only ever
 # creates one ETW session per service instance so the constraint
 # is invisible in normal operation.
-serial_test = "3"
+serial_test = "4"
