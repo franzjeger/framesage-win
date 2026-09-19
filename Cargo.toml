@@ -82,7 +82,7 @@ static_assertions = "1"
 clap = { version = "4", features = ["derive"] }
 
 # Windows bindings. We enable feature sets per-crate to keep build times down.
-windows = "0.58"
+windows = "0.62"
 
 # Windows service hosting
 windows-service = "0.7"
