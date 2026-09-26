@@ -5066,12 +5066,35 @@ impl FramesageApp {
                                 ui.monospace(p.pid.to_string());
                             });
                             row.col(|ui| {
-                                // Color the CPU% column based on intensity: green for
-                                // idle, yellow for moderate, red for hot. Anchors
-                                // attention on the actually-busy processes at a
-                                // glance — same affordance Task Manager / PL use.
+                                // Design Round 3 §3b — CPU as a mini bar + the
+                                // % beside it. Bar length is clamped to one core
+                                // (100%); the number still shows the real value
+                                // (which can exceed 100 for multi-threaded hogs).
+                                // Color by intensity, same green→amber→red
+                                // affordance Task Manager / PL use.
                                 let color = cpu_percent_color(p.cpu_percent);
-                                ui.colored_label(color, format!("{}", p.cpu_percent));
+                                let frac = (p.cpu_percent as f32 / 100.0).clamp(0.0, 1.0);
+                                ui.horizontal(|ui| {
+                                    let (rect, _) = ui.allocate_exact_size(
+                                        egui::vec2(40.0, 7.0),
+                                        egui::Sense::hover(),
+                                    );
+                                    let pal = theme::p();
+                                    let painter = ui.painter();
+                                    painter.rect_filled(
+                                        rect,
+                                        egui::Rounding::same(2.0),
+                                        pal.surface_active,
+                                    );
+                                    let mut fill = rect;
+                                    fill.set_width(rect.width() * frac);
+                                    painter.rect_filled(fill, egui::Rounding::same(2.0), color);
+                                    ui.label(
+                                        egui::RichText::new(format!("{}%", p.cpu_percent))
+                                            .color(color)
+                                            .size(11.5),
+                                    );
+                                });
                             });
                             row.col(|ui| {
                                 let resp = ui.monospace(format_bytes(p.memory_bytes));
@@ -5192,17 +5215,27 @@ impl FramesageApp {
                                 }
                             });
                             row.col(|ui| {
+                                // Design Round 3 §3b — status as a themed pill
+                                // rather than bare colored text.
                                 if p.restrained_by_probalance {
-                                    // ● prefix calls out ProBalance involvement;
-                                    // visually pairs with the WARNING-tinted marker
-                                    // bar on the same row.
-                                    ui.colored_label(theme::p().warning, "● ProBalance");
+                                    theme::status_badge(theme::p().warning).show(ui, |ui| {
+                                        ui.colored_label(
+                                            theme::p().warning,
+                                            egui::RichText::new("● ProBalance").size(11.0),
+                                        );
+                                    });
                                 } else if let Some(note) = &p.matched_rule_note {
-                                    if note.is_empty() {
-                                        ui.weak("rule");
+                                    let txt = if note.is_empty() {
+                                        "rule".to_string()
                                     } else {
-                                        ui.weak(note);
-                                    }
+                                        note.clone()
+                                    };
+                                    theme::status_badge(theme::p().text_muted).show(ui, |ui| {
+                                        ui.colored_label(
+                                            theme::p().text_muted,
+                                            egui::RichText::new(txt).size(11.0),
+                                        );
+                                    });
                                 } else {
                                     ui.weak("—");
                                 }
